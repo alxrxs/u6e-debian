@@ -150,9 +150,11 @@ ln -sf /etc/systemd/system/u6e-netconsole.service $RF/etc/systemd/system/multi-u
 # hands the next boot to stock; fw_setenv writes only the U-Boot env (mtd6).
 printf '/dev/mtd6 0x0 0x10000 0x1000\n' > $RF/etc/fw_env.config
 
-# fastfetch shows the board, so it shows the board's logo too.
+# fastfetch shows the board, so it shows the board's logo too. A config file
+# replaces the default module list, so let fastfetch write out its own.
 install -d $RF/etc/xdg/fastfetch
-printf '{\n  "logo": { "source": "unifi" }\n}\n' > $RF/etc/xdg/fastfetch/config.jsonc
+rm -f $RF/etc/xdg/fastfetch/config.jsonc
+chroot $RF fastfetch -c none -l unifi --gen-config /etc/xdg/fastfetch/config.jsonc >/dev/null
 cat > $RF/usr/local/sbin/u6e-arm <<'ARM'
 #!/bin/sh
 set -e
