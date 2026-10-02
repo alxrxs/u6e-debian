@@ -66,6 +66,10 @@ if [ "$1" = nss ]; then
 		-m BONDING -m MACVLAN -m NET_IPIP -m NET_IPGRE_DEMUX -m NET_IPGRE -e NET_IPGRE_BROADCAST -m IPV6_GRE \
 		-m IPV6_SIT -e IPV6_SIT_6RD -m IPV6_TUNNEL -m XFRM_USER -m INET_ESP -m INET_ESP_OFFLOAD \
 		-m INET6_ESP -m INET6_ESP_OFFLOAD
+	# Per-client rate limits: the qdiscs, classifiers and actions tc classifies
+	# with, for the NSS qdiscs and for traffic the firmware hands back to Linux.
+	./scripts/config -m NET_SCH_HTB -m NET_SCH_TBF -m NET_SCH_FQ_CODEL -m NET_SCH_PRIO -m NET_CLS_U32 \
+		-m NET_CLS_FW -m NET_CLS_MATCHALL -m NET_ACT_POLICE -m NET_ACT_SKBEDIT -m NET_ACT_CONNMARK
 fi
 make -s olddefconfig
 cp .config "$here/config-$(make -s kernelversion)-u6e-$1"

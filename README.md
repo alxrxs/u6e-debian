@@ -30,6 +30,7 @@ Inputs:
 Then, on an x86 host with the aarch64/armhf cross toolchains, `mmdebstrap`, `qemu-user-static` and `u-boot-tools`:
 
 ```sh
+sudo pkg/iproute2-nss/build.sh     # Debian's iproute2 with the NSS qdiscs in tc -> pkg/iproute2-nss/out/
 sudo ./mkrootfs.sh arm64           # Debian rootfs -> rootfs/
 fw/mk-board2.sh                    # board-2.bin with the U6-E variants -> fw/out/
 ./config-u6e.sh nss                # kernel .config (also arm64 / arm without NSS)
@@ -46,7 +47,7 @@ Ubiquiti's U-Boot is AArch32 and only `bootm`s its own signed FIT images, but `b
 
 `boot/go8.sh shim.bin u6e.dtb u6e.initrd Image`, run against the stock firmware, stages the four payloads as files in stock's `/tmp/log` (ext4 on the eMMC, kept across reboots), rewriting only the 64 KiB chunks that changed, maps their extents with `ext4map.py`, and writes one U-Boot environment batch: a `bootcmd_real` that first disarms itself, then reads the payloads, CRC-checks each and `bootz`es the shim. Reboot stock and the AP comes up in Debian; any reboot after that returns to stock. `boot/apstate.sh` tells which system is running.
 
-What is ever written: files in `/tmp/log`, the U-Boot environment partition, and raw eMMC sectors past the last partition (5000000+) for boot traces. Never the SPI flash.
+What is ever written: files in `/tmp/log`, raw eMMC sectors past the last partition (5000000+) for boot traces, and on the SPI flash only the U-Boot environment partition. The device tree marks every SPI partition read-only; a persistent image's DTB lifts that for the environment alone.
 
 ### Persistent mode
 
@@ -58,6 +59,8 @@ Each boot `go8.sh` arms is one-shot: `bootcmd_real` disarms itself before it sta
 - `boot/wifi-up.sh` starts the test SSID on all three radios (country and channel plan from `site.conf`).
 - Recovery: a hang warm-resets (systemd watchdog, panic on lockups and oops); with no management network after 3 minutes `u6e-netcheck` writes its diagnosis to pstore and reboots into stock, where `boot/ramoops.sh` reads it back. The kernel log also goes to the management VLAN's broadcast address (netconsole, UDP 6666).
 - `u6e-caldata` writes each radio's calibration from the AP's own ART partition at every boot.
+- Installed for the SSIDs, not yet configured: `tc` from `pkg/iproute2-nss` drives the NSS qdiscs (`nsshtb`, `nsstbl`, `nssfq_codel`, …; `accel_mode 0` shapes in the firmware), with the kernel's HTB/TBF/u32/police/skbedit/connmark modules for traffic the firmware hands back to Linux; `radsecproxy` carries hostapd's RADIUS (UDP only) over RadSec, and stays disabled until it has a configuration.
+- `fastfetch` shows the board with the UniFi logo.
 
 ## Licence
 

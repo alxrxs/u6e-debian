@@ -149,6 +149,10 @@ ln -sf /etc/systemd/system/u6e-netconsole.service $RF/etc/systemd/system/multi-u
 # starting us. u6e-arm re-arms it from the steps go8.sh staged, or with "disarm"
 # hands the next boot to stock; fw_setenv writes only the U-Boot env (mtd6).
 printf '/dev/mtd6 0x0 0x10000 0x1000\n' > $RF/etc/fw_env.config
+
+# fastfetch shows the board, so it shows the board's logo too.
+install -d $RF/etc/xdg/fastfetch
+printf '{\n  "logo": { "source": "unifi" }\n}\n' > $RF/etc/xdg/fastfetch/config.jsonc
 cat > $RF/usr/local/sbin/u6e-arm <<'ARM'
 #!/bin/sh
 set -e
@@ -247,7 +251,7 @@ rm -rf modstage $RF/usr/lib/modules/* $RF/etc/modprobe.d/u6e-nss.conf \
 	$RF/etc/udev/rules.d/80-u6e-wlan.rules $RF/etc/systemd/system/u6e-nss.service $RF/etc/systemd/system/multi-user.target.wants/u6e-nss.service
 make -s -C $K ARCH=${MODE/nss/arm64} CROSS_COMPILE=$X INSTALL_MOD_PATH=$PWD/modstage INSTALL_MOD_STRIP=1 modules_install
 M=$PWD/modstage/lib/modules/$R
-WANT="netconsole qcom_q6v5_mpd qcom_q6v5_wcss_sec qrtr-smd qcrypto st_accel_i2c phy-qcom-m31 qrtr qrtr-mhi vxlan macsec bridge 8021q nf_tables nft_ct nft_chain_nat nft_nat nft_masq nft_reject_inet nft_fib_inet nft_log nft_limit nf_conntrack tun wireguard"
+WANT="netconsole qcom_q6v5_mpd qcom_q6v5_wcss_sec qrtr-smd qcrypto st_accel_i2c phy-qcom-m31 qrtr qrtr-mhi vxlan macsec bridge 8021q nf_tables nft_ct nft_chain_nat nft_nat nft_masq nft_reject_inet nft_fib_inet nft_log nft_limit nf_conntrack tun wireguard sch_htb sch_tbf sch_fq_codel sch_prio sch_ingress cls_u32 cls_fw cls_matchall cls_flower act_police act_skbedit act_connmark act_mirred ifb"
 if [ $MODE = nss ]; then
 	install -d "$M/updates"
 	cp nss/out/$R/*.ko "$M/updates/"
