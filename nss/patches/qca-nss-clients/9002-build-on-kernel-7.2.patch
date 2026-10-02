@@ -1,0 +1,76 @@
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Subject: [PATCH] build on kernel 7.2
+
+- gre: net_device's netns_local became netns_immutable in 6.13.
+- igs mirred: count an overlimit through tcf_action_inc_overlimit_qstats(),
+  which also covers an action without per-CPU stats, and include the
+  netfilter headers for the NF_IP_PRI_* hook priorities, which are no
+  longer reachable through the conntrack headers.
+- vxlanmgr: the IPv6 stubs are gone on 7.x; look the route up with
+  ip6_dst_lookup_flow() through the socket's sk, and test the result with
+  IS_ERR() - the lookup reports a failure as an ERR_PTR, never NULL.
+---
+--- a/gre/nss_connmgr_gre.c
++++ b/gre/nss_connmgr_gre.c
+@@ -196,7 +196,11 @@
+ 		dev->features |= NETIF_F_NETNS_LOCAL | NETIF_F_SG | NETIF_F_FRAGLIST | NETIF_F_HIGHDMA;
+ #else
+ 		dev->features |= NETIF_F_SG | NETIF_F_FRAGLIST | NETIF_F_HIGHDMA;
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 13, 0)
+ 		dev->netns_local = true;
++#else
++		dev->netns_immutable = true;
++#endif
+ #endif
+ 		dev->hw_features |= NETIF_F_SG | NETIF_F_FRAGLIST | NETIF_F_HIGHDMA;
+ 		return 0;
+@@ -213,8 +217,10 @@
+ 
+ #if LINUX_VERSION_CODE <= KERNEL_VERSION(6, 10, 0)
+ 	dev->features |= NETIF_F_NETNS_LOCAL;
+-#else
++#elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 13, 0)
+ 	dev->netns_local = true;
++#else
++	dev->netns_immutable = true;
+ #endif
+ 	return 0;
+ }
+--- a/nss_qdisc/igs/nss_mirred.c
++++ b/nss_qdisc/igs/nss_mirred.c
+@@ -18,6 +18,8 @@
+ #include <nss_cmn.h>
+ #include <linux/tc_act/tc_nss_mirred.h>
+ #include <net/netfilter/nf_conntrack_core.h>
++#include <linux/netfilter_ipv4.h>
++#include <linux/netfilter_ipv6.h>
+ #include "nss_mirred.h"
+ #include "nss_igs.h"
+ #include "nss_ifb.h"
+@@ -395,7 +397,7 @@
+ 		return retval;
+ 	}
+ out:
+-	qstats_overlimit_inc(this_cpu_ptr(act->common.cpu_qstats));
++	tcf_action_inc_overlimit_qstats(&act->common);
+ 	retval = TC_ACT_SHOT;
+ 	rcu_read_unlock();
+ 	return retval;
+--- a/vxlanmgr/nss_vxlanmgr_tunnel.c
++++ b/vxlanmgr/nss_vxlanmgr_tunnel.c
+@@ -204,10 +204,14 @@
+ 		err = ipv6_stub->ipv6_dst_lookup(vxlan->net,
+ 				vxlan->vn6_sock->sock->sk, &dst, &fl6);
+ 		if (err < 0) {
+-#else
++#elif (LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0))
+ 		dentry = ipv6_stub->ipv6_dst_lookup_flow(vxlan->net,
+ 				vxlan->vn6_sock->sock->sk, &fl6, final_dst);
+ 		if (!dentry) {
++#else
++		dentry = ip6_dst_lookup_flow(vxlan->net, vxlan->vn6_sock->sk,
++				&fl6, final_dst);
++		if (IS_ERR(dentry)) {
+ #endif
+ 			nss_vxlanmgr_warn("No route, drop packet.\n");
+ 			return false;

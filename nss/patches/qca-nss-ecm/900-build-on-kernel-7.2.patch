@@ -1,0 +1,41 @@
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Subject: [PATCH] ecm: build on kernel 7.2
+
+On 7.x struct pppoe_hdr no longer declares the tag[] flexible array to the
+kernel; the PPP protocol of a session frame is the 16-bit word right after
+the 6-byte header either way, so read it from there. struct
+pptp_gre_header is no longer reachable through the GRE headers; include
+net/pptp.h where the PPTP path dissects it.
+---
+--- a/ecm_interface.c
++++ b/ecm_interface.c
+@@ -98,6 +98,7 @@
+ #endif
+ #ifdef ECM_INTERFACE_PPTP_ENABLE
+ #include <linux/netfilter/nf_conntrack_proto_gre.h>
++#include <net/pptp.h>
+ #endif
+ #endif
+ #ifdef ECM_INTERFACE_MAP_T_ENABLE
+--- a/frontends/cmn/ecm_ipv4.c
++++ b/frontends/cmn/ecm_ipv4.c
+@@ -1832,7 +1832,7 @@
+ 	struct ecm_tracker_ip_header ip_hdr;
+ 	unsigned int result = NF_ACCEPT;
+ 	struct pppoe_hdr *ph = pppoe_hdr(skb);
+-	uint16_t ppp_proto = *(uint16_t *)ph->tag;
++	uint16_t ppp_proto = *(uint16_t *)(ph + 1);
+ 	uint32_t encap_header_len = 0;
+ 
+ 	ppp_proto = ntohs(ppp_proto);
+--- a/frontends/cmn/ecm_ipv6.c
++++ b/frontends/cmn/ecm_ipv6.c
+@@ -1938,7 +1938,7 @@
+ 	struct ecm_tracker_ip_header ip_hdr;
+ 	unsigned int result = NF_ACCEPT;
+ 	struct pppoe_hdr *ph = pppoe_hdr(skb);
+-	uint16_t ppp_proto = *(uint16_t *)ph->tag;
++	uint16_t ppp_proto = *(uint16_t *)(ph + 1);
+ 	uint32_t encap_header_len = 0;
+ 
+ 	ppp_proto = ntohs(ppp_proto);

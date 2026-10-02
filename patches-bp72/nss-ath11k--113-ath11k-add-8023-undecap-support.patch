@@ -1,0 +1,67 @@
+From 37ffa1456627ec325814db423dd97521d9fa2c9f Mon Sep 17 00:00:00 2001
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Date: Fri, 2 Oct 2026 09:56:42 +0300
+Subject: [PATCH] ath11k-add-8023-undecap-support
+
+Imported from https://github.com/kuncy7/openwrt-nss-edma package/kernel/mac80211/patches/nss/ath11k/113-ath11k-add-8023-undecap-support.patch (added in 82c7d2cde8); the patch file carries no author or description.
+---
+ drivers/net/wireless/ath/ath11k/dp_rx.c | 39 ++++++++++++++++++++++++-
+ 1 file changed, 38 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/wireless/ath/ath11k/dp_rx.c b/drivers/net/wireless/ath/ath11k/dp_rx.c
+index ccc20e91d..812be5aca 100644
+--- a/drivers/net/wireless/ath/ath11k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath11k/dp_rx.c
+@@ -2299,6 +2299,42 @@ static void ath11k_dp_rx_h_undecap_eth(struct ath11k *ar,
+ 	ether_addr_copy(ieee80211_get_SA(hdr), sa);
+ }
+ 
++static void ath11k_dp_rx_h_undecap_snap(struct ath11k *ar,
++				        struct sk_buff *msdu,
++				        u8 *first_hdr,
++				        enum hal_encrypt_type enctype,
++				        struct ieee80211_rx_status *status)
++{
++	struct ieee80211_hdr *hdr;
++	size_t hdr_len;
++	u8 l3_pad_bytes;
++	struct hal_rx_desc *rx_desc;
++
++	/* Delivered decapped frame:
++	 * [amsdu header] <-- replaced with 802.11 hdr
++	 * [rfc1042/llc]
++	 * [payload]
++	 */
++
++	rx_desc = (void *)msdu->data - sizeof(*rx_desc);
++	l3_pad_bytes = ath11k_dp_rx_h_msdu_end_l3pad(ar->ab, rx_desc);
++
++	skb_put(msdu, l3_pad_bytes);
++	skb_pull(msdu, sizeof(struct ath11k_dp_amsdu_subframe_hdr) + l3_pad_bytes);
++
++	hdr = (struct ieee80211_hdr *)first_hdr;
++	hdr_len = ieee80211_hdrlen(hdr->frame_control);
++
++	if (!(status->flag & RX_FLAG_IV_STRIPPED)) {
++		memcpy(skb_push(msdu,
++				ath11k_dp_rx_crypto_param_len(ar, enctype)),
++		       (void *)hdr + hdr_len,
++			ath11k_dp_rx_crypto_param_len(ar, enctype));
++	}
++
++	memcpy(skb_push(msdu, hdr_len), hdr, hdr_len);
++}
++
+ static void ath11k_dp_rx_h_undecap(struct ath11k *ar, struct sk_buff *msdu,
+ 				   struct hal_rx_desc *rx_desc,
+ 				   enum hal_encrypt_type enctype,
+@@ -2340,7 +2376,8 @@ static void ath11k_dp_rx_h_undecap(struct ath11k *ar, struct sk_buff *msdu,
+ 						   enctype, status);
+ 		break;
+ 	case DP_RX_DECAP_TYPE_8023:
+-		/* TODO: Handle undecap for these formats */
++		ath11k_dp_rx_h_undecap_snap(ar, msdu, first_hdr,
++					    enctype, status);
+ 		break;
+ 	}
+ }

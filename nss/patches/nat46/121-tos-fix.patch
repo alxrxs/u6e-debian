@@ -1,0 +1,30 @@
+Author: Ramkishan Gurjar <quic_rgurjar@quicinc.com>
+Date:   Thu Nov 16 15:30:04 2023 +0530
+
+    nat46: Fix traffic class is not set in ipv6 Header from ipv4 tos value.
+
+    Change-Id: I781d7af8bc9751dd23f6c3f4195644b3f9025fcb
+    Signed-off-by: Ramkishan Gurjar <quic_rgurjar@quicinc.com>
+
+---
+diff --git a/nat46/modules/nat46-core.c b/nat46/modules/nat46-core.c
+index 8a48eb6..52fa3e3 100644
+--- a/nat46/modules/nat46-core.c
++++ b/nat46/modules/nat46-core.c
+@@ -2470,6 +2470,8 @@ int nat46_ipv4_input(struct sk_buff *old_skb) {
+     return err;
+   }
+ 
++  tclass = ip_tos_ignore ? 0 : ipv4_get_dsfield(hdr4); /* traffic class */
++
+   memset(v6saddr, 1, 16);
+   memset(v6daddr, 2, 16);
+ 
+@@ -2601,7 +2603,6 @@ int nat46_ipv4_input(struct sk_buff *old_skb) {
+   memset(hdr6, 0, sizeof(*hdr6) + (add_frag_header?8:0));
+ 
+   /* build IPv6 header */
+-  tclass = ip_tos_ignore ? 0 : ipv4_get_dsfield(hdr4); /* traffic class */
+   *(__be32 *)hdr6 = htonl(0x60000000 | (tclass << 20)) | flowlabel; /* version, priority, flowlabel */
+ 
+   /* IPv6 length is a payload length, IPv4 is hdr+payload */

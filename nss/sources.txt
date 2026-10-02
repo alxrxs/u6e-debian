@@ -1,0 +1,8 @@
+qca-dwmac-nss https://github.com/kuncy7/openwrt-nss-edma.git 6dac1ad69c5603db090522a7e7836e8c32102505 package/kernel/qca-dwmac-nss/src
+qca-nss-drv https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-drv.git d7ef98b1d3d31346981d3a1abff5152a206374af
+qca-nss-crypto https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-crypto.git 60e27b91f9cdb1d6de38337c03444021ae8c1040
+qca-mcs https://git.codelinaro.org/clo/qsdk/oss/lklm/qca-mcs.git 063a4679ed22b1610925d3809397ff82308d4d00
+qca-nss-ecm https://git.codelinaro.org/clo/qsdk/oss/lklm/qca-nss-ecm.git 5997ffd40deef3ee6788a411bd3a06dbb5beb784
+qca-nss-clients https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-clients.git 51be82d43ef85079f78aa163d014223b05baa6a2
+qca-nss-cfi https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-cfi.git ff11daede9ed465cf11f764f68e11ad2dc2e6699
+nat46 https://github.com/ayourtch/nat46.git f2bb2ebe47e9f86cf7340f9f2595815658bee2f1

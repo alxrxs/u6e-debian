@@ -1,0 +1,32 @@
+From fe8600d0cdd72bc74ccdd04f4cf6519d3a55b18f Mon Sep 17 00:00:00 2001
+From: Stanislaw Pal <kuncy7@gmail.com>
+Date: Fri, 2 Oct 2026 09:53:52 +0300
+Subject: [PATCH] 
+ wifi-cfg80211-drop-noisy-key-addition-failed-message-during-FT
+
+Imported from https://github.com/kuncy7/openwrt-nss-edma package/kernel/mac80211/patches/nss/subsys/350-wifi-cfg80211-drop-noisy-key-addition-failed-message-during-FT.patch (added in aaacdca9a1); the patch file carries no author or description.
+[Andrei: Ported to 7.2: rdev_add_key() now takes the wdev.]
+---
+ net/wireless/nl80211.c | 7 ++-----
+ 1 file changed, 2 insertions(+), 5 deletions(-)
+
+diff --git a/net/wireless/nl80211.c b/net/wireless/nl80211.c
+index c450b3899..7cd945b1f 100644
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@ -5626,13 +5626,10 @@ static int nl80211_new_key(struct sk_buff *skb, struct genl_info *info)
+ 		err = nl80211_validate_key_link_id(info, wdev, link_id,
+ 				key.type == NL80211_KEYTYPE_PAIRWISE);
+ 
+-	if (!err) {
+-		err = rdev_add_key(rdev, wdev, link_id, key.idx,
++	if (!err)
++		return rdev_add_key(rdev, wdev, link_id, key.idx,
+ 				   key.type == NL80211_KEYTYPE_PAIRWISE,
+ 				    mac_addr, &key.p);
+-		if (err)
+-			GENL_SET_ERR_MSG(info, "key addition failed");
+-	}
+ 
+ 	return err;
+ }

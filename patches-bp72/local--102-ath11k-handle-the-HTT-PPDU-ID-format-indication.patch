@@ -1,0 +1,45 @@
+From fac76f4362e77941aec911ae4df71da65421e700 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Fri, 2 Oct 2026 11:48:40 +0300
+Subject: [PATCH] wifi: ath11k: handle the HTT PPDU ID format indication
+
+WLAN.HK 2.8 and later firmware sends HTT_T2H_PPDU_ID_FMT_IND (0x30, HTT
+3.106) once per radio at bring-up: for each field it packs into a PPDU ID
+(HW scheduler command id, ring, sequence index, link, command type, TQM
+command, MAC id, CRC), whether it is present, its width and its bit
+offset. ath11k only ever compares PPDU IDs, so it needs none of this, but
+the unknown type ends in "htt event 48 not handled" at warning level on
+every boot. Name the type and dump the message at HTT debug level.
+---
+ drivers/net/wireless/ath/ath11k/dp.h    | 1 +
+ drivers/net/wireless/ath/ath11k/dp_rx.c | 5 +++++
+ 2 files changed, 6 insertions(+)
+
+diff --git a/drivers/net/wireless/ath/ath11k/dp.h b/drivers/net/wireless/ath/ath11k/dp.h
+index db80b1f..cf0aa05 100644
+--- a/drivers/net/wireless/ath/ath11k/dp.h
++++ b/drivers/net/wireless/ath/ath11k/dp.h
+@@ -1189,6 +1189,7 @@ enum htt_t2h_msg_type {
+ 	HTT_T2H_MSG_TYPE_PPDU_STATS_IND = 0x1d,
+ 	HTT_T2H_MSG_TYPE_EXT_STATS_CONF = 0x1c,
+ 	HTT_T2H_MSG_TYPE_BKPRESSURE_EVENT_IND = 0x24,
++	HTT_T2H_MSG_TYPE_PPDU_ID_FMT_IND = 0x30,
+ };
+ 
+ #define HTT_TARGET_VERSION_MAJOR 3
+diff --git a/drivers/net/wireless/ath/ath11k/dp_rx.c b/drivers/net/wireless/ath/ath11k/dp_rx.c
+index a582c7b..dd1cbdf 100644
+--- a/drivers/net/wireless/ath/ath11k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath11k/dp_rx.c
+@@ -2258,6 +2258,11 @@ void ath11k_dp_htt_htc_t2h_msg_handler(struct ath11k_base *ab,
+ 	case HTT_T2H_MSG_TYPE_BKPRESSURE_EVENT_IND:
+ 		ath11k_htt_backpressure_event_handler(ab, skb);
+ 		break;
++	case HTT_T2H_MSG_TYPE_PPDU_ID_FMT_IND:
++		/* The bit layout of the firmware's PPDU IDs; ath11k only compares them. */
++		ath11k_dbg_dump(ab, ATH11K_DBG_DP_HTT, NULL, "htt ppdu id format: ",
++				skb->data, skb->len);
++		break;
+ 	default:
+ 		ath11k_warn(ab, "htt event %d not handled\n", type);
+ 		break;

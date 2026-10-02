@@ -1,0 +1,17 @@
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Subject: [PATCH] nat46: include net/dsfield.h for ipv4_get_dsfield()
+
+The TOS translation reads the IPv4 DS field through ipv4_get_dsfield(),
+which on 7.x is no longer reachable through net/route.h; include its own
+header.
+---
+--- a/nat46/modules/nat46-core.c
++++ b/nat46/modules/nat46-core.c
+@@ -18,6 +18,7 @@
+ 
+ #include <linux/version.h>
+ #include <net/route.h>
++#include <net/dsfield.h>
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(4,19,0)
+ #include <net/ipv6.h>
+ #else

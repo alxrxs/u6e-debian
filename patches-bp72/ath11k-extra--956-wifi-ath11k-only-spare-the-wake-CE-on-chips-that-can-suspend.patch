@@ -1,0 +1,62 @@
+From c79aac3fc333dcb092e3d54ee3a023442204892b Mon Sep 17 00:00:00 2001
+From: Adriel Santos <adriel.turox@gmail.com>
+Date: Fri, 2 Oct 2026 09:49:08 +0300
+Subject: [PATCH] wifi: ath11k: only spare the wake CE on chips that can
+ suspend
+
+The except_wake_irq pair skips ATH11K_PCI_CE_WAKE_IRQ (CE2) so that a
+chip suspended with WoW keeps its wakeup interrupt armed. That skip is
+unconditional, but suspend itself is not: ath11k_core_suspend() refuses
+outright on any chip with !hw_params.supports_suspend, which includes
+both AHB-attached users of these helpers (wcn6750 and qcn6122).
+
+On those chips the asymmetry is a bug. The firmware crash path tears
+interrupts down with ath11k_hif_ce_irq_disable() - the except-wake
+disable, which leaves CE2 untouched - while the recovery path re-enables
+through ath11k_pcic_ce_irqs_enable(), which takes every CE. CE2 then
+gets an enable_irq() at depth zero on every single recovery:
+
+  Unbalanced enable for IRQ 67
+  WARNING: CPU: 0 PID: 12 at kernel/irq/manage.c:801 __enable_irq+0x4c/0x80
+  Workqueue: ath11k_wq ath11k_core_restart [ath11k]
+
+Observed 22 times across a 24-cycle crash/recover soak on IPQ5018 +
+QCN6122, once per QCN6122 recovery.
+
+Skip the wake CE only when the chip can actually suspend. Chips with
+supports_suspend keep the current behaviour exactly; chips that can
+never suspend get the symmetric all-CE semantics their recovery path
+already assumes.
+
+Signed-off-by: Adriel Santos <adriel.turox@gmail.com>
+---
+ drivers/net/wireless/ath/ath11k/pcic.c | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath11k/pcic.c b/drivers/net/wireless/ath/ath11k/pcic.c
+index cdcf3df26..2d3691e56 100644
+--- a/drivers/net/wireless/ath/ath11k/pcic.c
++++ b/drivers/net/wireless/ath/ath11k/pcic.c
+@@ -843,7 +843,10 @@ void ath11k_pci_enable_ce_irqs_except_wake_irq(struct ath11k_base *ab)
+ 	int i;
+ 
+ 	for (i = 0; i < ab->hw_params.ce_count; i++) {
+-		if (ath11k_ce_get_attr_flags(ab, i) & CE_ATTR_DIS_INTR ||
++		if (ath11k_ce_get_attr_flags(ab, i) & CE_ATTR_DIS_INTR)
++			continue;
++		/* only a chip that can suspend needs its wake CE left armed */
++		if (ab->hw_params.supports_suspend &&
+ 		    i == ATH11K_PCI_CE_WAKE_IRQ)
+ 			continue;
+ 		ath11k_pcic_ce_irq_enable(ab, i);
+@@ -861,7 +864,9 @@ void ath11k_pci_disable_ce_irqs_except_wake_irq(struct ath11k_base *ab)
+ 		ce_pipe = &ab->ce.ce_pipe[i];
+ 		irq_idx = ATH11K_PCI_IRQ_CE0_OFFSET + i;
+ 
+-		if (ath11k_ce_get_attr_flags(ab, i) & CE_ATTR_DIS_INTR ||
++		if (ath11k_ce_get_attr_flags(ab, i) & CE_ATTR_DIS_INTR)
++			continue;
++		if (ab->hw_params.supports_suspend &&
+ 		    i == ATH11K_PCI_CE_WAKE_IRQ)
+ 			continue;
+ 

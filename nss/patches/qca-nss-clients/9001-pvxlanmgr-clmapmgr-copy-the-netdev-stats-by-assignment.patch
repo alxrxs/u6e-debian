@@ -1,0 +1,36 @@
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Subject: [PATCH] pvxlanmgr, clmapmgr: copy the netdev stats by assignment
+
+GCC 14 cannot see through netdev_priv() and rejects the memcpy of the
+private rtnl_link_stats64 as a 200-byte read from a zero-size region
+(-Werror=stringop-overread). A struct assignment copies the same bytes
+and makes the memset before it redundant.
+---
+diff --git a/clmapmgr/nss_clmapmgr.c b/clmapmgr/nss_clmapmgr.c
+index 6a32c99..1b637ec 100644
+--- a/clmapmgr/nss_clmapmgr.c
++++ b/clmapmgr/nss_clmapmgr.c
+@@ -105,8 +105,7 @@ static struct rtnl_link_stats64 *nss_clmapmgr_get_dev_stats64(struct net_device
+ 	 */
+ 	atomic_long_set(&(dev)->stats.__rx_dropped, 0);
+ 	priv = netdev_priv(dev);
+-	memset(stats, 0, sizeof(struct rtnl_link_stats64));
+-	memcpy(stats, &priv->stats, sizeof(struct rtnl_link_stats64));
++	*stats = priv->stats;
+ 	dev_put(dev);
+ 
+ 	return stats;
+diff --git a/pvxlanmgr/nss_pvxlanmgr.c b/pvxlanmgr/nss_pvxlanmgr.c
+index 3849756..5930f5e 100644
+--- a/pvxlanmgr/nss_pvxlanmgr.c
++++ b/pvxlanmgr/nss_pvxlanmgr.c
+@@ -179,8 +179,7 @@ static struct rtnl_link_stats64 *nss_pvxlanmgr_get_tunnel_stats(struct net_devic
+ 	 */
+ 	atomic_long_set(&(dev)->stats.__rx_dropped, 0);
+ 	priv = netdev_priv(dev);
+-	memset(stats, 0, sizeof(struct rtnl_link_stats64));
+-	memcpy(stats, &priv->stats, sizeof(struct rtnl_link_stats64));
++	*stats = priv->stats;
+ 	dev_put(dev);
+ 
+ 	return stats;

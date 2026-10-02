@@ -1,0 +1,30 @@
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Subject: [PATCH] vxlanmgr: release the source-address route lookups
+
+Picking a tunnel's source address looks a route up and keeps only the
+address it yields, but never drops the reference the lookup took, so every
+tunnel created with an unspecified local address leaked a route. Put the
+IPv4 rtable and release the IPv6 dst once the address is copied.
+---
+--- a/vxlanmgr/nss_vxlanmgr_tunnel.c
++++ b/vxlanmgr/nss_vxlanmgr_tunnel.c
+@@ -182,6 +182,7 @@
+ 				return false;
+ 			}
+ 			new_src_ip[0] = fl4.saddr;
++			ip_rt_put(rt);
+ 			return true;
+ 		}
+ 		new_src_ip[0] = src_ip->sin.sin_addr.s_addr;
+@@ -217,6 +218,11 @@
+ 			return false;
+ 		}
+ 		memcpy(new_src_ip, &fl6.saddr, sizeof(struct in6_addr));
++#if (LINUX_VERSION_CODE <= KERNEL_VERSION(4, 5, 7))
++		dst_release(dst);
++#else
++		dst_release(dentry);
++#endif
+ 		return true;
+ 	}
+ 	memcpy(new_src_ip, &src_ip->sin6.sin6_addr, sizeof(struct in6_addr));

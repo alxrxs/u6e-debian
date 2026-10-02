@@ -1,0 +1,73 @@
+From: Gustavo Foletto Mora <gusfmora@gmail.com>
+Subject: [PATCH] ath11k: give the 256M memory profile smaller RXDMA rings
+
+ATH11K_MEM_PROFILE_256M exists in Kconfig but nothing in the driver
+tests it, so selecting it gives a board the 1G defaults. Make it mean
+"the 512M profile, plus smaller RXDMA rings": the build defines both
+symbols when 256M is selected (ath.mk), and this patch shrinks, under
+CPTCFG_ATH11K_MEM_PROFILE_256M only, the four rings the 512M profile
+leaves at their 1G sizes: DP_RXDMA_BUF_RING_SIZE 4096 -> 512,
+DP_RXDMA_ERR_DST_RING_SIZE 1024 -> 128, DP_RXDMA_MONITOR_DESC_RING_SIZE
+4096 -> 128 and ATH11K_DP_RXDMA_REFILL_RING_SIZE 2048 -> 512.
+
+The NSS Wi-Fi datapath sizes its RX descriptor pool from
+DP_RXDMA_BUF_RING_SIZE (WIFILI_RX_DESC_POOL_WEIGHT * ring size), so this
+is not a change to make for boards that do not need it; 512M and 1G
+builds are untouched. On a 256 MB IPQ5018 with the NSS plane holding its
+reserved region, the two radios cannot both complete QMI bring-up with
+the 1G rings - the second one loses a GFP_KERNEL allocation and reports
+
+    ath11k c000000.wifi: failed to load board data file: -12
+
+This must apply after 207-ath11k-Enable-256_512MB-profiles, which turns
+some of the same constants into ATH11K_DP_* macros, hence the 999- prefix.
+
+Signed-off-by: Gustavo Foletto Mora <gusfmora@gmail.com>
+---
+--- a/drivers/net/wireless/ath/ath11k/dp.h
++++ b/drivers/net/wireless/ath/ath11k/dp.h
+@@ -237,14 +237,30 @@
+ #define DP_REO_EXCEPTION_RING_SIZE	128
+ #define DP_REO_CMD_RING_SIZE		256
+ #define DP_REO_STATUS_RING_SIZE		2048
++/* The 256M profile is the 512M profile plus smaller RXDMA rings. The NSS
++ * Wi-Fi datapath sizes its RX descriptor pool from DP_RXDMA_BUF_RING_SIZE,
++ * so only a board that cannot afford the 1G rings should see this.
++ */
++#ifdef CPTCFG_ATH11K_MEM_PROFILE_256M
++#define DP_RXDMA_BUF_RING_SIZE		512
++#else
+ #define DP_RXDMA_BUF_RING_SIZE		4096
++#endif
+ #define DP_RXDMA_REFILL_RING_SIZE	ATH11K_DP_RXDMA_REFILL_RING_SIZE
+ #define DP_RXDMA_NSS_REFILL_RING_SIZE	ATH11K_DP_RXDMA_NSS_REFILL_RING_SIZE
++#ifdef CPTCFG_ATH11K_MEM_PROFILE_256M
++#define DP_RXDMA_ERR_DST_RING_SIZE	128
++#else
+ #define DP_RXDMA_ERR_DST_RING_SIZE	1024
++#endif
+ #define DP_RXDMA_MON_STATUS_RING_SIZE	ATH11K_DP_RXDMA_MON_STATUS_RING_SIZE
+ #define DP_RXDMA_MONITOR_BUF_RING_SIZE	ATH11K_DP_RXDMA_MONITOR_BUF_RING_SIZE
+ #define DP_RXDMA_MONITOR_DST_RING_SIZE	ATH11K_DP_RXDMA_MONITOR_BUF_RING_SIZE
++#ifdef CPTCFG_ATH11K_MEM_PROFILE_256M
++#define DP_RXDMA_MONITOR_DESC_RING_SIZE	128
++#else
+ #define DP_RXDMA_MONITOR_DESC_RING_SIZE	4096
++#endif
+ 
+ #define DP_RX_RELEASE_RING_NUM	3
+ 
+--- a/drivers/net/wireless/ath/ath11k/hw.h
++++ b/drivers/net/wireless/ath/ath11k/hw.h
+@@ -22,7 +22,11 @@
+ #define ATH11K_DP_RXDMA_MON_STATUS_RING_SIZE	512
+ #define ATH11K_DP_RXDMA_MONITOR_BUF_RING_SIZE	128
+ #define ATH11K_DP_RXDMA_MONITOR_DST_RING_SIZE	128
++#ifdef CPTCFG_ATH11K_MEM_PROFILE_256M
++#define ATH11K_DP_RXDMA_REFILL_RING_SIZE	512
++#else
+ #define ATH11K_DP_RXDMA_REFILL_RING_SIZE	2048
++#endif
+ /* 256b desc TLV + 4b(rounded) Pad + 30byte max nwifi header +
+  * 18byte mesh hdr + 8byte snap + 1500 eth payload
+  */

@@ -1,0 +1,33 @@
+Author:  Pavithra R <pavir@codeaurora.org>
+Date:    Wed Aug 5 20:35:00 2020 +0530
+
+nat46: Fix null pointer dereference issue
+
+This patch is propagated from the kernel 4.4 commit
+5bdf9bd5500c45ab5a3fd43e60c40a09d5e5a13d
+
+get_nat46_instance possibly returns null point, before using the returning
+point, caller needs to check if it is null.
+
+Change-Id: Id407a71ca8eccd60a713c34429e7e3f16e2cdd12
+Signed-off-by: Pavithra R <pavir@codeaurora.org>
+
+
+[Andrei: rebased onto nat46 f2bb2eb; the NULL-instance checks are upstream (0792119); only the rest remains.]
+---
+diff --git a/nat46/modules/nat46-core.c b/nat46/modules/nat46-core.c
+index 77409bf..90f93cd 100644
+--- a/nat46/modules/nat46-core.c
++++ b/nat46/modules/nat46-core.c
+@@ -2432,6 +2432,11 @@ int nat46_ipv4_input(struct sk_buff *old_skb) {
+ 
+   char v6saddr[16], v6daddr[16];
+ 
++  if (nat46 == NULL) {
++    printk("nat46:%p skb is dropped for no valid instance found\n", old_skb);
++    return err;
++  }
++
+   memset(v6saddr, 1, 16);
+   memset(v6daddr, 2, 16);
+ 

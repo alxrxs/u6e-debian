@@ -1,0 +1,29 @@
+From: kuncy7 <noreply@example.com>
+Subject: [PATCH] ath11k: add the missing compact RX descriptor ops to ipq5018_ops
+
+With the 256/512MB memory profiles the rx header TLV is off, so
+ath11k_dp_rx_h_undecap_*() and the mcbc/EAPOL host path rebuild the
+802.11 header from the descriptor through rx_desc_get_mpdu_frame_ctl,
+rx_desc_dot11_hdr_fields_valid, rx_desc_get_dot11_hdr and
+rx_desc_get_crypto_header. qcn9074_ops has them, ipq5018_ops (which
+uses the same descriptor layout) does not, so these paths would call
+through a NULL pointer on IPQ5018.
+
+Use the qcn9074 helpers, as for the other rx_desc ops.
+
+Found by Adriel Santos in his RD03v2 port
+(github.com/ADCDS/openwrt-xiaomi-ax3000t-rd03v2, ipq5018-compact-rx-ops).
+
+--- a/drivers/net/wireless/ath/ath11k/hw.c
++++ b/drivers/net/wireless/ath/ath11k/hw.c
+@@ -1486,6 +1486,10 @@ const struct ath11k_hw_ops ipq5018_ops =
+ #ifdef CPTCFG_ATH11K_MEM_PROFILE_512M
+ 	.rx_desc_get_offset = ath11k_hw_qcn9074_rx_desc_get_offset,
+ #endif
++	.rx_desc_get_mpdu_frame_ctl = ath11k_hw_qcn9074_rx_desc_get_mpdu_frame_ctl,
++	.rx_desc_dot11_hdr_fields_valid = ath11k_hw_qcn9074_rx_desc_dot11_hdr_fields_valid,
++	.rx_desc_get_dot11_hdr = ath11k_hw_qcn9074_rx_desc_get_dot11_hdr,
++	.rx_desc_get_crypto_header = ath11k_hw_qcn9074_rx_desc_get_crypto_hdr,
+ };
+ 
+ #define ATH11K_TX_RING_MASK_0 BIT(0)

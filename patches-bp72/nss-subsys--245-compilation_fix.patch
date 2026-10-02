@@ -1,0 +1,112 @@
+From 5a578d7c63415abe3b42545bf3485d0455ba4215 Mon Sep 17 00:00:00 2001
+From: Tamizh Chelvam <tamizhr@codeaurora.org>
+Date: Fri, 2 Oct 2026 09:52:40 +0300
+Subject: [PATCH] backport: Compile fix
+
+Adding these changes to fix compilation issue due to
+package upgrade
+
+Signed-off-by: Tamizh Chelvam <tamizhr@codeaurora.org>
+Signed-off-by: Gautham Kumar Senthilkumaran <quic_gauthamk@quicinc.com>
+[Andrei: Ported to 7.2: the NSS early exit in the 802.3 transmit path sits after the new multicast-offload branch of __ieee80211_subif_start_xmit_8023(), and the A-MPDU state block it skips keeps 7.2's NULL-sta guard.]
+---
+ net/mac80211/ieee80211_i.h |  1 +
+ net/mac80211/tx.c          | 43 +++++++++++++++++++-------------------
+ 2 files changed, 23 insertions(+), 21 deletions(-)
+
+diff --git a/net/mac80211/ieee80211_i.h b/net/mac80211/ieee80211_i.h
+index bca0f9a3d..adeb1ca1d 100644
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -225,6 +225,7 @@ enum ieee80211_rx_flags {
+ };
+ 
+ struct ieee80211_rx_data {
++	struct napi_struct *napi;
+ 	struct list_head *list;
+ 	struct sk_buff *skb;
+ 	struct ieee80211_local *local;
+diff --git a/net/mac80211/tx.c b/net/mac80211/tx.c
+index ee38c6af5..027e0482b 100644
+--- a/net/mac80211/tx.c
++++ b/net/mac80211/tx.c
+@@ -4821,21 +4821,23 @@ static void ieee80211_8023_xmit(struct ieee80211_sub_if_data *sdata,
+ 
+ 	ieee80211_aggr_check(sdata, sta, skb);
+ 
+-	tid = skb->priority & IEEE80211_QOS_CTL_TAG1D_MASK;
++	if (!ieee80211_hw_check(&local->hw, SUPPORTS_NSS_OFFLOAD)) {
++		tid = skb->priority & IEEE80211_QOS_CTL_TAG1D_MASK;
+ 
+-	if (sta)
+-		tid_tx = rcu_dereference(sta->ampdu_mlme.tid_tx[tid]);
+-	if (tid_tx) {
+-		if (!test_bit(HT_AGG_STATE_OPERATIONAL, &tid_tx->state)) {
+-			/* fall back to non-offload slow path */
+-			__ieee80211_subif_start_xmit(skb, dev, 0,
+-						     IEEE80211_TX_CTRL_MLO_LINK_UNSPEC,
+-						     NULL);
+-			return;
+-		}
++		if (sta)
++			tid_tx = rcu_dereference(sta->ampdu_mlme.tid_tx[tid]);
++		if (tid_tx) {
++			if (!test_bit(HT_AGG_STATE_OPERATIONAL, &tid_tx->state)) {
++				/* fall back to non-offload slow path */
++				__ieee80211_subif_start_xmit(skb, dev, 0,
++							     IEEE80211_TX_CTRL_MLO_LINK_UNSPEC,
++							     NULL);
++				return;
++			}
+ 
+-		if (tid_tx->timeout)
+-			tid_tx->last_tx = jiffies;
++			if (tid_tx->timeout)
++				tid_tx->last_tx = jiffies;
++		}
+ 	}
+ 
+ 	skb = ieee80211_tx_skb_fixup(skb, ieee80211_sdata_netdev_features(sdata));
+@@ -4916,7 +4918,7 @@ static void __ieee80211_subif_start_xmit_8023(struct sk_buff *skb,
+ 	struct ieee80211_sub_if_data *sdata = IEEE80211_DEV_TO_SUB_IF(dev);
+ 	struct ethhdr *ehdr = (struct ethhdr *)skb->data;
+ 	struct ieee80211_link_data *link;
+-	struct ieee80211_key *key;
++	struct ieee80211_key *key = NULL;
+ 	struct sta_info *sta;
+ 
+ 	rcu_read_lock();
+@@ -4941,6 +4943,10 @@ static void __ieee80211_subif_start_xmit_8023(struct sk_buff *skb,
+ 		}
+ 		link = &sdata->deflink;
+ 		key = rcu_dereference(link->default_multicast_key);
++	} else if (ieee80211_hw_check(&sdata->local->hw, SUPPORTS_NSS_OFFLOAD)) {
++		if (unlikely(IS_ERR_OR_NULL(sta) || !sta->uploaded))
++			sta = NULL;
++		goto tx_offload;
+ 	} else if (unlikely(IS_ERR_OR_NULL(sta) || !sta->uploaded ||
+ 		   !test_sta_flag(sta, WLAN_STA_AUTHORIZED) ||
+ 	    sdata->control_port_protocol == ehdr->h_proto)) {
+@@ -4955,6 +4961,7 @@ static void __ieee80211_subif_start_xmit_8023(struct sk_buff *skb,
+ 		goto skip_offload;
+ 
+ 	sk_pacing_shift_update(skb->sk, sdata->local->hw.tx_sk_pacing_shift);
++tx_offload:
+ 	ieee80211_8023_xmit(sdata, dev, sta, key, skb);
+ 	goto out;
+ 
+@@ -6737,13 +6744,7 @@ int ieee80211_tx_control_port(struct wiphy *wiphy, struct net_device *dev,
+ 
+ start_xmit:
+ 	local_bh_disable();
+-
+-	/* added hardware encap check for ethernet mode */
+-	if (sdata->vif.offload_flags & IEEE80211_OFFLOAD_ENCAP_ENABLED)
+-		ieee80211_subif_start_xmit_8023(skb, skb->dev);
+-	else
+-		__ieee80211_subif_start_xmit(skb, skb->dev, flags, ctrl_flags, cookie);
+-
++	__ieee80211_subif_start_xmit(skb, skb->dev, flags, ctrl_flags, cookie);
+ 	local_bh_enable();
+ 
+ 	return 0;

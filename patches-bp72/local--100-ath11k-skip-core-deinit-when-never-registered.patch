@@ -1,0 +1,41 @@
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Subject: [PATCH] wifi: ath11k: do not deinit the core of a device that never registered
+
+Removing a device whose firmware never came up (no QMI server, so the
+core was never started) runs ath11k_core_deinit(), which stops the CE
+pipes and reaps rings that were never set up in the HAL: a NULL
+dereference in ath11k_hal_srng_access_begin() from
+ath11k_ce_cleanup_pipes(). Shutdown already skips the deinit for such a
+device; take the QMI-failure path in remove() too, and unregister the
+PM notifier on that path for AHB as PCI does.
+---
+--- a/drivers/net/wireless/ath/ath11k/ahb.c
++++ b/drivers/net/wireless/ath/ath11k/ahb.c
+@@ -1350,10 +1350,13 @@
+ {
+ 	struct ath11k_base *ab = platform_get_drvdata(pdev);
+ 
+-	if (test_bit(ATH11K_FLAG_QMI_FAIL, &ab->dev_flags)) {
++	/* Without firmware the rings were never set up: core_deinit would reap them. */
++	if (test_bit(ATH11K_FLAG_QMI_FAIL, &ab->dev_flags) ||
++	    !test_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags)) {
+ 		ath11k_ahb_power_down(ab, false);
+ 		ath11k_debugfs_soc_destroy(ab);
+ 		ath11k_qmi_deinit_service(ab);
++		ath11k_core_pm_notifier_unregister(ab);
+ 		goto qmi_fail;
+ 	}
+ 
+--- a/drivers/net/wireless/ath/ath11k/pci.c
++++ b/drivers/net/wireless/ath/ath11k/pci.c
+@@ -1202,7 +1202,9 @@
+ 
+ 	ath11k_pci_set_irq_affinity_hint(ab_pci, NULL);
+ 
+-	if (test_bit(ATH11K_FLAG_QMI_FAIL, &ab->dev_flags)) {
++	/* Without firmware the rings were never set up: core_deinit would reap them. */
++	if (test_bit(ATH11K_FLAG_QMI_FAIL, &ab->dev_flags) ||
++	    !test_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags)) {
+ 		ath11k_pci_power_down(ab, false);
+ 		ath11k_debugfs_soc_destroy(ab);
+ 		ath11k_qmi_deinit_service(ab);

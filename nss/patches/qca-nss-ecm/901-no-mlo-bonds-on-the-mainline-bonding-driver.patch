@@ -1,0 +1,25 @@
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Subject: [PATCH] ecm_interface: no MLO bonds on the mainline bonding driver
+
+bond_is_mlo_device() comes from QSDK's bonding driver, which adds bonds of
+Wi-Fi 7 multi-link devices. The mainline driver has no such bonds, so with
+LAG support enabled every bond is an ordinary link aggregate.
+---
+--- a/ecm_interface.c
++++ b/ecm_interface.c
+@@ -53,6 +53,15 @@
+ #endif
+ #ifdef ECM_INTERFACE_BOND_ENABLE
+ #include <net/bonding.h>
++
++/*
++ * MLO bonds are a QSDK bonding-driver extension for Wi-Fi 7 multi-link
++ * devices; the mainline bonding driver has none.
++ */
++static inline bool bond_is_mlo_device(struct net_device *bond_dev)
++{
++	return false;
++}
+ #endif
+ #if defined(ECM_DB_XREF_ENABLE) && defined(ECM_BAND_STEERING_ENABLE)
+ #include <linux/if_bridge.h>

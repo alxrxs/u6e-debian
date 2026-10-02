@@ -1,0 +1,43 @@
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Subject: [PATCH] qca-mcs: build on kernel 7.2
+
+proto_ops->bind() takes a struct sockaddr_unsized, and the IGMPV3_MRC and
+IGMPV3_QQIC macros are gone: IGMPv3 queries decode through igmpv3_mrt()
+and igmpv3_qqi(), and the MLDv2 QQIC - the same 8-bit exponential code -
+through igmpv3_exp_field_decode() (net/mld.h's mldv2_qqi() would need
+struct mld2_query, which this module defines itself). The decoded values
+are unchanged.
+---
+--- a/mc_snooping.c
++++ b/mc_snooping.c
+@@ -2149,8 +2149,8 @@
+ 		if (ih3->nsrcs)
+ 			return;
+ 
+-		max_resp_time = ih3->code ? IGMPV3_MRC(ih3->code) * (HZ / IGMP_TIMER_SCALE) : mc->query_response_interval;
+-		qqic = ih3->qqic ? IGMPV3_QQIC(ih3->qqic) * HZ : mc->query_interval;
++		max_resp_time = ih3->code ? igmpv3_mrt(ih3) * (HZ / IGMP_TIMER_SCALE) : mc->query_response_interval;
++		qqic = ih3->qqic ? igmpv3_qqi(ih3) * HZ : mc->query_interval;
+ 		qrv = ih3->qrv ? ih3->qrv : mc->last_member_count;
+ 	}
+ 
+@@ -2239,7 +2239,7 @@
+ 		if (mld2q->mld2q_nsrcs)
+ 			return 0;
+ 		max_resp_time = mld2q->mld2q_mrc ? msecs_to_jiffies(MLDV2_MRC(ntohs(mld2q->mld2q_mrc))) : mc->query_response_interval;
+-		qqic = mld2q->mld2q_qqic ? IGMPV3_QQIC(mld2q->mld2q_qqic) * HZ : mc->query_interval;
++		qqic = mld2q->mld2q_qqic ? igmpv3_exp_field_decode(mld2q->mld2q_qqic) * HZ : mc->query_interval;
+ 		qrv = mld2q->mld2q_qrv ? mld2q->mld2q_qrv : mc->last_member_count;
+ 		group = &mld2q->mld2q_mca;
+ 	}
+--- a/mc_wifi_events.c
++++ b/mc_wifi_events.c
+@@ -840,7 +840,7 @@
+ 	saddr.nl_family = AF_NETLINK;
+ 	saddr.nl_pid    = current->pid;
+ 
+-	err = __ewn.sock->ops->bind(__ewn.sock, (struct sockaddr *)&saddr, sizeof(struct sockaddr));
++	err = __ewn.sock->ops->bind(__ewn.sock, (struct sockaddr_unsized *)&saddr, sizeof(struct sockaddr));
+ 	if (err < 0) {
+ 		printk(KERN_ERR"failed to bind sock err %d\n", err);
+ 		goto exit2;

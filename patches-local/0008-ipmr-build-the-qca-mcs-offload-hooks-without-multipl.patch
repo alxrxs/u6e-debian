@@ -1,0 +1,359 @@
+From 474128964d7a63be0f32c081127ebcf160dcb8b7 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Fri, 2 Oct 2026 09:42:08 +0300
+Subject: [PATCH] ipmr: build the qca-mcs offload hooks without multiple tables
+
+qca-add-mcs-support placed the IPv4 MFC offload callbacks and sync helpers
+inside the CONFIG_IP_MROUTE_MULTIPLE_TABLES block, so with single-table
+multicast routing they vanished and ECM failed to link. Move them after
+the block, where the same code already sits in ip6mr.c.
+[Andrei: Redone for 7.2: both hook sections move to just after ipmr_get_table(), which 7.2 defines outside the multiple-tables block.]
+---
+ net/ipv4/ipmr.c | 320 ++++++++++++++++++++++++------------------------
+ 1 file changed, 160 insertions(+), 160 deletions(-)
+
+diff --git a/net/ipv4/ipmr.c b/net/ipv4/ipmr.c
+index ddc5870c1..5f17ec74d 100644
+--- a/net/ipv4/ipmr.c
++++ b/net/ipv4/ipmr.c
+@@ -233,6 +233,166 @@ static int ipmr_rule_fill(struct fib_rule *rule, struct sk_buff *skb,
+ 	return 0;
+ }
+ 
++static const struct fib_rules_ops __net_initconst ipmr_rules_ops_template = {
++	.family		= RTNL_FAMILY_IPMR,
++	.rule_size	= sizeof(struct ipmr_rule),
++	.addr_size	= sizeof(u32),
++	.action		= ipmr_rule_action,
++	.match		= ipmr_rule_match,
++	.configure	= ipmr_rule_configure,
++	.compare	= ipmr_rule_compare,
++	.fill		= ipmr_rule_fill,
++	.nlgroup	= RTNLGRP_IPV4_RULE,
++	.owner		= THIS_MODULE,
++};
++
++static int __net_init ipmr_rules_init(struct net *net)
++{
++	struct fib_rules_ops *ops;
++	LIST_HEAD(dev_kill_list);
++	struct mr_table *mrt;
++	int err;
++
++	ops = fib_rules_register(&ipmr_rules_ops_template, net);
++	if (IS_ERR(ops))
++		return PTR_ERR(ops);
++
++	INIT_LIST_HEAD(&net->ipv4.mr_tables);
++
++	mrt = ipmr_new_table(net, RT_TABLE_DEFAULT);
++	if (IS_ERR(mrt)) {
++		err = PTR_ERR(mrt);
++		goto err1;
++	}
++
++	err = fib_default_rule_add(ops, 0x7fff, RT_TABLE_DEFAULT);
++	if (err < 0)
++		goto err2;
++
++	net->ipv4.mr_rules_ops = ops;
++	return 0;
++
++err2:
++	ipmr_free_table(mrt, &dev_kill_list);
++err1:
++	fib_rules_unregister(ops);
++	return err;
++}
++
++static void __net_exit ipmr_rules_exit(struct net *net)
++{
++	fib_rules_unregister(net->ipv4.mr_rules_ops);
++}
++
++static void __net_exit ipmr_rules_exit_rtnl(struct net *net,
++					    struct list_head *dev_kill_list)
++{
++	struct mr_table *mrt, *next;
++
++	list_for_each_entry_safe(mrt, next, &net->ipv4.mr_tables, list) {
++		list_del_rcu(&mrt->list);
++		ipmr_free_table(mrt, dev_kill_list);
++	}
++}
++
++static int ipmr_rules_dump(struct net *net, struct notifier_block *nb,
++			   struct netlink_ext_ack *extack)
++{
++	return fib_rules_dump(net, nb, RTNL_FAMILY_IPMR, extack);
++}
++
++static unsigned int ipmr_rules_seq_read(const struct net *net)
++{
++	return fib_rules_seq_read(net, RTNL_FAMILY_IPMR);
++}
++
++bool ipmr_rule_default(const struct fib_rule *rule)
++{
++	return fib_rule_matchall(rule) && rule->table == RT_TABLE_DEFAULT;
++}
++EXPORT_SYMBOL(ipmr_rule_default);
++#else
++static struct mr_table *ipmr_mr_table_iter(struct net *net,
++					   struct mr_table *mrt)
++{
++	if (!mrt)
++		return rcu_dereference(net->ipv4.mrt);
++	return NULL;
++}
++
++static struct mr_table *__ipmr_get_table(struct net *net, u32 id)
++{
++	return rcu_dereference_check(net->ipv4.mrt,
++				     lockdep_rtnl_is_held() ||
++				     !rcu_access_pointer(net->ipv4.mrt));
++}
++
++#define ipmr_for_each_table(mrt, net)				\
++	for (mrt = __ipmr_get_table(net, 0); mrt; mrt = NULL)
++
++static int ipmr_fib_lookup(struct net *net, struct flowi4 *flp4,
++			   struct mr_table **mrt)
++{
++	*mrt = rcu_dereference(net->ipv4.mrt);
++	if (!*mrt)
++		return -EAGAIN;
++	return 0;
++}
++
++static int __net_init ipmr_rules_init(struct net *net)
++{
++	struct mr_table *mrt;
++
++	mrt = ipmr_new_table(net, RT_TABLE_DEFAULT);
++	if (IS_ERR(mrt))
++		return PTR_ERR(mrt);
++
++	rcu_assign_pointer(net->ipv4.mrt, mrt);
++	return 0;
++}
++
++static void __net_exit ipmr_rules_exit(struct net *net)
++{
++}
++
++static void __net_exit ipmr_rules_exit_rtnl(struct net *net,
++					    struct list_head *dev_kill_list)
++{
++	struct mr_table *mrt = rcu_dereference_protected(net->ipv4.mrt, 1);
++
++	RCU_INIT_POINTER(net->ipv4.mrt, NULL);
++	ipmr_free_table(mrt, dev_kill_list);
++}
++
++static int ipmr_rules_dump(struct net *net, struct notifier_block *nb,
++			   struct netlink_ext_ack *extack)
++{
++	return 0;
++}
++
++static unsigned int ipmr_rules_seq_read(const struct net *net)
++{
++	return 0;
++}
++
++bool ipmr_rule_default(const struct fib_rule *rule)
++{
++	return true;
++}
++EXPORT_SYMBOL(ipmr_rule_default);
++#endif
++
++static struct mr_table *ipmr_get_table(struct net *net, u32 id)
++{
++	struct mr_table *mrt;
++
++	rcu_read_lock();
++	mrt = __ipmr_get_table(net, id);
++	rcu_read_unlock();
++
++	return mrt;
++}
++
+ /* QCA ECM qca-mcs support - Start */
+ /* ipmr_sync_entry_update()
+  * Call the registered offload callback to report an update to a multicast
+@@ -307,19 +467,6 @@ static void ipmr_sync_entry_delete(u32 origin, u32 group)
+ }
+ /* QCA ECM qca-mcs support - End */
+ 
+-static const struct fib_rules_ops __net_initconst ipmr_rules_ops_template = {
+-	.family		= RTNL_FAMILY_IPMR,
+-	.rule_size	= sizeof(struct ipmr_rule),
+-	.addr_size	= sizeof(u32),
+-	.action		= ipmr_rule_action,
+-	.match		= ipmr_rule_match,
+-	.configure	= ipmr_rule_configure,
+-	.compare	= ipmr_rule_compare,
+-	.fill		= ipmr_rule_fill,
+-	.nlgroup	= RTNLGRP_IPV4_RULE,
+-	.owner		= THIS_MODULE,
+-};
+-
+ /* QCA ECM qca-mcs support - Start */
+ /* ipmr_register_mfc_event_offload_callback()
+  * Register the IPv4 Multicast update offload callback with IPMR
+@@ -470,153 +617,6 @@ int ipmr_mfc_stats_update(struct net *net, __be32 origin, __be32 group,
+ EXPORT_SYMBOL(ipmr_mfc_stats_update);
+ /* QCA ECM qca-mcs support - End */
+ 
+-static int __net_init ipmr_rules_init(struct net *net)
+-{
+-	struct fib_rules_ops *ops;
+-	LIST_HEAD(dev_kill_list);
+-	struct mr_table *mrt;
+-	int err;
+-
+-	ops = fib_rules_register(&ipmr_rules_ops_template, net);
+-	if (IS_ERR(ops))
+-		return PTR_ERR(ops);
+-
+-	INIT_LIST_HEAD(&net->ipv4.mr_tables);
+-
+-	mrt = ipmr_new_table(net, RT_TABLE_DEFAULT);
+-	if (IS_ERR(mrt)) {
+-		err = PTR_ERR(mrt);
+-		goto err1;
+-	}
+-
+-	err = fib_default_rule_add(ops, 0x7fff, RT_TABLE_DEFAULT);
+-	if (err < 0)
+-		goto err2;
+-
+-	net->ipv4.mr_rules_ops = ops;
+-	return 0;
+-
+-err2:
+-	ipmr_free_table(mrt, &dev_kill_list);
+-err1:
+-	fib_rules_unregister(ops);
+-	return err;
+-}
+-
+-static void __net_exit ipmr_rules_exit(struct net *net)
+-{
+-	fib_rules_unregister(net->ipv4.mr_rules_ops);
+-}
+-
+-static void __net_exit ipmr_rules_exit_rtnl(struct net *net,
+-					    struct list_head *dev_kill_list)
+-{
+-	struct mr_table *mrt, *next;
+-
+-	list_for_each_entry_safe(mrt, next, &net->ipv4.mr_tables, list) {
+-		list_del_rcu(&mrt->list);
+-		ipmr_free_table(mrt, dev_kill_list);
+-	}
+-}
+-
+-static int ipmr_rules_dump(struct net *net, struct notifier_block *nb,
+-			   struct netlink_ext_ack *extack)
+-{
+-	return fib_rules_dump(net, nb, RTNL_FAMILY_IPMR, extack);
+-}
+-
+-static unsigned int ipmr_rules_seq_read(const struct net *net)
+-{
+-	return fib_rules_seq_read(net, RTNL_FAMILY_IPMR);
+-}
+-
+-bool ipmr_rule_default(const struct fib_rule *rule)
+-{
+-	return fib_rule_matchall(rule) && rule->table == RT_TABLE_DEFAULT;
+-}
+-EXPORT_SYMBOL(ipmr_rule_default);
+-#else
+-static struct mr_table *ipmr_mr_table_iter(struct net *net,
+-					   struct mr_table *mrt)
+-{
+-	if (!mrt)
+-		return rcu_dereference(net->ipv4.mrt);
+-	return NULL;
+-}
+-
+-static struct mr_table *__ipmr_get_table(struct net *net, u32 id)
+-{
+-	return rcu_dereference_check(net->ipv4.mrt,
+-				     lockdep_rtnl_is_held() ||
+-				     !rcu_access_pointer(net->ipv4.mrt));
+-}
+-
+-#define ipmr_for_each_table(mrt, net)				\
+-	for (mrt = __ipmr_get_table(net, 0); mrt; mrt = NULL)
+-
+-static int ipmr_fib_lookup(struct net *net, struct flowi4 *flp4,
+-			   struct mr_table **mrt)
+-{
+-	*mrt = rcu_dereference(net->ipv4.mrt);
+-	if (!*mrt)
+-		return -EAGAIN;
+-	return 0;
+-}
+-
+-static int __net_init ipmr_rules_init(struct net *net)
+-{
+-	struct mr_table *mrt;
+-
+-	mrt = ipmr_new_table(net, RT_TABLE_DEFAULT);
+-	if (IS_ERR(mrt))
+-		return PTR_ERR(mrt);
+-
+-	rcu_assign_pointer(net->ipv4.mrt, mrt);
+-	return 0;
+-}
+-
+-static void __net_exit ipmr_rules_exit(struct net *net)
+-{
+-}
+-
+-static void __net_exit ipmr_rules_exit_rtnl(struct net *net,
+-					    struct list_head *dev_kill_list)
+-{
+-	struct mr_table *mrt = rcu_dereference_protected(net->ipv4.mrt, 1);
+-
+-	RCU_INIT_POINTER(net->ipv4.mrt, NULL);
+-	ipmr_free_table(mrt, dev_kill_list);
+-}
+-
+-static int ipmr_rules_dump(struct net *net, struct notifier_block *nb,
+-			   struct netlink_ext_ack *extack)
+-{
+-	return 0;
+-}
+-
+-static unsigned int ipmr_rules_seq_read(const struct net *net)
+-{
+-	return 0;
+-}
+-
+-bool ipmr_rule_default(const struct fib_rule *rule)
+-{
+-	return true;
+-}
+-EXPORT_SYMBOL(ipmr_rule_default);
+-#endif
+-
+-static struct mr_table *ipmr_get_table(struct net *net, u32 id)
+-{
+-	struct mr_table *mrt;
+-
+-	rcu_read_lock();
+-	mrt = __ipmr_get_table(net, id);
+-	rcu_read_unlock();
+-
+-	return mrt;
+-}
+-
+ static inline int ipmr_hash_cmp(struct rhashtable_compare_arg *arg,
+ 				const void *ptr)
+ {

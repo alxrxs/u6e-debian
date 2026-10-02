@@ -1,0 +1,56 @@
+#!/bin/sh
+# Write ath11k calibration files for the U6-Enterprise's three radios from the
+# ART partition, each with its own MAC (EEPROM base MAC +1/+2/+3, as stock
+# assigns them). ART carries Qualcomm's placeholder MAC in every blob; the
+# blob checksum (word at 0xa) keeps the XOR of all 16-bit words at 0xffff.
+# ART / EEPROM / FW may be overridden to run against image files.
+set -eu
+
+mtd_dev() { # <partition name> -> /dev/mtdN
+	for _ in $(seq 50); do
+		n=$(grep "\"$1\"" /proc/mtd | cut -d: -f1)
+		[ -n "$n" ] && { echo "/dev/$n"; return; }
+		sleep 0.2
+	done
+	echo "u6e-caldata: no \"$1\" partition" >&2
+	exit 1
+}
+ART=${ART:-$(mtd_dev 0:art)}
+EEPROM=${EEPROM:-$(mtd_dev eeprom)}
+FW=${FW:-/usr/lib/firmware/ath11k}
+
+byte() { od -An -tu1 -j "$(($2))" -N1 "$1" | tr -d ' '; }
+put() { printf "$(printf '\\%03o' "$3")" | dd of="$1" bs=1 seek="$(($2))" conv=notrunc status=none; }
+
+# patch <file> <offset> <byte>... : write bytes, folding the change into the checksum.
+patch() {
+	f=$1 o=$(($2)) c0=0 c1=0
+	shift 2
+	for new; do
+		old=$(byte "$f" "$o")
+		if [ $((o % 2)) -eq 0 ]; then c0=$((c0 ^ old ^ new)); else c1=$((c1 ^ old ^ new)); fi
+		put "$f" "$o" "$new"
+		o=$((o + 1))
+	done
+	put "$f" 0xa $(($(byte "$f" 0xa) ^ c0))
+	put "$f" 0xb $(($(byte "$f" 0xb) ^ c1))
+}
+
+# extract <ART offset> <output> <MAC increment>
+extract() {
+	off=$1 out=$2 inc=$3
+	mkdir -p "$(dirname "$out")"
+	dd if="$ART" of="$out.tmp" bs=512 skip=$((off / 512)) count=256 status=none
+	# base MAC as a 48-bit number, plus the radio's increment
+	m=$(od -An -tx1 -N6 "$EEPROM" | tr -d ' \n')
+	m=$((0x$m + inc))
+	set --
+	for sh in 40 32 24 16 8 0; do set -- "$@" $(((m >> sh) & 0xff)); done
+	patch "$out.tmp" 0xe "$@"   # MAC slot 0
+	patch "$out.tmp" 0x3e 1 0   # "use the MAC from caldata" flag
+	mv "$out.tmp" "$out"
+}
+
+extract 0x1000  "$FW/IPQ5018/hw1.0/cal-ahb-c000000.wifi.bin" 1  # 2.4 GHz
+extract 0x26800 "$FW/QCN9074/hw1.0/cal-pci-0000:01:00.0.bin" 2  # 5 GHz (pcie0)
+extract 0x4c000 "$FW/QCN9074/hw1.0/cal-pci-0001:01:00.0.bin" 3  # 6 GHz (pcie1)

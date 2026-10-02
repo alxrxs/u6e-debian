@@ -1,0 +1,51 @@
+# shellcheck shell=bash disable=SC2034
+# Site configuration for the U6-Enterprise image and its boot tooling: copy to
+# site.conf (not tracked) and fill in. prep-rootfs.sh and boot/*.sh source it.
+
+AP_HOSTNAME=u6e
+# Management: a tagged VLAN on the uplink with a static address - how the
+# stock firmware runs with a UniFi controller's static network settings.
+MGMT_VLAN=11
+MGMT_ADDR=192.0.2.16/24
+MGMT_GW=192.0.2.1
+MGMT_DNS=192.0.2.53
+MGMT_DOMAIN=example.net
+# Wi-Fi clients: a VLAN bridged, unaddressed, into br<vid>; hostapd adds the
+# radios to it.
+CLIENT_VLAN=42
+# root's authorized_keys in the image.
+ROOT_AUTHORIZED_KEYS=/root/.ssh/id_ed25519.pub
+# Proprietary inputs (Wi-Fi firmware, the stock board data): see README.md.
+BLOBS=../u6e-blobs
+
+# Stock firmware SSH: the controller's "Device Authentication" user, and a
+# command printing its password.
+STOCK_USER=ubnt
+stock_password() { cat ~/.config/u6e/stock-password; }
+
+# boot/powercycle.sh: cut and restore the AP's power, e.g. its PoE injector's
+# smart plug.
+power_off() { echo "power_off: not configured" >&2; return 1; }
+power_on() { echo "power_on: not configured" >&2; return 1; }
+
+# boot/wifi-up.sh: the test SSID, the regulatory country and each radio's
+# channel (hostapd lines). The example is stock's plan in South Korea (KR);
+# check what your country allows.
+WIFI_COUNTRY=KR
+wifi_ssid() { echo u6e-test; }
+wifi_psk() { cat ~/.config/u6e/wifi-psk; }
+WIFI_24="hw_mode=g
+channel=13"
+WIFI_5="hw_mode=a
+channel=149
+ht_capab=[HT40+][SHORT-GI-20][SHORT-GI-40]
+ieee80211ac=1
+vht_oper_chwidth=1
+vht_oper_centr_freq_seg0_idx=155
+he_oper_chwidth=1
+he_oper_centr_freq_seg0_idx=155"
+WIFI_6="hw_mode=a
+op_class=134
+channel=53
+he_oper_chwidth=2
+he_oper_centr_freq_seg0_idx=47"

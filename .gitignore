@@ -1,0 +1,25 @@
+# Site-specific configuration (see site.conf.example).
+/site.conf
+# Trees checked out from their own repositories (see README.md).
+/linux-7.2.8/
+/linux-6.12.111/
+/linux-arm/
+/backports-7.2/
+# Downloads, build inputs and outputs.
+/linux-*.tar.*
+/sha256sums.asc
+/rootfs/
+/rootfs-armhf/
+/out-*/
+/modules.keep
+/config-*-u6e-*
+/*.log
+/fw/out/
+/boot/memdump
+/shim/shim.bin
+/nss/src/
+/nss/stage/
+/nss/out/
+/nss/dl/
+/nss/build.log
+__pycache__/

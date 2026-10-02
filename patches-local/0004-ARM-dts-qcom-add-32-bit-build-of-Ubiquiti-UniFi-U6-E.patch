@@ -1,0 +1,34 @@
+From 65533ec2e57840ec25f9d3134729fd4c56af42c3 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Thu, 1 Oct 2026 17:41:13 +0300
+Subject: [PATCH] ARM: dts: qcom: add 32-bit build of Ubiquiti UniFi U6
+ Enterprise
+
+The board U-Boot only boots 32-bit kernels (bootz), so build the arm64
+board DTS for ARM too, as is done for apq8016-sbc.
+---
+ arch/arm/boot/dts/qcom/Makefile                            | 1 +
+ arch/arm/boot/dts/qcom/qcom-ipq5018-ubnt-u6-enterprise.dts | 2 ++
+ 2 files changed, 3 insertions(+)
+ create mode 100644 arch/arm/boot/dts/qcom/qcom-ipq5018-ubnt-u6-enterprise.dts
+
+diff --git a/arch/arm/boot/dts/qcom/Makefile b/arch/arm/boot/dts/qcom/Makefile
+index 32a44b02d..9bd101b04 100644
+--- a/arch/arm/boot/dts/qcom/Makefile
++++ b/arch/arm/boot/dts/qcom/Makefile
+@@ -22,6 +22,7 @@ dtb-$(CONFIG_ARCH_QCOM) += \
+ 	qcom-ipq4019-ap.dk04.1-c3.dtb \
+ 	qcom-ipq4019-ap.dk07.1-c1.dtb \
+ 	qcom-ipq4019-ap.dk07.1-c2.dtb \
++	qcom-ipq5018-ubnt-u6-enterprise.dtb \
+ 	qcom-ipq8064-ap148.dtb \
+ 	qcom-ipq8064-rb3011.dtb \
+ 	qcom-msm8226-microsoft-dempsey.dtb \
+diff --git a/arch/arm/boot/dts/qcom/qcom-ipq5018-ubnt-u6-enterprise.dts b/arch/arm/boot/dts/qcom/qcom-ipq5018-ubnt-u6-enterprise.dts
+new file mode 100644
+index 000000000..27b0c1943
+--- /dev/null
++++ b/arch/arm/boot/dts/qcom/qcom-ipq5018-ubnt-u6-enterprise.dts
+@@ -0,0 +1,2 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++#include "arm64/qcom/ipq5018-ubnt-u6-enterprise.dts"
