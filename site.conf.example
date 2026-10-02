@@ -17,6 +17,10 @@ CLIENT_VLAN=42
 ROOT_AUTHORIZED_KEYS=/root/.ssh/id_ed25519.pub
 # Proprietary inputs (Wi-Fi firmware, the stock board data): see README.md.
 BLOBS=../u6e-blobs
+# 1: once the management network is up, the image re-arms its own boot, so it
+# survives reboots and power cuts (README.md, Persistent mode). 0: every boot
+# armed by boot/go8.sh is one-shot.
+U6E_PERSIST=0
 
 # Stock firmware SSH: the controller's "Device Authentication" user, and a
 # command printing its password.

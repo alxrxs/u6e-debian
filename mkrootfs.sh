@@ -15,5 +15,5 @@ esac
 mmdebstrap --variant=minbase --architectures="$1" --components=main,non-free-firmware \
 	--include=systemd-sysv,udev,kmod,procps,iproute2,iputils-ping,less,vim-tiny,tzdata,ca-certificates \
 	--include=openssh-server,systemd-resolved,ethtool,pciutils,mmc-utils,mtd-utils,nftables,tcpdump,iperf3 \
-	--include=iw,hostapd,wireless-regdb,firmware-atheros,qrtr-tools \
+	--include=iw,hostapd,wireless-regdb,firmware-atheros,qrtr-tools,libubootenv-tool \
 	trixie "$dir" http://deb.debian.org/debian

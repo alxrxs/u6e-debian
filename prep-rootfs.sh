@@ -145,13 +145,37 @@ WantedBy=multi-user.target
 UNIT
 ln -sf /etc/systemd/system/u6e-netconsole.service $RF/etc/systemd/system/multi-user.target.wants/u6e-netconsole.service
 
-# No management network 3 minutes after boot: put the journal into pstore and
-# warm-reboot, so the fallback to stock keeps the evidence (read it there with
-# boot/ramoops.sh). ARP, not ICMP: a gateway may well drop pings from this VLAN.
+# The boot that brought this image up was one-shot: U-Boot disarmed it before
+# starting us. u6e-arm re-arms it from the steps go8.sh staged, or with "disarm"
+# hands the next boot to stock; fw_setenv writes only the U-Boot env (mtd6).
+printf '/dev/mtd6 0x0 0x10000 0x1000\n' > $RF/etc/fw_env.config
+cat > $RF/usr/local/sbin/u6e-arm <<'ARM'
+#!/bin/sh
+set -e
+cur=$(fw_printenv -n bootcmd_real 2>/dev/null || true)
+if [ "${1:-}" = disarm ]; then
+	[ "$cur" = bootubnt ] || fw_setenv bootcmd_real bootubnt
+	exit 0
+fi
+fw_printenv -n u8b >/dev/null 2>&1 || { echo "u6e-arm: no staged boot (u8b)" >&2; exit 1; }
+steps=$(fw_printenv | sed -n 's/^\(u8[0-9]\)=.*/\1/p' | sort | sed 's/.*/run &;/' | tr '\n' ' ')
+want="setenv bootcmd_real bootubnt; saveenv; ${steps}run u8b"
+[ "$cur" = "$want" ] || fw_setenv bootcmd_real "$want"
+ARM
+chmod 0755 $RF/usr/local/sbin/u6e-arm
+
+# Management network up 3 minutes after boot: with U6E_PERSIST the image re-arms
+# itself once, so a reboot or power cut comes back here. None: disarm, put the
+# journal into pstore and warm-reboot, so the fallback to stock keeps the
+# evidence (boot/ramoops.sh). ARP, not ICMP: a gateway may well drop pings.
 cat > $RF/usr/local/sbin/u6e-netcheck <<'CHECK'
 #!/bin/sh
 ping -c1 -W2 @MGMT_GW@ >/dev/null 2>&1
-ip neigh show @MGMT_GW@ | grep -qE 'REACHABLE|STALE|DELAY|PROBE' && exit 0
+if ip neigh show @MGMT_GW@ | grep -qE 'REACHABLE|STALE|DELAY|PROBE'; then
+	[ @PERSIST@ = 1 ] && [ ! -e /run/u6e-armed ] && /usr/local/sbin/u6e-arm && touch /run/u6e-armed
+	exit 0
+fi
+/usr/local/sbin/u6e-arm disarm
 { echo "u6e-netcheck: no gateway at $(cut -d' ' -f1 /proc/uptime)s; links:"; ip -br link; ip -br addr; ip neigh
   mount -t debugfs none /sys/kernel/debug 2>/dev/null; D=/sys/kernel/debug/qca-nss-drv/stats
   grep -iE 'uniphy|gmac1|cmn_pll|ubi32' /sys/kernel/debug/clk/clk_summary; head -20 /sys/kernel/debug/clk/clk_orphan_summary
@@ -169,7 +193,7 @@ ip neigh show @MGMT_GW@ | grep -qE 'REACHABLE|STALE|DELAY|PROBE' && exit 0
 } | head -c 120000 > /dev/pmsg0
 systemctl reboot
 CHECK
-sed -i "s/@MGMT_GW@/$MGMT_GW/g; s/@MGMT_IF@/$MGMT_IF/g" $RF/usr/local/sbin/u6e-netcheck
+sed -i "s/@MGMT_GW@/$MGMT_GW/g; s/@MGMT_IF@/$MGMT_IF/g; s/@PERSIST@/${U6E_PERSIST:-0}/g" $RF/usr/local/sbin/u6e-netcheck
 chmod 0755 $RF/usr/local/sbin/u6e-netcheck
 printf '[Unit]\nDescription=U6E reboot to stock when the management network is lost\n\n[Service]\nType=oneshot\nExecStart=/usr/local/sbin/u6e-netcheck\n' \
 	> $RF/etc/systemd/system/u6e-netcheck.service
@@ -362,5 +386,8 @@ cp $DTB $OUT/u6e.dtb
 S=$(stat -c %s $OUT/u6e.initrd)
 fdtput -t x $OUT/u6e.dtb /chosen linux,initrd-start $INITRD_ADDR
 fdtput -t x $OUT/u6e.dtb /chosen linux,initrd-end "$(printf '%#x' $((INITRD_ADDR + S)))"
+# A persistent image re-arms its own boot, so the U-Boot env (and only it) must
+# be writable; every other SPI partition stays read-only.
+[ "${U6E_PERSIST:-0}" = 1 ] && fdtput -d $OUT/u6e.dtb /soc@0/spi@78b5000/flash@0/partitions/partition@110000 read-only
 echo "release $R, modules $(wc -l < modules.keep), rootfs $(du -sh $RF | cut -f1)"
 ls -la $OUT; sha256sum $OUT/*

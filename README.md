@@ -48,6 +48,10 @@ Ubiquiti's U-Boot is AArch32 and only `bootm`s its own signed FIT images, but `b
 
 What is ever written: files in `/tmp/log`, the U-Boot environment partition, and raw eMMC sectors past the last partition (5000000+) for boot traces. Never the SPI flash.
 
+### Persistent mode
+
+Each boot `go8.sh` arms is one-shot: `bootcmd_real` disarms itself before it starts the image, so any reboot lands in stock. With `U6E_PERSIST=1` in `site.conf`, `u6e-netcheck` re-arms it (`u6e-arm`) the first time the management network is reachable after a boot, so reboots and power cuts come back into Debian. A boot that never reaches the network is not re-armed, and losing the network later disarms (`u6e-arm disarm`) before the netcheck reboot, so a broken image always falls back to stock instead of looping. `u6e-arm disarm` by hand hands the next boot to stock. Each Debian boot costs two writes of the 64 KiB environment: U-Boot's disarm and the re-arm. The payloads stay where `go8.sh` staged them, in stock's `/tmp/log`, which only stock writes to.
+
 ## On the AP
 
 - `u6e-nss.service` brings NSS up in the order the hardware needs: once networkd has the uplink up, VLAN'd and bridged, it arms the GMAC (`qca-dwmac-nss` hands it to the firmware), sizes the firmware's buffer pools to stock's values, loads the radios with NSS offload, every offload manager, then ECM.
