@@ -40,8 +40,11 @@ wifi_ssid() { echo u6e-test; }
 wifi_psk() { cat ~/.config/u6e/wifi-psk; }
 WIFI_24="hw_mode=g
 channel=13"
+# noscan: keep primary 149; hostapd's 20/40 coexistence scan otherwise moves
+# it to whatever primary a neighbouring BSS uses.
 WIFI_5="hw_mode=a
 channel=149
+noscan=1
 ht_capab=[HT40+][SHORT-GI-20][SHORT-GI-40]
 ieee80211ac=1
 vht_oper_chwidth=1
