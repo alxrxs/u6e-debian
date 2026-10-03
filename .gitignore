@@ -9,6 +9,7 @@
 /sha256sums.asc
 /rootfs/
 /rootfs-armhf/
+/rootfs-*/
 /out-*/
 /images/
 /modules.keep
