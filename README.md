@@ -57,7 +57,7 @@ Each boot `go8.sh` arms is one-shot: `bootcmd_real` disarms itself before it sta
 ## On the AP
 
 - `u6e-nss.service` brings NSS up in the order the hardware needs: once networkd has the uplink up, VLAN'd and bridged, it arms the GMAC (`qca-dwmac-nss` hands it to the firmware), sizes the firmware's buffer pools to stock's values, loads the radios with NSS offload, every offload manager, then ECM.
-- `boot/wifi-up.sh` starts the test SSID on all three radios (country and channel plan from `site.conf`).
+- `boot/wifi-up.sh` starts the test SSID on all three radios (country and channel plan from `site.conf`) with 802.11d/e/h/i/k/r/u/v/w, MBO, beacon protection, the RFC 8325 QoS map and the 802.11ax features (beamforming, TWT, BSS colour, spatial reuse); the 2.4 and 5 GHz beacons announce the 6 GHz BSS.
 - Recovery: a hang warm-resets (systemd watchdog, panic on lockups and oops); with no management network after 3 minutes `u6e-netcheck` writes its diagnosis to pstore and reboots into stock, where `boot/ramoops.sh` reads it back. The kernel log also goes to the management VLAN's broadcast address (netconsole, UDP 6666).
 - `u6e-caldata` writes each radio's calibration from the AP's own ART partition at every boot.
 - Bluetooth: the IPQ5018's own controller (`btqcomipc`, firmware loaded through TrustZone) is `hci0` for BlueZ; `u6e-btaddr` gives it the stock firmware's address, the base MAC + 4, before `bluetoothd` starts.

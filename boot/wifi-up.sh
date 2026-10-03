@@ -5,6 +5,8 @@
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 SSID=$(wifi_ssid) PSK=$(wifi_psk)
+# 802.11r: every AP serving the SSID derives the same mobility domain from it.
+MDID=$(printf %s "$SSID" | md5sum | cut -c1-4)
 
 common="ctrl_interface=/run/hostapd
 bridge=br$CLIENT_VLAN
@@ -13,15 +15,39 @@ country_code=$WIFI_COUNTRY
 ieee80211d=1
 ieee80211h=1
 wmm_enabled=1
+uapsd_advertisement_enabled=1
 ieee80211n=1
 ieee80211ax=1
+he_su_beamformer=1
+he_su_beamformee=1
+he_mu_beamformer=1
+he_twt_responder=1
+he_spr_sr_control=3
+he_spr_non_srg_obss_pd_max_offset=10
 wpa=2
 rsn_pairwise=CCMP
-sae_password=$PSK"
-mixed="wpa_key_mgmt=SAE WPA-PSK
+sae_password=$PSK
+group_mgmt_cipher=AES-128-CMAC
+beacon_prot=1
+mobility_domain=$MDID
+ft_psk_generate_local=1
+rrm_neighbor_report=1
+rrm_beacon_report=1
+bss_transition=1
+wnm_sleep_mode=1
+time_advertisement=2
+time_zone=KST-9
+mbo=1
+interworking=1
+access_network_type=0
+internet=1
+qos_map_set=8,1,18,3,20,3,22,3,24,4,26,4,28,4,30,4,32,4,34,4,36,4,38,4,40,5,44,6,46,6,0,63,255,255,255,255,255,255,255,255,255,255,255,255,255,255"
+# qos_map_set: RFC 8325's DSCP to user priority mapping (CS6/CS7 stay best
+# effort), so clients mark their uplink the way the network does.
+mixed="wpa_key_mgmt=SAE WPA-PSK FT-SAE FT-PSK
 wpa_passphrase=$PSK
 ieee80211w=1"
-sae="wpa_key_mgmt=SAE
+sae="wpa_key_mgmt=SAE FT-SAE
 sae_pwe=1
 ieee80211w=2"
 
@@ -46,13 +72,19 @@ iw reg get | grep -E '^(phy|country)' | paste - - | sed 's/^/reg: /'"
 	# reports a 6 GHz BSS it runs in the same process.
 	conf wlan24 "$WIFI_24
 $mixed
+nas_identifier=u6e-wlan24
+he_bss_color=11
 rnr=1"
 	conf wlan5 "$WIFI_5
 $mixed
+nas_identifier=u6e-wlan5
+he_bss_color=22
 rnr=1"
 	# WPA3-only: 6 GHz admits nothing else.
 	conf wlan6 "$WIFI_6
-$sae"
+$sae
+nas_identifier=u6e-wlan6
+he_bss_color=33"
 	echo "chmod 600 /run/hostapd-u6e/*.conf"
 	# A rerun stops the previous instance and waits until it has torn its BSSs
 	# down: a radio that still has one refuses the new beacon.
