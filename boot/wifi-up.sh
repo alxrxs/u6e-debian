@@ -46,11 +46,9 @@ qos_map_set=8,1,18,3,20,3,22,3,24,4,26,4,28,4,30,4,32,4,34,4,36,4,38,4,40,5,44,6
 # a 0 dB Power Constraint) outside DFS channels too, where hostapd sets it only
 # on its own. qos_map_set: RFC 8325's DSCP to user priority mapping (CS6/CS7 stay best
 # effort), so clients mark their uplink the way the network does.
-mixed="wpa_key_mgmt=SAE WPA-PSK FT-SAE FT-PSK
-wpa_passphrase=$PSK
-ieee80211w=1"
+# WPA3 on every band: 6 GHz admits nothing else, and clients (iOS) only treat
+# the 6 GHz BSS as the same network when 2.4/5 GHz offer the same security.
 sae="wpa_key_mgmt=SAE FT-SAE
-sae_pwe=1
 ieee80211w=2"
 
 conf() { # <iface> <band lines>
@@ -73,18 +71,21 @@ iw reg get | grep -E '^(phy|country)' | paste - - | sed 's/^/reg: /'"
 	# Report), which is how most clients find 6 GHz at all; hostapd only
 	# reports a 6 GHz BSS it runs in the same process.
 	conf wlan24 "$WIFI_24
-$mixed
+$sae
+sae_pwe=2
 nas_identifier=u6e-wlan24
 he_bss_color=11
 rnr=1"
 	conf wlan5 "$WIFI_5
-$mixed
+$sae
+sae_pwe=2
 nas_identifier=u6e-wlan5
 he_bss_color=22
 rnr=1"
-	# WPA3-only: 6 GHz admits nothing else.
+	# SAE hash-to-element only: 6 GHz admits no hunting-and-pecking.
 	conf wlan6 "$WIFI_6
 $sae
+sae_pwe=1
 nas_identifier=u6e-wlan6
 he_bss_color=33"
 	echo "chmod 600 /run/hostapd-u6e/*.conf"
@@ -99,8 +100,10 @@ for _ in $(seq 20); do
 	iw dev | grep -q "^[[:space:]]*ssid " || break
 	sleep 0.5
 done
+# 6 GHz first: 2.4 and 5 GHz announce it in their RNR, which hostapd builds
+# when they start and does not rebuild once a later interface gets its BSSID.
 confs=
-for i in wlan24 wlan5 wlan6; do
+for i in wlan6 wlan24 wlan5; do
 	[ -e /sys/class/net/$i ] && confs="$confs /run/hostapd-u6e/$i.conf" || echo "$i: no such radio"
 done
 hostapd -B -P /run/hostapd-u6e/hostapd.pid -f /run/hostapd-u6e/hostapd.log $confs || echo "hostapd failed"
