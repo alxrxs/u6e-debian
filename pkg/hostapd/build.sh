@@ -5,7 +5,7 @@
 # and holds. Run as root; needs qemu-user binfmt.
 set -euo pipefail
 cd "$(dirname "$0")"
-UP=2.12 DEBVER=2.11-2 VER=2:2.12-0+u6e2
+UP=2.12 DEBVER=2.11-2 VER=2:2.12-0+u6e3
 FIXES=aa02cfa569477f67f3915c8b9a83d1a7ca93693d  # w1.fi security/2026-5
 [ ! -e work ] || { echo "work exists; remove it first" >&2; exit 1; }
 mkdir work; mkdir -p out
@@ -23,10 +23,13 @@ sed -i '/^Bump-DEFAULT_BSS_MAX_COUNT-to-1000.patch$/d; /^CVE-2024-5290-lib_engin
 	/^upstream-fixes\/0001-nl80211-add-extra-ies-only-if-allowed-by-driver.patch$/d;
 	/^0014-sae_pk_gen-needs-random_get_bytes-wpa_key_mgmt_txt-w.patch$/d;
 	/^systemd-add-reload-support.patch$/d; /^wpa_service_netdev.patch$/d' $D/patches/series
-# Ours, sent upstream: refresh co-located beacons once an interface is set up,
-# so the 2.4/5 GHz RNR carries the 6 GHz BSSID.
-cp rnr-refresh-colocated-beacons.patch $D/patches/
-echo rnr-refresh-colocated-beacons.patch >> $D/patches/series
+# Ours, for upstream: refresh co-located beacons once an interface is set up,
+# so the 2.4/5 GHz RNR carries the 6 GHz BSSID; make no_pri_sec_switch a
+# config option, so a planned primary channel stays put.
+for p in rnr-refresh-colocated-beacons.patch no-pri-sec-switch-option.patch; do
+	cp $p $D/patches/
+	echo $p >> $D/patches/series
+done
 cat hostapd.config >> $D/config/hostapd/linux
 # nodoc installs no examples, which this rule's glob assumes.
 sed -i 's#^\tsed -e .s="includes.h"#\t-sed -e \x27s="includes.h"#' $D/rules
