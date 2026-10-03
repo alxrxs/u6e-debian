@@ -56,8 +56,13 @@ he_oper_centr_freq_seg0_idx=155"
 # 6 GHz: a 160 MHz block with a PSC primary, inside the band the clients'
 # region allows (EU: 5945-6425 MHz, channels 1-93), and a whole block clear of
 # any other 6 GHz AP in range: next to another 160 MHz BSS, clients' frames are lost.
+# Indoor (LPI) AP; Transmit Power Envelope client PSD in 0.5 dB units: KR LPI
+# allows 2 dBm/MHz (24 dBm EIRP) for APs and clients alike.
 WIFI_6="hw_mode=a
 op_class=134
 channel=53
 he_oper_chwidth=2
-he_oper_centr_freq_seg0_idx=47"
+he_oper_centr_freq_seg0_idx=47
+he_6ghz_reg_pwr_type=0
+reg_def_cli_eirp_psd=4
+reg_sub_cli_eirp_psd=4"

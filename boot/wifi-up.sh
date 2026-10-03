@@ -24,7 +24,7 @@ he_su_beamformer=1
 he_su_beamformee=1
 he_mu_beamformer=1
 he_twt_responder=1
-he_spr_sr_control=3
+he_spr_sr_control=5
 he_spr_non_srg_obss_pd_max_offset=10
 wpa=2
 rsn_pairwise=CCMP
@@ -34,17 +34,16 @@ beacon_prot=1
 mobility_domain=$MDID
 r0kh=ff:ff:ff:ff:ff:ff * $FTKEY
 r1kh=00:00:00:00:00:00 00:00:00:00:00:00 $FTKEY
-pmk_r1_push=1
 ft_over_ds=0
 transition_disable=0x01
 ocv=1
 ssid_protection=1
 stationary_ap=1
 rrm_neighbor_report=1
-rrm_beacon_report=1
 rrm_link_measurement_report=1
 bss_transition=1
 wnm_sleep_mode=1
+bss_load_update_period=50
 mbo=1
 enable_dscp_policy_capa=1
 interworking=1
@@ -59,8 +58,11 @@ qos_map_set=8,1,18,3,20,3,22,3,24,4,26,4,28,4,30,4,32,4,34,4,36,4,38,4,40,5,44,6
 # and ssid_protection (802.11-2024) bind the channel and SSID into the key
 # exchange; ft_over_ds=0 keeps 802.11r roaming over the air only;
 # enable_dscp_policy_capa: Wi-Fi QoS Management DSCP policies (hostapd main). FT-SAE's
-# PMK comes from each SAE exchange, so the radios hand roaming keys to each
-# other (r0kh/r1kh wildcards with one shared key, pushed ahead of the roam).
+# PMK comes from each SAE exchange, so a radio pulls a roaming client's keys
+# from the one it came from (r0kh/r1kh wildcards with one shared key); the
+# R0KH-ID (nas_identifier) is unique per AP in the mobility domain.
+# he_spr_sr_control=5: non-SRG OBSS-PD spatial reuse at
+# he_spr_non_srg_obss_pd_max_offset (parameterized SR disallowed).
 # WPA3 on every band: 6 GHz admits nothing else, and clients (iOS) only treat
 # the 6 GHz BSS as the same network when 2.4/5 GHz offer the same security.
 sae="wpa_key_mgmt=SAE FT-SAE
@@ -84,17 +86,21 @@ for _ in \$(seq 20); do [ \"\$(iw reg get | grep -c '^country $WIFI_COUNTRY')\" 
 iw reg get | grep -E '^(phy|country)' | paste - - | sed 's/^/reg: /'"
 	# rnr: 2.4 and 5 GHz beacons announce the 6 GHz BSS (Reduced Neighbor
 	# Report), which is how most clients find 6 GHz at all; hostapd only
-	# reports a 6 GHz BSS it runs in the same process.
+	# reports a 6 GHz BSS it runs in the same process. 2.4 GHz is OFDM only, so
+	# beacons and management frames go at 6 Mbit/s rather than 1 (Wi-Fi Optimized
+	# Connectivity wants at least 5.5).
 	conf wlan24 "$WIFI_24
 $sae
 sae_pwe=2
-nas_identifier=u6e-wlan24
+nas_identifier=${AP}-wlan24
 he_bss_color=11
+supported_rates=60 90 120 180 240 360 480 540
+basic_rates=60 120 240
 rnr=1"
 	conf wlan5 "$WIFI_5
 $sae
 sae_pwe=2
-nas_identifier=u6e-wlan5
+nas_identifier=${AP}-wlan5
 he_bss_color=22
 rnr=1"
 	# SAE hash-to-element only: 6 GHz admits no hunting-and-pecking. FILS
@@ -102,7 +108,7 @@ rnr=1"
 	conf wlan6 "$WIFI_6
 $sae
 sae_pwe=1
-nas_identifier=u6e-wlan6
+nas_identifier=${AP}-wlan6
 he_bss_color=33
 fils_discovery_max_interval=20"
 	echo "chmod 600 /run/hostapd-u6e/*.conf"
