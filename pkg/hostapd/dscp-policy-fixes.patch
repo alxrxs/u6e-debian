@@ -1,0 +1,75 @@
+From 990c8ce9a152502cba89ba84bf20adab7c343721 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Sat, 3 Oct 2026 22:23:21 +0300
+Subject: [PATCH] DSCP: Fix policy invalidation and empty unsolicited requests
+
+When a STA rejected a DSCP policy, invalidate_policy_by_id() freed the
+policy's members, leaked the policy itself and left a NULL entry in
+sta->policies[] without changing num_dscp_policies. The next DSCP Policy
+Response, a wildcard DSCP Policy Query, or a reassociation then
+dereferenced that NULL entry, crashing hostapd and with it every BSS it
+runs. Free the policy and remove it from the array instead.
+
+hostapd_send_unsolicited_dscp_policy_request() sent the frame when it
+was longer than 5 octets, but the DSCP Policy Request header alone is
+longer than that, so a request with neither Reset nor any QoS Management
+element went out. Wi-Fi QoS Management 3.4.3 requires at least one
+element when Reset is not set; compare against the header length.
+
+Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
+---
+ src/ap/robust_av.c | 17 +++++++++++------
+ 1 file changed, 11 insertions(+), 6 deletions(-)
+
+diff --git a/src/ap/robust_av.c b/src/ap/robust_av.c
+index 775b8b8b7..3aa4ab099 100644
+--- a/src/ap/robust_av.c
++++ b/src/ap/robust_av.c
+@@ -590,7 +590,7 @@ int hostapd_send_unsolicited_dscp_policy_request(struct hostapd_data *hapd,
+ 	struct wpabuf *frame = NULL;
+ 	u8 dialog_token;
+ 	size_t i;
+-	size_t frame_len;
++	size_t frame_len, hdr_len;
+ 	bool more = false;
+ 
+ 	/* TODO: When sending a request, if this is not a resync (reset == 0),
+@@ -609,7 +609,7 @@ int hostapd_send_unsolicited_dscp_policy_request(struct hostapd_data *hapd,
+ 	if (!frame)
+ 		return -1;
+ 
+-	frame_len = wpabuf_len(frame);
++	hdr_len = frame_len = wpabuf_len(frame);
+ 
+ 	for (i = 0; i < num_policies; i++) {
+ 		struct hostapd_dscp_policy *policy;
+@@ -645,9 +645,9 @@ int hostapd_send_unsolicited_dscp_policy_request(struct hostapd_data *hapd,
+ 		buf[7] |= DSCP_POLICY_CTRL_MORE;
+ 	}
+ 
+-	/* Only send if the frame contains at least one QoS element beyond the
+-	 * header */
+-	if (frame && wpabuf_len(frame) > 5 &&
++	/* Without Reset, a request carries at least one QoS Management element
++	 * (Wi-Fi QoS Management 3.4.3) */
++	if (frame && (reset || wpabuf_len(frame) > hdr_len) &&
+ 	    hostapd_drv_send_action(hapd, hapd->iface->freq, 0, sta->addr,
+ 				    wpabuf_head(frame), wpabuf_len(frame))) {
+ 		wpa_printf(MSG_DEBUG, "DSCP: Failed to send policy request to "
+@@ -1458,7 +1458,12 @@ static void invalidate_policy_by_id(struct sta_info *sta, u8 policy_id)
+ 			wpa_printf(MSG_DEBUG, "DSCP: Invalidating policy %u",
+ 				   policy_id);
+ 			free_dscp_policy(policy);
+-			sta->policies[i] = NULL;
++			os_free(policy);
++			/* Keep the array dense: its users do not expect holes */
++			os_memmove(&sta->policies[i], &sta->policies[i + 1],
++				   (sta->num_dscp_policies - i - 1) *
++				   sizeof(sta->policies[0]));
++			sta->num_dscp_policies--;
+ 			break;
+ 		}
+ 	}
+-- 
+2.47.3
+

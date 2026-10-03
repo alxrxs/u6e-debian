@@ -1,0 +1,40 @@
+From aa5b7a355567d8381886a801fc550c5dcf0f1b19 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Sat, 3 Oct 2026 22:27:15 +0300
+Subject: [PATCH] AP: Set the Mobility Domain bit in the own neighbor report
+
+The BSSID Information field of a Neighbor Report element has the Mobility
+Domain bit set when the reported AP includes an MDE in its Beacon frames
+whose contents are identical to the MDE of the reporting AP (IEEE Std
+802.11-2024, 9.4.2.35). hostapd left a TODO for it in its own neighbor
+report, so the report it hands to STAs, and copies of it that the other
+APs of the mobility domain add with SET_NEIGHBOR, said that FT to the
+reported AP is not possible.
+
+Set it when FT is enabled.
+
+Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
+---
+ src/ap/neighbor_db.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/ap/neighbor_db.c b/src/ap/neighbor_db.c
+index fd4f881df..93203c5d2 100644
+--- a/src/ap/neighbor_db.c
++++ b/src/ap/neighbor_db.c
+@@ -274,7 +274,11 @@ void hostapd_neighbor_set_own_report(struct hostapd_data *hapd)
+ 		bssid_info |= NEI_REP_BSSID_INFO_HE;
+ 	if (eht)
+ 		bssid_info |= NEI_REP_BSSID_INFO_EHT;
+-	/* TODO: Set NEI_REP_BSSID_INFO_MOBILITY_DOMAIN if MDE is set */
++#ifdef CONFIG_IEEE80211R_AP
++	/* The own MDE is identical to itself (IEEE Std 802.11-2024, 9.4.2.35) */
++	if (hapd->conf->wpa && wpa_key_mgmt_ft(hapd->conf->wpa_key_mgmt))
++		bssid_info |= NEI_REP_BSSID_INFO_MOBILITY_DOMAIN;
++#endif /* CONFIG_IEEE80211R_AP */
+ 
+ 	hostapd_get_oper_chan_info_of_bss(hapd, &oper_chwidth,
+ 					  &center_freq1_idx, &center_freq2_idx);
+-- 
+2.47.3
+
