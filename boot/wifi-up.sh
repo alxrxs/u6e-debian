@@ -14,6 +14,8 @@ ssid=$SSID
 country_code=$WIFI_COUNTRY
 ieee80211d=1
 ieee80211h=1
+local_pwr_constraint=0
+spectrum_mgmt_required=1
 wmm_enabled=1
 uapsd_advertisement_enabled=1
 ieee80211n=1
@@ -35,14 +37,14 @@ rrm_neighbor_report=1
 rrm_beacon_report=1
 bss_transition=1
 wnm_sleep_mode=1
-time_advertisement=2
-time_zone=KST-9
 mbo=1
 interworking=1
 access_network_type=0
 internet=1
 qos_map_set=8,1,18,3,20,3,22,3,24,4,26,4,28,4,30,4,32,4,34,4,36,4,38,4,40,5,44,6,46,6,0,63,255,255,255,255,255,255,255,255,255,255,255,255,255,255"
-# qos_map_set: RFC 8325's DSCP to user priority mapping (CS6/CS7 stay best
+# local_pwr_constraint + spectrum_mgmt_required: 802.11h (spectrum management,
+# a 0 dB Power Constraint) outside DFS channels too, where hostapd sets it only
+# on its own. qos_map_set: RFC 8325's DSCP to user priority mapping (CS6/CS7 stay best
 # effort), so clients mark their uplink the way the network does.
 mixed="wpa_key_mgmt=SAE WPA-PSK FT-SAE FT-PSK
 wpa_passphrase=$PSK
@@ -86,12 +88,17 @@ $sae
 nas_identifier=u6e-wlan6
 he_bss_color=33"
 	echo "chmod 600 /run/hostapd-u6e/*.conf"
-	# A rerun stops the previous instance and waits until it has torn its BSSs
-	# down: a radio that still has one refuses the new beacon.
+	# A rerun stops the previous instance and waits until its BSSs are gone from
+	# the radios, which outlast the process: a radio that still has one refuses
+	# the new beacon.
 	echo 'old=$(cat /run/hostapd-u6e/hostapd.pid 2>/dev/null)
 if [ -n "$old" ] && kill "$old" 2>/dev/null; then
 	for _ in $(seq 20); do kill -0 "$old" 2>/dev/null || break; sleep 0.5; done
 fi
+for _ in $(seq 20); do
+	iw dev | grep -q "^[[:space:]]*ssid " || break
+	sleep 0.5
+done
 confs=
 for i in wlan24 wlan5 wlan6; do
 	[ -e /sys/class/net/$i ] && confs="$confs /run/hostapd-u6e/$i.conf" || echo "$i: no such radio"
