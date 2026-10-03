@@ -12,7 +12,7 @@ Verified on hardware: the image boots in about 40 s, the NSS core takes the upli
 | `u6e-linux` | The kernel: branch `u6e` (7.2.8 + the board, clock and NSS hook patches), `u6e-armv7` (the 32-bit build), `u6e-6.12` (the first NSS port) |
 | `u6e-backports` | Wireless backports 7.2 (OpenWrt) with the NSS mac80211/ath11k series, branch `u6e-nss` |
 
-Every imported patch keeps its author; a hand-ported one carries a note on what the port changed. The lists (`patches-7.2-nss.list`, `patches-bp72.list`) replay the series onto the upstream trees with `apply-list.sh`; `patches-local/` exports the board's own kernel patches.
+Every imported patch keeps its author; a hand-ported one carries a note on what the port changed. The lists (`patches-7.2-nss.list`, `patches-bp72.list`) replay the series onto the upstream trees with `apply-list.sh`; `patches-local/` exports the board's own kernel patches, with George Moussalem's IPQ5018 Bluetooth series (v5, from the lists; 0013-0018) ahead of our fixes for it.
 
 ## Building
 
@@ -26,6 +26,7 @@ Inputs:
 | `wifi/firmware/ipq5018-WLAN.HK.2.7.0.1-01744/` (`q6_fw.*`, `m3_fw.*`) | Qualcomm `quic/upstream-wifi-fw` |
 | `wifi/board/linux-firmware/{IPQ5018,QCN9074}/` | linux-firmware's `ath11k/<chip>/hw1.0/board-2.bin`, unpacked with `fw/ath11k-bdencoder -e` |
 | `wifi/board/stock-a654/bdwlan.{b23,ba3,ba4}` | the stock firmware's `/lib/firmware/platforms/a654/` |
+| `bt/firmware/` (`bt_fw_patch.mdt` + `.b00`-`.b02`, `mpnv10.bin`) | the stock firmware's `/lib/firmware/IPQ5018/` |
 
 Then, on an x86 host with the aarch64/armhf cross toolchains, `mmdebstrap`, `qemu-user-static` and `u-boot-tools`:
 
@@ -59,6 +60,8 @@ Each boot `go8.sh` arms is one-shot: `bootcmd_real` disarms itself before it sta
 - `boot/wifi-up.sh` starts the test SSID on all three radios (country and channel plan from `site.conf`).
 - Recovery: a hang warm-resets (systemd watchdog, panic on lockups and oops); with no management network after 3 minutes `u6e-netcheck` writes its diagnosis to pstore and reboots into stock, where `boot/ramoops.sh` reads it back. The kernel log also goes to the management VLAN's broadcast address (netconsole, UDP 6666).
 - `u6e-caldata` writes each radio's calibration from the AP's own ART partition at every boot.
+- Bluetooth: the IPQ5018's own controller (`btqcomipc`, firmware loaded through TrustZone) is `hci0` for BlueZ; `u6e-btaddr` gives it the stock firmware's address, the base MAC + 4, before `bluetoothd` starts.
+- The status light is two LEDs, `white:status` and `blue:status` in `/sys/class/leds`; blue comes on at boot.
 - Installed for the SSIDs, not yet configured: `tc` from `pkg/iproute2-nss` drives the NSS qdiscs (`nsshtb`, `nsstbl`, `nssfq_codel`, …; `accel_mode 0` shapes in the firmware), with the kernel's HTB/TBF/u32/police/skbedit/connmark modules for traffic the firmware hands back to Linux; `radsecproxy` carries hostapd's RADIUS (UDP only) over RadSec, and stays disabled until it has a configuration.
 - `fastfetch` shows the board with the UniFi logo.
 

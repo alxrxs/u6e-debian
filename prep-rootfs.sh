@@ -235,6 +235,40 @@ rm -f $RF/usr/lib/firmware/ath11k/IPQ5018/hw1.0/q6_fw.* $RF/usr/lib/firmware/ath
 WCSS=$BLOBS/wifi/firmware/ipq5018-WLAN.HK.2.7.0.1-01744
 install -m0644 "$WCSS"/q6_fw.* "$WCSS"/m3_fw.* $RF/usr/lib/firmware/ath11k/IPQ5018/hw1.0/
 
+# The controller comes up with the NVM's placeholder address; give it the one
+# the stock firmware uses, the board's base MAC + 4, before bluetoothd powers it.
+cat > $RF/usr/local/sbin/u6e-btaddr <<'BTADDR'
+#!/bin/sh
+base=$(cat /sys/class/net/lan/address) || exit 1
+addr=$(printf '%012x' $((0x$(echo "$base" | tr -d :) + 4)) | sed 's/../&:/g; s/:$//')
+# btmgmt is an interactive shell: it only answers on a terminal, hence script.
+mgmt() { timeout 5 script -qec "btmgmt --index 0 $*" /dev/null; }
+for _ in $(seq 30); do
+	mgmt info | grep -qi "addr $addr" && exit 0
+	mgmt public-addr "$addr" >/dev/null
+	sleep 2
+done
+echo "u6e-btaddr: could not set $addr" >&2
+exit 1
+BTADDR
+chmod 0755 $RF/usr/local/sbin/u6e-btaddr
+cat > $RF/etc/systemd/system/u6e-btaddr.service <<'UNIT'
+[Unit]
+Description=U6E Bluetooth public address (base MAC + 4)
+After=systemd-udev-settle.service systemd-networkd.service
+Before=bluetooth.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/u6e-btaddr
+RemainAfterExit=yes
+
+[Install]
+WantedBy=bluetooth.target
+UNIT
+install -d $RF/etc/systemd/system/bluetooth.target.wants
+ln -sf /etc/systemd/system/u6e-btaddr.service $RF/etc/systemd/system/bluetooth.target.wants/u6e-btaddr.service
+
 # Bring-up diagnostics: ath11k AHB/BOOT/QMI debug and the WCSS IPC path's pr_debug.
 install -d $RF/etc/modprobe.d
 printf '%s\n' 'options ath11k debug_mask=0x61' 'options qrtr dyndbg=+p' 'options qrtr_smd dyndbg=+p' \
@@ -253,7 +287,7 @@ rm -rf modstage $RF/usr/lib/modules/* $RF/etc/modprobe.d/u6e-nss.conf \
 	$RF/etc/udev/rules.d/80-u6e-wlan.rules $RF/etc/systemd/system/u6e-nss.service $RF/etc/systemd/system/multi-user.target.wants/u6e-nss.service
 make -s -C $K ARCH=${MODE/nss/arm64} CROSS_COMPILE=$X INSTALL_MOD_PATH=$PWD/modstage INSTALL_MOD_STRIP=1 modules_install
 M=$PWD/modstage/lib/modules/$R
-WANT="netconsole qcom_q6v5_mpd qcom_q6v5_wcss_sec qrtr-smd qcrypto st_accel_i2c phy-qcom-m31 qrtr qrtr-mhi vxlan macsec bridge 8021q nf_tables nft_ct nft_chain_nat nft_nat nft_masq nft_reject_inet nft_fib_inet nft_log nft_limit nf_conntrack tun wireguard sch_htb sch_tbf sch_fq_codel sch_prio sch_ingress cls_u32 cls_fw cls_matchall cls_flower act_police act_skbedit act_connmark act_mirred ifb"
+WANT="netconsole qcom_q6v5_mpd qcom_q6v5_wcss_sec qrtr-smd qcrypto st_accel_i2c phy-qcom-m31 qrtr qrtr-mhi vxlan macsec bridge 8021q nf_tables nft_ct nft_chain_nat nft_nat nft_masq nft_reject_inet nft_fib_inet nft_log nft_limit nf_conntrack tun wireguard sch_htb sch_tbf sch_fq_codel sch_prio sch_ingress cls_u32 cls_fw cls_matchall cls_flower act_police act_skbedit act_connmark act_mirred ifb btqcomipc"
 if [ $MODE = nss ]; then
 	install -d "$M/updates"
 	cp nss/out/$R/*.ko "$M/updates/"
@@ -286,10 +320,14 @@ if [ $MODE = nss ]; then
 fi
 depmod -b $RF "$R"
 
-# Firmware: ath11k for this board's radios + regdb only.
+# Firmware: ath11k for this board's radios, its Bluetooth, and regdb only.
 FW=$RF/usr/lib/firmware
 find $FW -mindepth 1 -maxdepth 1 ! -name ath11k ! -name 'regulatory.db*' -exec rm -rf {} +
 find $FW/ath11k -mindepth 1 -maxdepth 1 ! -name 'IPQ5018*' ! -name QCN9074 -exec rm -rf {} +
+# Bluetooth: the stock firmware (the split image TrustZone authenticates, and
+# the NVM) under the qca/ names btqcomipc and btqca ask for.
+install -d $FW/qca
+install -m0644 "$BLOBS"/bt/firmware/bt_fw_patch.* "$BLOBS"/bt/firmware/mpnv10.bin $FW/qca/
 if [ $MODE = nss ]; then
 	install -m0644 nss/out/$R/firmware/qca-nss0-retail.bin $FW/
 	ln -sf qca-nss0-retail.bin $FW/qca-nss0.bin
