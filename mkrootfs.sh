@@ -18,8 +18,9 @@ esac
 [ ! -e "$dir" ] || { echo "$dir exists; remove it first" >&2; exit 1; }
 localdeb=()
 if [ "$1" = arm64 ]; then
-	tc=$(ls pkg/iproute2-nss/out/iproute2_*+nss1_arm64.deb)
-	ap=$(ls pkg/hostapd/out/hostapd_*+u6e*_arm64.deb)
+	# out/ keeps every build; take the newest.
+	tc=$(printf '%s\n' pkg/iproute2-nss/out/iproute2_*+nss*_arm64.deb | sort -V | tail -1)
+	ap=$(printf '%s\n' pkg/hostapd/out/hostapd_*+u6e*_arm64.deb | sort -V | tail -1)
 	localdeb=(--include="$PWD/$tc,$PWD/$ap" --customize-hook='chroot "$1" apt-mark hold iproute2 hostapd')
 fi
 mmdebstrap --variant=minbase --architectures="$1" --components=main,non-free-firmware "${localdeb[@]}" \
