@@ -54,7 +54,12 @@ rnr=1"
 	conf wlan6 "$WIFI_6
 $sae"
 	echo "chmod 600 /run/hostapd-u6e/*.conf"
-	echo '[ -s /run/hostapd-u6e/hostapd.pid ] && kill "$(cat /run/hostapd-u6e/hostapd.pid)" && sleep 2
+	# A rerun stops the previous instance and waits until it has torn its BSSs
+	# down: a radio that still has one refuses the new beacon.
+	echo 'old=$(cat /run/hostapd-u6e/hostapd.pid 2>/dev/null)
+if [ -n "$old" ] && kill "$old" 2>/dev/null; then
+	for _ in $(seq 20); do kill -0 "$old" 2>/dev/null || break; sleep 0.5; done
+fi
 confs=
 for i in wlan24 wlan5 wlan6; do
 	[ -e /sys/class/net/$i ] && confs="$confs /run/hostapd-u6e/$i.conf" || echo "$i: no such radio"
