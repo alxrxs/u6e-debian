@@ -43,7 +43,9 @@ wifi_ft_key() { cat ~/.config/u6e/wifi-ft-key; }
 WIFI_24="hw_mode=g
 channel=13"
 # no_pri_sec_switch: keep primary 149; hostapd's 20/40 coexistence scan would
-# otherwise swap it with the secondary when a neighbour's primary sits there.
+# otherwise swap it with the secondary when something beacons there.
+# 802.11-2024 11.15.3.2 makes avoiding that a "should", but a "shall" to
+# follow an existing 20/40 MHz BSS's primary: drop it if one shares the block.
 WIFI_5="hw_mode=a
 channel=149
 no_pri_sec_switch=1
