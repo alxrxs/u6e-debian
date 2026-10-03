@@ -1,0 +1,118 @@
+From 2ed14cb16c29fa8cdf5cad738177262c282ec15f Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Sat, 3 Oct 2026 21:53:11 +0300
+Subject: [PATCH] AP: Set the RNR 20 MHz PSD subfield for co-located 6 GHz APs
+
+IEEE Std 802.11-2024, 11.50 requires an AP that reports a co-located
+6 GHz AP in its Reduced Neighbor Report element to set the 20 MHz PSD
+subfield so that the resulting maximum transmit power on the primary
+20 MHz channel equals the minimum of the regulatory client limits in
+the 6 GHz AP's Transmit Power Envelope elements. hostapd always wrote
+127 ("no maximum specified"), so a client probing the 6 GHz channel
+before receiving its beacon had no limit to apply.
+
+Derive the value from the Default category regulatory client EIRP PSD
+the 6 GHz AP advertises (from AFC when available, else
+reg_def_cli_eirp_psd or the built-in default), lowered by its
+regulatory client EIRP, if any, spread over 20 MHz. The configured or
+default PSD now comes from one helper shared with the Transmit Power
+Envelope element.
+
+Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
+---
+ src/ap/ieee802_11.c | 58 ++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 49 insertions(+), 9 deletions(-)
+
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index 219a94b0f..69205eaf3 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -9946,6 +9946,17 @@ static u8 * hostapd_add_tpe_info(u8 *eid, u8 tx_pwr_count,
+ #define REG_PSD_MAX_TXPOWER_FOR_DEFAULT_CLIENT      (-1) /* dBm/MHz */
+ #define REG_PSD_MAX_TXPOWER_FOR_SUBORDINATE_CLIENT  5    /* dBm/MHz */
+ 
++#ifdef CONFIG_IEEE80211AX
++/* Regulatory client EIRP PSD for the Default category, in units of 0.5 dBm/MHz,
++ * when AFC does not provide one */
++static int hostapd_reg_def_cli_eirp_psd(struct hostapd_config *iconf)
++{
++	if (iconf->reg_def_cli_eirp_psd != -1)
++		return iconf->reg_def_cli_eirp_psd;
++	return REG_PSD_MAX_TXPOWER_FOR_DEFAULT_CLIENT * 2;
++}
++#endif /* CONFIG_IEEE80211AX */
++
+ u8 * hostapd_eid_txpower_envelope(struct hostapd_data *hapd, u8 *eid)
+ {
+ 	struct hostapd_iface *iface = hapd->iface;
+@@ -9993,14 +10004,8 @@ u8 * hostapd_eid_txpower_envelope(struct hostapd_data *hapd, u8 *eid)
+ 		/* Default Transmit Power Envelope for Global Operating Class */
+ 		err = hostap_afc_get_chan_max_eirp_power(iface, true,
+ 							 &max_eirp_psd);
+-		if (err < 0) {
+-			if (hapd->iconf->reg_def_cli_eirp_psd != -1)
+-				max_eirp_psd =
+-					hapd->iconf->reg_def_cli_eirp_psd;
+-			else
+-				max_eirp_psd =
+-					REG_PSD_MAX_TXPOWER_FOR_DEFAULT_CLIENT * 2;
+-		}
++		if (err < 0)
++			max_eirp_psd = hostapd_reg_def_cli_eirp_psd(iconf);
+ 
+ 		eid = hostapd_add_tpe_info(eid, tx_pwr_count, tx_pwr_intrpn,
+ 					   REG_DEFAULT_CLIENT, max_eirp_psd);
+@@ -10806,6 +10811,40 @@ static u8 * hostapd_eid_nr_db(struct hostapd_data *hapd, u8 *eid,
+ }
+ 
+ 
++/*
++ * 20 MHz PSD subfield for a reported 6 GHz AP: the lowest Default category
++ * regulatory client limit in that AP's Transmit Power Envelope elements
++ * (IEEE Std 802.11-2024, 11.50), in units of 0.5 dBm/MHz.
++ */
++static u8 hostapd_rnr_6ghz_psd(struct hostapd_data *bss)
++{
++#ifdef CONFIG_IEEE80211AX
++	struct hostapd_iface *iface = bss->iface;
++	int psd, eirp;
++
++	if (hostap_afc_get_chan_max_eirp_power(iface, true, &psd) < 0)
++		psd = hostapd_reg_def_cli_eirp_psd(iface->conf);
++
++	if (hostap_afc_get_chan_max_eirp_power(iface, false, &eirp)) {
++		eirp = iface->conf->reg_def_cli_eirp;
++		if (!he_reg_is_sp(iface->conf->he_6ghz_reg_pwr_type))
++			eirp = -1;
++	}
++	/* An EIRP limit spread over 20 MHz is a PSD limit 13 dB lower */
++	if (eirp != -1 && eirp - 26 < psd)
++		psd = eirp - 26;
++
++	if (psd < -127)
++		psd = -127;
++	else if (psd >= RNR_20_MHZ_PSD_MAX_TXPOWER)
++		psd = RNR_20_MHZ_PSD_MAX_TXPOWER - 1;
++	return (u8) psd;
++#else /* CONFIG_IEEE80211AX */
++	return RNR_20_MHZ_PSD_MAX_TXPOWER;
++#endif /* CONFIG_IEEE80211AX */
++}
++
++
+ static bool hostapd_eid_rnr_bss(struct hostapd_data *hapd,
+ 				struct hostapd_data *reporting_hapd,
+ 				size_t i, u8 *tbtt_count, size_t *len,
+@@ -10863,7 +10902,8 @@ static bool hostapd_eid_rnr_bss(struct hostapd_data *hapd,
+ 	bss_param |= RNR_BSS_PARAM_CO_LOCATED;
+ 
+ 	*eid++ = bss_param;
+-	*eid++ = RNR_20_MHZ_PSD_MAX_TXPOWER;
++	*eid++ = is_6ghz_op_class(op_class) ? hostapd_rnr_6ghz_psd(bss) :
++		RNR_20_MHZ_PSD_MAX_TXPOWER;
+ 
+ #ifdef CONFIG_IEEE80211BE
+ 	/* Include the MLD parameters only when TBTT length is for ML RNR */
+-- 
+2.47.3
+

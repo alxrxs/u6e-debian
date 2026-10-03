@@ -7,7 +7,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 REV=5b156e272a0266ca6be0f394192bad42b0ff176c  # hostap main, 2026-10-01
-UP=2.13~git20261001 DEBVER=2.11-2 VER=2:2.13~git20261001-0+u6e1
+UP=2.13~git20261001 DEBVER=2.11-2 VER=2:2.13~git20261001-0+u6e2
 [ ! -e work ] || { echo "work exists; remove it first" >&2; exit 1; }
 mkdir work; mkdir -p out
 git clone -q https://w1.fi/hostap.git work/src
@@ -24,8 +24,12 @@ sed -i '/^Bump-DEFAULT_BSS_MAX_COUNT-to-1000.patch$/d; /^CVE-2024-5290-lib_engin
 	/^systemd-add-reload-support.patch$/d; /^wpa_service_netdev.patch$/d' $D/patches/series
 # Ours, for upstream: refresh co-located beacons once an interface is set up,
 # so the 2.4/5 GHz RNR carries the 6 GHz BSSID; make no_pri_sec_switch a
-# config option, so a planned primary channel stays put.
-for p in rnr-refresh-colocated-beacons.patch no-pri-sec-switch-option.patch; do
+# config option, so a planned primary channel stays put; set the RNR 20 MHz
+# PSD from the 6 GHz client limit; answer a BSS TM Query with the candidate
+# list (Agile Multiband); answer Link Measurement Requests (802.11k).
+for p in rnr-refresh-colocated-beacons.patch no-pri-sec-switch-option.patch \
+	rnr-6ghz-psd.patch btm-query-candidates.patch \
+	rrm-link-measurement-responder.patch; do
 	cp $p $D/patches/
 	echo $p >> $D/patches/series
 done

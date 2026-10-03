@@ -1,0 +1,131 @@
+From 47850583536c01483652283cea499ddc8a674834 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Sat, 3 Oct 2026 22:00:13 +0300
+Subject: [PATCH] WNM: Include the candidate list when answering a BSS TM Query
+ with MBO
+
+Wi-Fi Agile Multiband 3.5.1.2 requires an AP that receives a BSS
+Transition Management Query to respond with a BSS Transition Management
+Request that includes the BSS Transition Candidate List Entries field:
+Neighbor Report elements, each with a BSS Transition Candidate
+Preference subelement, including one for the AP's own BSS. hostapd
+answered with an empty request (request mode 0), which gives the STA
+nothing to choose from.
+
+With MBO enabled, list every BSS of the same SSID from the neighbor
+report database, which includes the own BSS, adding a preference of 255
+to entries configured without one, and set the Preferred Candidate List
+Included bit. The list then stays valid for 255 TBTTs instead of one, so
+that the STA has time to scan the candidates.
+
+Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
+---
+ src/ap/wnm_ap.c | 71 ++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 70 insertions(+), 1 deletion(-)
+
+diff --git a/src/ap/wnm_ap.c b/src/ap/wnm_ap.c
+index 37c85f851..625f05639 100644
+--- a/src/ap/wnm_ap.c
++++ b/src/ap/wnm_ap.c
+@@ -11,6 +11,7 @@
+ #include "utils/common.h"
+ #include "utils/eloop.h"
+ #include "common/ieee802_11_defs.h"
++#include "common/ieee802_11_common.h"
+ #include "common/wpa_ctrl.h"
+ #include "common/ocv.h"
+ #include "ap/hostapd.h"
+@@ -379,6 +380,58 @@ static void ieee802_11_rx_wnmsleep_req(struct hostapd_data *hapd,
+ }
+ 
+ 
++#ifdef CONFIG_MBO
++/*
++ * BSS Transition Candidate List Entries for a BSS Transition Management
++ * Request that answers a BSS Transition Management Query (Wi-Fi Agile
++ * Multiband 3.5.1.2): a Neighbor Report element, with a BSS Transition
++ * Candidate Preference subelement, for every BSS of this ESS in the neighbor
++ * report database, including the own BSS. An entry configured without a
++ * preference gets the highest one, 255.
++ */
++static size_t wnm_bss_tm_candidates(struct hostapd_data *hapd, u8 *pos,
++				    size_t max_len)
++{
++	struct hostapd_neighbor_entry *nr;
++	u8 *start = pos;
++
++	dl_list_for_each(nr, &hapd->nr_db, struct hostapd_neighbor_entry,
++			 list) {
++		const u8 *nr_pos;
++		size_t len;
++		bool pref;
++
++		if (!nr->nr || wpabuf_len(nr->nr) < 13 ||
++		    nr->ssid.ssid_len != hapd->conf->ssid.ssid_len ||
++		    os_memcmp(nr->ssid.ssid, hapd->conf->ssid.ssid,
++			      nr->ssid.ssid_len) != 0)
++			continue;
++
++		nr_pos = wpabuf_head_u8(nr->nr);
++		len = wpabuf_len(nr->nr);
++		pref = get_ie(nr_pos + 13, len - 13,
++			      WNM_NEIGHBOR_BSS_TRANSITION_CANDIDATE) != NULL;
++		if (!pref)
++			len += 3;
++		if (len > 255 || (size_t) (pos - start) + 2 + len > max_len)
++			continue;
++
++		*pos++ = WLAN_EID_NEIGHBOR_REPORT;
++		*pos++ = len;
++		os_memcpy(pos, nr_pos, wpabuf_len(nr->nr));
++		pos += wpabuf_len(nr->nr);
++		if (!pref) {
++			*pos++ = WNM_NEIGHBOR_BSS_TRANSITION_CANDIDATE;
++			*pos++ = 1;
++			*pos++ = 255;
++		}
++	}
++
++	return pos - start;
++}
++#endif /* CONFIG_MBO */
++
++
+ static int ieee802_11_send_bss_trans_mgmt_request(struct hostapd_data *hapd,
+ 						  const u8 *addr,
+ 						  u8 dialog_token)
+@@ -390,7 +443,7 @@ static int ieee802_11_send_bss_trans_mgmt_request(struct hostapd_data *hapd,
+ 	u8 *pos;
+ 	int res;
+ 
+-	mgmt = os_zalloc(sizeof(*mgmt));
++	mgmt = os_zalloc(IEEE80211_MAX_MMPDU_SIZE);
+ 	if (mgmt == NULL)
+ 		return -1;
+ 
+@@ -410,6 +463,22 @@ static int ieee802_11_send_bss_trans_mgmt_request(struct hostapd_data *hapd,
+ 	mgmt->u.action.u.bss_tm_req.validity_interval = 1;
+ 	pos = mgmt->u.action.u.bss_tm_req.variable;
+ 
++#ifdef CONFIG_MBO
++	if (hapd->conf->mbo_enabled) {
++		size_t cand_len;
++
++		cand_len = wnm_bss_tm_candidates(
++			hapd, pos, (u8 *) mgmt + IEEE80211_MAX_MMPDU_SIZE - pos);
++		if (cand_len) {
++			mgmt->u.action.u.bss_tm_req.req_mode =
++				WNM_BSS_TM_REQ_PREF_CAND_LIST_INCLUDED;
++			/* Long enough for the STA to scan the candidates */
++			mgmt->u.action.u.bss_tm_req.validity_interval = 255;
++			pos += cand_len;
++		}
++	}
++#endif /* CONFIG_MBO */
++
+ 	wpa_printf(MSG_DEBUG, "WNM: Send BSS Transition Management Request to "
+ 		   MACSTR " dialog_token=%u req_mode=0x%x disassoc_timer=%u "
+ 		   "validity_interval=%u",
+-- 
+2.47.3
+
