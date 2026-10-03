@@ -4,8 +4,9 @@
 #   mkrootfs.sh armhf -> rootfs-armhf/  (the arm image)
 # Run as root; a foreign architecture needs qemu-user binfmt. prep-rootfs.sh
 # then adds the kernel, the firmware and the AP's configuration. The arm64
-# rootfs takes iproute2 from pkg/iproute2-nss (tc with the NSS qdiscs), held so
-# apt cannot swap it for Debian's; radsecproxy stays off until it is configured.
+# rootfs takes iproute2 from pkg/iproute2-nss (tc with the NSS qdiscs) and
+# hostapd from pkg/hostapd (2.12, every feature), both held so apt cannot swap
+# them for Debian's; radsecproxy stays off until it is configured.
 # shellcheck disable=SC2016 # each mmdebstrap hook gets the chroot as its own $1
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -17,8 +18,9 @@ esac
 [ ! -e "$dir" ] || { echo "$dir exists; remove it first" >&2; exit 1; }
 localdeb=()
 if [ "$1" = arm64 ]; then
-	deb=$(ls pkg/iproute2-nss/out/iproute2_*+nss1_arm64.deb)
-	localdeb=(--include="$PWD/$deb" --customize-hook='chroot "$1" apt-mark hold iproute2')
+	tc=$(ls pkg/iproute2-nss/out/iproute2_*+nss1_arm64.deb)
+	ap=$(ls pkg/hostapd/out/hostapd_*+u6e*_arm64.deb)
+	localdeb=(--include="$PWD/$tc,$PWD/$ap" --customize-hook='chroot "$1" apt-mark hold iproute2 hostapd')
 fi
 mmdebstrap --variant=minbase --architectures="$1" --components=main,non-free-firmware "${localdeb[@]}" \
 	--include=systemd-sysv,udev,kmod,procps,iproute2,iputils-ping,less,vim-tiny,tzdata,ca-certificates \
