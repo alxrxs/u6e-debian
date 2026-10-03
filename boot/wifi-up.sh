@@ -41,18 +41,25 @@ conf() { # <iface> <band lines>
 iw reg set $WIFI_COUNTRY
 for _ in \$(seq 20); do [ \"\$(iw reg get | grep -c '^country $WIFI_COUNTRY')\" -ge 3 ] && break; sleep 0.5; done
 iw reg get | grep -E '^(phy|country)' | paste - - | sed 's/^/reg: /'"
+	# rnr: 2.4 and 5 GHz beacons announce the 6 GHz BSS (Reduced Neighbor
+	# Report), which is how most clients find 6 GHz at all; hostapd only
+	# reports a 6 GHz BSS it runs in the same process.
 	conf wlan24 "$WIFI_24
-$mixed"
+$mixed
+rnr=1"
 	conf wlan5 "$WIFI_5
-$mixed"
+$mixed
+rnr=1"
 	# WPA3-only: 6 GHz admits nothing else.
 	conf wlan6 "$WIFI_6
 $sae"
 	echo "chmod 600 /run/hostapd-u6e/*.conf"
-	echo 'for i in wlan24 wlan5 wlan6; do
-	[ -e /sys/class/net/$i ] || { echo "$i: no such radio"; continue; }
-	hostapd -B -P /run/hostapd-u6e/$i.pid -f /run/hostapd-u6e/$i.log /run/hostapd-u6e/$i.conf || echo "$i: hostapd failed"
+	echo '[ -s /run/hostapd-u6e/hostapd.pid ] && kill "$(cat /run/hostapd-u6e/hostapd.pid)" && sleep 2
+confs=
+for i in wlan24 wlan5 wlan6; do
+	[ -e /sys/class/net/$i ] && confs="$confs /run/hostapd-u6e/$i.conf" || echo "$i: no such radio"
 done
+hostapd -B -P /run/hostapd-u6e/hostapd.pid -f /run/hostapd-u6e/hostapd.log $confs || echo "hostapd failed"
 sleep 8
 for i in wlan24 wlan5 wlan6; do
 	echo "== $i: $(hostapd_cli -p /run/hostapd -i $i status 2>/dev/null | grep -E "^(state|freq|channel|num_sta\[0\]|ssid\[0\])=" | tr "\n" " ")"
