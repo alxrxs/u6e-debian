@@ -48,8 +48,9 @@ vht_oper_chwidth=1
 vht_oper_centr_freq_seg0_idx=155
 he_oper_chwidth=1
 he_oper_centr_freq_seg0_idx=155"
-# 6 GHz: a 160 MHz block with a PSC primary, and a whole block clear of any
-# other 6 GHz AP in range: next to another 160 MHz BSS, clients' frames are lost.
+# 6 GHz: a 160 MHz block with a PSC primary, inside the band the clients'
+# region allows (EU: 5945-6425 MHz, channels 1-93), and a whole block clear of
+# any other 6 GHz AP in range: next to another 160 MHz BSS, clients' frames are lost.
 WIFI_6="hw_mode=a
 op_class=134
 channel=53
