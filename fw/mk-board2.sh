@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build the board-2.bin each radio's ath11k loads: linux-firmware's board files
 # plus the U6-Enterprise's own from the stock firmware, appended under the
-# variant names the board DTS selects (qcom,ath11k-calibration-variant).
+# variant names the board DTS selects (qcom,calibration-variant).
 #   fw/mk-board2.sh   -> fw/out/{IPQ5018,QCN9074}/board-2.bin (inputs from $BLOBS)
 # ath11k-bdencoder is qca-swiss-army-knife's (ISC licence).
 set -euo pipefail

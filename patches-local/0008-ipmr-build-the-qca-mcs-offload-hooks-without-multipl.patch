@@ -1,4 +1,4 @@
-From 474128964d7a63be0f32c081127ebcf160dcb8b7 Mon Sep 17 00:00:00 2001
+From 3702e15121c5f61c86ff039d9f65fc07e2a4f02d Mon Sep 17 00:00:00 2001
 From: Andrei-Alexandru Bleortu <me@andrei-z.com>
 Date: Fri, 2 Oct 2026 09:42:08 +0300
 Subject: [PATCH] ipmr: build the qca-mcs offload hooks without multiple tables

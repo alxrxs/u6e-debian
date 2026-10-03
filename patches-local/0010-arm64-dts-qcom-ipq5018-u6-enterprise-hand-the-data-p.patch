@@ -1,4 +1,4 @@
-From 0b2d5a03438ea7122a57c2843aff0af89a705c12 Mon Sep 17 00:00:00 2001
+From 9eb058ded1cca247d1cf088f13a19252e97862b1 Mon Sep 17 00:00:00 2001
 From: Andrei-Alexandru Bleortu <me@andrei-z.com>
 Date: Fri, 2 Oct 2026 09:46:37 +0300
 Subject: [PATCH] arm64: dts: qcom: ipq5018-u6-enterprise: hand the data plane
@@ -13,7 +13,7 @@ it. Kept apart from the board support, which stays upstreamable.
  1 file changed, 17 insertions(+)
 
 diff --git a/arch/arm64/boot/dts/qcom/ipq5018-ubnt-u6-enterprise.dts b/arch/arm64/boot/dts/qcom/ipq5018-ubnt-u6-enterprise.dts
-index 4ef7b630f..c1291af82 100644
+index b33ab183a..11ba1d116 100644
 --- a/arch/arm64/boot/dts/qcom/ipq5018-ubnt-u6-enterprise.dts
 +++ b/arch/arm64/boot/dts/qcom/ipq5018-ubnt-u6-enterprise.dts
 @@ -4,6 +4,7 @@
@@ -45,7 +45,7 @@ index 4ef7b630f..c1291af82 100644
  };
 @@ -245,6 +258,8 @@ wifi@0,0 {
  			reg = <0x00010000 0 0 0 0>;
- 			qcom,ath11k-calibration-variant = "Ubiquiti-U6-Enterprise-5G";
+ 			qcom,calibration-variant = "Ubiquiti-U6-Enterprise-5G";
  			qcom,ath11k-fw-memory-mode = <1>;
 +			/* read only by the NSS Wi-Fi offload */
 +			nss-radio-priority = <1>;
@@ -54,7 +54,7 @@ index 4ef7b630f..c1291af82 100644
  };
 @@ -266,6 +281,8 @@ wifi@0,0 {
  			reg = <0x00010000 0 0 0 0>;
- 			qcom,ath11k-calibration-variant = "Ubiquiti-U6-Enterprise-6G";
+ 			qcom,calibration-variant = "Ubiquiti-U6-Enterprise-6G";
  			qcom,ath11k-fw-memory-mode = <1>;
 +			/* read only by the NSS Wi-Fi offload */
 +			nss-radio-priority = <1>;
