@@ -33,8 +33,14 @@ group_mgmt_cipher=AES-128-CMAC
 beacon_prot=1
 mobility_domain=$MDID
 ft_psk_generate_local=1
+ft_over_ds=0
+transition_disable=0x01
+ocv=1
+ssid_protection=1
+stationary_ap=1
 rrm_neighbor_report=1
 rrm_beacon_report=1
+rrm_link_measurement_report=1
 bss_transition=1
 wnm_sleep_mode=1
 mbo=1
@@ -46,6 +52,9 @@ qos_map_set=8,1,18,3,20,3,22,3,24,4,26,4,28,4,30,4,32,4,34,4,36,4,38,4,40,5,44,6
 # a 0 dB Power Constraint) outside DFS channels too, where hostapd sets it only
 # on its own. qos_map_set: RFC 8325's DSCP to user priority mapping (CS6/CS7 stay best
 # effort), so clients mark their uplink the way the network does.
+# transition_disable: clients never fall back to WPA2 here; ocv (802.11-2020)
+# and ssid_protection (802.11-2024) bind the channel and SSID into the key
+# exchange; ft_over_ds=0 keeps 802.11r roaming over the air only.
 # WPA3 on every band: 6 GHz admits nothing else, and clients (iOS) only treat
 # the 6 GHz BSS as the same network when 2.4/5 GHz offer the same security.
 sae="wpa_key_mgmt=SAE FT-SAE
@@ -82,12 +91,14 @@ sae_pwe=2
 nas_identifier=u6e-wlan5
 he_bss_color=22
 rnr=1"
-	# SAE hash-to-element only: 6 GHz admits no hunting-and-pecking.
+	# SAE hash-to-element only: 6 GHz admits no hunting-and-pecking. FILS
+	# Discovery (802.11ai) every 20 ms between beacons speeds up 6 GHz scans.
 	conf wlan6 "$WIFI_6
 $sae
 sae_pwe=1
 nas_identifier=u6e-wlan6
-he_bss_color=33"
+he_bss_color=33
+fils_discovery_max_interval=20"
 	echo "chmod 600 /run/hostapd-u6e/*.conf"
 	# A rerun stops the previous instance and waits until its BSSs are gone from
 	# the radios, which outlast the process: a radio that still has one refuses
