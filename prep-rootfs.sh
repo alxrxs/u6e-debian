@@ -435,3 +435,16 @@ fdtput -t x $OUT/u6e.dtb /chosen linux,initrd-end "$(printf '%#x' $((INITRD_ADDR
 [ "${U6E_PERSIST:-0}" = 1 ] && fdtput -d $OUT/u6e.dtb /soc@0/spi@78b5000/flash@0/partitions/partition@110000 read-only
 echo "release $R, modules $(wc -l < modules.keep), rootfs $(du -sh $RF | cut -f1)"
 ls -la $OUT; sha256sum $OUT/*
+
+# Keep every image (~85 MB): images/<time>-<kernel>-<backports>/ can be staged
+# again with go8.sh without a rebuild; MANIFEST records what went into it.
+g() { git -c safe.directory='*' -C "$1" log -1 --format='%h %s'; }
+A=images/$(date +%Y%m%d-%H%M%S)-$MODE-$(git -c safe.directory='*' -C $K rev-parse --short HEAD)
+[ $MODE = nss ] && A=$A-$(git -c safe.directory='*' -C backports-7.2 rev-parse --short HEAD)
+install -d "$A"; cp -a $OUT/. "$A"/
+{ echo "kernel:    $(g $K)"
+  [ $MODE = nss ] && echo "backports: $(g backports-7.2)"
+  echo "debian-ap: $(g .)"
+  echo "hostapd:   $(dpkg-query --admindir=$RF/var/lib/dpkg -W -f '${Version}' hostapd)"
+  sha256sum $OUT/*; } > "$A"/MANIFEST
+echo "kept as $A"

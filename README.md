@@ -41,7 +41,7 @@ nss/build.sh                       # NSS drivers, the wireless stack, NSS firmwa
 sudo ./prep-rootfs.sh nss          # -> out-nss/{shim.bin,Image,u6e.dtb,u6e.initrd}
 ```
 
-`prep-rootfs.sh` packs the initrd reproducibly (fixed mtimes, the paths it rewrites last), so a rebuild changes only the tail of the image.
+`prep-rootfs.sh` packs the initrd reproducibly (fixed mtimes, the paths it rewrites last), so a rebuild changes only the tail of the image. It also keeps every image it makes under `images/<time>-<mode>-<kernel>[-<backports>]/` with a `MANIFEST` (commits, hostapd version, checksums), so an earlier build can be staged again with `go8.sh` without rebuilding.
 
 ## Booting
 

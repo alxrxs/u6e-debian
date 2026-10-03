@@ -10,6 +10,7 @@
 /rootfs/
 /rootfs-armhf/
 /out-*/
+/images/
 /modules.keep
 /config-*-u6e-*
 /*.log
