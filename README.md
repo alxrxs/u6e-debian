@@ -32,7 +32,7 @@ Then, on an x86 host with the aarch64/armhf cross toolchains, `mmdebstrap`, `qem
 
 ```sh
 sudo pkg/iproute2-nss/build.sh     # Debian's iproute2 with the NSS qdiscs in tc -> pkg/iproute2-nss/out/
-sudo pkg/hostapd/build.sh          # hostapd 2.12 (+ the 2026-5 fix) with every feature -> pkg/hostapd/out/
+sudo pkg/hostapd/build.sh          # hostapd (pinned upstream main) with every feature -> pkg/hostapd/out/
 sudo ./mkrootfs.sh arm64           # Debian rootfs -> rootfs/
 fw/mk-board2.sh                    # board-2.bin with the U6-E variants -> fw/out/
 ./config-u6e.sh nss                # kernel .config (also arm64 / arm without NSS)
@@ -63,7 +63,7 @@ Each boot `go8.sh` arms is one-shot: `bootcmd_real` disarms itself before it sta
 - `u6e-caldata` writes each radio's calibration from the AP's own ART partition at every boot.
 - Bluetooth: the IPQ5018's own controller (`btqcomipc`, firmware loaded through TrustZone) is `hci0` for BlueZ; `u6e-btaddr` gives it the stock firmware's address, the base MAC + 4, before `bluetoothd` starts.
 - The status light is two LEDs, `white:status` and `blue:status` in `/sys/class/leds`; blue comes on at boot.
-- hostapd is 2.12 from `pkg/hostapd` (Debian's packaging, every feature built in, testing options off) with two patches of ours: co-located beacons are refreshed once an interface is set up (so the 2.4/5 GHz RNR carries the 6 GHz BSSID), and `no_pri_sec_switch` is a config option (so the 5 GHz primary stays where `site.conf` puts it).
+- hostapd is upstream main pinned to one commit (newer than 2.12: AP-side Wi-Fi QoS Management DSCP policy) from `pkg/hostapd` (Debian's packaging, every feature built in, testing options off) with two patches of ours: co-located beacons are refreshed once an interface is set up (so the 2.4/5 GHz RNR carries the 6 GHz BSSID), and `no_pri_sec_switch` is a config option (so the 5 GHz primary stays where `site.conf` puts it).
 - Installed for the SSIDs, not yet configured: `tc` from `pkg/iproute2-nss` drives the NSS qdiscs (`nsshtb`, `nsstbl`, `nssfq_codel`, …; `accel_mode 0` shapes in the firmware), with the kernel's HTB/TBF/u32/police/skbedit/connmark modules for traffic the firmware hands back to Linux; `radsecproxy` carries hostapd's RADIUS (UDP only) over RadSec, and stays disabled until it has a configuration.
 - `fastfetch` shows the board with the UniFi logo.
 

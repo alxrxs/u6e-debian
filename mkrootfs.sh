@@ -5,7 +5,7 @@
 # Run as root; a foreign architecture needs qemu-user binfmt. prep-rootfs.sh
 # then adds the kernel, the firmware and the AP's configuration. The arm64
 # rootfs takes iproute2 from pkg/iproute2-nss (tc with the NSS qdiscs) and
-# hostapd from pkg/hostapd (2.12, every feature), both held so apt cannot swap
+# hostapd from pkg/hostapd (pinned upstream main, every feature), both held so apt cannot swap
 # them for Debian's; radsecproxy stays off until it is configured.
 # shellcheck disable=SC2016 # each mmdebstrap hook gets the chroot as its own $1
 set -euo pipefail

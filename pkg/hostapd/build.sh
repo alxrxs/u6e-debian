@@ -1,23 +1,22 @@
 #!/bin/bash
-# Build hostapd 2.12 (with the 2026-5 RADIUS fix) as a Debian package, from
-# Debian's newest packaging (wpa 2.11-2, experimental) with every hostapd
-# feature built in: out/hostapd_<ver>_arm64.deb, which mkrootfs.sh installs
-# and holds. Run as root; needs qemu-user binfmt.
+# Build hostapd from a pinned upstream main commit (newer than the 2.12
+# release: AP-side Wi-Fi QoS Management, the 2026-5 RADIUS fix) as a Debian
+# package, from Debian's newest packaging (wpa 2.11-2, experimental) with
+# every hostapd feature built in: out/hostapd_<ver>_arm64.deb, which
+# mkrootfs.sh installs and holds. Run as root; needs qemu-user binfmt.
 set -euo pipefail
 cd "$(dirname "$0")"
-UP=2.12 DEBVER=2.11-2 VER=2:2.12-0+u6e3
-FIXES=aa02cfa569477f67f3915c8b9a83d1a7ca93693d  # w1.fi security/2026-5
+REV=5b156e272a0266ca6be0f394192bad42b0ff176c  # hostap main, 2026-10-01
+UP=2.13~git20261001 DEBVER=2.11-2 VER=2:2.13~git20261001-0+u6e1
 [ ! -e work ] || { echo "work exists; remove it first" >&2; exit 1; }
 mkdir work; mkdir -p out
-git clone -q --branch hostap_${UP//./_} https://w1.fi/hostap.git work/src
-git -C work/src fetch -q origin "$FIXES"
-git -C work/src -c user.name=build -c user.email=build@localhost cherry-pick -x "$FIXES" >/dev/null
-git -C work/src archive --prefix=wpa-$UP/ HEAD | xz > work/wpa_$UP.orig.tar.xz
+git clone -q https://w1.fi/hostap.git work/src
+git -C work/src archive --prefix=wpa-$UP/ "$REV" | xz > work/wpa_$UP.orig.tar.xz
 tar -xJf work/wpa_$UP.orig.tar.xz -C work
 curl -fsSL -o work/debian.tar.xz https://deb.debian.org/debian/pool/main/w/wpa/wpa_$DEBVER.debian.tar.xz
 tar -xJf work/debian.tar.xz -C work/wpa-$UP
 D=work/wpa-$UP/debian
-# Fixed in 2.12 (the CVE, extra-IEs and sae_pk_gen ones differently), or wpa_supplicant-only
+# Fixed upstream since 2.11 (the CVE, extra-IEs and sae_pk_gen ones differently), or wpa_supplicant-only
 # unit changes this package does not ship.
 sed -i '/^Bump-DEFAULT_BSS_MAX_COUNT-to-1000.patch$/d; /^CVE-2024-5290-lib_engine_trusted_path.patch$/d;
 	/^upstream-fixes\/0001-nl80211-add-extra-ies-only-if-allowed-by-driver.patch$/d;
@@ -35,8 +34,8 @@ cat hostapd.config >> $D/config/hostapd/linux
 sed -i 's#^\tsed -e .s="includes.h"#\t-sed -e \x27s="includes.h"#' $D/rules
 sed -i '/^CONFIG_TESTING_OPTIONS=y$/d' $D/config/hostapd/linux
 { printf 'wpa (%s) experimental; urgency=medium\n\n' "$VER"
-  printf '  * hostapd 2.12 with the RADIUS Message-Authenticator fix (2026-5) and every\n'
-  printf '    hostapd feature built in (hostapd.config); no testing options.\n\n'
+  printf '  * hostapd from upstream main %s with every hostapd feature built in\n' "${REV:0:9}"
+  printf '    (hostapd.config); no testing options.\n\n'
   printf ' -- Andrei-Alexandru Bleortu <me@andrei-z.com>  %s\n\n' "$(date -R)"
   cat $D/changelog; } > work/changelog
 mv work/changelog $D/changelog

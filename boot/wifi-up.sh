@@ -46,6 +46,7 @@ rrm_link_measurement_report=1
 bss_transition=1
 wnm_sleep_mode=1
 mbo=1
+enable_dscp_policy_capa=1
 interworking=1
 access_network_type=0
 internet=1
@@ -56,7 +57,8 @@ qos_map_set=8,1,18,3,20,3,22,3,24,4,26,4,28,4,30,4,32,4,34,4,36,4,38,4,40,5,44,6
 # effort), so clients mark their uplink the way the network does.
 # transition_disable: clients never fall back to WPA2 here; ocv (802.11-2020)
 # and ssid_protection (802.11-2024) bind the channel and SSID into the key
-# exchange; ft_over_ds=0 keeps 802.11r roaming over the air only. FT-SAE's
+# exchange; ft_over_ds=0 keeps 802.11r roaming over the air only;
+# enable_dscp_policy_capa: Wi-Fi QoS Management DSCP policies (hostapd main). FT-SAE's
 # PMK comes from each SAE exchange, so the radios hand roaming keys to each
 # other (r0kh/r1kh wildcards with one shared key, pushed ahead of the roam).
 # WPA3 on every band: 6 GHz admits nothing else, and clients (iOS) only treat
