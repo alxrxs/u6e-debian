@@ -4,7 +4,7 @@
 # wifi_psk (site.conf) and only ever lands in /run on the AP.
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
-SSID=$(wifi_ssid) PSK=$(wifi_psk)
+SSID=$(wifi_ssid) PSK=$(wifi_psk) FTKEY=$(wifi_ft_key)
 # 802.11r: every AP serving the SSID derives the same mobility domain from it.
 MDID=$(printf %s "$SSID" | md5sum | cut -c1-4)
 
@@ -32,7 +32,9 @@ sae_password=$PSK
 group_mgmt_cipher=AES-128-CMAC
 beacon_prot=1
 mobility_domain=$MDID
-ft_psk_generate_local=1
+r0kh=ff:ff:ff:ff:ff:ff * $FTKEY
+r1kh=00:00:00:00:00:00 00:00:00:00:00:00 $FTKEY
+pmk_r1_push=1
 ft_over_ds=0
 transition_disable=0x01
 ocv=1
@@ -54,7 +56,9 @@ qos_map_set=8,1,18,3,20,3,22,3,24,4,26,4,28,4,30,4,32,4,34,4,36,4,38,4,40,5,44,6
 # effort), so clients mark their uplink the way the network does.
 # transition_disable: clients never fall back to WPA2 here; ocv (802.11-2020)
 # and ssid_protection (802.11-2024) bind the channel and SSID into the key
-# exchange; ft_over_ds=0 keeps 802.11r roaming over the air only.
+# exchange; ft_over_ds=0 keeps 802.11r roaming over the air only. FT-SAE's
+# PMK comes from each SAE exchange, so the radios hand roaming keys to each
+# other (r0kh/r1kh wildcards with one shared key, pushed ahead of the roam).
 # WPA3 on every band: 6 GHz admits nothing else, and clients (iOS) only treat
 # the 6 GHz BSS as the same network when 2.4/5 GHz offer the same security.
 sae="wpa_key_mgmt=SAE FT-SAE
@@ -111,14 +115,21 @@ for _ in $(seq 20); do
 	iw dev | grep -q "^[[:space:]]*ssid " || break
 	sleep 0.5
 done
-# 6 GHz first: 2.4 and 5 GHz announce it in their RNR, which hostapd builds
-# when they start and does not rebuild once a later interface gets its BSSID.
+# 6 GHz first: 2.4 and 5 GHz announce it in their RNR, which upstream hostapd
+# builds before a later interface has its BSSID (pkg/hostapd patches that).
 confs=
 for i in wlan6 wlan24 wlan5; do
 	[ -e /sys/class/net/$i ] && confs="$confs /run/hostapd-u6e/$i.conf" || echo "$i: no such radio"
 done
 hostapd -B -P /run/hostapd-u6e/hostapd.pid -f /run/hostapd-u6e/hostapd.log $confs || echo "hostapd failed"
 sleep 8
+# 802.11k: each radio also reports the other two in its neighbor reports.
+for i in wlan24 wlan5 wlan6; do
+	own=$(hostapd_cli -p /run/hostapd -i $i show_neighbor 2>/dev/null | grep " stat$") || continue
+	for j in wlan24 wlan5 wlan6; do
+		[ $j = $i ] || hostapd_cli -p /run/hostapd -i $j set_neighbor ${own% stat} >/dev/null
+	done
+done
 for i in wlan24 wlan5 wlan6; do
 	echo "== $i: $(hostapd_cli -p /run/hostapd -i $i status 2>/dev/null | grep -E "^(state|freq|channel|num_sta\[0\]|ssid\[0\])=" | tr "\n" " ")"
 done'

@@ -38,6 +38,8 @@ power_on() { echo "power_on: not configured" >&2; return 1; }
 WIFI_COUNTRY=KR
 wifi_ssid() { echo u6e-test; }
 wifi_psk() { cat ~/.config/u6e/wifi-psk; }
+# 802.11r key the radios hand roaming keys over with (64 hex digits).
+wifi_ft_key() { cat ~/.config/u6e/wifi-ft-key; }
 WIFI_24="hw_mode=g
 channel=13"
 # no_pri_sec_switch: keep primary 149; hostapd's 20/40 coexistence scan would
