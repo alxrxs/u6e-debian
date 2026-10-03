@@ -63,10 +63,13 @@ qos_map_set=8,1,18,3,20,3,22,3,24,4,26,4,28,4,30,4,32,4,34,4,36,4,38,4,40,5,44,6
 # R0KH-ID (nas_identifier) is unique per AP in the mobility domain.
 # he_spr_sr_control=5: non-SRG OBSS-PD spatial reuse at
 # he_spr_non_srg_obss_pd_max_offset (parameterized SR disallowed).
+# SAE hash-to-element only (sae_pwe=1) on every band: 6 GHz admits no
+# hunting-and-pecking, and every client here does H2E.
 # WPA3 on every band: 6 GHz admits nothing else, and clients (iOS) only treat
 # the 6 GHz BSS as the same network when 2.4/5 GHz offer the same security.
 sae="wpa_key_mgmt=SAE FT-SAE
-ieee80211w=2"
+ieee80211w=2
+sae_pwe=1"
 
 conf() { # <iface> <band lines>
 	echo "cat > /run/hostapd-u6e/$1.conf <<'EOF'"
@@ -91,7 +94,6 @@ iw reg get | grep -E '^(phy|country)' | paste - - | sed 's/^/reg: /'"
 	# Connectivity wants at least 5.5).
 	conf wlan24 "$WIFI_24
 $sae
-sae_pwe=2
 nas_identifier=${AP}-wlan24
 he_bss_color=11
 supported_rates=60 90 120 180 240 360 480 540
@@ -99,15 +101,13 @@ basic_rates=60 120 240
 rnr=1"
 	conf wlan5 "$WIFI_5
 $sae
-sae_pwe=2
 nas_identifier=${AP}-wlan5
 he_bss_color=22
 rnr=1"
-	# SAE hash-to-element only: 6 GHz admits no hunting-and-pecking. FILS
-	# Discovery (802.11ai) every 20 ms between beacons speeds up 6 GHz scans.
+	# FILS Discovery (802.11ai) every 20 ms between beacons speeds up 6 GHz
+	# scans.
 	conf wlan6 "$WIFI_6
 $sae
-sae_pwe=1
 nas_identifier=${AP}-wlan6
 he_bss_color=33
 fils_discovery_max_interval=20"
@@ -131,11 +131,18 @@ for i in wlan6 wlan24 wlan5; do
 done
 hostapd -B -P /run/hostapd-u6e/hostapd.pid -f /run/hostapd-u6e/hostapd.log $confs || echo "hostapd failed"
 sleep 8
-# 802.11k: each radio also reports the other two in its neighbor reports.
+# 802.11k: each radio also reports the other two in its neighbor reports,
+# marked co-located (BSSID Information bit 16) and, for 2.4/5 GHz, co-located
+# with the 6 GHz AP they announce (bit 20) or, for 6 GHz, a member of an ESS
+# with 2.4/5 GHz co-located APs (bit 18): byte 8 of the report.
 for i in wlan24 wlan5 wlan6; do
 	own=$(hostapd_cli -p /run/hostapd -i $i show_neighbor 2>/dev/null | grep " stat$") || continue
+	nr=${own#*nr=}; nr=${nr%% *}
+	[ $i = wlan6 ] && bits=0x05 || bits=0x11
+	b8=$(printf %02x $((0x$(echo "$nr" | cut -c17-18) | bits)))
+	nr=$(echo "$nr" | cut -c1-16)$b8$(echo "$nr" | cut -c19-)
 	for j in wlan24 wlan5 wlan6; do
-		[ $j = $i ] || hostapd_cli -p /run/hostapd -i $j set_neighbor ${own% stat} >/dev/null
+		[ $j = $i ] || hostapd_cli -p /run/hostapd -i $j set_neighbor ${own%% *} ssid=$(echo "$own" | sed "s/.*ssid=\([0-9a-f]*\).*/\1/") nr=$nr >/dev/null
 	done
 done
 for i in wlan24 wlan5 wlan6; do
