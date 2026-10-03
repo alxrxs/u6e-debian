@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 VER=6.15.0 DEB=1
 [ ! -e work ] || { echo "work exists; remove it first" >&2; exit 1; }
-mkdir work out
+mkdir work; mkdir -p out
 base=https://deb.debian.org/debian/pool/main/i/iproute2
 for f in iproute2_$VER-$DEB.dsc iproute2_$VER.orig.tar.xz iproute2_$VER-$DEB.debian.tar.xz; do
 	curl -fsSL -o "work/$f" "$base/$f"
