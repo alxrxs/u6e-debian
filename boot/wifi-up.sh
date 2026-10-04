@@ -42,6 +42,7 @@ transition_disable=0x01
 ocv=1
 ssid_protection=1
 stationary_ap=1
+ftm_responder=1
 rrm_neighbor_report=1
 rrm_link_measurement_report=1
 bss_transition=1
@@ -71,6 +72,8 @@ qos_map_set=8,1,18,3,20,3,22,3,24,4,26,4,28,4,30,4,32,4,34,4,36,4,38,4,40,5,44,6
 # he_spr_non_srg_obss_pd_max_offset (parameterized SR disallowed).
 # SAE hash-to-element only (sae_pwe=1) on every band: 6 GHz admits no
 # hunting-and-pecking, and every client here does H2E.
+# ftm_responder: Fine Timing Measurement responder (802.11-2024 11.21.6), so
+# clients can range to the AP for indoor location.
 # oce=4: Wi-Fi Optimized Connectivity AP (hostapd answers the probes here);
 # esp: Estimated Service Parameters, so clients can estimate their throughput.
 # WPA3 on every band: 6 GHz admits nothing else, and clients (iOS) only treat
