@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: kuncy7 <noreply@example.com>
+Date: Fri, 2 Oct 2026 09:37:57 +0300
+Subject: [PATCH 087/119] net: bridge: keep the default PVID of a new bridge
+
+0966 (QSDK "bridge: Fixes for Bridge VLAN Filtering") disables the
+default PVID of every bridge at NETDEV_REGISTER, so each bridge starts
+with default_pvid=0 and no VLAN on its ports or on itself. Turning on
+vlan_filtering on such a bridge without bridge-vlan sections then drops
+every frame in br_allowed_ingress() and the LAN dies. Measured over Wi-Fi
+on a GL-B3000: default_pvid=0 and an empty
+`bridge vlan show` after boot; `vlan_filtering 1` -> 0/20 pings, with
+`vlan_default_pvid 1` set first -> 20/20.
+
+netifd does not need it: with bridge-vlan sections it deletes VLAN 1
+from the bridge and from every member itself, and without them it
+relies on the kernel default. Keep the kernel default - VLAN 1 PVID
+untagged - as upstream does. The rest of 0966 (the bridge VLAN lookups
+ECM uses) stays as it is.
+---
+ net/bridge/br.c | 4 ----
+ 1 file changed, 4 deletions(-)
+
+diff --git a/net/bridge/br.c b/net/bridge/br.c
+index c8ccd3c80..a5e5b2db1 100644
+--- a/net/bridge/br.c
++++ b/net/bridge/br.c
+@@ -47,10 +47,6 @@ static int br_device_event(struct notifier_block *unused, unsigned long event, v
+ 			return notifier_from_errno(err);
+ 
+ 		if (event == NETDEV_REGISTER) {
+-#if IS_ENABLED(CONFIG_BRIDGE_VLAN_FILTERING)
+-			br_vlan_disable_default_pvid(netdev_priv(dev));
+-#endif
+-
+ 			/* register of bridge completed, add sysfs entries */
+ 			err = br_sysfs_addbr(dev);
+ 			if (err)

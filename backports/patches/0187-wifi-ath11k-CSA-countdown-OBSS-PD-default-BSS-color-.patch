@@ -1,0 +1,115 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Sat, 3 Oct 2026 22:35:15 +0300
+Subject: [PATCH 187/192] wifi: ath11k: CSA countdown, OBSS PD default, BSS
+ color while disabled
+
+Same code as the upstream candidates on linux-next ath11k-he-fixes:
+- count down channel switch announcements in mac80211 (an event per
+  count, as ath12k does), so probe responses carry the live count;
+- leave OBSS PD off when spatial reuse is not configured, instead of
+  enabling non-SRG OBSS PD at -62 dBm;
+- keep the BSS color in the vdev parameter while it is disabled
+  (802.11-2024 26.11.4).
+---
+ drivers/net/wireless/ath/ath11k/core.h |  2 ++
+ drivers/net/wireless/ath/ath11k/mac.c  | 15 +++++++++------
+ drivers/net/wireless/ath/ath11k/wmi.c  | 23 ++++++++++++++++++-----
+ 3 files changed, 29 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath11k/core.h b/drivers/net/wireless/ath/ath11k/core.h
+index c540b10..da985b2 100644
+--- a/drivers/net/wireless/ath/ath11k/core.h
++++ b/drivers/net/wireless/ath/ath11k/core.h
+@@ -436,6 +436,8 @@ struct ath11k_vif {
+ 
+ 	bool is_started;
+ 	bool is_up;
++	/* CSA countdown value the firmware is expected to report next */
++	u8 current_cntdown_counter;
+ 	bool ftm_responder;
+ 	bool spectral_enabled;
+ 	bool ps;
+diff --git a/drivers/net/wireless/ath/ath11k/mac.c b/drivers/net/wireless/ath/ath11k/mac.c
+index 9d98b0f..51dd780 100644
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -3449,7 +3449,8 @@ static int ath11k_mac_config_obss_pd(struct ath11k *ar,
+ 
+ 	/* Set and enable SRG/non-SRG OBSS PD Threshold */
+ 	param_id = WMI_PDEV_PARAM_SET_CMD_OBSS_PD_THRESHOLD;
+-	if (test_bit(ATH11K_FLAG_MONITOR_STARTED, &ar->monitor_flags)) {
++	if (test_bit(ATH11K_FLAG_MONITOR_STARTED, &ar->monitor_flags) ||
++	    !he_obss_pd->enable) {
+ 		ret = ath11k_wmi_pdev_set_param(ar, param_id, 0, pdev_id);
+ 		if (ret)
+ 			ath11k_warn(ar->ab,
+@@ -3922,12 +3923,14 @@ static void ath11k_mac_op_bss_info_changed(struct ieee80211_hw *hw,
+ 				ath11k_warn(ar->ab, "failed to set bss color collision on vdev %i: %d\n",
+ 					    arvif->vdev_id,  ret);
+ 
++			/* A disabled color stays in the PPDUs the AP transmits
++			 * (IEEE Std 802.11-2024, 26.11.4)
++			 */
+ 			param_id = WMI_VDEV_PARAM_BSS_COLOR;
+-			if (info->he_bss_color.enabled)
+-				param_value = info->he_bss_color.color <<
+-						IEEE80211_HE_OPERATION_BSS_COLOR_OFFSET;
+-			else
+-				param_value = IEEE80211_HE_OPERATION_BSS_COLOR_DISABLED;
++			param_value = info->he_bss_color.color <<
++					IEEE80211_HE_OPERATION_BSS_COLOR_OFFSET;
++			if (!info->he_bss_color.enabled)
++				param_value |= IEEE80211_HE_OPERATION_BSS_COLOR_DISABLED;
+ 
+ 			ret = ath11k_wmi_vdev_set_param_cmd(ar, arvif->vdev_id,
+ 							    param_id,
+diff --git a/drivers/net/wireless/ath/ath11k/wmi.c b/drivers/net/wireless/ath/ath11k/wmi.c
+index a5a14b9..c49383f 100644
+--- a/drivers/net/wireless/ath/ath11k/wmi.c
++++ b/drivers/net/wireless/ath/ath11k/wmi.c
+@@ -1933,6 +1933,9 @@ int ath11k_wmi_bcn_tmpl(struct ath11k *ar, u32 vdev_id,
+ 	if (vif->bss_conf.csa_active) {
+ 		cmd->csa_switch_count_offset = offs->cntdwn_counter_offs[0];
+ 		cmd->ext_csa_switch_count_offset = offs->cntdwn_counter_offs[1];
++		/* a switch count event for every count, not just the last */
++		cmd->csa_event_bitmap = 0xffffffff;
++		arvif->current_cntdown_counter = bcn->data[offs->cntdwn_counter_offs[0]];
+ 	}
+ 
+ 	cmd->buf_len = bcn->len;
+@@ -8717,10 +8720,6 @@ ath11k_wmi_process_csa_switch_count_event(struct ath11k_base *ab,
+ 	int i;
+ 	struct ath11k_vif *arvif;
+ 
+-	/* Finish CSA once the switch count becomes NULL */
+-	if (ev->current_switch_count)
+-		return;
+-
+ 	rcu_read_lock();
+ 	for (i = 0; i < ev->num_vdevs; i++) {
+ 		arvif = ath11k_mac_get_arvif_by_vdev_id(ab, vdev_ids[i]);
+@@ -8731,8 +8730,22 @@ ath11k_wmi_process_csa_switch_count_event(struct ath11k_base *ab,
+ 			continue;
+ 		}
+ 
+-		if (arvif->is_up && arvif->vif->bss_conf.csa_active)
++		if (!arvif->is_up || !arvif->vif->bss_conf.csa_active)
++			continue;
++
++		if (!ev->current_switch_count) {
+ 			ieee80211_csa_finish(arvif->vif, 0);
++			arvif->current_cntdown_counter = 0;
++		} else if (ev->current_switch_count > 1) {
++			/* A beacon that failed to go out repeats the previous
++			 * count; mac80211 counts down once per beacon sent.
++			 */
++			if (ev->current_switch_count != arvif->current_cntdown_counter)
++				continue;
++
++			arvif->current_cntdown_counter =
++				ieee80211_beacon_update_cntdwn(arvif->vif, 0);
++		}
+ 	}
+ 	rcu_read_unlock();
+ }

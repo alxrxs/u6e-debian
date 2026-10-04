@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Felix Fietkau <nbd@nbd.name>
+Date: Fri, 2 Oct 2026 09:59:53 +0300
+Subject: [PATCH 016/192] brcmfmac_usb_driver_backport
+
+Imported from https://github.com/openwrt/openwrt.git package/kernel/mac80211/patches/build/220-brcmfmac_usb_driver_backport.patch (added in a85059438f); the patch file carries no author or description.
+---
+ drivers/net/wireless/broadcom/brcm80211/brcmfmac/usb.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/usb.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/usb.c
+index b41949a..7679500 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/usb.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/usb.c
+@@ -1588,7 +1588,11 @@ static int brcmf_usb_reset_device(struct device *dev, void *notused)
+ 
+ void brcmf_usb_exit(void)
+ {
++#if LINUX_VERSION_IS_GEQ(6,8,0)
+ 	struct device_driver *drv = &brcmf_usbdrvr.driver;
++#else
++	struct device_driver *drv = &brcmf_usbdrvr.drvwrap.driver;
++#endif
+ 	int ret;
+ 
+ 	brcmf_dbg(USB, "Enter\n");

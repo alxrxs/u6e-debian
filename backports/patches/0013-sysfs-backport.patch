@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Felix Fietkau <nbd@nbd.name>
+Date: Fri, 2 Oct 2026 09:59:53 +0300
+Subject: [PATCH 013/192] sysfs-backport
+
+Imported from https://github.com/openwrt/openwrt.git package/kernel/mac80211/patches/build/150-sysfs-backport.patch (added in bf44cb5fb0); the patch file carries no author or description.
+---
+ net/wireless/sysfs.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/net/wireless/sysfs.c b/net/wireless/sysfs.c
+index 3ec25d3..4386af9 100644
+--- a/net/wireless/sysfs.c
++++ b/net/wireless/sysfs.c
+@@ -160,12 +160,21 @@ static SIMPLE_DEV_PM_OPS(wiphy_pm_ops, wiphy_suspend, wiphy_resume);
+ #define WIPHY_PM_OPS NULL
+ #endif
+ 
++#if LINUX_VERSION_IS_GEQ(7,0,0)
+ static const struct ns_common *wiphy_namespace(const struct device *d)
+ {
+ 	struct wiphy *wiphy = container_of(d, struct wiphy, dev);
+ 
+ 	return to_ns_common(wiphy_net(wiphy));
+ }
++#else
++static const void *wiphy_namespace(const struct device *d)
++{
++	struct wiphy *wiphy = container_of(d, struct wiphy, dev);
++
++	return wiphy_net(wiphy);
++}
++#endif
+ 
+ struct class ieee80211_class = {
+ 	.name = "ieee80211",

@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gautham Kumar Senthilkumaran <gauthamk@qti.qualcomm.com>
+Date: Mon, 19 Jan 2026 11:55:51 +0100
+Subject: [PATCH 066/192] wifi: ath11k: Fix the WMM param type
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Since FW does not support the 11ax EDCA parameter in WMI TLV command.
+FW was crashing as host was sending this parameter, now changed the
+WMM parameter type as default zero before sending to FW.
+
+Fixes: b78c02f7c710 ("wifi: ath11k: add support for MU EDCA")
+Signed-off-by: Gautham Kumar Senthilkumaran <gauthamk@qti.qualcomm.com>
+Signed-off-by: Paweł Owoc <frut3k7@gmail.com>
+---
+ drivers/net/wireless/ath/ath11k/wmi.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/net/wireless/ath/ath11k/wmi.c b/drivers/net/wireless/ath/ath11k/wmi.c
+index dca6e01..0964b42 100644
+--- a/drivers/net/wireless/ath/ath11k/wmi.c
++++ b/drivers/net/wireless/ath/ath11k/wmi.c
+@@ -2700,7 +2700,7 @@ int ath11k_wmi_send_wmm_update_cmd_tlv(struct ath11k *ar, u32 vdev_id,
+ 			  FIELD_PREP(WMI_TLV_LEN, sizeof(*cmd) - TLV_HDR_SIZE);
+ 
+ 	cmd->vdev_id = vdev_id;
+-	cmd->wmm_param_type = wmm_param_type;
++	cmd->wmm_param_type = WMI_WMM_PARAM_TYPE_LEGACY;
+ 
+ 	for (ac = 0; ac < WME_NUM_AC; ac++) {
+ 		switch (ac) {

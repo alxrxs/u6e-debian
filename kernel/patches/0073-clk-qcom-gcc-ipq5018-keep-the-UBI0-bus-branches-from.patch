@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Fri, 2 Oct 2026 00:32:17 +0300
+Subject: [PATCH 073/119] clk: qcom: gcc-ipq5018: keep the UBI0 bus branches
+ from reclocking the NoCs
+
+gcc_ubi0_cfg_clk sits on the peripheral NoC and gcc_ubi0_utcm_clk and
+gcc_ubi0_nc_axi_clk on the system NoC, all with CLK_SET_RATE_PARENT. A
+rate request on these leaf gates - the NSS driver makes one on each when
+it starts the UBI32 core - therefore reprograms the live NoC clock
+sources under every other peripheral. Each NoC has a single rate anyway,
+so let these gates follow the bus instead of setting it.
+---
+ drivers/clk/qcom/gcc-ipq5018.c | 3 ---
+ 1 file changed, 3 deletions(-)
+
+diff --git a/drivers/clk/qcom/gcc-ipq5018.c b/drivers/clk/qcom/gcc-ipq5018.c
+index c565954a4..dfc587d8c 100644
+--- a/drivers/clk/qcom/gcc-ipq5018.c
++++ b/drivers/clk/qcom/gcc-ipq5018.c
+@@ -2853,7 +2853,6 @@ static struct clk_branch gcc_ubi0_cfg_clk = {
+ 				&pcnoc_clk_src.hw,
+ 			},
+ 			.num_parents = 1,
+-			.flags = CLK_SET_RATE_PARENT,
+ 			.ops = &clk_branch2_ops,
+ 		},
+ 	},
+@@ -2907,7 +2906,6 @@ static struct clk_branch gcc_ubi0_nc_axi_clk = {
+ 				&system_noc_clk_src.hw,
+ 			},
+ 			.num_parents = 1,
+-			.flags = CLK_SET_RATE_PARENT,
+ 			.ops = &clk_branch2_ops,
+ 		},
+ 	},
+@@ -2925,7 +2923,6 @@ static struct clk_branch gcc_ubi0_utcm_clk = {
+ 				&system_noc_clk_src.hw,
+ 			},
+ 			.num_parents = 1,
+-			.flags = CLK_SET_RATE_PARENT,
+ 			.ops = &clk_branch2_ops,
+ 		},
+ 	},

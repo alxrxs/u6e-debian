@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: George Moussalem <george.moussalem@outlook.com>
+Date: Wed, 5 Feb 2025 12:12:47 +0400
+Subject: [PATCH 021/119] arm64: dts: qcom: ipq5018: add tz_apps reserved
+ memory region
+
+Add tz_apps memory region needed for wifi to work.
+
+Signed-off-by: George Moussalem <george.moussalem@outlook.com>
+---
+ arch/arm64/boot/dts/qcom/ipq5018.dtsi | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/qcom/ipq5018.dtsi b/arch/arm64/boot/dts/qcom/ipq5018.dtsi
+index ff034044d..a74a017e4 100644
+--- a/arch/arm64/boot/dts/qcom/ipq5018.dtsi
++++ b/arch/arm64/boot/dts/qcom/ipq5018.dtsi
+@@ -136,6 +136,11 @@ reserved-memory {
+ 		#size-cells = <2>;
+ 		ranges;
+ 
++		tz_apps@4a400000 {
++			reg = <0x0 0x4a400000 0x0 0x400000>;
++			no-map;
++		};
++
+ 		bootloader@4a800000 {
+ 			reg = <0x0 0x4a800000 0x0 0x200000>;
+ 			no-map;

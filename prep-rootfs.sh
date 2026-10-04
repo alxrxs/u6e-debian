@@ -1,10 +1,9 @@
 #!/bin/bash
-# Turn a Debian rootfs into the U6-Enterprise RAM-boot set:
-#   prep-rootfs.sh arm   -> out-arm/{zImage,u6e.dtb,u6e.initrd}           (rootfs-armhf, linux-arm)
-#   prep-rootfs.sh arm64 -> out-arm64/{shim.bin,Image,u6e.dtb,u6e.initrd} (rootfs, linux-7.2.8)
-#   prep-rootfs.sh nss   -> out-nss/{shim.bin,Image,u6e.dtb,u6e.initrd}   (rootfs, linux-7.2.8
-#                           + the NSS drivers, wireless backports and NSS firmware from nss/build.sh)
-# Run as root after that kernel's build; boot the output with boot/go8.sh.
+# Turn the Debian rootfs into the RAM-boot set of the AP that U6E_AP names:
+#   prep-rootfs.sh -> out/{shim.bin,Image,u6e.dtb,u6e.initrd}
+# from rootfs/, the kernel in linux-7.2.8 and the NSS drivers, wireless stack
+# and NSS firmware from nss/build.sh. Run as root after those builds (deploy.sh
+# runs it); boot the output with boot/stage.sh.
 # Site details (addresses, VLANs, keys, the blobs checkout) come from site.conf.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -15,16 +14,8 @@ case " $WIFI_VLANS " in *" $CLIENT_VLAN "*) ;; *) echo "WIFI_VLANS must include 
 MGMT_IP=${MGMT_ADDR%/*}
 MGMT_BCAST=$(python3 -c 'import ipaddress, sys; print(ipaddress.ip_interface(sys.argv[1]).network.broadcast_address)' "$MGMT_ADDR")
 INITRD_ADDR=0x52200000   # must match go8.sh
-case "${1:-}" in
-	arm)   RF=rootfs-armhf K=linux-arm   X=arm-linux-gnueabihf- IMG=arch/arm/boot/zImage
-	       DTB=linux-arm/arch/arm/boot/dts/qcom/qcom-ipq5018-ubnt-u6-enterprise.dtb ;;
-	arm64) RF=rootfs       K=linux-7.2.8 X=aarch64-linux-gnu-   IMG=arch/arm64/boot/Image
-	       DTB=linux-7.2.8/arch/arm64/boot/dts/qcom/ipq5018-ubnt-u6-enterprise.dtb ;;
-	nss)   RF=rootfs       K=linux-7.2.8 X=aarch64-linux-gnu-   IMG=arch/arm64/boot/Image
-	       DTB=linux-7.2.8/arch/arm64/boot/dts/qcom/ipq5018-ubnt-u6-enterprise.dtb ;;
-	*) echo "usage: $0 arm|arm64|nss" >&2; exit 2 ;;
-esac
-MODE=$1 OUT=out-$1
+RF=rootfs K=linux-7.2.8 X=aarch64-linux-gnu- OUT=out
+DTB=$K/arch/arm64/boot/dts/qcom/ipq5018-ubnt-u6-enterprise.dtb
 R=$(cat $K/include/config/kernel.release)
 
 # Identity, access, console.
@@ -55,7 +46,7 @@ for v in $WIFI_VLANS; do
 	printf '[Match]\nName=br%s\n\n[Network]\nLinkLocalAddressing=no\nConfigureWithoutCarrier=yes\n' $v > $N/25-br$v.network
 done
 # Stable names by device path (PCI domains are pinned in the DT): the uplink
-# GMAC is lan, which the NSS glue arms by name; nss mode creates the radio
+# GMAC is lan, which the NSS glue arms by name; the udev rule below creates the radio
 # interfaces under these names itself.
 printf '[Match]\nPath=platform-39d00000.ethernet\n\n[Link]\nName=lan\n' > $N/30-lan.link
 printf '[Match]\nPath=platform-c000000.wifi\n\n[Link]\nName=wlan24\n' > $N/30-wlan24.link
@@ -465,45 +456,37 @@ printf '%s\n' 'options ath11k debug_mask=0x61' 'options qrtr dyndbg=+p' 'options
 ln -sf /lib/firmware/regulatory.db-upstream $RF/etc/alternatives/regulatory.db
 ln -sf /lib/firmware/regulatory.db.p7s-upstream $RF/etc/alternatives/regulatory.db.p7s
 
-# Kernel modules: only the closure of what this AP uses. In nss mode the NSS
-# drivers and the backports wireless stack go in updates/ first, so the closure
-# also pulls in the kernel modules they need. NSS-only pieces are cleared
-# first: arm64 and nss share the rootfs.
-rm -rf modstage $RF/usr/lib/modules/* $RF/etc/modprobe.d/u6e-nss.conf \
-	$RF/etc/udev/rules.d/80-u6e-wlan.rules $RF/etc/systemd/system/u6e-nss.service $RF/etc/systemd/system/multi-user.target.wants/u6e-nss.service
-make -s -C $K ARCH=${MODE/nss/arm64} CROSS_COMPILE=$X INSTALL_MOD_PATH=$PWD/modstage INSTALL_MOD_STRIP=1 modules_install
+# Kernel modules: only the closure of what this AP uses. The NSS drivers and
+# the backports wireless stack go in updates/ first, so the closure also pulls
+# in the kernel modules they need.
+rm -rf modstage $RF/usr/lib/modules/*
+make -s -C $K ARCH=arm64 CROSS_COMPILE=$X INSTALL_MOD_PATH=$PWD/modstage INSTALL_MOD_STRIP=1 modules_install
 M=$PWD/modstage/lib/modules/$R
 WANT="netconsole qcom_q6v5_mpd qcom_q6v5_wcss_sec qrtr-smd qcrypto st_accel_i2c phy-qcom-m31 qrtr qrtr-mhi vxlan macsec bridge 8021q nf_tables nft_ct nft_chain_nat nft_nat nft_masq nft_reject_inet nft_fib_inet nft_log nft_limit nf_conntrack tun wireguard sch_htb sch_tbf sch_fq_codel sch_prio sch_ingress cls_u32 cls_fw cls_matchall cls_flower act_police act_skbedit act_connmark act_mirred ifb btqcomipc"
-if [ $MODE = nss ]; then
-	install -d "$M/updates"
-	cp nss/out/$R/*.ko "$M/updates/"
-	find nss/src/backports -name '*.ko' -print0 | while IFS= read -r -d '' f; do
-		${X}strip --strip-debug -o "$M/updates/$(basename "$f")" "$f"
-	done
-	depmod -b modstage "$R"
-	WANT="$WANT $(ls "$M/updates" | sed 's/\.ko$//')"
-else
-	WANT="$WANT ath11k_pci ath11k_ahb"
-fi
+install -d "$M/updates"
+cp nss/out/$R/*.ko "$M/updates/"
+find nss/src/backports -name '*.ko' -print0 | while IFS= read -r -d '' f; do
+	${X}strip --strip-debug -o "$M/updates/$(basename "$f")" "$f"
+done
+depmod -b modstage "$R"
+WANT="$WANT $(ls "$M/updates" | sed 's/\.ko$//')"
 for m in $WANT; do /sbin/modprobe -S "$R" -d modstage --show-depends $m; done | awk '/^insmod/{print $2}' | sort -u > modules.keep
 install -d $RF/usr/lib/modules/$R
 (cd "$M" && cp modules.order modules.builtin modules.builtin.modinfo "$OLDPWD/$RF/usr/lib/modules/$R/")
 while read -r f; do install -D -m0644 "$f" "$RF/usr/lib/modules/$R/${f#"$M"/}"; done < modules.keep
 rm -rf modstage
-if [ $MODE = nss ]; then
-	# Nothing NSS loads on its own: u6e-nss.service brings the plane up in
-	# order once networkd has configured lan, and only then loads the radios.
-	# The firmware computes the TX checksums (12.2 honours the host's flags),
-	# so the glue keeps checksum offload and TSO on lan.
-	printf '%s\n' 'options ath11k nss_offload=1 frame_mode=2' 'options qca-dwmac-nss ifname=lan fw_if=1 fw_csum=1' \
-		'blacklist ath11k_ahb' 'blacklist ath11k_pci' > $RF/etc/modprobe.d/u6e-nss.conf
-	# The OpenWrt wireless stack makes no default interface (a station vif
-	# taken through NSS offload hangs the NSS core); add each radio's as an AP.
-	for r in c000000.wifi:wlan24 0000:01:00.0:wlan5 0001:01:00.0:wlan6; do
-		printf 'ACTION=="add", SUBSYSTEM=="ieee80211", KERNELS=="%s", RUN+="/usr/sbin/iw phy %%k interface add %s type __ap"\n' \
-			"${r%:*}" "${r##*:}"
-	done > $RF/etc/udev/rules.d/80-u6e-wlan.rules
-fi
+# Nothing NSS loads on its own: u6e-nss.service brings the plane up in
+# order once networkd has configured lan, and only then loads the radios.
+# The firmware computes the TX checksums (12.2 honours the host's flags),
+# so the glue keeps checksum offload and TSO on lan.
+printf '%s\n' 'options ath11k nss_offload=1 frame_mode=2' 'options qca-dwmac-nss ifname=lan fw_if=1 fw_csum=1' \
+	'blacklist ath11k_ahb' 'blacklist ath11k_pci' > $RF/etc/modprobe.d/u6e-nss.conf
+# The OpenWrt wireless stack makes no default interface (a station vif
+# taken through NSS offload hangs the NSS core); add each radio's as an AP.
+for r in c000000.wifi:wlan24 0000:01:00.0:wlan5 0001:01:00.0:wlan6; do
+	printf 'ACTION=="add", SUBSYSTEM=="ieee80211", KERNELS=="%s", RUN+="/usr/sbin/iw phy %%k interface add %s type __ap"\n' \
+		"${r%:*}" "${r##*:}"
+done > $RF/etc/udev/rules.d/80-u6e-wlan.rules
 depmod -b $RF "$R"
 
 # Firmware: ath11k for this board's radios, its Bluetooth, and regdb only.
@@ -514,12 +497,11 @@ find $FW/ath11k -mindepth 1 -maxdepth 1 ! -name 'IPQ5018*' ! -name QCN9074 -exec
 # the NVM) under the qca/ names btqcomipc and btqca ask for.
 install -d $FW/qca
 install -m0644 "$BLOBS"/bt/firmware/bt_fw_patch.* "$BLOBS"/bt/firmware/mpnv10.bin $FW/qca/
-if [ $MODE = nss ]; then
-	install -m0644 nss/out/$R/firmware/qca-nss0-retail.bin $FW/
-	ln -sf qca-nss0-retail.bin $FW/qca-nss0.bin
-	# NSS start-up in the order kuncy7's nss-dwmac-up measured for the dwmac
-	# data plane, for this 1 GB, 2-core board; each step reports its own failure.
-	cat > $RF/usr/local/sbin/u6e-nss <<'NSS'
+install -m0644 nss/out/$R/firmware/qca-nss0-retail.bin $FW/
+ln -sf qca-nss0-retail.bin $FW/qca-nss0.bin
+# NSS start-up in the order kuncy7's nss-dwmac-up measured for the dwmac
+# data plane, for this 1 GB, 2-core board; each step reports its own failure.
+cat > $RF/usr/local/sbin/u6e-nss <<'NSS'
 #!/bin/sh
 s() { sysctl -q -w "$@" || echo "u6e-nss: sysctl $* failed" >&2; }
 wait_for() { # <seconds> <what> <test...>
@@ -577,9 +559,9 @@ s net.netfilter.nf_conntrack_tcp_no_window_check=1 net.netfilter.nf_conntrack_ma
 modprobe ecm front_end_selection=1
 modprobe qca-nss-netlink
 NSS
-	sed -i "s/@MGMT_IF@/$MGMT_IF/g; s/@CLIENT_IF@/$CLIENT_IF/g" $RF/usr/local/sbin/u6e-nss
-	chmod 0755 $RF/usr/local/sbin/u6e-nss
-	cat > $RF/etc/systemd/system/u6e-nss.service <<'UNIT'
+sed -i "s/@MGMT_IF@/$MGMT_IF/g; s/@CLIENT_IF@/$CLIENT_IF/g" $RF/usr/local/sbin/u6e-nss
+chmod 0755 $RF/usr/local/sbin/u6e-nss
+cat > $RF/etc/systemd/system/u6e-nss.service <<'UNIT'
 [Unit]
 Description=U6E NSS offload: data plane, Wi-Fi offload, managers, ECM flow acceleration
 After=systemd-networkd.service
@@ -593,8 +575,7 @@ ExecStart=/usr/local/sbin/u6e-nss
 [Install]
 WantedBy=multi-user.target
 UNIT
-	ln -sf /etc/systemd/system/u6e-nss.service $RF/etc/systemd/system/multi-user.target.wants/u6e-nss.service
-fi
+ln -sf /etc/systemd/system/u6e-nss.service $RF/etc/systemd/system/multi-user.target.wants/u6e-nss.service
 
 # Pack: a reproducible zstd initrd (fixed mtimes, renumbered inodes) with the
 # paths this script rewrites last, so go8.sh's chunk compare only rewrites the
@@ -606,12 +587,8 @@ find $RF -exec touch -h -d @1767225600 {} +
 	find . -print0 | sort -z | grep -zvE "^\./(${TAIL// /|})(/|\$)"
 	for d in $TAIL; do find ./$d -print0 | sort -z; done
 } | cpio --null -o -H newc --quiet --reproducible) | (umask 077; zstd -q -19 -T0 > $OUT/u6e.initrd)
-if [ $MODE = arm ]; then
-	cp $K/$IMG $OUT/zImage
-else
-	cp $K/$IMG $OUT/Image
-	shim/build.sh && cp shim/shim.bin $OUT/shim.bin
-fi
+cp $K/arch/arm64/boot/Image $OUT/Image
+shim/build.sh && cp shim/shim.bin $OUT/shim.bin
 cp $DTB $OUT/u6e.dtb
 S=$(stat -c %s $OUT/u6e.initrd)
 fdtput -t x $OUT/u6e.dtb /chosen linux,initrd-start $INITRD_ADDR
@@ -625,13 +602,12 @@ ls -la $OUT; sha256sum $OUT/*
 # Keep every image (~85 MB): images/<time>-<kernel>-<backports>-<AP>/ can be staged
 # again with go8.sh without a rebuild; MANIFEST records what went into it.
 g() { git -c safe.directory='*' -C "$1" log -1 --format='%h %s'; }
-A=images/$(date +%Y%m%d-%H%M%S)-$MODE-$(git -c safe.directory='*' -C $K rev-parse --short HEAD)
-[ $MODE = nss ] && A=$A-$(git -c safe.directory='*' -C backports-7.2 rev-parse --short HEAD)
+A=images/$(date +%Y%m%d-%H%M%S)-$(git -c safe.directory='*' -C $K rev-parse --short HEAD)-$(git -c safe.directory='*' -C backports-7.2 rev-parse --short HEAD)
 A=$A-${U6E_AP:-default}
 install -d -m 0700 "$A"; cp -a $OUT/. "$A"/
 { echo "ap:        ${U6E_AP:-default} ($AP_HOSTNAME, $MGMT_ADDR)"
   echo "kernel:    $(g $K)"
-  [ $MODE = nss ] && echo "backports: $(g backports-7.2)"
+  echo "backports: $(g backports-7.2)"
   echo "debian-ap: $(g .)"
   echo "hostapd:   $(dpkg-query --admindir=$RF/var/lib/dpkg -W -f '${Version}' hostapd)"
   sha256sum $OUT/*; } > "$A"/MANIFEST

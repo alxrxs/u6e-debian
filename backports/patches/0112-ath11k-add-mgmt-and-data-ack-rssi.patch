@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Stanislaw Pal <kuncy7@gmail.com>
+Date: Fri, 2 Oct 2026 09:56:43 +0300
+Subject: [PATCH 112/192] ath11k-add-mgmt-and-data-ack-rssi
+
+Imported from https://github.com/kuncy7/openwrt-nss-edma package/kernel/mac80211/patches/nss/ath11k/191-ath11k-add-mgmt-and-data-ack-rssi.patch (added in aaacdca9a1); the patch file carries no author or description.
+---
+ drivers/net/wireless/ath/ath11k/mac.c | 2 ++
+ drivers/net/wireless/ath/ath11k/wmi.c | 1 +
+ 2 files changed, 3 insertions(+)
+
+diff --git a/drivers/net/wireless/ath/ath11k/mac.c b/drivers/net/wireless/ath/ath11k/mac.c
+index b078f9f..52a6582 100644
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -10614,6 +10614,8 @@ static int __ath11k_mac_register(struct ath11k *ar)
+ 		wiphy_ext_feature_set(ar->hw->wiphy,
+ 				      NL80211_EXT_FEATURE_ACK_SIGNAL_SUPPORT);
+ 
++	wiphy_ext_feature_set(ar->hw->wiphy, NL80211_EXT_FEATURE_ACK_SIGNAL_SUPPORT);
++
+ 	ar->hw->queues = ATH11K_HW_MAX_QUEUES;
+ 	ar->hw->wiphy->tx_queue_len = ATH11K_QUEUE_LEN;
+ 	ar->hw->offchannel_tx_hw_queue = ATH11K_HW_MAX_QUEUES - 1;
+diff --git a/drivers/net/wireless/ath/ath11k/wmi.c b/drivers/net/wireless/ath/ath11k/wmi.c
+index b732d57..101d34a 100644
+--- a/drivers/net/wireless/ath/ath11k/wmi.c
++++ b/drivers/net/wireless/ath/ath11k/wmi.c
+@@ -4233,6 +4233,7 @@ ath11k_wmi_copy_resource_config(struct wmi_resource_config *wmi_cfg,
+ 	wmi_cfg->max_bssid_rx_filters = tg_cfg->max_bssid_rx_filters;
+ 	wmi_cfg->use_pdev_id = tg_cfg->use_pdev_id;
+ 	wmi_cfg->flag1 = tg_cfg->flag1;
++	wmi_cfg->flag1 |= WMI_RSRC_CFG_FLAG1_ACK_RSSI;
+ 	wmi_cfg->peer_map_unmap_v2_support = tg_cfg->peer_map_unmap_v2_support;
+ 	wmi_cfg->sched_params = tg_cfg->sched_params;
+ 	wmi_cfg->twt_ap_pdev_count = tg_cfg->twt_ap_pdev_count;

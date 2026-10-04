@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: kuncy7 <noreply@example.com>
+Date: Fri, 2 Oct 2026 10:18:08 +0300
+Subject: [PATCH 176/192] ath11k: nss: account each peer's stats on its own
+
+ath11k_nss_get_peer_stats() walks the per-peer entries of one wifili
+stats message, but two things leak from one entry into the next:
+
+- tx_dropped is set to 0 once before the loop and only ever added to,
+  so every peer after the first gets the drops of all peers before it
+  added to its tx_failed;
+- a peer without nss_stats makes the function return, so the peers
+  after it in the same message are not accounted at all.
+
+Reset tx_dropped for every entry and skip only the entry that has no
+stats.
+
+Both found by Adriel Santos in his RD03v2 port
+(github.com/ADCDS/openwrt-xiaomi-ax3000t-rd03v2, nss-peer-accounting).
+---
+ drivers/net/wireless/ath/ath11k/nss.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath11k/nss.c b/drivers/net/wireless/ath/ath11k/nss.c
+index 536f76c..ef2a503 100644
+--- a/drivers/net/wireless/ath/ath11k/nss.c
++++ b/drivers/net/wireless/ath/ath11k/nss.c
+@@ -145,7 +145,7 @@ static void ath11k_nss_get_peer_stats(struct ath11k_base *ab, struct nss_wifili_
+ 	struct ath11k_peer *peer;
+ 	struct nss_wifili_peer_ctrl_stats *pstats = NULL;
+ 	int i, j, i2;
+-	u64 tx_packets, tx_bytes, tx_dropped = 0;
++	u64 tx_packets, tx_bytes, tx_dropped;
+ 	u64 rx_packets, rx_bytes, rx_dropped;
+ 
+ 	if (!ab->nss.stats_enabled)
+@@ -153,6 +153,7 @@ static void ath11k_nss_get_peer_stats(struct ath11k_base *ab, struct nss_wifili_
+ 
+ 	for (i = 0; i < stats->npeers; i++) {
+ 		pstats = &stats->wpcs[i];
++		tx_dropped = 0;
+ 
+ 		rcu_read_lock();
+ 		spin_lock_bh(&ab->base_lock);
+@@ -174,7 +175,7 @@ static void ath11k_nss_get_peer_stats(struct ath11k_base *ab, struct nss_wifili_
+ 		if (!peer->nss.nss_stats) {
+ 			spin_unlock_bh(&ab->base_lock);
+ 			rcu_read_unlock();
+-			return;
++			continue;
+ 		}
+ 
+ 		if (pstats->tx.tx_success_cnt)

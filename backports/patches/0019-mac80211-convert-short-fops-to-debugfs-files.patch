@@ -1,0 +1,237 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mieczyslaw Nalewaj <namiltd@yahoo.com>
+Date: Fri, 2 Oct 2026 09:59:54 +0300
+Subject: [PATCH 019/192] mac80211-convert-short-fops-to-debugfs-files
+
+Imported from https://github.com/openwrt/openwrt.git package/kernel/mac80211/patches/build/410-mac80211-convert-short-fops-to-debugfs-files.patch (added in 88f4c32060); the patch file carries no author or description.
+---
+ net/mac80211/debugfs.c        | 27 ++++++++++++++++++---------
+ net/mac80211/debugfs_key.c    |  9 ++++++---
+ net/mac80211/debugfs_netdev.c |  3 ++-
+ net/mac80211/debugfs_sta.c    |  9 ++++++---
+ net/mac80211/rate.c           |  3 ++-
+ net/mac80211/rate.h           |  2 +-
+ 6 files changed, 35 insertions(+), 18 deletions(-)
+
+diff --git a/net/mac80211/debugfs.c b/net/mac80211/debugfs.c
+index bc40a67..95887ff 100644
+--- a/net/mac80211/debugfs.c
++++ b/net/mac80211/debugfs.c
+@@ -42,8 +42,9 @@ static ssize_t name## _read(struct file *file, char __user *userbuf,	\
+ }
+ 
+ #define DEBUGFS_READONLY_FILE_OPS(name)			\
+-static const struct debugfs_short_fops name## _ops = {				\
++static const struct file_operations name## _ops = {			\
+ 	.read = name## _read,						\
++	.open = simple_open,						\
+ 	.llseek = generic_file_llseek,					\
+ };
+ 
+@@ -139,9 +140,10 @@ static ssize_t aqm_write(struct file *file,
+ 	return -EINVAL;
+ }
+ 
+-static const struct debugfs_short_fops aqm_ops = {
++static const struct file_operations aqm_ops = {
+ 	.write = aqm_write,
+ 	.read = aqm_read,
++	.open = simple_open,
+ 	.llseek = default_llseek,
+ };
+ 
+@@ -190,9 +192,10 @@ static ssize_t airtime_flags_write(struct file *file,
+ 	return count;
+ }
+ 
+-static const struct debugfs_short_fops airtime_flags_ops = {
++static const struct file_operations airtime_flags_ops = {
+ 	.write = airtime_flags_write,
+ 	.read = airtime_flags_read,
++	.open = simple_open,
+ 	.llseek = default_llseek,
+ };
+ 
+@@ -220,8 +223,9 @@ static ssize_t aql_pending_read(struct file *file,
+ 				       buf, len);
+ }
+ 
+-static const struct debugfs_short_fops aql_pending_ops = {
++static const struct file_operations aql_pending_ops = {
+ 	.read = aql_pending_read,
++	.open = simple_open,
+ 	.llseek = default_llseek,
+ };
+ 
+@@ -299,9 +303,10 @@ static ssize_t aql_txq_limit_write(struct file *file,
+ 	return count;
+ }
+ 
+-static const struct debugfs_short_fops aql_txq_limit_ops = {
++static const struct file_operations aql_txq_limit_ops = {
+ 	.write = aql_txq_limit_write,
+ 	.read = aql_txq_limit_read,
++	.open = simple_open,
+ 	.llseek = default_llseek,
+ };
+ 
+@@ -335,9 +340,10 @@ static ssize_t aql_enable_write(struct file *file, const char __user *user_buf,
+ 	return count;
+ }
+ 
+-static const struct debugfs_short_fops aql_enable_ops = {
++static const struct file_operations aql_enable_ops = {
+ 	.write = aql_enable_write,
+ 	.read = aql_enable_read,
++	.open = simple_open,
+ 	.llseek = default_llseek,
+ };
+ 
+@@ -373,9 +379,10 @@ static ssize_t force_tx_status_write(struct file *file,
+ 	return count;
+ }
+ 
+-static const struct debugfs_short_fops force_tx_status_ops = {
++static const struct file_operations force_tx_status_ops = {
+ 	.write = force_tx_status_write,
+ 	.read = force_tx_status_read,
++	.open = simple_open,
+ 	.llseek = default_llseek,
+ };
+ 
+@@ -400,8 +407,9 @@ static ssize_t reset_write(struct file *file, const char __user *user_buf,
+ 	return count;
+ }
+ 
+-static const struct debugfs_short_fops reset_ops = {
++static const struct file_operations reset_ops = {
+ 	.write = reset_write,
++	.open = simple_open,
+ 	.llseek = noop_llseek,
+ };
+ #endif
+@@ -629,8 +637,9 @@ static ssize_t stats_ ##name## _read(struct file *file,			\
+ 				      print_devstats_##name);		\
+ }									\
+ 									\
+-static const struct debugfs_short_fops stats_ ##name## _ops = {			\
++static const struct file_operations stats_ ##name## _ops = {		\
+ 	.read = stats_ ##name## _read,					\
++	.open = simple_open,						\
+ 	.llseek = generic_file_llseek,					\
+ };
+ 
+diff --git a/net/mac80211/debugfs_key.c b/net/mac80211/debugfs_key.c
+index 117f58a..9a335fa 100644
+--- a/net/mac80211/debugfs_key.c
++++ b/net/mac80211/debugfs_key.c
+@@ -26,15 +26,17 @@ static ssize_t key_##name##_read(struct file *file,			\
+ #define KEY_READ_X(name) KEY_READ(name, name, "0x%x\n")
+ 
+ #define KEY_OPS(name)							\
+-static const struct debugfs_short_fops key_ ##name## _ops = {		\
++static const struct file_operations key_ ##name## _ops = {		\
+ 	.read = key_##name##_read,					\
++	.open = simple_open,						\
+ 	.llseek = generic_file_llseek,					\
+ }
+ 
+ #define KEY_OPS_W(name)							\
+-static const struct debugfs_short_fops key_ ##name## _ops = {		\
++static const struct file_operations key_ ##name## _ops = {		\
+ 	.read = key_##name##_read,					\
+ 	.write = key_##name##_write,					\
++	.open = simple_open,						\
+ 	.llseek = generic_file_llseek,					\
+ }
+ 
+@@ -47,8 +49,9 @@ static const struct debugfs_short_fops key_ ##name## _ops = {		\
+ #define KEY_CONF_READ_D(name) KEY_CONF_READ(name, "%d\n")
+ 
+ #define KEY_CONF_OPS(name)						\
+-static const struct debugfs_short_fops key_ ##name## _ops = {		\
++static const struct file_operations key_ ##name## _ops = {		\
+ 	.read = key_conf_##name##_read,					\
++	.open = simple_open,						\
+ 	.llseek = generic_file_llseek,					\
+ }
+ 
+diff --git a/net/mac80211/debugfs_netdev.c b/net/mac80211/debugfs_netdev.c
+index 0df269c..92e8df6 100644
+--- a/net/mac80211/debugfs_netdev.c
++++ b/net/mac80211/debugfs_netdev.c
+@@ -222,9 +222,10 @@ static ssize_t ieee80211_if_fmt_##name(					\
+ }
+ 
+ #define _IEEE80211_IF_FILE_OPS(name, _read, _write)			\
+-static const struct debugfs_short_fops name##_ops = {				\
++static const struct file_operations name##_ops = {			\
+ 	.read = (_read),						\
+ 	.write = (_write),						\
++	.open = simple_open,						\
+ 	.llseek = generic_file_llseek,					\
+ }
+ 
+diff --git a/net/mac80211/debugfs_sta.c b/net/mac80211/debugfs_sta.c
+index ef75255..6b70e8a 100644
+--- a/net/mac80211/debugfs_sta.c
++++ b/net/mac80211/debugfs_sta.c
+@@ -30,15 +30,17 @@ static ssize_t sta_ ##name## _read(struct file *file,			\
+ #define STA_READ_D(name, field) STA_READ(name, field, "%d\n")
+ 
+ #define STA_OPS(name)							\
+-static const struct debugfs_short_fops sta_ ##name## _ops = {		\
++static const struct file_operations sta_ ##name## _ops = {		\
+ 	.read = sta_##name##_read,					\
++	.open = simple_open,						\
+ 	.llseek = generic_file_llseek,					\
+ }
+ 
+ #define STA_OPS_RW(name)						\
+-static const struct debugfs_short_fops sta_ ##name## _ops = {		\
++static const struct file_operations sta_ ##name## _ops = {		\
+ 	.read = sta_##name##_read,					\
+ 	.write = sta_##name##_write,					\
++	.open = simple_open,						\
+ 	.llseek = generic_file_llseek,					\
+ }
+ 
+@@ -440,8 +442,9 @@ STA_OPS_RW(agg_status);
+ 
+ /* link sta attributes */
+ #define LINK_STA_OPS(name)						\
+-static const struct debugfs_short_fops link_sta_ ##name## _ops = {		\
++static const struct file_operations link_sta_ ##name## _ops = {		\
+ 	.read = link_sta_##name##_read,					\
++	.open = simple_open,						\
+ 	.llseek = generic_file_llseek,					\
+ }
+ 
+diff --git a/net/mac80211/rate.c b/net/mac80211/rate.c
+index 35f2ba8..433838a 100644
+--- a/net/mac80211/rate.c
++++ b/net/mac80211/rate.c
+@@ -250,8 +250,9 @@ static ssize_t rcname_read(struct file *file, char __user *userbuf,
+ 				       ref->ops->name, len);
+ }
+ 
+-const struct debugfs_short_fops rcname_ops = {
++const struct file_operations rcname_ops = {
+ 	.read = rcname_read,
++	.open = simple_open,
+ 	.llseek = default_llseek,
+ };
+ #endif
+diff --git a/net/mac80211/rate.h b/net/mac80211/rate.h
+index ba24a39..8285ddf 100644
+--- a/net/mac80211/rate.h
++++ b/net/mac80211/rate.h
+@@ -62,7 +62,7 @@ static inline void rate_control_add_sta_debugfs(struct sta_info *sta)
+ #endif
+ }
+ 
+-extern const struct debugfs_short_fops rcname_ops;
++extern const struct file_operations rcname_ops;
+ 
+ static inline void rate_control_add_debugfs(struct ieee80211_local *local)
+ {

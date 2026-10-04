@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sean Khan <datapronix@protonmail.com>
+Date: Fri, 2 Oct 2026 09:42:29 +0300
+Subject: [PATCH 100/119] qca-nss-clients-iptunnel-fixes
+
+Imported from https://github.com/qosmio/openwrt-ipq.git target/linux/qualcommax/patches-6.12/0607-1-qca-nss-clients-iptunnel-fixes.patch (added in 2f34da0af7); the patch file carries no author or description.
+[Andrei: Ported to a 7.2 kernel.org tree: the four ip6_tunnel.c hunks on OpenWrt's MAP-E FMR code are dropped (that code is not here); ip6tunnel_xmit() gained a flags argument and sit.c context moved.]
+---
+ net/ipv4/ip_tunnel_core.c | 15 +++++++++++++++
+ net/ipv6/ip6_tunnel.c     |  6 ++++++
+ net/ipv6/sit.c            |  4 ++++
+ 3 files changed, 25 insertions(+)
+
+diff --git a/net/ipv4/ip_tunnel_core.c b/net/ipv4/ip_tunnel_core.c
+index bab42b9e2..46db63516 100644
+--- a/net/ipv4/ip_tunnel_core.c
++++ b/net/ipv4/ip_tunnel_core.c
+@@ -38,6 +38,7 @@
+ #include <net/geneve.h>
+ #include <net/vxlan.h>
+ #include <net/erspan.h>
++#include <net/vxlan.h>
+ 
+ const struct ip_tunnel_encap_ops __rcu *
+ 		iptun_encaps[MAX_IPTUN_ENCAP_OPS] __read_mostly;
+@@ -56,7 +57,12 @@ void iptunnel_xmit(struct sock *sk, struct rtable *rt, struct sk_buff *skb,
+ 	struct net *net = dev_net(rt->dst.dev);
+ 	struct net_device *dev = skb->dev;
+ 	struct iphdr *iph;
++	struct net_device *in_dev = NULL;
+ 	int err;
++	int skb_iif;
++
++	/* Save input interface index */
++	skb_iif = skb->skb_iif;
+ 
+ 	if (unlikely(dev_recursion_level() > IP_TUNNEL_RECURSION_LIMIT)) {
+ 		if (dev) {
+@@ -94,6 +100,15 @@ void iptunnel_xmit(struct sock *sk, struct rtable *rt, struct sk_buff *skb,
+ 	iph->ttl	=	ttl;
+ 	__ip_select_ident(net, iph, skb_shinfo(skb)->gso_segs ?: 1);
+ 
++	/* Get input interface */
++	if (skb_iif) {
++		in_dev = __dev_get_by_index(&init_net, skb_iif);
++	}
++
++	if (proto == IPPROTO_IPV6 || proto == IPPROTO_GRE || (in_dev && netif_is_vxlan(in_dev))) {
++		skb->skb_iif = skb_iif;
++	}
++
+ 	err = ip_local_out(net, sk, skb);
+ 
+ 	if (dev) {
+diff --git a/net/ipv6/ip6_tunnel.c b/net/ipv6/ip6_tunnel.c
+index cff29f0d0..dfba9582d 100644
+--- a/net/ipv6/ip6_tunnel.c
++++ b/net/ipv6/ip6_tunnel.c
+@@ -892,6 +892,9 @@ static int __ip6_tnl_rcv(struct ip6_tnl *tunnel, struct sk_buff *skb,
+ 	if (tun_dst)
+ 		skb_dst_set(skb, (struct dst_entry *)tun_dst);
+ 
++	/* Reset the skb_iif to Tunnels interface index */
++	skb->skb_iif = tunnel->dev->ifindex;
++
+ 	gro_cells_receive(&tunnel->gro_cells, skb);
+ 	return 0;
+ 
+@@ -1282,6 +1285,9 @@ int ip6_tnl_xmit(struct sk_buff *skb, struct net_device *dev, __u8 dsfield,
+ 	ipv6h->nexthdr = proto;
+ 	ipv6h->saddr = fl6->saddr;
+ 	ipv6h->daddr = fl6->daddr;
++
++	/* Reset the skb_iif to Tunnels interface index */
++	skb->skb_iif = dev->ifindex;
+ 	ip6tunnel_xmit(NULL, skb, dev, 0);
+ 	return 0;
+ tx_err_link_failure:
+diff --git a/net/ipv6/sit.c b/net/ipv6/sit.c
+index a3e5dc2f4..59a929af1 100644
+--- a/net/ipv6/sit.c
++++ b/net/ipv6/sit.c
+@@ -726,6 +726,8 @@ static int ipip6_rcv(struct sk_buff *skb)
+ 
+ 		dev_sw_netstats_rx_add(tunnel->dev, skb->len);
+ 
++		/* Reset the skb_iif to Tunnels interface index */
++		skb->skb_iif = tunnel->dev->ifindex;
+ 		netif_rx(skb);
+ 
+ 		return 0;
+@@ -1030,6 +1032,8 @@ static netdev_tx_t ipip6_tunnel_xmit(struct sk_buff *skb,
+ 
+ 	skb_set_inner_ipproto(skb, IPPROTO_IPV6);
+ 
++	/* Reset the skb_iif to Tunnels interface index */
++	skb->skb_iif = tunnel->dev->ifindex;
+ 	iptunnel_xmit(NULL, rt, skb, fl4.saddr, fl4.daddr, protocol, tos, ttl,
+ 		      df, !net_eq(tunnel->net, dev_net(dev)), 0);
+ 	return NETDEV_TX_OK;

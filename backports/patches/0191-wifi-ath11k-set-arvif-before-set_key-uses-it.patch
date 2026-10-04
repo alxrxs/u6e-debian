@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Sat, 3 Oct 2026 23:29:58 +0300
+Subject: [PATCH 191/192] wifi: ath11k: set arvif before set_key uses it
+
+The BIGTK check at the top of ath11k_mac_op_set_key() reads arvif->vdev_type, but this tree assigned arvif only after the early returns: an uninitialized pointer, which the compiler turned into a NULL load, oopsing on every group key an AP installed. Initialize it at its declaration, as mainline does.
+---
+ drivers/net/wireless/ath/ath11k/mac.c | 5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath11k/mac.c b/drivers/net/wireless/ath/ath11k/mac.c
+index ab0a5f8..3b4b569 100644
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -4667,7 +4667,8 @@ static int ath11k_mac_op_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
+ {
+ 	struct ath11k *ar = hw->priv;
+ 	struct ath11k_base *ab = ar->ab;
+-	struct ath11k_vif *arvif, *ap_vlan_arvif = NULL;
++	struct ath11k_vif *arvif = ath11k_vif_to_arvif(vif);
++	struct ath11k_vif *ap_vlan_arvif = NULL;
+ 	struct ath11k_peer *peer;
+ 	struct ath11k_sta *arsta = NULL;
+ 	bool is_ap_with_no_sta;
+@@ -4689,8 +4690,6 @@ static int ath11k_mac_op_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
+ 	if (key->keyidx > WMI_MAX_KEY_INDEX)
+ 		return -ENOSPC;
+ 
+-	arvif = ath11k_vif_to_arvif(vif);
+-
+ 	mutex_lock(&ar->conf_mutex);
+ 	if (sta) {
+ 		peer_addr = sta->addr;

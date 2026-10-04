@@ -1,0 +1,85 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Stanislaw Pal <kuncy7@gmail.com>
+Date: Fri, 2 Oct 2026 09:49:07 +0300
+Subject: [PATCH 072/192] wifi: ath11k: tear down QMI when ahb probe fails
+ after core init
+
+ath11k_ahb_probe() calls ath11k_core_init() before it configures the
+interrupts. ath11k_core_init() reaches ath11k_qmi_init_service(), which
+registers the QMI service and starts ath11k_qmi_driver_event_work(), so
+from that point a workqueue holds a reference to ab and the firmware
+handshake is running.
+
+If ath11k_ahb_config_irq() then fails, the error path jumps to
+err_ce_free, which frees the CE pipes, the SRNGs and the smp2p handle
+and ends in ath11k_core_free(ab) - without ever calling
+ath11k_qmi_deinit_service(). The QMI work keeps running on freed memory:
+
+  ath11k c000000.wifi: failed to configure irq: -16
+  ath11k c000000.wifi: probe with driver ath11k failed with error -16
+  platform c000000.wifi: chip_id 0x0 chip_family 0x4 board_id 0xff
+  platform c000000.wifi: fw_version 0x270206d0 fw_build_timestamp ...
+  Unable to handle kernel read from unreadable memory at virtual address 166
+
+The prefix changing from "ath11k c000000.wifi:" to "platform
+c000000.wifi:" is the driver detaching while its own work carries on.
+
+Undo what ath11k_core_init() set up before the memory it works on goes
+away, using the same sequence ath11k_ahb_remove() already uses for a
+device whose QMI never came up: cancel the work, power the target down,
+destroy the soc debugfs, release the QMI service and unregister the PM
+notifier. ath11k_core_deinit() is not the right call here - it tears
+down a fully started device and would stop pdevs and a firmware that
+this path never created.
+
+ath11k_pci_probe() does not have the problem: ath11k_pcic_config_irq()
+runs before ath11k_core_init() there, and the failure paths after it
+unwind in order.
+
+Found while reading a crash report from an IPQ5018 board whose QCN6122
+lost an interrupt request to a PCIe modem driver (OpenWrt forum thread
+252655); reproduced and tested on a GL-B3000 by injecting a failure into
+ath11k_ahb_config_irq() and rebinding a wifi device - the box panics
+without this change and logs a clean probe failure with it.
+
+Signed-off-by: Stanislaw Pal <kuncy7@gmail.com>
+[Andrei: Ported to 7.2: the probe error path has no rproc deconfiguration step there; the new teardown runs before err_ce_free.]
+---
+ drivers/net/wireless/ath/ath11k/ahb.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/wireless/ath/ath11k/ahb.c b/drivers/net/wireless/ath/ath11k/ahb.c
+index 91f2585..deea597 100644
+--- a/drivers/net/wireless/ath/ath11k/ahb.c
++++ b/drivers/net/wireless/ath/ath11k/ahb.c
+@@ -1173,6 +1173,8 @@ static int ath11k_ahb_fw_resource_deinit(struct ath11k_base *ab)
+ 	return 0;
+ }
+ 
++static void ath11k_ahb_remove_prepare(struct ath11k_base *ab);
++
+ static int ath11k_ahb_probe(struct platform_device *pdev)
+ {
+ 	struct ath11k_base *ab;
+@@ -1275,13 +1277,20 @@ static int ath11k_ahb_probe(struct platform_device *pdev)
+ 	ret = ath11k_ahb_config_irq(ab);
+ 	if (ret) {
+ 		ath11k_err(ab, "failed to configure irq: %d\n", ret);
+-		goto err_ce_free;
++		goto err_core_stop;
+ 	}
+ 
+ 	ath11k_qmi_fwreset_from_cold_boot(ab);
+ 
+ 	return 0;
+ 
++err_core_stop:
++	ath11k_ahb_remove_prepare(ab);
++	ath11k_ahb_power_down(ab, false);
++	ath11k_debugfs_soc_destroy(ab);
++	ath11k_qmi_deinit_service(ab);
++	ath11k_core_pm_notifier_unregister(ab);
++
+ err_ce_free:
+ 	ath11k_ce_free_pipes(ab);
+ 

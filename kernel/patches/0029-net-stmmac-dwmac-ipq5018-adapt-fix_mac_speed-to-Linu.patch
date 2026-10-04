@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Wed, 30 Sep 2026 18:51:04 +0300
+Subject: [PATCH 029/119] net: stmmac: dwmac-ipq5018: adapt fix_mac_speed to
+ Linux 7.x
+
+stmmac passes the PHY interface to fix_mac_speed since 7.x. Use the new
+signature and drop the LINUX_VERSION_CODE switch.
+---
+ drivers/net/ethernet/stmicro/stmmac/dwmac-ipq5018.c | 8 ++------
+ 1 file changed, 2 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac-ipq5018.c b/drivers/net/ethernet/stmicro/stmmac/dwmac-ipq5018.c
+index cacc1c92e..f0040ecdf 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/dwmac-ipq5018.c
++++ b/drivers/net/ethernet/stmicro/stmmac/dwmac-ipq5018.c
+@@ -12,7 +12,6 @@
+ #include <linux/platform_device.h>
+ #include <linux/reset.h>
+ #include <linux/stmmac.h>
+-#include <linux/version.h>
+ 
+ #include "stmmac_platform.h"
+ 
+@@ -36,11 +35,8 @@ struct ipq5018_gmac {
+ 	struct clk *tx_clk;
+ };
+ 
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+-static void ipq5018_gmac_fix_speed(void *priv, int speed, unsigned int mode)
+-#else
+-static void ipq5018_gmac_fix_speed(void *priv, unsigned int speed, unsigned int mode)
+-#endif
++static void ipq5018_gmac_fix_speed(void *priv, phy_interface_t interface,
++				   int speed, unsigned int mode)
+ {
+ 	struct ipq5018_gmac *gmac = priv;
+ 	unsigned long rate;

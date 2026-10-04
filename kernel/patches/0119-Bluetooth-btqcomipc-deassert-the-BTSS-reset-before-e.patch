@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Sat, 3 Oct 2026 13:38:13 +0300
+Subject: [PATCH 119/119] Bluetooth: btqcomipc: deassert the BTSS reset before
+ enabling its clock
+
+An unbind asserts the BTSS reset through devres, and a later probe then
+enabled the LPO branch clock with the subsystem still in reset:
+"gcc_btss_lpo_clk status stuck at 'off'" and the probe failed with
+-EBUSY. Deassert the reset first; devres then also undoes them in the
+right order (clock off, then reset).
+---
+ drivers/bluetooth/btqcomipc.c | 14 +++++++++-----
+ 1 file changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/bluetooth/btqcomipc.c b/drivers/bluetooth/btqcomipc.c
+index 21dd3e812..8513c1780 100644
+--- a/drivers/bluetooth/btqcomipc.c
++++ b/drivers/bluetooth/btqcomipc.c
+@@ -1147,16 +1147,20 @@ static int btqcomipc_probe(struct platform_device *pdev)
+ 
+ 	of_node_put(ipc_np);
+ 
+-	lpo_clk = devm_clk_get_enabled(dev, "lpo");
+-	if (IS_ERR(lpo_clk))
+-		return dev_err_probe(dev, PTR_ERR(lpo_clk),
+-				     "Failed to get lpo clock\n");
+-
++	/*
++	 * The LPO branch clock cannot turn on while the subsystem is held
++	 * in reset, which is how an unbind leaves it: deassert first.
++	 */
+ 	btss_reset = devm_reset_control_get_exclusive_deasserted(dev, NULL);
+ 	if (IS_ERR_OR_NULL(btss_reset))
+ 		return dev_err_probe(dev, PTR_ERR(btss_reset),
+ 				     "unable to deassert reset\n");
+ 
++	lpo_clk = devm_clk_get_enabled(dev, "lpo");
++	if (IS_ERR(lpo_clk))
++		return dev_err_probe(dev, PTR_ERR(lpo_clk),
++				     "Failed to get lpo clock\n");
++
+ 	desc->irq = platform_get_irq(pdev, 0);
+ 	if (desc->irq < 0)
+ 		return dev_err_probe(dev, desc->irq, "Failed to acquire IRQ\n");

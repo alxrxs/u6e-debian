@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Sat, 3 Oct 2026 22:37:16 +0300
+Subject: [PATCH 188/192] wifi: ath11k: set the 6 GHz transmit power limits of
+ an AP
+
+Same code as the upstream candidate on linux-next ath11k-he-fixes: send the per-20 MHz regulatory limits (WMI_VDEV_SET_TPC_POWER_CMDID) for AP vdevs too, as low power indoor, as ath12k does; an AP's levels from an earlier start are not taken for a received TPE.
+---
+ drivers/net/wireless/ath/ath11k/mac.c | 26 ++++++++++++++++++--------
+ 1 file changed, 18 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath11k/mac.c b/drivers/net/wireless/ath/ath11k/mac.c
+index 51dd780..1d14b58 100644
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -3591,13 +3591,14 @@ static int ath11k_mac_config_obss_pd(struct ath11k *ar,
+ 	return 0;
+ }
+ 
+-static bool ath11k_mac_supports_station_tpc(struct ath11k *ar,
+-					    struct ath11k_vif *arvif,
+-					    const struct cfg80211_chan_def *chandef)
++static bool ath11k_mac_supports_tpc(struct ath11k *ar,
++				    struct ath11k_vif *arvif,
++				    const struct cfg80211_chan_def *chandef)
+ {
+ 	return ath11k_wmi_supports_6ghz_cc_ext(ar) &&
+ 		test_bit(WMI_TLV_SERVICE_EXT_TPC_REG_SUPPORT, ar->ab->wmi_ab.svc_map) &&
+-		arvif->vdev_type == WMI_VDEV_TYPE_STA &&
++		(arvif->vdev_type == WMI_VDEV_TYPE_STA ||
++		 arvif->vdev_type == WMI_VDEV_TYPE_AP) &&
+ 		arvif->vdev_subtype == WMI_VDEV_SUBTYPE_NONE &&
+ 		chandef->chan &&
+ 		chandef->chan->band == NL80211_BAND_6GHZ;
+@@ -8244,7 +8245,7 @@ ath11k_mac_vdev_start_restart(struct ath11k_vif *arvif,
+ 	/* TODO: For now we only set TPC power here. However when
+ 	 * channel changes, say CSA, it should be updated again.
+ 	 */
+-	if (ath11k_mac_supports_station_tpc(ar, arvif, chandef)) {
++	if (ath11k_mac_supports_tpc(ar, arvif, chandef)) {
+ 		ath11k_mac_fill_reg_tpc_info(ar, arvif->vif, &arvif->chanctx);
+ 		ath11k_wmi_send_vdev_set_tpc_power(ar, arvif->vdev_id,
+ 						   &arvif->reg_tpc_info);
+@@ -8761,7 +8762,11 @@ void ath11k_mac_fill_reg_tpc_info(struct ath11k *ar,
+ 	start_freq = ath11k_mac_get_6ghz_start_frequency(&ctx->def);
+ 	pwr_reduction = bss_conf->pwr_reduction;
+ 
+-	if (arvif->reg_tpc_info.num_pwr_levels) {
++	/* Only a station takes power levels from its AP's TPE; an AP's own
++	 * levels from an earlier start are not a TPE.
++	 */
++	if (arvif->vdev_type == WMI_VDEV_TYPE_STA &&
++	    arvif->reg_tpc_info.num_pwr_levels) {
+ 		is_tpe_present = true;
+ 		num_pwr_levels = arvif->reg_tpc_info.num_pwr_levels;
+ 	} else {
+@@ -8912,8 +8917,13 @@ void ath11k_mac_fill_reg_tpc_info(struct ath11k *ar,
+ 	reg_tpc_info->num_pwr_levels = num_pwr_levels;
+ 	reg_tpc_info->is_psd_power = is_psd_power;
+ 	reg_tpc_info->eirp_power = eirp_power;
+-	reg_tpc_info->ap_power_type =
+-		ath11k_reg_ap_pwr_convert(vif->bss_conf.power_type);
++	if (arvif->vdev_type == WMI_VDEV_TYPE_STA)
++		reg_tpc_info->ap_power_type =
++			ath11k_reg_ap_pwr_convert(vif->bss_conf.power_type);
++	else
++		/* LPI is the only AP power mode supported for now */
++		reg_tpc_info->ap_power_type =
++			ath11k_reg_ap_pwr_convert(IEEE80211_REG_LPI_AP);
+ }
+ 
+ static void ath11k_mac_parse_tx_pwr_env(struct ath11k *ar,

@@ -1,0 +1,175 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Sat, 3 Oct 2026 13:47:07 +0300
+Subject: [PATCH 182/192] wifi: ath11k: support beacon protection
+
+Port of the linux-next patch (branch ath11k-features): the firmware signs beacons with the BIGTK when WMI_TLV_SERVICE_BEACON_PROTECTION_SUPPORT is set; the IGTK stays in software.
+---
+ drivers/net/wireless/ath/ath11k/core.h |  1 +
+ drivers/net/wireless/ath/ath11k/mac.c  | 61 +++++++++++++++++++++++---
+ drivers/net/wireless/ath/ath11k/wmi.c  |  2 +
+ drivers/net/wireless/ath/ath11k/wmi.h  |  5 ++-
+ 4 files changed, 63 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath11k/core.h b/drivers/net/wireless/ath/ath11k/core.h
+index 556dab3..1c163cd 100644
+--- a/drivers/net/wireless/ath/ath11k/core.h
++++ b/drivers/net/wireless/ath/ath11k/core.h
+@@ -449,6 +449,7 @@ struct ath11k_vif {
+ 	int txpower;
+ 	bool rsnie_present;
+ 	bool wpaie_present;
++	bool beacon_prot;
+ 	bool bcca_zero_sent;
+ 	bool do_not_send_tmpl;
+ 	struct ath11k_arp_ns_offload arp_ns_offload;
+diff --git a/drivers/net/wireless/ath/ath11k/mac.c b/drivers/net/wireless/ath/ath11k/mac.c
+index 615aee1..7d06d6a 100644
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -1510,6 +1510,44 @@ static int ath11k_mac_remove_vendor_ie(struct sk_buff *skb, unsigned int oui,
+ 	return 0;
+ }
+ 
++static bool ath11k_mac_ext_capa_bcn_prot(const struct element *ext_capa)
++{
++	return ext_capa && ext_capa->datalen >= 11 &&
++	       (ext_capa->data[10] & WLAN_EXT_CAPA11_BCN_PROTECT);
++}
++
++/* Beacon protection covers the whole beacon, so enable it when the
++ * transmitted BSS or any nontransmitted profile in it advertises it.
++ */
++static bool ath11k_mac_bcn_prot_enabled(struct sk_buff *bcn)
++{
++	struct ieee80211_mgmt *mgmt = (struct ieee80211_mgmt *)bcn->data;
++	const u8 *ies = mgmt->u.beacon.variable;
++	int ies_len = skb_tail_pointer(bcn) - ies;
++	const struct element *elem, *profile;
++
++	if (ath11k_mac_ext_capa_bcn_prot(cfg80211_find_elem(WLAN_EID_EXT_CAPABILITY,
++							    ies, ies_len)))
++		return true;
++
++	for_each_element_id(elem, WLAN_EID_MULTIPLE_BSSID, ies, ies_len) {
++		if (elem->datalen < 1)
++			continue;
++
++		for_each_element(profile, elem->data + 1, elem->datalen - 1) {
++			if (profile->id != 0)
++				continue;
++
++			if (ath11k_mac_ext_capa_bcn_prot(cfg80211_find_elem(WLAN_EID_EXT_CAPABILITY,
++									    profile->data,
++									    profile->datalen)))
++				return true;
++		}
++	}
++
++	return false;
++}
++
+ static int ath11k_mac_set_vif_params(struct ath11k_vif *arvif,
+ 				     struct sk_buff *bcn)
+ {
+@@ -1613,6 +1651,7 @@ static int ath11k_mac_setup_bcn_tmpl_ema(struct ath11k_vif *arvif,
+ 		params |= ((!i ? 1 : 0) << WMI_EMA_FIRST_TMPL_SHIFT);
+ 		params |= ((i + 1 == beacons->cnt ? 1 : 0) << WMI_EMA_LAST_TMPL_SHIFT);
+ 
++		tx_arvif->beacon_prot = ath11k_mac_bcn_prot_enabled(beacons->bcn[i].skb);
+ 		ret = ath11k_wmi_bcn_tmpl(tx_arvif->ar, tx_arvif->vdev_id,
+ 					  &beacons->bcn[i].offs,
+ 					  beacons->bcn[i].skb, params);
+@@ -1666,6 +1705,7 @@ static int ath11k_mac_setup_bcn_tmpl_mbssid(struct ath11k_vif *arvif,
+ 		goto free;
+ 	}
+ 
++	arvif->beacon_prot = ath11k_mac_bcn_prot_enabled(bcn);
+ 	ret = ath11k_wmi_bcn_tmpl(ar, arvif->vdev_id, &offs, bcn, 0);
+ 	if (ret)
+ 		ath11k_warn(ab, "failed to submit beacon template command: %d\n",
+@@ -4485,6 +4525,14 @@ static int ath11k_install_key(struct ath11k_vif *arvif,
+ 		arg.key_cipher = WMI_CIPHER_AES_GCM;
+ 		key->flags |= IEEE80211_KEY_FLAG_GENERATE_IV_MGMT;
+ 		break;
++	case WLAN_CIPHER_SUITE_AES_CMAC:
++	case WLAN_CIPHER_SUITE_BIP_CMAC_256:
++		arg.key_cipher = WMI_CIPHER_AES_CMAC;
++		break;
++	case WLAN_CIPHER_SUITE_BIP_GMAC_128:
++	case WLAN_CIPHER_SUITE_BIP_GMAC_256:
++		arg.key_cipher = WMI_CIPHER_AES_GMAC;
++		break;
+ 	default:
+ 		ath11k_warn(ar->ab, "cipher %d is not supported\n", key->cipher);
+ 		return -EOPNOTSUPP;
+@@ -4623,11 +4671,10 @@ static int ath11k_mac_op_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
+ 	int ret = 0;
+ 	u32 flags = 0;
+ 
+-	/* BIP needs to be done in software */
+-	if (key->cipher == WLAN_CIPHER_SUITE_AES_CMAC ||
+-	    key->cipher == WLAN_CIPHER_SUITE_BIP_GMAC_128 ||
+-	    key->cipher == WLAN_CIPHER_SUITE_BIP_GMAC_256 ||
+-	    key->cipher == WLAN_CIPHER_SUITE_BIP_CMAC_256)
++	/* The IGTK protects management frames, which are done in software;
++	 * only the BIGTK (index 6/7) goes to the firmware, which signs beacons.
++	 */
++	if (key->keyidx == 4 || key->keyidx == 5)
+ 		return 1;
+ 
+ 	if (test_bit(ATH11K_FLAG_HW_CRYPTO_DISABLED, &ar->ab->dev_flags))
+@@ -11293,6 +11340,10 @@ static int __ath11k_mac_register(struct ath11k *ar)
+ 		wiphy_ext_feature_set(ar->hw->wiphy,
+ 				      NL80211_EXT_FEATURE_ENABLE_FTM_RESPONDER);
+ 
++	if (test_bit(WMI_TLV_SERVICE_BEACON_PROTECTION_SUPPORT, ar->ab->wmi_ab.svc_map))
++		wiphy_ext_feature_set(ar->hw->wiphy,
++				      NL80211_EXT_FEATURE_BEACON_PROTECTION);
++
+ 	ar->hw->wiphy->mbssid_max_interfaces = TARGET_NUM_VDEVS(ab);
+ 	ar->hw->wiphy->ema_max_profile_periodicity = TARGET_EMA_MAX_PROFILE_PERIOD;
+ 
+diff --git a/drivers/net/wireless/ath/ath11k/wmi.c b/drivers/net/wireless/ath/ath11k/wmi.c
+index 07007c4..2b261f9 100644
+--- a/drivers/net/wireless/ath/ath11k/wmi.c
++++ b/drivers/net/wireless/ath/ath11k/wmi.c
+@@ -1938,6 +1938,8 @@ int ath11k_wmi_bcn_tmpl(struct ath11k *ar, u32 vdev_id,
+ 	cmd->buf_len = bcn->len;
+ 	cmd->mbssid_ie_offset = offs->mbssid_off;
+ 	cmd->ema_params = ema_params;
++	if (arvif->beacon_prot)
++		cmd->feature_enable_bitmap |= WMI_BCN_TMPL_BEACON_PROTECTION_EN;
+ 
+ 	ptr = skb->data + sizeof(*cmd);
+ 
+diff --git a/drivers/net/wireless/ath/ath11k/wmi.h b/drivers/net/wireless/ath/ath11k/wmi.h
+index 96059fd..2c4a872 100644
+--- a/drivers/net/wireless/ath/ath11k/wmi.h
++++ b/drivers/net/wireless/ath/ath11k/wmi.h
+@@ -2136,6 +2136,7 @@ enum wmi_tlv_service {
+ 	WMI_TLV_SERVICE_PER_PEER_HTT_STATS_RESET = 213,
+ 	WMI_TLV_SERVICE_FREQINFO_IN_METADATA = 219,
+ 	WMI_TLV_SERVICE_EXT2_MSG = 220,
++	WMI_TLV_SERVICE_BEACON_PROTECTION_SUPPORT = 244,
+ 	WMI_TLV_SERVICE_PEER_POWER_SAVE_DURATION_SUPPORT = 246,
+ 	WMI_TLV_SERVICE_SRG_SRP_SPATIAL_REUSE_SUPPORT = 249,
+ 	WMI_TLV_SERVICE_MBSS_PARAM_IN_VDEV_START_SUPPORT = 253,
+@@ -3692,6 +3693,8 @@ struct ath11k_wmi_p2p_noa_info {
+ #define WMI_EMA_FIRST_TMPL_SHIFT          16
+ #define WMI_EMA_LAST_TMPL_SHIFT           24
+ 
++#define WMI_BCN_TMPL_BEACON_PROTECTION_EN BIT(0)
++
+ struct wmi_bcn_tmpl_cmd {
+ 	u32 tlv_header;
+ 	u32 vdev_id;
+@@ -5374,7 +5377,7 @@ enum wmi_ap_ps_peer_param {
+ 
+ #define DISABLE_SIFS_RESPONSE_TRIGGER 0
+ 
+-#define WMI_MAX_KEY_INDEX   3
++#define WMI_MAX_KEY_INDEX   7
+ #define WMI_MAX_KEY_LEN     32
+ 
+ #define WMI_KEY_PAIRWISE 0x00

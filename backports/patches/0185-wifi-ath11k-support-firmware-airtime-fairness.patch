@@ -1,0 +1,401 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Sat, 3 Oct 2026 18:36:32 +0300
+Subject: [PATCH 185/192] wifi: ath11k: support firmware airtime fairness
+
+Firmware with WMI_TLV_SERVICE_ATF schedules airtime between stations
+itself, in proportion to per-station shares the host gives it in parts
+per thousand. Enable it at init (resource config flag) and on each
+radio, advertise NL80211_EXT_FEATURE_AIRTIME_FAIRNESS, and send the
+shares of all AP stations of the radio, derived from their airtime
+weights (sta_set_airtime_weight), whenever a station associates or
+leaves or user space changes a weight.
+
+The firmware schedules a station only within the share of its ATF group,
+so group 0, which every station belongs to, first gets the whole radio
+(WMI_ATF_SSID_GROUPING_REQUEST_CMDID, fair policy). Without it the
+firmware gives each station a share of an empty group and passes no data
+to it at all; that was the failure of the first version of this commit.
+
+On the U6 Enterprise's QCN9074 (WLAN.HK.2.9.0.1), a station capped at
+100/1000 under strict scheduling falls from 885 to 122 Mbit/s downlink
+and recovers once uncapped; at its full fair share it runs at full rate.
+mac80211's own airtime scheduler cannot do this here: with the data path
+offloaded to NSS, frames never pass mac80211's queues.
+---
+ drivers/net/wireless/ath/ath11k/core.h |   1 +
+ drivers/net/wireless/ath/ath11k/mac.c  | 105 +++++++++++++++++++++++++
+ drivers/net/wireless/ath/ath11k/wmi.c  |  97 +++++++++++++++++++++++
+ drivers/net/wireless/ath/ath11k/wmi.h  |  53 +++++++++++++
+ 4 files changed, 256 insertions(+)
+
+diff --git a/drivers/net/wireless/ath/ath11k/core.h b/drivers/net/wireless/ath/ath11k/core.h
+index 1c163cd..c540b10 100644
+--- a/drivers/net/wireless/ath/ath11k/core.h
++++ b/drivers/net/wireless/ath/ath11k/core.h
+@@ -606,6 +606,7 @@ struct ath11k_per_peer_cfr_capture {
+ 
+ struct ath11k_sta {
+ 	struct ath11k_vif *arvif;
++	u16 airtime_weight;
+ 
+ 	/* the following are protected by ar->data_lock */
+ 	u32 changed; /* IEEE80211_RC_* */
+diff --git a/drivers/net/wireless/ath/ath11k/mac.c b/drivers/net/wireless/ath/ath11k/mac.c
+index 196b59d..51631b2 100644
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -7144,6 +7144,16 @@ static int ath11k_mac_op_start(struct ieee80211_hw *hw)
+ 		goto err;
+ 	}
+ 
++	if (test_bit(WMI_TLV_SERVICE_ATF, ab->wmi_ab.svc_map)) {
++		ret = ath11k_wmi_pdev_set_param(ar, WMI_PDEV_PARAM_ATF_DYNAMIC_ENABLE,
++						1, pdev->pdev_id);
++		if (ret) {
++			ath11k_err(ab, "failed to enable airtime fairness: %d\n",
++				   ret);
++			goto err;
++		}
++	}
++
+ 	ret = ath11k_wmi_send_dfs_phyerr_offload_enable_cmd(ar, pdev->pdev_id);
+ 	if (ret) {
+ 		ath11k_err(ab, "failed to offload radar detection: %d\n",
+@@ -10573,6 +10583,90 @@ static int ath11k_mac_cfg_dyn_vlan(struct ath11k *ar,
+ 	return ret;
+ }
+ 
++#define ATH11K_ATF_PEERS_PER_CMD 32
++
++struct ath11k_mac_atf_iter {
++	struct ath11k_wmi_atf_peer_arg *peers;
++	u16 *weights;
++	u32 num, max, total;
++};
++
++static void ath11k_mac_atf_iter(void *data, struct ieee80211_sta *sta)
++{
++	struct ath11k_mac_atf_iter *it = data;
++	struct ath11k_sta *arsta = ath11k_sta_to_arsta(sta);
++
++	if (it->num == it->max || !arsta->arvif ||
++	    arsta->arvif->vdev_type != WMI_VDEV_TYPE_AP)
++		return;
++
++	ether_addr_copy(it->peers[it->num].addr, sta->addr);
++	it->peers[it->num].vdev_id = arsta->arvif->vdev_id;
++	it->weights[it->num] = arsta->airtime_weight;
++	it->total += arsta->airtime_weight;
++	it->num++;
++}
++
++/* Firmware airtime fairness: give every station of the radio its share of
++ * the airtime, in proportion to its airtime weight. The firmware schedules
++ * a station only by the share of its group, so group 0 (every station's)
++ * gets the whole radio first.
++ */
++static int ath11k_mac_atf_update(struct ath11k *ar)
++{
++	struct ath11k_mac_atf_iter it = { .max = ar->max_num_stations };
++	u32 i, n;
++	int ret = 0;
++
++	lockdep_assert_held(&ar->conf_mutex);
++
++	if (!test_bit(WMI_TLV_SERVICE_ATF, ar->ab->wmi_ab.svc_map))
++		return 0;
++
++	it.peers = kcalloc(it.max, sizeof(*it.peers), GFP_KERNEL);
++	it.weights = kcalloc(it.max, sizeof(*it.weights), GFP_KERNEL);
++	if (!it.peers || !it.weights) {
++		ret = -ENOMEM;
++		goto out;
++	}
++
++	ieee80211_iterate_stations_atomic(ar->hw, ath11k_mac_atf_iter, &it);
++
++	for (i = 0; i < it.num; i++)
++		it.peers[i].units = max_t(u32, 1, div_u64((u64)WMI_ATF_DENOMINATION *
++							  it.weights[i], it.total));
++
++	ret = ath11k_wmi_send_atf_group(ar, 0, WMI_ATF_DENOMINATION);
++	if (ret)
++		goto out;
++
++	for (i = 0; i < it.num; i += n) {
++		n = min_t(u32, it.num - i, ATH11K_ATF_PEERS_PER_CMD);
++		ret = ath11k_wmi_send_peer_atf_request(ar, &it.peers[i], n,
++						       i + n < it.num);
++		if (ret)
++			break;
++	}
++
++out:
++	kfree(it.weights);
++	kfree(it.peers);
++	return ret;
++}
++
++static void ath11k_mac_op_sta_set_airtime_weight(struct ieee80211_hw *hw,
++						 struct ieee80211_vif *vif,
++						 struct ieee80211_sta *sta, u16 weight)
++{
++	struct ath11k_sta *arsta = ath11k_sta_to_arsta(sta);
++	struct ath11k *ar = hw->priv;
++
++	mutex_lock(&ar->conf_mutex);
++	arsta->airtime_weight = weight;
++	ath11k_mac_atf_update(ar);
++	mutex_unlock(&ar->conf_mutex);
++}
++
+ static int ath11k_mac_op_sta_state(struct ieee80211_hw *hw,
+ 				   struct ieee80211_vif *vif,
+ 				   struct ieee80211_sta *sta,
+@@ -10600,6 +10694,7 @@ static int ath11k_mac_op_sta_state(struct ieee80211_hw *hw,
+ 	    new_state == IEEE80211_STA_NONE) {
+ 		memset(arsta, 0, sizeof(*arsta));
+ 		arsta->arvif = arvif;
++		arsta->airtime_weight = IEEE80211_DEFAULT_AIRTIME_WEIGHT;
+ 		arsta->peer_ps_state = WMI_PEER_PS_STATE_DISABLED;
+ 		INIT_WORK(&arsta->update_wk, ath11k_sta_rc_update_wk);
+ 		INIT_WORK(&arsta->set_4addr_wk, ath11k_sta_set_4addr_wk);
+@@ -10631,6 +10726,9 @@ static int ath11k_mac_op_sta_state(struct ieee80211_hw *hw,
+ 		mutex_unlock(&ar->tbl_mtx_lock);
+ 
+ 		ath11k_cfr_decrement_peer_count(ar, arsta);
++
++		if (vif->type == NL80211_IFTYPE_AP)
++			ath11k_mac_atf_update(ar);
+ 	} else if (old_state == IEEE80211_STA_AUTH &&
+ 		   new_state == IEEE80211_STA_ASSOC &&
+ 		   (vif->type == NL80211_IFTYPE_AP ||
+@@ -10640,6 +10738,8 @@ static int ath11k_mac_op_sta_state(struct ieee80211_hw *hw,
+ 		if (ret)
+ 			ath11k_warn(ar->ab, "Failed to associate station: %pM\n",
+ 				    sta->addr);
++		else if (vif->type == NL80211_IFTYPE_AP)
++			ath11k_mac_atf_update(ar);
+ 
+ 		spin_lock_bh(&ar->data_lock);
+ 		/* Set arsta bw and prev bw */
+@@ -10799,6 +10899,7 @@ static const struct ieee80211_ops ath11k_ops = {
+ 	.sta_state                      = ath11k_mac_op_sta_state,
+ 	.sta_set_4addr                  = ath11k_mac_op_sta_set_4addr,
+ 	.sta_set_txpwr			= ath11k_mac_op_sta_set_txpwr,
++	.sta_set_airtime_weight		= ath11k_mac_op_sta_set_airtime_weight,
+ 	.link_sta_rc_update		= ath11k_mac_op_sta_rc_update,
+ 	.conf_tx                        = ath11k_mac_op_conf_tx,
+ 	.set_antenna			= ath11k_mac_op_set_antenna,
+@@ -11350,6 +11451,10 @@ static int __ath11k_mac_register(struct ath11k *ar)
+ 		wiphy_ext_feature_set(ar->hw->wiphy,
+ 				      NL80211_EXT_FEATURE_BEACON_PROTECTION);
+ 
++	if (test_bit(WMI_TLV_SERVICE_ATF, ar->ab->wmi_ab.svc_map))
++		wiphy_ext_feature_set(ar->hw->wiphy,
++				      NL80211_EXT_FEATURE_AIRTIME_FAIRNESS);
++
+ 	ar->hw->wiphy->mbssid_max_interfaces = TARGET_NUM_VDEVS(ab);
+ 	ar->hw->wiphy->ema_max_profile_periodicity = TARGET_EMA_MAX_PROFILE_PERIOD;
+ 
+diff --git a/drivers/net/wireless/ath/ath11k/wmi.c b/drivers/net/wireless/ath/ath11k/wmi.c
+index 2b261f9..a5a14b9 100644
+--- a/drivers/net/wireless/ath/ath11k/wmi.c
++++ b/drivers/net/wireless/ath/ath11k/wmi.c
+@@ -4599,6 +4599,100 @@ int ath11k_wmi_set_hw_mode(struct ath11k_base *ab,
+ 	return 0;
+ }
+ 
++int ath11k_wmi_send_atf_group(struct ath11k *ar, u32 group_id, u32 units)
++{
++	struct ath11k_pdev_wmi *wmi = ar->wmi;
++	struct wmi_atf_ssid_grp_request_cmd *cmd;
++	struct wmi_atf_group_info *grp;
++	struct wmi_tlv *tlv;
++	struct sk_buff *skb;
++	int ret;
++
++	skb = ath11k_wmi_alloc_skb(wmi->wmi_ab, sizeof(*cmd) + TLV_HDR_SIZE + sizeof(*grp));
++	if (!skb)
++		return -ENOMEM;
++
++	cmd = (struct wmi_atf_ssid_grp_request_cmd *)skb->data;
++	cmd->tlv_header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_ATF_SSID_GRP_REQUEST) |
++			  FIELD_PREP(WMI_TLV_LEN, sizeof(*cmd) - TLV_HDR_SIZE);
++	cmd->pdev_id = ar->pdev->pdev_id;
++
++	tlv = (struct wmi_tlv *)(skb->data + sizeof(*cmd));
++	tlv->header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_ARRAY_STRUCT) |
++		      FIELD_PREP(WMI_TLV_LEN, sizeof(*grp));
++	grp = (struct wmi_atf_group_info *)tlv->value;
++	grp->tlv_header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_ATF_GROUP_INFO) |
++			  FIELD_PREP(WMI_TLV_LEN, sizeof(*grp) - TLV_HDR_SIZE);
++	grp->atf_group_id = group_id;
++	grp->atf_group_units = units;
++	grp->atf_group_flags = WMI_ATF_GROUP_POLICY_FAIR;
++
++	ret = ath11k_wmi_cmd_send(wmi, skb, WMI_ATF_SSID_GROUPING_REQUEST_CMDID);
++	if (ret) {
++		ath11k_warn(ar->ab, "failed to send atf group request: %d\n", ret);
++		dev_kfree_skb(skb);
++		return ret;
++	}
++
++	ath11k_dbg(ar->ab, ATH11K_DBG_WMI, "cmd atf group %u units %u\n", group_id, units);
++
++	return 0;
++}
++
++int ath11k_wmi_send_peer_atf_request(struct ath11k *ar,
++				     const struct ath11k_wmi_atf_peer_arg *peers,
++				     u32 num_peers, bool more)
++{
++	struct ath11k_pdev_wmi *wmi = ar->wmi;
++	struct wmi_peer_atf_request_cmd *cmd;
++	struct wmi_atf_peer_info *info;
++	struct wmi_tlv *tlv;
++	struct sk_buff *skb;
++	u32 i, pdev_id = ar->pdev->pdev_id;
++	int ret, len;
++
++	len = sizeof(*cmd) + TLV_HDR_SIZE + num_peers * sizeof(*info);
++	skb = ath11k_wmi_alloc_skb(wmi->wmi_ab, len);
++	if (!skb)
++		return -ENOMEM;
++
++	cmd = (struct wmi_peer_atf_request_cmd *)skb->data;
++	cmd->tlv_header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_PEER_ATF_REQUEST) |
++			  FIELD_PREP(WMI_TLV_LEN, sizeof(*cmd) - TLV_HDR_SIZE);
++	cmd->num_peers = num_peers;
++	cmd->pdev_id = pdev_id;
++	cmd->atf_flags = WMI_PEER_ATF_REQ_FLAG_FULL_UPDATE |
++			 WMI_PEER_ATF_REQ_FLAG_PDEV_ID_VALID;
++	if (more)
++		cmd->atf_flags |= WMI_PEER_ATF_REQ_FLAG_PENDING_CMDS;
++
++	tlv = (struct wmi_tlv *)(skb->data + sizeof(*cmd));
++	tlv->header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_ARRAY_STRUCT) |
++		      FIELD_PREP(WMI_TLV_LEN, num_peers * sizeof(*info));
++	info = (struct wmi_atf_peer_info *)tlv->value;
++
++	for (i = 0; i < num_peers; i++, info++) {
++		info->tlv_header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_ATF_PEER_INFO) |
++				   FIELD_PREP(WMI_TLV_LEN, sizeof(*info) - TLV_HDR_SIZE);
++		ether_addr_copy(info->peer_macaddr.addr, peers[i].addr);
++		info->atf_units = peers[i].units;
++		info->vdev_id = peers[i].vdev_id;
++		info->pdev_id = pdev_id;
++	}
++
++	ret = ath11k_wmi_cmd_send(wmi, skb, WMI_PEER_ATF_REQUEST_CMDID);
++	if (ret) {
++		ath11k_warn(ar->ab, "failed to send peer atf request: %d\n", ret);
++		dev_kfree_skb(skb);
++		return ret;
++	}
++
++	ath11k_dbg(ar->ab, ATH11K_DBG_WMI, "cmd peer atf request pdev %u peers %u%s\n",
++		   pdev_id, num_peers, more ? " (more)" : "");
++
++	return 0;
++}
++
+ int ath11k_wmi_cmd_init(struct ath11k_base *ab)
+ {
+ 	struct ath11k_wmi_base *wmi_ab = &ab->wmi_ab;
+@@ -4617,6 +4711,9 @@ int ath11k_wmi_cmd_init(struct ath11k_base *ab)
+ 		     ab->wmi_ab.svc_map))
+ 		config.is_reg_cc_ext_event_supported = 1;
+ 
++	if (test_bit(WMI_TLV_SERVICE_ATF, ab->wmi_ab.svc_map))
++		config.flag1 |= WMI_RSRC_CFG_FLAG1_ATF_CONFIG_ENABLE;
++
+ 	memcpy(&wmi_ab->wlan_resource_config, &config, sizeof(config));
+ 
+ 	init_param.res_cfg = &wmi_ab->wlan_resource_config;
+diff --git a/drivers/net/wireless/ath/ath11k/wmi.h b/drivers/net/wireless/ath/ath11k/wmi.h
+index 2c4a872..6de8b9c 100644
+--- a/drivers/net/wireless/ath/ath11k/wmi.h
++++ b/drivers/net/wireless/ath/ath11k/wmi.h
+@@ -212,6 +212,7 @@ enum wmi_cmd_group {
+ 	WMI_GRP_TWT            = 0x3e,
+ 	WMI_GRP_MOTION_DET     = 0x3f,
+ 	WMI_GRP_SPATIAL_REUSE  = 0x40,
++	WMI_GRP_ATM            = 0x45,
+ };
+ 
+ #define WMI_CMD_GRP(grp_id) (((grp_id) << 12) | 0x1)
+@@ -2372,6 +2373,7 @@ struct wmi_init_cmd {
+ } __packed;
+ 
+ #define WMI_RSRC_CFG_FLAG1_BSS_CHANNEL_INFO_64 BIT(5)
++#define WMI_RSRC_CFG_FLAG1_ATF_CONFIG_ENABLE BIT(6)
+ #define WMI_RSRC_CFG_FLAG2_CALC_NEXT_DTIM_COUNT_SET BIT(9)
+ #define WMI_RSRC_CFG_FLAG1_ACK_RSSI BIT(18)
+ 
+@@ -3695,6 +3697,53 @@ struct ath11k_wmi_p2p_noa_info {
+ 
+ #define WMI_BCN_TMPL_BEACON_PROTECTION_EN BIT(0)
+ 
++/* Airtime fairness: a share is in parts per thousand of the radio's airtime */
++#define WMI_ATF_DENOMINATION			1000
++#define WMI_PEER_ATF_REQ_FLAG_FULL_UPDATE	BIT(0)
++#define WMI_PEER_ATF_REQ_FLAG_PENDING_CMDS	BIT(1)
++#define WMI_PEER_ATF_REQ_FLAG_PDEV_ID_VALID	BIT(2)
++#define WMI_ATF_GROUP_POLICY_FAIR		0
++
++#define WMI_ATF_SSID_GROUPING_REQUEST_CMDID	WMI_TLV_CMD(WMI_GRP_ATM)
++/* Outside enum wmi_tlv_tag: its WMI_TAG_MAX sizes the TLV policy table. */
++#define WMI_TAG_ATF_SSID_GRP_REQUEST		0x346
++#define WMI_TAG_ATF_GROUP_INFO			0x347
++
++struct wmi_atf_ssid_grp_request_cmd {
++	u32 tlv_header;
++	u32 pdev_id;
++} __packed;
++
++struct wmi_atf_group_info {
++	u32 tlv_header;
++	u32 atf_group_id;
++	u32 atf_group_units;
++	u32 atf_group_flags;
++} __packed;
++
++struct wmi_peer_atf_request_cmd {
++	u32 tlv_header;
++	u32 num_peers;
++	u32 pdev_id;
++	u32 atf_flags;
++} __packed;
++
++struct wmi_atf_peer_info {
++	u32 tlv_header;
++	struct wmi_mac_addr peer_macaddr;
++	u32 atf_units;
++	u32 atf_groupid;
++	u32 atf_units_reserved;
++	u32 vdev_id;
++	u32 pdev_id;
++} __packed;
++
++struct ath11k_wmi_atf_peer_arg {
++	u8 addr[ETH_ALEN];
++	u32 vdev_id;
++	u32 units;
++};
++
+ struct wmi_bcn_tmpl_cmd {
+ 	u32 tlv_header;
+ 	u32 vdev_id;
+@@ -6604,6 +6653,10 @@ int ath11k_wmi_vdev_start(struct ath11k *ar, struct wmi_vdev_start_req_arg *arg,
+ 			  bool restart);
+ int ath11k_wmi_set_peer_param(struct ath11k *ar, const u8 *peer_addr,
+ 			      u32 vdev_id, u32 param_id, u32 param_val);
++int ath11k_wmi_send_atf_group(struct ath11k *ar, u32 group_id, u32 units);
++int ath11k_wmi_send_peer_atf_request(struct ath11k *ar,
++				     const struct ath11k_wmi_atf_peer_arg *peers,
++				     u32 num_peers, bool more);
+ int ath11k_wmi_pdev_set_param(struct ath11k *ar, u32 param_id,
+ 			      u32 param_value, u8 pdev_id);
+ int ath11k_wmi_pdev_set_ps_mode(struct ath11k *ar, int vdev_id,

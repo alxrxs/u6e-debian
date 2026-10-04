@@ -1,5 +1,5 @@
 #!/bin/bash
-# Boot an image directory (default out-nss/, or one kept under images/) on the
+# Boot an image directory (default out/, or one kept under images/) on the
 # AP that U6E_AP names: from our image, disarm the next boot and reboot into
 # stock; stage the image there with go8.sh; reboot stock and wait until our
 # image answers.
@@ -7,7 +7,7 @@
 set -uo pipefail
 B=$(cd "$(dirname "$0")" && pwd)
 . "$B/lib.sh"
-dir=$(cd "${1:-$U6E/out-nss}" && pwd) || exit 1
+dir=$(cd "${1:-$U6E/out}" && pwd) || exit 1
 wait_for() { # <state> <seconds>
 	local t0=$SECONDS
 	until [ "$("$B/apstate.sh")" = "$1" ]; do

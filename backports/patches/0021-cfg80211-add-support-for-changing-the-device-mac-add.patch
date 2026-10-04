@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Felix Fietkau <nbd@nbd.name>
+Date: Thu, 11 Dec 2014 00:00:00 +0100
+Subject: [PATCH 021/192] cfg80211: add support for changing the device mac
+ address via sysfs
+
+[Andrei: linux/hex.h included for mac_pton(), which 7.x no longer reaches through the other headers.]
+---
+ net/wireless/sysfs.c | 28 +++++++++++++++++++++++-----
+ 1 file changed, 23 insertions(+), 5 deletions(-)
+
+diff --git a/net/wireless/sysfs.c b/net/wireless/sysfs.c
+index 4386af9..40ed9b9 100644
+--- a/net/wireless/sysfs.c
++++ b/net/wireless/sysfs.c
+@@ -9,6 +9,7 @@
+  */
+ 
+ #include <linux/device.h>
++#include <linux/hex.h>
+ #include <linux/module.h>
+ #include <linux/netdevice.h>
+ #include <linux/nl80211.h>
+@@ -24,18 +25,35 @@ static inline struct cfg80211_registered_device *dev_to_rdev(
+ 	return container_of(dev, struct cfg80211_registered_device, wiphy.dev);
+ }
+ 
+-#define SHOW_FMT(name, fmt, member)					\
++#define SHOW_FMT(name, fmt, member, mode)				\
+ static ssize_t name ## _show(struct device *dev,			\
+ 			      struct device_attribute *attr,		\
+ 			      char *buf)				\
+ {									\
+ 	return sprintf(buf, fmt "\n", dev_to_rdev(dev)->member);	\
+ }									\
+-static DEVICE_ATTR_RO(name)
++static DEVICE_ATTR_##mode(name)
+ 
+-SHOW_FMT(index, "%d", wiphy_idx);
+-SHOW_FMT(macaddress, "%pM", wiphy.perm_addr);
+-SHOW_FMT(address_mask, "%pM", wiphy.addr_mask);
++static ssize_t macaddress_store(struct device *dev,
++				struct device_attribute *attr,
++				const char *buf, size_t len)
++{
++	u8 mac[ETH_ALEN];
++
++	if (!mac_pton(buf, mac))
++		return -EINVAL;
++
++	if (buf[3 * ETH_ALEN - 1] && buf[3 * ETH_ALEN - 1] != '\n')
++		return -EINVAL;
++
++	memcpy(dev_to_rdev(dev)->wiphy.perm_addr, mac, ETH_ALEN);
++
++	return strnlen(buf, len);
++}
++
++SHOW_FMT(index, "%d", wiphy_idx, RO);
++SHOW_FMT(macaddress, "%pM", wiphy.perm_addr, RW);
++SHOW_FMT(address_mask, "%pM", wiphy.addr_mask, RO);
+ 
+ static ssize_t name_show(struct device *dev,
+ 			 struct device_attribute *attr,

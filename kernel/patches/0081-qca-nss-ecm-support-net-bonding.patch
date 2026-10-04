@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sean Khan <datapronix@protonmail.com>
+Date: Fri, 2 Oct 2026 09:36:12 +0300
+Subject: [PATCH 081/119] qca-nss-ecm-support-net-bonding
+
+Imported from https://github.com/qosmio/openwrt-ipq.git target/linux/qualcommax/patches-6.12/0600-3-qca-nss-ecm-support-net-bonding.patch (added in 527c31de29); the patch file carries no author or description.
+---
+ drivers/net/bonding/bond_main.c | 13 +++++++++++++
+ include/net/bonding.h           |  1 +
+ 2 files changed, 14 insertions(+)
+
+diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
+index 6ea46a617..f03d7dd6f 100644
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@ -208,6 +208,7 @@ DEFINE_STATIC_KEY_FALSE(netpoll_block_tx);
+ #endif
+ 
+ unsigned int bond_net_id __read_mostly;
++static unsigned long bond_id_mask = 0xFFFFFFF0; /* QCA NSS ECM bonding support */
+ 
+ DEFINE_STATIC_KEY_FALSE(bond_bcast_neigh_enabled);
+ 
+@@ -5992,6 +5993,11 @@ static void bond_destructor(struct net_device *bond_dev)
+ 	if (bond->wq)
+ 		destroy_workqueue(bond->wq);
+ 
++	/* QCA NSS ECM bonding support - Start */
++	if (bond->id != (~0U))
++		clear_bit(bond->id, &bond_id_mask);
++	/* QCA NSS ECM bonding support - End */
++
+ 	free_percpu(bond->rr_tx_counter);
+ }
+ 
+@@ -6549,6 +6555,13 @@ int bond_create(struct net *net, const char *name)
+ 
+ 	bond_work_init_all(bond);
+ 
++	/* QCA NSS ECM bonding support - Start */
++	bond->id = ~0U;
++	if (bond_id_mask != (~0UL)) {
++		bond->id = (u32)ffz(bond_id_mask);
++		set_bit(bond->id, &bond_id_mask);
++	}
++	/* QCA NSS ECM bonding support - End */
+ out:
+ 	rtnl_unlock();
+ 	return res;
+diff --git a/include/net/bonding.h b/include/net/bonding.h
+index 2c54a36a8..e17156519 100644
+--- a/include/net/bonding.h
++++ b/include/net/bonding.h
+@@ -264,6 +264,7 @@ struct bonding {
+ 	struct mutex ipsec_lock;
+ #endif /* CONFIG_XFRM_OFFLOAD */
+ 	struct bpf_prog *xdp_prog;
++	u32 id;/* QCA NSS ECM bonding support */
+ };
+ 
+ #define bond_slave_get_rcu(dev) \

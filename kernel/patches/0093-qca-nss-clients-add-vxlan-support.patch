@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sean Khan <datapronix@protonmail.com>
+Date: Fri, 2 Oct 2026 09:40:35 +0300
+Subject: [PATCH 093/119] qca-nss-clients-add-vxlan-support
+
+Imported from https://github.com/qosmio/openwrt-ipq.git target/linux/qualcommax/patches-6.12/0603-5-qca-nss-clients-add-vxlan-support.patch (added in 2f34da0af7); the patch file carries no author or description.
+[Andrei: Ported to 7.2: vxlan_xmit_one() now takes the inner header from ip_hdr(skb) and transmits through sock*->sk; skb_iif is set at the same two points, and the fdb notifier declarations precede vxlan_dev_create() after the grown VXLAN_F_ALLOWED_VNIFILTER mask. The fdb is an RCU rhashtable keyed by fdb->key: the notifier copies key.eth_addr, and vxlan_fdb_update_mac() refreshes the entry under rcu_read_lock() as the xmit path does.
+---
+ drivers/net/vxlan/vxlan_core.c | 34 ++++++++++++++++++++++++++++++++++
+ include/net/vxlan.h            | 13 +++++++++++++
+ 2 files changed, 47 insertions(+)
+
+diff --git a/drivers/net/vxlan/vxlan_core.c b/drivers/net/vxlan/vxlan_core.c
+index e045e1ee9..1869daf6d 100644
+--- a/drivers/net/vxlan/vxlan_core.c
++++ b/drivers/net/vxlan/vxlan_core.c
+@@ -30,6 +30,20 @@
+ #include <net/vxlan.h>
+ #include <net/nexthop.h>
+ 
++ATOMIC_NOTIFIER_HEAD(vxlan_fdb_notifier_list);
++
++void vxlan_fdb_register_notify(struct notifier_block *nb)
++{
++	atomic_notifier_chain_register(&vxlan_fdb_notifier_list, nb);
++}
++EXPORT_SYMBOL(vxlan_fdb_register_notify);
++
++void vxlan_fdb_unregister_notify(struct notifier_block *nb)
++{
++	atomic_notifier_chain_unregister(&vxlan_fdb_notifier_list, nb);
++}
++EXPORT_SYMBOL(vxlan_fdb_unregister_notify);
++
+ #if IS_ENABLED(CONFIG_IPV6)
+ #include <net/ip6_tunnel.h>
+ #include <net/ip6_checksum.h>
+@@ -265,6 +279,7 @@ static void __vxlan_fdb_notify(struct vxlan_dev *vxlan, struct vxlan_fdb *fdb,
+ {
+ 	struct net *net = dev_net(vxlan->dev);
+ 	struct sk_buff *skb;
++	struct vxlan_fdb_event vfe;
+ 	int err = -ENOBUFS;
+ 
+ 	skb = nlmsg_new(vxlan_nlmsg_size(), GFP_ATOMIC);
+@@ -280,6 +295,10 @@ static void __vxlan_fdb_notify(struct vxlan_dev *vxlan, struct vxlan_fdb *fdb,
+ 	}
+ 
+ 	rtnl_notify(skb, net, 0, RTNLGRP_NEIGH, NULL, GFP_ATOMIC);
++	vfe.dev = vxlan->dev;
++	vfe.rdst = rd;
++	ether_addr_copy(vfe.eth_addr, fdb->key.eth_addr);
++	atomic_notifier_call_chain(&vxlan_fdb_notifier_list, type, (void *)&vfe);
+ 	return;
+ errout:
+ 	rtnl_set_sk_err(net, RTNLGRP_NEIGH, err);
+@@ -422,6 +441,15 @@ static struct vxlan_fdb *vxlan_find_mac(struct vxlan_dev *vxlan,
+ 	return f;
+ }
+ 
++/* Find and update age of fdb entry corresponding to MAC. */
++void vxlan_fdb_update_mac(struct vxlan_dev *vxlan, const u8 *mac, uint32_t vni)
++{
++	rcu_read_lock();
++	vxlan_find_mac_tx(vxlan, mac, vni);
++	rcu_read_unlock();
++}
++EXPORT_SYMBOL(vxlan_fdb_update_mac);
++
+ /* caller should hold vxlan->hash_lock */
+ static struct vxlan_rdst *vxlan_fdb_find_rdst(struct vxlan_fdb *f,
+ 					      union vxlan_addr *ip, __be16 port,
+@@ -2557,6 +2585,9 @@ void vxlan_xmit_one(struct sk_buff *skb, struct net_device *dev,
+ 			goto out_unlock;
+ 		}
+ 
++		/* Reset the skb_iif to Tunnels interface index */
++		skb->skb_iif = dev->ifindex;
++
+ 		tos = ip_tunnel_ecn_encap(tos, ip_hdr(skb), skb);
+ 		ttl = ttl ? : ip4_dst_hoplimit(&rt->dst);
+ 		err = vxlan_build_skb(skb, ndst, sizeof(struct iphdr),
+@@ -2641,6 +2672,9 @@ void vxlan_xmit_one(struct sk_buff *skb, struct net_device *dev,
+ 			goto tx_error;
+ 		}
+ 
++		/* Reset the skb_iif to Tunnels interface index */
++		skb->skb_iif = dev->ifindex;
++
+ 		udp_tunnel6_xmit_skb(ndst, sock6->sk, skb, dev,
+ 				     &saddr, &pkey->u.ipv6.dst, tos, ttl,
+ 				     pkey->label, src_port, dst_port, !udp_sum,
+diff --git a/include/net/vxlan.h b/include/net/vxlan.h
+index f4620379a..b366155b3 100644
+--- a/include/net/vxlan.h
++++ b/include/net/vxlan.h
+@@ -359,6 +359,19 @@ struct vxlan_dev {
+ 					 VXLAN_F_MC_ROUTE          |	\
+ 					 0)
+ 
++/*
++ * Application data for fdb notifier event
++ */
++struct vxlan_fdb_event {
++	struct net_device *dev;
++	struct vxlan_rdst *rdst;
++	u8 eth_addr[ETH_ALEN];
++};
++
++extern void vxlan_fdb_register_notify(struct notifier_block *nb);
++extern void vxlan_fdb_unregister_notify(struct notifier_block *nb);
++extern void vxlan_fdb_update_mac(struct vxlan_dev *vxlan, const u8 *mac, uint32_t vni);
++
+ struct net_device *vxlan_dev_create(struct net *net, const char *name,
+ 				    u8 name_assign_type, struct vxlan_config *conf);
+ 

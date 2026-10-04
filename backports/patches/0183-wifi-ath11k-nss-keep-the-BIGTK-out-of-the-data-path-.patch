@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Sat, 3 Oct 2026 13:47:22 +0300
+Subject: [PATCH 183/192] wifi: ath11k: nss: keep the BIGTK out of the data
+ path security setup
+
+Installing a beacon protection key ran the NSS vdev/peer security calls with its BIP cipher, which would switch the data path's security type. The BIGTK only signs beacons in the firmware.
+---
+ drivers/net/wireless/ath/ath11k/mac.c | 36 ++++++++++++++++-----------
+ 1 file changed, 21 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath11k/mac.c b/drivers/net/wireless/ath/ath11k/mac.c
+index 7d06d6a..196b59d 100644
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -4871,23 +4871,29 @@ static int ath11k_mac_op_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
+ 	spin_lock_bh(&ab->base_lock);
+ 	peer = ath11k_peer_find(ar, arvif->vdev_id, peer_addr);
+ 
+-	/* TODO: Check if vdev specific security cfg is mandatory */
+-	ret = ath11k_nss_vdev_set_cmd(arvif, ATH11K_NSS_WIFI_VDEV_SECURITY_TYPE_CMD, key->cipher);
+-	if (ret) {
+-		ath11k_warn(ab, "failure to set vdev security type in nss");
+-		goto unlock;
+-	}
++	/* The BIGTK only signs beacons, in the firmware; the NSS data path's
++	 * security type stays that of the data keys.
++	 */
++	if (key->keyidx < 6) {
++		/* TODO: Check if vdev specific security cfg is mandatory */
++		ret = ath11k_nss_vdev_set_cmd(arvif, ATH11K_NSS_WIFI_VDEV_SECURITY_TYPE_CMD,
++					      key->cipher);
++		if (ret) {
++			ath11k_warn(ab, "failure to set vdev security type in nss");
++			goto unlock;
++		}
+ 
+-	ret = ath11k_nss_set_peer_sec_type(ar, peer, key);
+-	if (ret) {
+-		ath11k_warn(ab, "failure to set peer security type in nss");
+-		goto unlock;
+-	}
++		ret = ath11k_nss_set_peer_sec_type(ar, peer, key);
++		if (ret) {
++			ath11k_warn(ab, "failure to set peer security type in nss");
++			goto unlock;
++		}
+ 
+-	ret = ath11k_nss_set_peer_authorize(ar, peer->peer_id);
+-	if (ret) {
+-		ath11k_warn(ab, "failure to authorize peer in nss");
+-		goto unlock;
++		ret = ath11k_nss_set_peer_authorize(ar, peer->peer_id);
++		if (ret) {
++			ath11k_warn(ab, "failure to authorize peer in nss");
++			goto unlock;
++		}
+ 	}
+ 
+ 	spin_unlock_bh(&ar->ab->base_lock);

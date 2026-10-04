@@ -1,0 +1,115 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Sat, 3 Oct 2026 22:32:09 +0300
+Subject: [PATCH 186/192] wifi: ath11k: beacon protection and ATF fixes from
+ review (v3)
+
+Beacon protection: only an AP's BIGTK goes to the firmware (a station
+verifies beacons in software), and installing a BIGTK no longer
+overwrites the peer's group key index and cipher, which the data path
+uses to decrypt group addressed frames; the feature is advertised only
+with hardware crypto. ATF: the command ID and TLV tags sit in their
+enums (the TLV enum has a gap there, so no other value moves), and a
+radio whose firmware refuses ATF keeps working. Same code as the
+upstream v3 series.
+---
+ drivers/net/wireless/ath/ath11k/mac.c | 23 +++++++++++++----------
+ drivers/net/wireless/ath/ath11k/wmi.h |  8 +++-----
+ 2 files changed, 16 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath11k/mac.c b/drivers/net/wireless/ath/ath11k/mac.c
+index 51631b2..9d98b0f 100644
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -4672,9 +4672,11 @@ static int ath11k_mac_op_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
+ 	u32 flags = 0;
+ 
+ 	/* The IGTK protects management frames, which are done in software;
+-	 * only the BIGTK (index 6/7) goes to the firmware, which signs beacons.
++	 * only an AP's BIGTK (index 6/7) goes to the firmware, which signs
++	 * beacons. A station verifies beacons in software.
+ 	 */
+-	if (key->keyidx == 4 || key->keyidx == 5)
++	if (key->keyidx == 4 || key->keyidx == 5 ||
++	    (key->keyidx >= 6 && arvif->vdev_type != WMI_VDEV_TYPE_AP))
+ 		return 1;
+ 
+ 	if (test_bit(ATH11K_FLAG_HW_CRYPTO_DISABLED, &ar->ab->dev_flags))
+@@ -4922,7 +4924,8 @@ static int ath11k_mac_op_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
+ 		if (key->flags & IEEE80211_KEY_FLAG_PAIRWISE) {
+ 			peer->ucast_keyidx = key->keyidx;
+ 			peer->sec_type = ath11k_dp_tx_get_encrypt_type(key->cipher);
+-		} else {
++		} else if (key->keyidx < 4) {
++			/* group data key; not the BIGTK */
+ 			peer->mcast_keyidx = key->keyidx;
+ 			peer->sec_type_grp = ath11k_dp_tx_get_encrypt_type(key->cipher);
+ 		}
+@@ -4933,7 +4936,7 @@ static int ath11k_mac_op_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
+ 		peer->keys[key->keyidx] = NULL;
+ 		if (key->flags & IEEE80211_KEY_FLAG_PAIRWISE)
+ 			peer->ucast_keyidx = 0;
+-		else
++		else if (key->keyidx < 4)
+ 			peer->mcast_keyidx = 0;
+ 		if (key->vlan_id)
+ 			arvif->vlan_keyid_map[key->vlan_id] = 0;
+@@ -7147,11 +7150,10 @@ static int ath11k_mac_op_start(struct ieee80211_hw *hw)
+ 	if (test_bit(WMI_TLV_SERVICE_ATF, ab->wmi_ab.svc_map)) {
+ 		ret = ath11k_wmi_pdev_set_param(ar, WMI_PDEV_PARAM_ATF_DYNAMIC_ENABLE,
+ 						1, pdev->pdev_id);
+-		if (ret) {
+-			ath11k_err(ab, "failed to enable airtime fairness: %d\n",
+-				   ret);
+-			goto err;
+-		}
++		/* Without it the radio still works, just without ATF */
++		if (ret)
++			ath11k_warn(ab, "failed to enable airtime fairness: %d\n",
++				    ret);
+ 	}
+ 
+ 	ret = ath11k_wmi_send_dfs_phyerr_offload_enable_cmd(ar, pdev->pdev_id);
+@@ -11447,7 +11449,8 @@ static int __ath11k_mac_register(struct ath11k *ar)
+ 		wiphy_ext_feature_set(ar->hw->wiphy,
+ 				      NL80211_EXT_FEATURE_ENABLE_FTM_RESPONDER);
+ 
+-	if (test_bit(WMI_TLV_SERVICE_BEACON_PROTECTION_SUPPORT, ar->ab->wmi_ab.svc_map))
++	if (test_bit(WMI_TLV_SERVICE_BEACON_PROTECTION_SUPPORT, ar->ab->wmi_ab.svc_map) &&
++	    !test_bit(ATH11K_FLAG_HW_CRYPTO_DISABLED, &ab->dev_flags))
+ 		wiphy_ext_feature_set(ar->hw->wiphy,
+ 				      NL80211_EXT_FEATURE_BEACON_PROTECTION);
+ 
+diff --git a/drivers/net/wireless/ath/ath11k/wmi.h b/drivers/net/wireless/ath/ath11k/wmi.h
+index 6de8b9c..6b582e7 100644
+--- a/drivers/net/wireless/ath/ath11k/wmi.h
++++ b/drivers/net/wireless/ath/ath11k/wmi.h
+@@ -627,6 +627,7 @@ enum wmi_tlv_cmd_id {
+ 	WMI_PDEV_OBSS_PD_SPATIAL_REUSE_CMDID =
+ 				WMI_TLV_CMD(WMI_GRP_SPATIAL_REUSE),
+ 	WMI_PDEV_OBSS_PD_SPATIAL_REUSE_SET_DEF_OBSS_THRESH_CMDID,
++	WMI_ATF_SSID_GROUPING_REQUEST_CMDID = WMI_TLV_CMD(WMI_GRP_ATM),
+ };
+ 
+ enum wmi_tlv_event_id {
+@@ -1898,6 +1899,8 @@ enum wmi_tlv_tag {
+ 	WMI_TAG_MUEDCA_PARAMS_CONFIG_EVENT = 0x32a,
+ 	WMI_TAG_CFR_CAPTURE_PHASE_PARAM = 0x33b,
+ 	WMI_TAG_FILS_DISCOVERY_TMPL_CMD = 0x344,
++	WMI_TAG_ATF_SSID_GRP_REQUEST = 0x346,
++	WMI_TAG_ATF_GROUP_INFO,
+ 	WMI_TAG_PDEV_SRG_BSS_COLOR_BITMAP_CMD = 0x37b,
+ 	WMI_TAG_PDEV_SRG_PARTIAL_BSSID_BITMAP_CMD,
+ 	WMI_TAG_PDEV_SRG_OBSS_COLOR_ENABLE_BITMAP_CMD = 0x381,
+@@ -3704,11 +3707,6 @@ struct ath11k_wmi_p2p_noa_info {
+ #define WMI_PEER_ATF_REQ_FLAG_PDEV_ID_VALID	BIT(2)
+ #define WMI_ATF_GROUP_POLICY_FAIR		0
+ 
+-#define WMI_ATF_SSID_GROUPING_REQUEST_CMDID	WMI_TLV_CMD(WMI_GRP_ATM)
+-/* Outside enum wmi_tlv_tag: its WMI_TAG_MAX sizes the TLV policy table. */
+-#define WMI_TAG_ATF_SSID_GRP_REQUEST		0x346
+-#define WMI_TAG_ATF_GROUP_INFO			0x347
+-
+ struct wmi_atf_ssid_grp_request_cmd {
+ 	u32 tlv_header;
+ 	u32 pdev_id;

@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sean Khan <datapronix@protonmail.com>
+Date: Fri, 2 Oct 2026 09:40:36 +0300
+Subject: [PATCH 095/119] qca-nss-clients-iptunnel-lock-this-cpu
+
+Imported from https://github.com/qosmio/openwrt-ipq.git target/linux/qualcommax/patches-6.12/0603-7-qca-nss-clients-iptunnel-lock-this-cpu.patch (added in 2f34da0af7); the patch file carries no author or description.
+---
+ net/ipv6/ip6_tunnel.c | 2 +-
+ net/ipv6/sit.c        | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/net/ipv6/ip6_tunnel.c b/net/ipv6/ip6_tunnel.c
+index a990d1a89..cff29f0d0 100644
+--- a/net/ipv6/ip6_tunnel.c
++++ b/net/ipv6/ip6_tunnel.c
+@@ -2233,7 +2233,7 @@ static int ip6_tnl_fill_info(struct sk_buff *skb, const struct net_device *dev)
+  */
+ void ip6_update_offload_stats(struct net_device *dev, void *ptr)
+ {
+-	struct pcpu_sw_netstats *tstats = per_cpu_ptr(dev->tstats, 0);
++	struct pcpu_sw_netstats *tstats = this_cpu_ptr(dev->tstats);
+ 	const struct pcpu_sw_netstats *offload_stats =
+ 					(struct pcpu_sw_netstats *)ptr;
+ 
+diff --git a/net/ipv6/sit.c b/net/ipv6/sit.c
+index e90a4aff5..a3e5dc2f4 100644
+--- a/net/ipv6/sit.c
++++ b/net/ipv6/sit.c
+@@ -1740,7 +1740,7 @@ static int ipip6_fill_info(struct sk_buff *skb, const struct net_device *dev)
+ /* QCA NSS Clients Support - Start */
+ void ipip6_update_offload_stats(struct net_device *dev, void *ptr)
+ {
+-	struct pcpu_sw_netstats *tstats = per_cpu_ptr(dev->tstats, 0);
++	struct pcpu_sw_netstats *tstats = this_cpu_ptr(dev->tstats);
+ 	const struct pcpu_sw_netstats *offload_stats =
+ 					(struct pcpu_sw_netstats *)ptr;
+ 

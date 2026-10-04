@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Sat, 3 Oct 2026 23:15:47 +0300
+Subject: [PATCH 190/192] wifi: ath11k: fill an AP's TPC limits from the vdev's
+ channel context
+
+arvif->chanctx is only copied for 6 GHz stations, so for an AP the TPC fill read a NULL channel (chan->flags at offset 0xc) and the kernel crashed when the 6 GHz AP started. Pass the channel context the vdev starts on, as ath12k does.
+---
+ drivers/net/wireless/ath/ath11k/mac.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/net/wireless/ath/ath11k/mac.c b/drivers/net/wireless/ath/ath11k/mac.c
+index 1d14b58..ab0a5f8 100644
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -8246,7 +8246,7 @@ ath11k_mac_vdev_start_restart(struct ath11k_vif *arvif,
+ 	 * channel changes, say CSA, it should be updated again.
+ 	 */
+ 	if (ath11k_mac_supports_tpc(ar, arvif, chandef)) {
+-		ath11k_mac_fill_reg_tpc_info(ar, arvif->vif, &arvif->chanctx);
++		ath11k_mac_fill_reg_tpc_info(ar, arvif->vif, ctx);
+ 		ath11k_wmi_send_vdev_set_tpc_power(ar, arvif->vdev_id,
+ 						   &arvif->reg_tpc_info);
+ 	}

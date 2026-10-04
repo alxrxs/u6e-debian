@@ -1,20 +1,15 @@
 # Site-specific configuration (see site.conf.example).
 /site.conf
-# Trees checked out from their own repositories (see README.md).
+# The source trees trees.sh builds from kernel/ and backports/.
 /linux-7.2.8/
-/linux-arm/
 /backports-7.2/
-# Downloads, build inputs and outputs.
-/linux-*.tar.*
-/sha256sums.asc
+# Downloads, build outputs and state.
+/dl/
 /rootfs/
-/rootfs-armhf/
-/rootfs-*/
-/out-*/
+/out/
 /images/
 /modules.keep
-/config-*-u6e-*
-/*.log
+/config-*-u6e
 /fw/out/
 /boot/memdump
 /shim/shim.bin
@@ -22,9 +17,8 @@
 /nss/stage/
 /nss/out/
 /nss/dl/
-/nss/build.log
-__pycache__/
-pkg/iproute2-nss/out/
-pkg/hostapd/out/
+/pkg/iproute2-nss/out/
+/pkg/hostapd/out/
 /log/
 /stamps/
+__pycache__/

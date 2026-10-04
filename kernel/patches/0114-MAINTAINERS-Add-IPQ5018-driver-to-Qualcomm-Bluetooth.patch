@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: George Moussalem <george.moussalem@outlook.com>
+Date: Thu, 9 Jul 2026 13:18:32 +0400
+Subject: [PATCH 114/119] MAINTAINERS: Add IPQ5018 driver to Qualcomm Bluetooth
+ driver entry
+
+Add the Qualcomm IPQ5018 Bluetooth driver to the existing entry for
+Qualcomm Bluetooth drivers.
+
+Acked-by: Bartosz Golaszewski <bartosz.golaszewski@oss.qualcomm.com>
+Signed-off-by: George Moussalem <george.moussalem@outlook.com>
+---
+ MAINTAINERS | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 95cd976a0..35faebded 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -22108,6 +22108,7 @@ L:	linux-arm-msm@vger.kernel.org
+ S:	Maintained
+ F:	Documentation/devicetree/bindings/net/bluetooth/qcom,*
+ F:	drivers/bluetooth/btqca.[ch]
++F:	drivers/bluetooth/btqcomipc.c
+ F:	drivers/bluetooth/btqcomsmd.c
+ F:	drivers/bluetooth/hci_qca.c
+ 

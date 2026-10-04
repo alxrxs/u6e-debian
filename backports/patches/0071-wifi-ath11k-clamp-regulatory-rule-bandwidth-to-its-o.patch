@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gustavo Foletto Mora <gusfmora@gmail.com>
+Date: Sat, 12 Sep 2026 11:20:00 -0300
+Subject: [PATCH 071/192] wifi: ath11k: clamp regulatory rule bandwidth to its
+ own range
+
+ath11k_reg_build_regd() takes each rule's bandwidth straight from the
+firmware, limited only against the band-wide maximum:
+
+	max_bw = min_t(u16, reg_rule->max_bw, reg_info->max_bw_5ghz);
+
+Nothing checks it against the rule's own frequency range. cfg80211 does:
+is_valid_reg_rule() rejects any rule where max_bandwidth_khz is greater
+than end_freq_khz - start_freq_khz, and is_valid_rd() then fails the
+whole regdomain, so regulatory_set_wiphy_regd() returns -EINVAL and the
+radio never registers:
+
+  Invalid regulatory domain detected: US
+  WARNING: ... net/wireless/reg.c:4035 ... [cfg80211]
+  ath11k b00a040.wifi: failed to perform regd update : -22
+  ath11k b00a040.wifi: ath11k regd update failed: -22
+  ath11k b00a040.wifi: failed register the radio with mac80211: -22
+  ath11k b00a040.wifi: failed to create pdev core: -22
+
+One malformed rule therefore costs the entire radio.
+
+Found on a TP-Link EX511 v2 (IPQ5018 + QCN6122). The vendor board files
+under /etc/board_data_files/ produce such a rule; the Qualcomm QSDK
+reference board files do not, so the device only works on reference board
+data, with the wrong power tables -- 5 GHz capped at 22 dBm where the
+regulatory limit is 27, costing most of the downstream throughput.
+
+Clamp the bandwidth to the rule's range instead of trusting the firmware.
+NL80211_RRF_AUTO_BW is already set for 5 GHz and 6 GHz rules, so the
+regulatory core widens the bandwidth again across contiguous rules
+wherever that is legal, and nothing is lost where the firmware was right.
+
+Signed-off-by: Gustavo Foletto Mora <gusfmora@gmail.com>
+---
+ drivers/net/wireless/ath/ath11k/reg.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/drivers/net/wireless/ath/ath11k/reg.c b/drivers/net/wireless/ath/ath11k/reg.c
+index b7dfc4f..2ac9156 100644
+--- a/drivers/net/wireless/ath/ath11k/reg.c
++++ b/drivers/net/wireless/ath/ath11k/reg.c
+@@ -395,6 +395,17 @@ ath11k_reg_update_rule(struct ieee80211_reg_rule *reg_rule, u32 start_freq,
+ 		       u32 end_freq, u32 bw, u32 ant_gain, u32 reg_pwr,
+ 		       s8 psd, u32 reg_flags)
+ {
++	/* cfg80211's is_valid_reg_rule() rejects any rule whose bandwidth is
++	 * wider than the rule's own frequency range, and a single bad rule
++	 * makes regulatory_set_wiphy_regd() reject the entire regdomain with
++	 * -EINVAL. Some board files report exactly that, so clamp instead of
++	 * trusting the firmware. NL80211_RRF_AUTO_BW, which we already set for
++	 * 5 GHz and 6 GHz rules, lets the regulatory core widen the bandwidth
++	 * again across contiguous rules wherever that is legal.
++	 */
++	if (end_freq > start_freq)
++		bw = min_t(u32, bw, end_freq - start_freq);
++
+ 	reg_rule->freq_range.start_freq_khz = MHZ_TO_KHZ(start_freq);
+ 	reg_rule->freq_range.end_freq_khz = MHZ_TO_KHZ(end_freq);
+ 	reg_rule->freq_range.max_bandwidth_khz = MHZ_TO_KHZ(bw);

@@ -1,22 +1,13 @@
 #!/bin/bash
-# Configure the U6-Enterprise kernel: config-u6e.sh arm|arm64|nss
-#   arm   -> ../linux-arm      (armv7 LPAE zImage, booted directly by bootz)
-#   arm64 -> ../linux-7.2.8    (arm64 Image, entered through shim/ via the TZ switch)
-#   nss   -> ../linux-7.2.8    (arm64 + Qualcomm NSS offload hooks; Wi-Fi comes from
-#                               the out-of-tree backports build, so not from here)
+# Configure the U6-Enterprise kernel in linux-7.2.8: arm64, entered through
+# shim/ via the TrustZone switch, with the Qualcomm NSS offload hooks; Wi-Fi
+# comes from the out-of-tree backports build, so not from here.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
-case "${1:-}" in
-	arm)   tree=linux-arm   defconfig=multi_v7_defconfig cross=arm-linux-gnueabihf-
-	       platforms=$(grep -hE "^(menu)?config (ARCH|SOC)_[A-Z0-9_]+$" "$here/$tree"/arch/arm/mach-*/Kconfig | awk '{print $2}' | sort -u) ;;
-	arm64|nss)
-	       tree=linux-7.2.8 defconfig=defconfig cross=aarch64-linux-gnu-
-	       platforms=$(grep -hE "^(menu)?config ARCH_[A-Z0-9_]+$" "$here/$tree"/arch/arm64/Kconfig.platforms | awk '{print $2}' | sort -u) ;;
-	*) echo "usage: $0 arm|arm64|nss" >&2; exit 2 ;;
-esac
-cd "$here/$tree"
-export ARCH=${1/nss/arm64} CROSS_COMPILE=$cross
-make -s $defconfig
+cd "$here/linux-7.2.8"
+platforms=$(grep -hE "^(menu)?config ARCH_[A-Z0-9_]+$" arch/arm64/Kconfig.platforms | awk '{print $2}' | sort -u)
+export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+make -s defconfig
 ./scripts/config \
 	-e ARCH_QCOM -e PINCTRL_IPQ5018 -e IPQ_GCC_5018 -e IPQ_CMN_PLL \
 	-e QCOM_APCS_IPC -e IPQ_APSS_PLL -e IPQ_APSS_6018 \
@@ -44,34 +35,28 @@ make -s $defconfig
 for sym in $platforms; do
 	[ "$sym" = ARCH_QCOM ] || ./scripts/config -d "$sym"
 done
-if [ "$1" = arm ]; then
-	./scripts/config -e ARM_LPAE -d ARCH_IPQ40XX -d ARCH_MSM8909 -d ARCH_MSM8916 \
-		-d ARCH_MSM8960 -d ARCH_MSM8974 -d ARCH_MSM8X60 -d ARCH_MDM9615
-fi
 # Subsystems an access point has no hardware for.
 ./scripts/config -d SOUND -d DRM -d FB -d MEDIA_SUPPORT -d BT -d CAN -d NFC \
 	-d INPUT_TOUCHSCREEN -d USB_GADGET -d STAGING -d SLIMBUS -d QCOM_APR -d QCOM_IPA -d CMA
 ./scripts/config -e IIO -m IIO_ST_ACCEL_3AXIS -m IIO_ST_ACCEL_I2C_3AXIS
-if [ "$1" = nss ]; then
-	# What the NSS host drivers hook into (the NSS firmware DMAs to physical
-	# addresses, and the IPQ5018 has no IOMMU); mac80211/ath11k are built from
-	# backports, which also provides qmi_helpers - so nothing in the kernel may
-	# build its own.
-	./scripts/config -e SKB_RECYCLER -e SKB_RECYCLER_MULTI_CPU -e NF_CONNTRACK_DSCPREMARK_EXT \
-		-e NET_CLS_ACT -e NF_CONNTRACK_EVENTS -e NF_CONNTRACK_MARK \
-		-e IP_MROUTE -e IPV6_MROUTE -m IFB -e CFG80211_HEADERS -d CFG80211 -d MAC80211 -d IOMMU_SUPPORT \
-		-d QCOM_SYSMON -d QCOM_PDR_HELPERS -d QCOM_PD_MAPPER
-	# Every link type ECM and the NSS clients can offload needs its kernel side.
-	./scripts/config -m PPP -m PPPOE -m PPTP -m NF_CONNTRACK_PPTP -m L2TP -e L2TP_V3 -m PPPOL2TP -m L2TP_ETH \
-		-m BONDING -m MACVLAN -m NET_IPIP -m NET_IPGRE_DEMUX -m NET_IPGRE -e NET_IPGRE_BROADCAST -m IPV6_GRE \
-		-m IPV6_SIT -e IPV6_SIT_6RD -m IPV6_TUNNEL -m XFRM_USER -m INET_ESP -m INET_ESP_OFFLOAD \
-		-m INET6_ESP -m INET6_ESP_OFFLOAD
-	# The IPQ5018's own Bluetooth controller (IPC transport, firmware via SCM).
-	./scripts/config -m BT -e BT_LE -m BT_QCOMIPC
-	# Per-client rate limits: the qdiscs, classifiers and actions tc classifies
-	# with, for the NSS qdiscs and for traffic the firmware hands back to Linux.
-	./scripts/config -m NET_SCH_HTB -m NET_SCH_TBF -m NET_SCH_FQ_CODEL -m NET_SCH_PRIO -m NET_CLS_U32 \
-		-m NET_CLS_FW -m NET_CLS_MATCHALL -m NET_ACT_POLICE -m NET_ACT_SKBEDIT -m NET_ACT_CONNMARK
-fi
+# What the NSS host drivers hook into (the NSS firmware DMAs to physical
+# addresses, and the IPQ5018 has no IOMMU); mac80211/ath11k are built from
+# backports, which also provides qmi_helpers - so nothing in the kernel may
+# build its own.
+./scripts/config -e SKB_RECYCLER -e SKB_RECYCLER_MULTI_CPU -e NF_CONNTRACK_DSCPREMARK_EXT \
+	-e NET_CLS_ACT -e NF_CONNTRACK_EVENTS -e NF_CONNTRACK_MARK \
+	-e IP_MROUTE -e IPV6_MROUTE -m IFB -e CFG80211_HEADERS -d CFG80211 -d MAC80211 -d IOMMU_SUPPORT \
+	-d QCOM_SYSMON -d QCOM_PDR_HELPERS -d QCOM_PD_MAPPER
+# Every link type ECM and the NSS clients can offload needs its kernel side.
+./scripts/config -m PPP -m PPPOE -m PPTP -m NF_CONNTRACK_PPTP -m L2TP -e L2TP_V3 -m PPPOL2TP -m L2TP_ETH \
+	-m BONDING -m MACVLAN -m NET_IPIP -m NET_IPGRE_DEMUX -m NET_IPGRE -e NET_IPGRE_BROADCAST -m IPV6_GRE \
+	-m IPV6_SIT -e IPV6_SIT_6RD -m IPV6_TUNNEL -m XFRM_USER -m INET_ESP -m INET_ESP_OFFLOAD \
+	-m INET6_ESP -m INET6_ESP_OFFLOAD
+# The IPQ5018's own Bluetooth controller (IPC transport, firmware via SCM).
+./scripts/config -m BT -e BT_LE -m BT_QCOMIPC
+# Per-client rate limits: the qdiscs, classifiers and actions tc classifies
+# with, for the NSS qdiscs and for traffic the firmware hands back to Linux.
+./scripts/config -m NET_SCH_HTB -m NET_SCH_TBF -m NET_SCH_FQ_CODEL -m NET_SCH_PRIO -m NET_CLS_U32 \
+	-m NET_CLS_FW -m NET_CLS_MATCHALL -m NET_ACT_POLICE -m NET_ACT_SKBEDIT -m NET_ACT_CONNMARK
 make -s olddefconfig
-cp .config "$here/config-$(make -s kernelversion)-u6e-$1"
+cp .config "$here/config-$(make -s kernelversion)-u6e"

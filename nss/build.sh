@@ -8,7 +8,7 @@
 # nss-drv, ECM, the clients and MCS, qosmio's fixes for the client managers and
 # nss-drv paths kuncy7 does not build, and our own); headers a later package
 # includes are staged in stage/, modules land in out/<kernel release>/. The wireless stack is the
-# patched ../backports-7.2 tree (branch u6e-nss). Ethernet is mainline
+# patched ../backports-7.2 tree that trees.sh builds. Ethernet is mainline
 # dwmac-ipq5018; qca-dwmac-nss hands its GMACs to the NSS firmware.
 # Flags mirror the OpenWrt package recipes with every engine the IPQ5018
 # firmware ships switched on.
@@ -128,7 +128,7 @@ build() {
 	backports)
 		# The 7.2 wireless subsystem; the kernel's own cfg80211/mac80211 are off.
 		rm -rf "$s"; mkdir -p "$s"
-		git -C "$BP" archive u6e-nss | tar -x -C "$s"
+		git -C "$BP" archive HEAD | tar -x -C "$s"
 		# Headers the kernel provides itself (OpenWrt's Build/Prepare drops the same set).
 		rm -rf "$s"/include/linux/ssb "$s"/include/linux/bcma "$s"/include/net/bluetooth \
 			"$s"/include/linux/{cordic,crc8,eeprom_93cx6,wl12xx,mhi}.h "$s"/include/net/ieee80211.h \

@@ -1,0 +1,9 @@
+# shellcheck shell=bash disable=SC2034
+# The upstream release backports/patches applies to (trees.sh): OpenWrt's
+# backports of the Linux 7.2 wireless stack.
+DIR=backports-7.2
+URL=https://github.com/openwrt/backports/releases/download/backports-v7.2/backports-7.2.tar.zst
+SHA256=6ec76a4cb0988b5382b2fc5053610a56ada90b8ef6a5a4f2807cd433badb9454
+BASE_SUBJECT="backports 7.2"
+BASE_AUTHOR="OpenWrt backports <openwrt-devel@lists.openwrt.org>"
+BASE_DATE="2026-08-21T08:58:48+00:00"

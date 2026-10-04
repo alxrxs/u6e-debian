@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Date: Fri, 2 Oct 2026 09:35:22 +0300
+Subject: [PATCH 070/119] Import tc_nss_mirred.h
+
+From https://github.com/kuncy7/openwrt-nss-edma target/linux/qualcommax/files/ at b16de08072; first added in aa6f3ce5c2 ("qualcommax: add NSS qdisc kernel support patches").
+---
+ include/uapi/linux/tc_act/tc_nss_mirred.h | 36 +++++++++++++++++++++++
+ 1 file changed, 36 insertions(+)
+ create mode 100644 include/uapi/linux/tc_act/tc_nss_mirred.h
+
+diff --git a/include/uapi/linux/tc_act/tc_nss_mirred.h b/include/uapi/linux/tc_act/tc_nss_mirred.h
+new file mode 100644
+index 000000000..3a368fcc8
+--- /dev/null
++++ b/include/uapi/linux/tc_act/tc_nss_mirred.h
+@@ -0,0 +1,36 @@
++#ifndef __LINUX_TC_NSS_MIRRED_H
++#define __LINUX_TC_NSS_MIRRED_H
++
++#include <linux/pkt_cls.h>
++
++/*
++ * Type of nss mirred action.
++ */
++#define TCA_ACT_MIRRED_NSS 17
++
++/*
++ * Types of parameters for nss mirred action.
++ */
++enum {
++	TC_NSS_MIRRED_UNSPEC,
++	TC_NSS_MIRRED_TM,
++	TC_NSS_MIRRED_PARMS,
++	__TC_NSS_MIRRED_MAX
++};
++#define TC_NSS_MIRRED_MAX (__TC_NSS_MIRRED_MAX - 1)
++
++/*
++ * tc_nss_mirred
++ *	tc command structure for nss mirred action.
++ */
++struct tc_nss_mirred {
++	tc_gen;			/* General tc structure. */
++	__u32 from_ifindex;	/* ifindex of the port from which traffic
++				 * will be redirected.
++				 */
++	__u32 to_ifindex;	/* ifindex of the port to which traffic
++				 * will be redirected.
++				 */
++};
++
++#endif	/* __LINUX_TC_NSS_MIRRED_H */
