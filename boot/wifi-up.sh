@@ -141,8 +141,8 @@ for _ in $(seq 20); do
 	iw dev | grep -q "^[[:space:]]*ssid " || break
 	sleep 0.5
 done
-# 6 GHz first: 2.4 and 5 GHz announce it in their RNR, which upstream hostapd
-# builds before a later interface has its BSSID (pkg/hostapd patches that).
+# 6 GHz first, so 2.4 and 5 GHz announce it in their RNR from their first
+# beacon (hostapd also refreshes them once a later interface starts).
 confs=
 for i in wlan6 wlan24 wlan5; do
 	[ -e /sys/class/net/$i ] && confs="$confs /run/hostapd-u6e/$i.conf" || echo "$i: no such radio"
