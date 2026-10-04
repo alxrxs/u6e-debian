@@ -206,7 +206,9 @@ ht() { # <band lines> <capabilities>: append them to the site's ht_capab
 # beacons announce the 6 GHz BSSs (Reduced Neighbor Report), which is how most
 # clients find 6 GHz at all; hostapd only reports a 6 GHz BSS it runs in the
 # same process. FILS Discovery (802.11ai) every 20 ms between beacons speeds
-# up 6 GHz scans.
+# up 6 GHz scans. member_of_colocated_6ghz_ess: every 6 GHz BSS of the site's
+# ESSs has its SSID on 2.4 or 5 GHz of the same AP, so STAs that have its RNR
+# entry or neighbor report can skip scanning 6 GHz for it.
 read -r COLOR_24 COLOR_5 COLOR_6 <<<"$WIFI_COLORS"
 radio_lines() { # <band>
 	case $1 in
@@ -222,7 +224,7 @@ bss_extra() { # <band> <kind>
 		[ "$2" = psk-mab ] ||
 			printf 'supported_rates=60 90 120 180 240 360 480 540\nbasic_rates=60 120 240\n' ;;
 	5) printf 'rnr=1\ndtim_period=3\n' ;;
-	6) printf 'fils_discovery_max_interval=20\ndtim_period=3\n' ;;
+	6) printf 'fils_discovery_max_interval=20\ndtim_period=3\nmember_of_colocated_6ghz_ess=1\n' ;;
 	esac
 }
 
@@ -324,15 +326,14 @@ sleep 8'
 	echo "iw dev wlan24 set txpower fixed $((tx24 * 100)); iw dev wlan5 set txpower fixed $((tx5 * 100)); iw dev wlan6 set txpower fixed $((tx6 * 100))"
 	# 802.11k: each of an SSID's BSSs also reports its others in its neighbor
 	# reports, marked co-located (BSSID Information bit 16) and, for 2.4/5 GHz,
-	# co-located with the 6 GHz AP they announce (bit 20) or, for 6 GHz, a
-	# member of an ESS with 2.4/5 GHz co-located APs (bit 18): byte 8 of the
-	# report.
+	# co-located with the 6 GHz AP they announce (bit 20): byte 8 of the report.
+	# hostapd sets bit 18 of a 6 GHz BSS itself (member_of_colocated_6ghz_ess).
 	for g in "${group[@]}"; do
 		echo "ifs='${g# }'"
 		echo 'for i in $ifs; do
 	own=$(hostapd_cli -p /run/hostapd -i $i show_neighbor 2>/dev/null | grep " stat$") || continue
 	nr=${own#*nr=}; nr=${nr%% *}
-	case $i in wlan6*) bits=0x05 ;; *) bits=0x11 ;; esac
+	case $i in wlan6*) bits=0x01 ;; *) bits=0x11 ;; esac
 	b8=$(printf %02x $((0x$(echo "$nr" | cut -c17-18) | bits)))
 	nr=$(echo "$nr" | cut -c1-16)$b8$(echo "$nr" | cut -c19-)
 	for j in $ifs; do

@@ -1,0 +1,109 @@
+From bc4230a1d216397d89f38a07149ff676164a4299 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Sun, 4 Oct 2026 16:53:18 +0300
+Subject: [PATCH] AP: Member of an ESS with co-located 2.4/5 GHz APs in 6 GHz
+
+A STA that knows every 6 GHz AP of an ESS has a co-located 2.4/5 GHz AP
+can skip scanning the 6 GHz band for it: IEEE Std 802.11-2024 carries
+this in the Member Of ESS With 2.4/5 GHz Colocated AP subfield, of the
+BSS Parameters of a reported 6 GHz AP in the Reduced Neighbor Report
+element and of the BSSID Information in a Neighbor Report element.
+hostapd defines both bits but never set them: the condition concerns
+the whole ESS, which hostapd cannot see, and is known only to whoever
+deploys it (dot11MemberOfColocated6GHzESSOptionActivated).
+
+Add member_of_colocated_6ghz_ess for a 6 GHz BSS to declare it. Its own
+Neighbor Report and the Reduced Neighbor Report elements of co-located
+2.4/5 GHz BSSs reporting it then set the subfield.
+
+Assisted-by: LLM
+Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
+---
+ hostapd/config_file.c  |  2 ++
+ hostapd/hostapd.conf   | 13 +++++++++
+ src/ap/ap_config.h     |  3 ++
+ src/ap/ieee802_11.c    |  4 +++
+ src/ap/neighbor_db.c   |  3 ++
+ tests/hwsim/test_he.py | 62 ++++++++++++++++++++++++++++++++++++++++++
+ 6 files changed, 87 insertions(+)
+
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index 59827966e..98aa7a9c0 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -3896,6 +3896,8 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 			return 1;
+ 		}
+ 		bss->unsol_bcast_probe_resp_interval = val;
++	} else if (os_strcmp(buf, "member_of_colocated_6ghz_ess") == 0) {
++		bss->member_of_colocated_6ghz_ess = atoi(pos);
+ #ifdef CONFIG_AFC
+ 	} else if (os_strcmp(buf, "afcd_sock") == 0) {
+ 		os_free(conf->afc.socket);
+diff --git a/hostapd/hostapd.conf b/hostapd/hostapd.conf
+index 0e9001221..e19bd3334 100644
+--- a/hostapd/hostapd.conf
++++ b/hostapd/hostapd.conf
+@@ -1038,6 +1038,19 @@ wmm_ac_vo_acm=0
+ # Valid range: 0..20 TUs; default is 0 (disabled)
+ #unsol_bcast_probe_resp_interval=0
+ 
++# Member of an ESS whose 6 GHz APs all have a co-located 2.4/5 GHz AP
++# (dot11MemberOfColocated6GHzESSOptionActivated, IEEE Std 802.11-2024)
++# This is for the 6 GHz band only and states a property of the whole ESS that
++# hostapd cannot see: set it only if no AP of the ESS operates in the 6 GHz
++# band without one in the 2.4 or 5 GHz band in the same colocated AP set. The
++# BSS then sets the Member Of ESS With 2.4/5 GHz Colocated AP subfield in its
++# own Neighbor Report and is reported with it in the Reduced Neighbor Report
++# element of the co-located 2.4/5 GHz BSSs, so that STAs that received one can
++# skip scanning the 6 GHz band for this ESS.
++# 0 = disabled (default)
++# 1 = enabled
++#member_of_colocated_6ghz_ess=0
++
+ #channel_usage: Whether Channel Usage procedures is supported by AP.
+ # 0 = Channel Usage support is disabled (default)
+ # 1 = Channel Usage support is enabled
+diff --git a/src/ap/ap_config.h b/src/ap/ap_config.h
+index c96481df7..8bf72d1d6 100644
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -995,6 +995,9 @@ struct hostapd_bss_config {
+ 
+ 	unsigned int unsol_bcast_probe_resp_interval;
+ 
++	/* dot11MemberOfColocated6GHzESSOptionActivated (6 GHz only) */
++	bool member_of_colocated_6ghz_ess;
++
+ 	u8 ext_capa_mask[EXT_CAPA_MAX_LEN];
+ 	u8 ext_capa[EXT_CAPA_MAX_LEN];
+ 
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index 219a94b0f..f374b0cfa 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -10860,6 +10860,10 @@ static bool hostapd_eid_rnr_bss(struct hostapd_data *hapd,
+ 	    bss->conf->unsol_bcast_probe_resp_interval)
+ 		bss_param |= RNR_BSS_PARAM_UNSOLIC_PROBE_RESP_ACTIVE;
+ 
++	if (is_6ghz_op_class(op_class) &&
++	    bss->conf->member_of_colocated_6ghz_ess)
++		bss_param |= RNR_BSS_PARAM_MEMBER_CO_LOCATED_ESS;
++
+ 	bss_param |= RNR_BSS_PARAM_CO_LOCATED;
+ 
+ 	*eid++ = bss_param;
+diff --git a/src/ap/neighbor_db.c b/src/ap/neighbor_db.c
+index fd4f881df..d20347257 100644
+--- a/src/ap/neighbor_db.c
++++ b/src/ap/neighbor_db.c
+@@ -290,6 +290,9 @@ void hostapd_neighbor_set_own_report(struct hostapd_data *hapd)
+ 					  &op_class, &channel) ==
+ 	    NUM_HOSTAPD_MODES)
+ 		return;
++	if (is_6ghz_op_class(op_class) &&
++	    hapd->conf->member_of_colocated_6ghz_ess)
++		bssid_info |= NEI_REP_BSSID_INFO_MEMBER_OF_ESS_WITH_COLOC_AP;
+ 	width = hostapd_get_nr_chan_width(hapd, ht, vht, he, oper_chwidth,
+ 					  secondary_channel);
+ 
