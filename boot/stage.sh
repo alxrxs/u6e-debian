@@ -22,7 +22,10 @@ if [ "$("$B/apstate.sh")" = debian ]; then
 	sleep 30
 	wait_for stock 400 || exit 1
 fi
-(cd "$dir" && "$B/go8.sh" shim.bin u6e.dtb u6e.initrd Image) || exit 1
+mkdir -p "$U6E/log"
+(cd "$dir" && "$B/go8.sh" shim.bin u6e.dtb u6e.initrd Image) > "$U6E/log/go8-$AP_HOSTNAME.log" 2>&1 ||
+	{ echo "$AP_HOSTNAME: go8.sh failed, see $U6E/log/go8-$AP_HOSTNAME.log" >&2; exit 1; }
+grep written "$U6E/log/go8-$AP_HOSTNAME.log"
 T=20 ap_stock -n reboot
 sleep 30
 wait_for debian 600

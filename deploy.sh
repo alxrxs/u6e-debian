@@ -13,7 +13,8 @@ cd "$(dirname "$0")" || exit 1
 L=$PWD/log
 mkdir -p "$L"
 fail() { echo "$*" >&2; exit 1; }
-ver=$(sed -n 's/^VER=2:\(.*\)$/\1/p' pkg/hostapd/build.sh)
+ver=$(sed -n 's/.* VER=2:\([^ ]*\).*/\1/p' pkg/hostapd/build.sh)
+[ -n "$ver" ] || fail "no VER= in pkg/hostapd/build.sh"
 if [ ! -f "pkg/hostapd/out/hostapd_${ver}_arm64.deb" ]; then
 	(cd pkg/hostapd && ./build.sh) > "$L/hostapd.log" 2>&1 || fail "hostapd $ver: build failed, see $L/hostapd.log"
 	echo "hostapd $ver built"
