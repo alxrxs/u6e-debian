@@ -1,86 +1,129 @@
 # Debian on the Ubiquiti UniFi U6 Enterprise
 
-Debian 13 (trixie) with Linux 7.2 on the UniFi U6 Enterprise (IPQ5018: two Cortex-A53, an internal 2.4 GHz radio, two QCN9074 radios for 5 and 6 GHz, one 2.5 GbE port), run from RAM next to the untouched stock firmware, with Qualcomm's NSS offload doing the data plane: the NSS core owns the Ethernet MAC (TSO and checksum offload on), all three radios run NSS Wi-Fi offload, ECM accelerates flows, and the NSS crypto engine serves the kernel crypto API.
+This repository turns a UniFi U6 Enterprise Wi-Fi access point into a small Debian 13 (trixie) computer running Linux 7.2.8, with all three radios working as a full-featured Wi-Fi 6/6E access point.
 
-Verified on hardware: the image boots in about 40 s, the NSS core takes the uplink, the three radios beacon, the 18 NSS crypto algorithms pass the kernel self-tests and every offload manager loads. Nothing is ever written to the SPI flash.
+The U6 Enterprise has a Qualcomm IPQ5018 chip (two ARM cores, an internal 2.4 GHz radio), two QCN9074 radios for 5 GHz and 6 GHz, and one 2.5 GbE network port. Debian runs entirely from RAM, started next to the untouched stock firmware, so the stock system is always one reboot away. Qualcomm's NSS (a separate network processor inside the chip) does the packet forwarding in hardware, including for Wi-Fi.
 
-## Repositories
+The only thing ever written to the SPI flash (the small chip holding the boot loader) is the boot loader's settings, which hold the command that starts Debian (see [Booting](#booting)).
 
-| Repository | What |
+## What you need
+
+- An x86 Linux build machine with the aarch64 cross compiler (and the armhf one, for the 32-bit boot shim), `mmdebstrap`, `qemu-user-static` and `u-boot-tools`.
+- SSH access to the stock firmware of each access point (the stock login set in `site.conf`).
+- `site.conf`: your site's settings. Copy `site.conf.example` and fill it in; it is never committed. It holds:
+  - the management network (VLAN, gateway, DNS, NTP, syslog collector) and the VLANs Wi-Fi clients land in;
+  - the Wi-Fi plan: country, one line per SSID (name, kind, bands, default VLAN), channels, transmit power, and the optional 6 GHz Multiple BSSID setting;
+  - how secrets are fetched: passphrases, the roaming key, the RADIUS-over-TLS certificate and the stock login are read by small shell functions, so they can come from a file or a password manager;
+  - one block per access point (hostname, address, LED colour, Wi-Fi colours), and the test client for `test/`;
+  - `U6E_PERSIST` (see [Booting](#booting)) and `BLOBS`, the location of the proprietary files below.
+- `$BLOBS`: a separate private repository with the proprietary files the build reads from it. They are not redistributable, so they are not included here:
+
+| Path under `$BLOBS/` | What it is |
 |---|---|
-| `u6e-debian` (this) | Build scripts, the NSS package patch sets, the AArch64 TrustZone shim, the RAM-boot tooling |
-| `u6e-linux` | The kernel: branch `u6e` (7.2.8 + the board, clock and NSS hook patches), `u6e-armv7` (the 32-bit build), `u6e-6.12` (the first NSS port) |
-| `u6e-backports` | Wireless backports 7.2 (OpenWrt) with the NSS mac80211/ath11k series, branch `u6e-nss` |
+| `wifi/firmware/ipq5018-WLAN.HK.2.7.0.1-01744/` | Wi-Fi firmware for the internal 2.4 GHz radio |
+| `wifi/firmware/qcn9074-WLAN.HK.2.13-01309/` | Wi-Fi firmware for the 5 GHz and 6 GHz radios |
+| `wifi/board/linux-firmware/{IPQ5018,QCN9074}/` | Board data (calibration tables) from linux-firmware |
+| `wifi/board/stock-a654/` | Board data for this model, taken from the stock firmware |
+| `bt/firmware/` | Bluetooth firmware, taken from the stock firmware |
 
-Every imported patch keeps its author; a hand-ported one carries a note on what the port changed. The lists (`patches-7.2-nss.list`, `patches-bp72.list`) replay the series onto the upstream trees with `apply-list.sh`; `patches-local/` exports the board's own kernel patches, with George Moussalem's IPQ5018 Bluetooth series (v5, from the lists; 0013-0018) ahead of our fixes for it.
+The NSS firmware is downloaded by the build and checked against a pinned checksum.
 
-## Building
-
-Inputs:
-- `linux-7.2.8/` and `backports-7.2/`: checkouts of `u6e-linux` (branch `u6e`) and `u6e-backports` (branch `u6e-nss`).
-- `site.conf`: copy `site.conf.example` and fill it in (addresses, VLANs, the stock login, the SSIDs).
-- `$BLOBS` (from `site.conf`): the proprietary inputs, laid out as below. The NSS firmware itself is downloaded by `nss/build.sh` (sha256-pinned).
-
-| `$BLOBS/` path | Source |
-|---|---|
-| `wifi/firmware/ipq5018-WLAN.HK.2.7.0.1-01744/` (`q6_fw.*`, `m3_fw.*`) | Qualcomm `quic/upstream-wifi-fw` |
-| `wifi/firmware/qcn9074-WLAN.HK.2.13-01309/` (`amss.bin`, `m3.bin`) | `qosmio/upstream-wifi-fw` `testing/2.13`; newer than linux-firmware's 2.9.0.1: its beacon protection works and its probe-response retries stay within OCE's limit |
-| `wifi/board/linux-firmware/{IPQ5018,QCN9074}/` | linux-firmware's `ath11k/<chip>/hw1.0/board-2.bin`, unpacked with `fw/ath11k-bdencoder -e` |
-| `wifi/board/stock-a654/bdwlan.{b23,ba3,ba4}` | the stock firmware's `/lib/firmware/platforms/a654/` |
-| `bt/firmware/` (`bt_fw_patch.mdt` + `.b00`-`.b02`, `mpnv10.bin`) | the stock firmware's `/lib/firmware/IPQ5018/` |
-
-Then, on an x86 host with the aarch64/armhf cross toolchains, `mmdebstrap`, `qemu-user-static` and `u-boot-tools`, `sudo ./deploy.sh [<ap>...]` builds whatever the checked-out commits need and boots it on the APs in `U6E_APS` (or those named). Each step runs only when its inputs changed since it last ran (`stamps/` records the commits each was built from); in order, they are:
+## Quick start
 
 ```sh
-fw/mk-board2.sh                    # board-2.bin with the U6-E variants -> fw/out/
-./config-u6e.sh nss                # kernel .config (also arm64 / arm without NSS)
-make -C linux-7.2.8 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image modules qcom/ipq5018-ubnt-u6-enterprise.dtb
-nss/build.sh                       # NSS drivers, the wireless stack, NSS firmware
-sudo pkg/hostapd/build.sh          # hostapd (pinned upstream main) with every feature -> pkg/hostapd/out/
-sudo pkg/iproute2-nss/build.sh     # Debian's iproute2 with the NSS qdiscs in tc -> pkg/iproute2-nss/out/
-sudo ./mkrootfs.sh arm64           # Debian rootfs -> rootfs/
-sudo ./prep-rootfs.sh nss          # per AP -> out-nss/{shim.bin,Image,u6e.dtb,u6e.initrd}
+cp site.conf.example site.conf    # then edit it
+sudo ./deploy.sh                  # build everything and boot every access point in U6E_APS
+sudo ./deploy.sh ap1 ap2          # or only the named ones
 ```
 
-`prep-rootfs.sh` packs the initrd reproducibly (fixed mtimes, the paths it rewrites last), so a rebuild changes only the tail of the image. It also keeps every image it makes under `images/<time>-<mode>-<kernel>[-<backports>]/` with a `MANIFEST` (commits, hostapd version, checksums), so an earlier build can be staged again with `go8.sh` without rebuilding.
+`deploy.sh` runs these steps in order and skips any whose inputs have not changed since the last run (it records them in `stamps/`; logs go to `log/`):
 
-Then, for each AP in turn, `deploy.sh` builds its image, boots it with `boot/stage.sh` and waits until the AP has brought all three radios up by itself. Build logs go to `log/`.
+1. `trees.sh`: prepares the kernel and Wi-Fi driver sources (see [Sources and patches](#sources-and-patches)).
+2. `fw/mk-board2.sh`: assembles the board data files for the radios.
+3. `config-u6e.sh` and `make`: configures and builds the kernel.
+4. `nss/build.sh`: builds the NSS drivers and the Wi-Fi stack, and fetches the NSS firmware.
+5. `pkg/hostapd/build.sh`: builds hostapd (the program that runs the Wi-Fi networks) as a Debian package.
+6. `pkg/iproute2-nss/build.sh`: builds Debian's `iproute2` with the NSS traffic-shaping options added to `tc`.
+7. `mkrootfs.sh`: creates the Debian root filesystem.
+8. For each access point: `prep-rootfs.sh` builds its image, `boot/stage.sh` boots it, and `deploy.sh` waits until all three radios are up.
+
+Every image is kept in `images/` with a `MANIFEST` (versions and checksums), so an earlier build can be booted again without rebuilding.
+
+## Sources and patches
+
+The kernel and the Wi-Fi drivers are stored here as a download address plus a series of patches, not as copies of the upstream code:
+
+- `kernel/`: Linux 7.2.8 (`kernel/source`) and 119 patches (`kernel/patches`) for this board and for NSS.
+- `backports/`: OpenWrt's backports of the Linux 7.2 wireless stack (`backports/source`) and 192 patches (`backports/patches`) adding NSS Wi-Fi offload and fixes.
+
+`./trees.sh` downloads each release (checked against its checksum), applies the patches as git commits and produces the working trees `linux-7.2.8/` and `backports-7.2/`. The commit IDs come out the same every time. To change something, commit in a tree and run `./export.sh kernel` (or `backports`) to turn your new commits back into patch files. `trees.sh` refuses to overwrite a tree whose work has not been exported.
+
+Patches keep their original authors. We are sending our patches to the upstream projects (the kernel and hostapd).
 
 ## Booting
 
-Ubiquiti's U-Boot is AArch32 and only `bootm`s its own signed FIT images, but `bootz` runs any armv7 zImage. `shim/` is a 208-byte zImage that makes the QSDK TrustZone call (`smc` 0x0200010F, `jump_kernel64`) which restarts the core in AArch64 EL1 at the arm64 `Image`.
+Ubiquiti's boot loader (U-Boot) is 32-bit and only starts its own signed images, but it will start any 32-bit ARM kernel. `shim/` is a tiny 32-bit program (208 bytes) that asks the chip's TrustZone (its built-in secure firmware) to restart the processor in 64-bit mode at our kernel.
 
-`boot/go8.sh shim.bin u6e.dtb u6e.initrd Image`, run against the stock firmware, stages the four payloads as files in stock's `/tmp/log` (ext4 on the eMMC, kept across reboots), rewriting only the 64 KiB chunks that changed, maps their extents with `ext4map.py`, and writes one U-Boot environment batch: a `bootcmd_real` that first disarms itself, then reads the payloads, CRC-checks each and `bootz`es the shim. Reboot stock and the AP comes up in Debian; any reboot after that returns to stock. `boot/apstate.sh` tells which system is running.
+`boot/go8.sh` does the staging while the stock firmware is running. It copies the shim, the kernel, the device tree and the initial filesystem into stock's data partition on the eMMC (changing only the parts that differ), and writes a one-shot U-Boot boot command that loads them. The next reboot starts Debian. The reboot after that returns to stock, because the command removes itself as it runs. `boot/stage.sh` does the whole cycle for one access point, from either system, and `boot/apstate.sh` tells you which system is running.
 
-What is ever written: files in `/tmp/log`, raw eMMC sectors past the last partition (5000000+) for boot traces, and on the SPI flash only the U-Boot environment partition. The device tree marks every SPI partition read-only; a persistent image's DTB lifts that for the environment alone.
+Persistent mode: with `U6E_PERSIST=1` in `site.conf`, the image re-arms the boot command once the management network is reachable (`u6e-netcheck` and `u6e-arm`), so reboots and power cuts come back into Debian. If the network never comes up, or is lost later, the boot command is removed and the access point returns to stock instead of looping. `u6e-arm disarm` does the same by hand. Each Debian boot in persistent mode writes the 64 KiB U-Boot settings area twice.
 
-### Persistent mode
+## What the access point does
 
-Each boot `go8.sh` arms is one-shot: `bootcmd_real` disarms itself before it starts the image, so any reboot lands in stock. With `U6E_PERSIST=1` in `site.conf`, `u6e-netcheck` re-arms it (`u6e-arm`) the first time the management network is reachable after a boot, so reboots and power cuts come back into Debian. A boot that never reaches the network is not re-armed, and losing the network later disarms (`u6e-arm disarm`) before the netcheck reboot, so a broken image always falls back to stock instead of looping. `u6e-arm disarm` by hand hands the next boot to stock. Each Debian boot costs two writes of the 64 KiB environment: U-Boot's disarm and the re-arm. The payloads stay where `go8.sh` staged them, in stock's `/tmp/log`, which only stock writes to.
+Wi-Fi starts by itself on every boot (`u6e-wifi.service`), with nothing else on the network needed. `boot/wifi-up.sh` generates the configuration from `site.conf`, and can install a changed one on a running access point.
 
-`U6E_AP=<ap> boot/stage.sh [<image dir>]` boots one image (default `out-nss/`, or one under `images/`) from either system: from ours it disarms the next boot and reboots into stock, then runs `go8.sh` there, reboots and waits until our image answers.
+**Networks**
+- Three kinds of SSID, each on the bands you choose: WPA3-Personal, WPA3-Enterprise, and WPA2-Personal with MAC-address authentication for old devices that can do nothing newer.
+- Enterprise logins are checked by your RADIUS server over TLS ("RadSec") spoken directly by hostapd. RADIUS can also place each client in its own VLAN.
+- Optional 6 GHz Multiple BSSID: all 6 GHz networks share one beacon.
 
-## On the AP
+**Roaming and client help**
+- Fast roaming between radios and access points (802.11r).
+- Roaming advice for clients (802.11k and 802.11v). The access points send each other lists of their networks every 10 seconds (`u6e-neighbors`), so clients are told about the others.
+- Optimized Connectivity (OCE), Agile Multiband (MBO) and Wi-Fi QoS Management, which help clients pick the best band and mark their traffic correctly.
+- Beacon protection on 5 GHz and 6 GHz, which stops forged beacons.
+- Time-of-flight ranging for indoor location, 6 GHz discovery frames, and 6 GHz announcements on the 2.4 and 5 GHz beacons so clients find 6 GHz quickly.
 
-- `u6e-nss.service` brings NSS up in the order the hardware needs: once networkd has the uplink up, VLAN'd and bridged, it arms the GMAC (`qca-dwmac-nss` hands it to the firmware), sizes the firmware's buffer pools to stock's values, loads the radios with NSS offload, every offload manager, then ECM.
-- Wi-Fi comes up on its own on every boot, with nothing else on the network involved: `u6e-wifi.service` runs `u6e-wifi`, the AP side of `boot/wifi-up.sh` that `prep-rootfs.sh` builds into the image, and restarts hostapd if it exits; `boot/wifi-up.sh` itself installs a changed configuration on a running AP and restarts the unit. It serves the site's SSIDs (`WIFI_SSIDS` in `site.conf`: name, kind, bands, default VLAN; country and channel plan also from `site.conf`), each a BSS per radio it names, extra ones on locally administered BSSIDs; with `WIFI_6_MBSSID` the 6 GHz BSSs form one Multiple BSSID set (one beacon and one FILS Discovery stream for all, every nontransmitted BSS with its own Mobility Domain element for FT), whose BSSIDs follow the 802.11 numbering clients compute. Three kinds: WPA3-Personal (SAE and SAE-EXT-KEY with FT, hash-to-element only, WPA3 transition disable); WPA3-Enterprise (802.1X with SHA-256 and FT-EAP, no periodic reauthentication); and WPA2-Personal plus RADIUS MAC authentication, without PMF, for clients that can do nothing newer (no MBO, OCE or FT there). hostapd itself talks RADIUS over TLS (RadSec, RFC 6614) to the site's RADIUS server with its client certificate; these and the passphrases are built into the image, so `u6e-wifi` and the images (`out-*`, `images/`) are root-only, and puts a client whose RADIUS reply names a VLAN into that VLAN's bridge (`WIFI_VLANS`, each bridged by the image). CCMP-128 and GCMP-256 data encryption run in hardware, BIP-CMAC-128 for management frames in software; DTIM 1 on 2.4 GHz, 3 on 5 and 6 GHz. Every BSS has 802.11d/e/h/i/k/u/v (h also off DFS channels; k: neighbor reports listing the SSID's other radios and, while they answer, the other APs' BSSs of it, which `u6e-neighbors` exchanges with them every 10 s; link measurement, BSS Load; v: BSS transition, WNM sleep, proxy ARP with the bridge doing client-to-client forwarding), multicast delivered to each client as unicast, and never an in-place pairwise rekey (the driver can't replace a client's key safely: traffic stops until the client is dropped); the WPA3 ones also 802.11r/w (FT over the air, keys pulled between radios), operating channel validation, SSID protection, MBO, OCE and Wi-Fi QoS Management DSCP policies. The radios: 6 GHz as an indoor (LPI) AP whose Transmit Power Envelope carries the site's client PSD limit, 2.4 GHz OFDM only for the WPA3 SSIDs (the WPA2 one keeps the 802.11b rates for the cheapest IoT radios), an FTM responder (802.11mc ranging), 802.11ai FILS Discovery on 6 GHz, the RFC 8325 QoS map, the full HT/VHT capabilities for Wi-Fi 4/5 clients (LDPC, STBC, short guard interval, VHT beamforming, 11454-byte MPDUs) and the 802.11ax features (beamforming, TWT, BSS colour, spatial reuse); the 2.4 and 5 GHz beacons announce the 6 GHz BSSs, as members of an ESS whose 6 GHz APs all have co-located 2.4/5 GHz ones, so clients can skip scanning 6 GHz. Beacon protection on 5 and 6 GHz, whose QCN9074 firmware (WLAN.HK.2.13) signs beacons correctly; the 2.4 GHz radio's firmware (WLAN.HK.2.7) signs them wrongly, so the driver does not offer it there.
-- Recovery: a hang warm-resets (systemd watchdog, panic on lockups and oops); with no management network after 3 minutes `u6e-netcheck` writes its diagnosis to pstore and reboots into stock, where `boot/ramoops.sh` reads it back. The kernel log also goes to the management VLAN's broadcast address (netconsole, UDP 6666). The whole journal, hostapd included, goes to the site's syslog collector (`systemd-netlogd` to `LOG_SERVER`), and `u6e-stats` adds the AP's state every 5 minutes: load, free memory, clients per BSS, temperatures and Wi-Fi firmware crashes.
-- `u6e-caldata` writes each radio's calibration from the AP's own ART partition at every boot.
-- Bluetooth: the IPQ5018's own controller (`btqcomipc`, firmware loaded through TrustZone) is `hci0` for BlueZ; `u6e-btaddr` gives it the stock firmware's address, the base MAC + 4, before `bluetoothd` starts.
-- The status light is two LEDs, `white:status` and `blue:status` in `/sys/class/leds`; the DTS lights blue at boot and `u6e-leds.service` sets them early in boot as the site's `AP_LED` says (off, blue or white).
-- hostapd is upstream main pinned to one commit (newer than 2.12: AP-side Wi-Fi QoS Management DSCP policy) from `pkg/hostapd` (Debian's packaging, every feature built in, testing options off) with fifteen patches of ours, all for upstream and each with hwsim tests where hwsim can show the behaviour: `no_pri_sec_switch` is a config option; the RNR's 20 MHz PSD carries the 6 GHz client power limit (802.11-2024 11.49); a BSS Transition Management Query is answered with a candidate list and the Neighbor Report ANQP-element is generated (Wi-Fi Agile Multiband 3.5.1); a client's Link Measurement Request is answered (802.11k); the own neighbor report carries the Mobility Domain bit; the Estimated Service Parameters element (`esp=1`); Wi-Fi Optimized Connectivity AP for drivers where hostapd answers probes (`oce=4`: probe suppression, broadcast probe responses, beacons in place of probe responses, Transmit Power and IP Subnet attributes, co-located RNR and AP Channel Report, one MBO-OCE element on RSSI rejection; OCE 3.3's retry limit of 3 for unicast probe responses holds on 2.4 GHz, where the IPQ5018 firmware makes 4 attempts, but not on 5 GHz, where the QCN9074 firmware (WLAN.HK 0x290b8862) makes 9 and neither honours `WMI_PDEV_PARAM_PROBE_RESP_RETRY_LIMIT` nor survives a per-frame `retry_limit` in the management TX parameters); BSS Transition Management Requests carry the cellular data preference only to cellular-capable clients; a zero Medium Time for downlink TSPECs (WMM); and fixes for a DSCP policy crash and FILS Request Parameters parsing.
-- Installed for the SSIDs, not yet configured: `tc` from `pkg/iproute2-nss` drives the NSS qdiscs (`nsshtb`, `nsstbl`, `nssfq_codel`, …; `accel_mode 0` shapes in the firmware), with the kernel's HTB/TBF/u32/police/skbedit/connmark modules for traffic the firmware hands back to Linux; `radsecproxy` carries hostapd's RADIUS (UDP only) over RadSec, and stays disabled until it has a configuration.
-- `fastfetch` shows the board with the UniFi logo.
+**Speed**
+- Packet forwarding, Wi-Fi offload and encryption run on the NSS processor.
+- Multicast is sent to each client as unicast, and the access point answers ARP for its clients so broadcasts stay off the air.
+- The usual Wi-Fi 4/5/6 speed features are enabled: beamforming, TWT and spatial reuse among them.
+
+**Running it day to day**
+- The whole system log goes to your syslog collector (the access point keeps logs only in RAM), the kernel log goes out over the network, and `u6e-stats` adds load, memory, clients per network, temperatures and Wi-Fi firmware crashes every 5 minutes.
+- A hang triggers a reset by the watchdog (a hardware timer), and crash information survives the reset so it can be read back from stock.
+- Each radio's own calibration is loaded at boot, the Bluetooth controller works with the stock firmware's address, and the status LED can be set to off, blue or white.
+- `tc` can shape traffic on the NSS processor.
+
+## Repository layout
+
+| Path | Contents |
+|---|---|
+| `deploy.sh` | Builds and boots everything, step by step |
+| `trees.sh`, `export.sh` | Create the source trees from the patch series, and export commits back to patches |
+| `kernel/`, `backports/` | Upstream release address and our patches |
+| `config-u6e.sh` | Kernel configuration |
+| `nss/` | Builds the NSS drivers, the Wi-Fi stack and the NSS firmware download, with the patches for each |
+| `fw/` | Builds the board data files; includes `ath11k-bdencoder` |
+| `pkg/hostapd/` | hostapd build with our 19 patches |
+| `pkg/iproute2-nss/` | `iproute2` with NSS support in `tc` |
+| `mkrootfs.sh` | Creates the Debian root filesystem |
+| `prep-rootfs.sh` | Adds the kernel, firmware and configuration, and produces one image per access point |
+| `u6e-caldata` | Script that writes each radio's calibration at boot |
+| `shim/` | The 32-bit to 64-bit boot shim |
+| `boot/` | Staging and booting scripts, the Wi-Fi configuration generator (`wifi-up.sh`) and recovery tools |
+| `test/` | Wi-Fi test tools |
+| `site.conf.example` | Template for your site settings |
 
 ## Testing
 
-`test/` checks the APs on air from a test client (`TEST_CLIENT` in `site.conf`: an SSH target whose Wi-Fi card sits in its own network namespace):
+`test/` checks the access points on the air, using a test client with a Wi-Fi card (set `TEST_CLIENT` in `site.conf`):
 
-- `test/join.sh "<SSID>" [<BSSID>]` joins one of the site's SSIDs as its kind requires, with beacon protection enforced where PMF is on, gets an address, pings the gateway and reports the association; `KEYS=1` also prints the BIGTK.
-- `test/sniff.sh <MHz> <width> [<center MHz>] <seconds> <out.pcap>` captures with the client's card in monitor mode.
-- `test/bip-verify.py <pcap> <BSSID> <BIGTK>` checks every beacon's BIP-CMAC-128 MIC as IEEE Std 802.11-2024 12.5.3 defines it.
-- `U6E_AP=<ap> test/oce-retry.sh <interface> [<count>]` measures how often a radio sends an unacknowledged probe response and action frame (`mgmtsend.c` on the AP, the firmware's over-the-air attempt counter).
+- `test/join.sh "<SSID>" [<BSSID>]` joins a network the way its kind requires, gets an address, pings the gateway and reports the association.
+- `test/sniff.sh <MHz> <width> [<center MHz>] <seconds> <out.pcap>` captures radio traffic.
+- `test/bip-verify.py <pcap> <BSSID> <key>` checks the beacon protection signature of every beacon in a capture.
+- `U6E_AP=<ap> test/oce-retry.sh <interface> [<count>]` counts how many times a radio retries unanswered management frames (`mgmtsend.c` is its helper).
 
 ## Licence
 
-The scripts are GPL-2.0-only; patches keep their authors' licences. `fw/ath11k-bdencoder` is qca-swiss-army-knife's (ISC).
+The scripts are GPL-2.0-only (see `LICENSE`); patches keep their authors' licences. `fw/ath11k-bdencoder` is qca-swiss-army-knife's (ISC).
