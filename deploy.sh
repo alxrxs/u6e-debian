@@ -2,14 +2,16 @@
 # Build whatever the checked-out commits need and boot it on the APs. Run as
 # root:
 #   ./deploy.sh [<ap>...]      (default: every AP in U6E_APS)
+#   FORCE=1 ./deploy.sh ...    (boot a new image even where nothing changed)
 # First the source trees (trees.sh: the kernel and backports releases with our
 # patch series). Then each step runs only when its inputs changed since it
 # last ran (stamps/ records them): the board files ($BLOBS), the kernel
 # (kernel/ and config-u6e.sh), the NSS drivers and wireless stack (backports/,
 # nss/ and the kernel), the hostapd and iproute2 packages (their versions) and
-# the rootfs (those packages and mkrootfs.sh). Then each AP in turn gets its
-# image (prep-rootfs.sh, kept under images/), boots it (boot/stage.sh) and must
-# bring its radios up by itself. Sources and trees are built as the checkout's
+# the rootfs (those packages and mkrootfs.sh). Then each AP whose running image
+# was built from other inputs (stamps/ap-<ap>) gets a new one (prep-rootfs.sh,
+# kept under images/), boots it (boot/stage.sh) and must bring its radios up by
+# itself. Sources and trees are built as the checkout's
 # owner, the packages and images as root. Logs go to log/.
 set -uo pipefail
 cd "$(dirname "$0")" || exit 1
@@ -52,8 +54,15 @@ if [ $# = 0 ]; then
 	read -ra aps <<<"$U6E_APS"
 	set -- "${aps[@]}"
 fi
+# Everything an AP's image is built from: this tree, the blobs, the site and
+# the two source trees.
+image=$(head_of .)/$(head_of "$BLOBS")/$(sha256sum < site.conf | cut -c1-16)/$(head_of linux-7.2.8)/$(head_of backports-7.2)
 for ap in "$@"; do
 	export U6E_AP=$ap
+	if [ "${FORCE:-0}" != 1 ] && [ "$(cat "stamps/ap-$ap" 2>/dev/null)" = "$image" ]; then
+		echo "$ap: already runs this image"
+		continue
+	fi
 	./prep-rootfs.sh > "$L/prep-$ap.log" 2>&1 || fail "$ap: image build failed, see $L/prep-$ap.log"
 	grep "^kept as" "$L/prep-$ap.log"
 	boot/stage.sh || fail "$ap: did not boot the image"
@@ -65,5 +74,6 @@ for ap in "$@"; do
 		sleep 10
 	done
 	[ "$up" = 3 ] || fail "$ap: Wi-Fi did not come up"
+	echo "$image" > "stamps/ap-$ap"
 	echo "$ap: Wi-Fi up on all three radios"
 done
