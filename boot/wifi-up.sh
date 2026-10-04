@@ -199,8 +199,10 @@ ht() { # <band lines> <capabilities>: append them to the site's ht_capab
 }
 
 # Each radio's own lines and its BSS extras (DTIM as on the UniFi controller).
-# 2.4 GHz is OFDM only, so beacons and management frames go at 6 Mbit/s rather
-# than 1 (Wi-Fi Optimized Connectivity wants at least 5.5). rnr: 2.4 and 5 GHz
+# On 2.4 GHz the WPA3 BSSs are OFDM only, so their beacons and management
+# frames go at 6 Mbit/s rather than 1 (Wi-Fi Optimized Connectivity wants at
+# least 5.5); psk-mab keeps the 802.11b rates for the cheapest IoT radios.
+# hostapd takes rates per BSS. rnr: 2.4 and 5 GHz
 # beacons announce the 6 GHz BSSs (Reduced Neighbor Report), which is how most
 # clients find 6 GHz at all; hostapd only reports a 6 GHz BSS it runs in the
 # same process. FILS Discovery (802.11ai) every 20 ms between beacons speeds
@@ -208,15 +210,17 @@ ht() { # <band lines> <capabilities>: append them to the site's ht_capab
 read -r COLOR_24 COLOR_5 COLOR_6 <<<"$WIFI_COLORS"
 radio_lines() { # <band>
 	case $1 in
-	24) printf '%s\nhe_bss_color=%s\nsupported_rates=60 90 120 180 240 360 480 540\nbasic_rates=60 120 240\n' \
-		"$(ht "$WIFI_24" "$HT_CAPS")" "$COLOR_24" ;;
+	24) printf '%s\nhe_bss_color=%s\n' "$(ht "$WIFI_24" "$HT_CAPS")" "$COLOR_24" ;;
 	5) printf '%s\nvht_capab=%s\nhe_bss_color=%s\n' "$(ht "$WIFI_5" "${HT_CAPS}[MAX-AMSDU-7935]")" "$VHT_CAPS_5" "$COLOR_5" ;;
 	6) printf '%s\nhe_bss_color=%s\n' "$WIFI_6" "$COLOR_6" ;;
 	esac
 }
-bss_extra() { # <band>
+bss_extra() { # <band> <kind>
 	case $1 in
-	24) printf 'rnr=1\ndtim_period=1\n' ;;
+	24)
+		printf 'rnr=1\ndtim_period=1\n'
+		[ "$2" = psk-mab ] ||
+			printf 'supported_rates=60 90 120 180 240 360 480 540\nbasic_rates=60 120 240\n' ;;
 	5) printf 'rnr=1\ndtim_period=3\n' ;;
 	6) printf 'fils_discovery_max_interval=20\ndtim_period=3\n' ;;
 	esac
@@ -243,7 +247,7 @@ radio_conf() { # <band>
 			printf 'bss=%s\nbssid=@LA%s@\n' $iface $n
 		fi
 		printf '%s\n%s\n%s\nnas_identifier=%s-%s\n' "$bss" "$(kind "$name" $kind $vlan $iface)" \
-			"$(bss_extra $1)" "$AP" $iface
+			"$(bss_extra $1 $kind)" "$AP" $iface
 		group[$i]="${group[$i]:-} $iface"
 		n=$((n + 1))
 	done
