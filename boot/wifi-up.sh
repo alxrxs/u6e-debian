@@ -30,10 +30,9 @@ he_twt_responder=1
 he_spr_sr_control=5
 he_spr_non_srg_obss_pd_max_offset=10
 wpa=2
-rsn_pairwise=CCMP
+rsn_pairwise=CCMP GCMP-256
 sae_password=$PSK
 group_mgmt_cipher=AES-128-CMAC
-beacon_prot=1
 mobility_domain=$MDID
 r0kh=ff:ff:ff:ff:ff:ff * $FTKEY
 r1kh=00:00:00:00:00:00 00:00:00:00:00:00 $FTKEY
@@ -78,7 +77,11 @@ qos_map_set=8,1,18,3,20,3,22,3,24,4,26,4,28,4,30,4,32,4,34,4,36,4,38,4,40,5,44,6
 # esp: Estimated Service Parameters, so clients can estimate their throughput.
 # WPA3 on every band: 6 GHz admits nothing else, and clients (iOS) only treat
 # the 6 GHz BSS as the same network when 2.4/5 GHz offer the same security.
-sae="wpa_key_mgmt=SAE FT-SAE
+# SAE-EXT-KEY (AKMs 24/25, WPA3 3.5) with GCMP-256 and SAE groups 20/21 next
+# to SAE/CCMP: clients that support it use it, the rest keep SAE; group
+# traffic stays CCMP-128 and BIP-CMAC-128, which every client supports.
+sae="wpa_key_mgmt=SAE SAE-EXT-KEY FT-SAE FT-SAE-EXT-KEY
+sae_groups=19 20 21
 ieee80211w=2
 sae_pwe=1"
 
