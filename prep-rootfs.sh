@@ -53,8 +53,8 @@ printf '[Match]\nPath=platform-c000000.wifi\n\n[Link]\nName=wlan24\n' > $N/30-wl
 printf '[Match]\nPath=*-pci-0000:01:00.0\nType=wlan\n\n[Link]\nName=wlan5\n' > $N/30-wlan5.link
 printf '[Match]\nPath=*-pci-0001:01:00.0\nType=wlan\n\n[Link]\nName=wlan6\n' > $N/30-wlan6.link
 printf '[NetDev]\nName=%s\nKind=vlan\n\n[VLAN]\nId=%s\n' $MGMT_IF $MGMT_VLAN > $N/20-$MGMT_IF.netdev
-printf '[Match]\nName=%s\n\n[Network]\nAddress=%s\nGateway=%s\nDNS=%s\nDomains=%s\n' \
-	$MGMT_IF "$MGMT_ADDR" "$MGMT_GW" "$MGMT_DNS" "$MGMT_DOMAIN" > $N/20-$MGMT_IF.network
+printf '[Match]\nName=%s\n\n[Network]\nAddress=%s\nGateway=%s\nDNS=%s\nDomains=%s\nNTP=%s\n' \
+	$MGMT_IF "$MGMT_ADDR" "$MGMT_GW" "$MGMT_DNS" "$MGMT_DOMAIN" "$MGMT_NTP" > $N/20-$MGMT_IF.network
 W=$RF/etc/systemd/system/multi-user.target.wants
 for u in systemd-networkd systemd-resolved; do ln -sf /usr/lib/systemd/system/$u.service $W/$u.service; done
 

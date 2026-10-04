@@ -30,7 +30,7 @@ if [ "$1" = arm64 ]; then
 fi
 mmdebstrap --variant=minbase --architectures="$1" --components=main,non-free-firmware "${localdeb[@]}" \
 	--include=systemd-sysv,udev,kmod,procps,iproute2,iputils-ping,less,vim-tiny,tzdata,ca-certificates \
-	--include=openssh-server,systemd-resolved,ethtool,pciutils,mmc-utils,mtd-utils,nftables,tcpdump,iperf3 \
+	--include=openssh-server,systemd-resolved,systemd-timesyncd,ethtool,pciutils,mmc-utils,mtd-utils,nftables,tcpdump,iperf3 \
 	--include=iw,hostapd,wireless-regdb,firmware-atheros,qrtr-tools,libubootenv-tool,radsecproxy,fastfetch,bluez \
 	--customize-hook='chroot "$1" systemctl disable radsecproxy hostapd' \
 	trixie "$dir" http://deb.debian.org/debian

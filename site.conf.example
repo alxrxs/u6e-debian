@@ -10,6 +10,8 @@ MGMT_ADDR=192.0.2.16/24
 MGMT_GW=192.0.2.1
 MGMT_DNS=192.0.2.53
 MGMT_DOMAIN=example.net
+# NTP server(s); the AP has no real-time clock.
+MGMT_NTP=192.0.2.123
 # Wi-Fi clients: a VLAN bridged, unaddressed, into br<vid>; hostapd adds the
 # radios to it.
 CLIENT_VLAN=42
@@ -68,3 +70,7 @@ he_oper_centr_freq_seg0_idx=47
 he_6ghz_reg_pwr_type=0
 reg_def_cli_eirp_psd=4
 reg_sub_cli_eirp_psd=4"
+
+# Optional: power-cycle the AP (here via a Home Assistant smart plug on its PoE
+# injector); boot scripts can use it to recover a wedged AP.
+# ap_power_cycle() { ...; }
