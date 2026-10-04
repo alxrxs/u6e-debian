@@ -42,6 +42,15 @@ wifi_ssid() { echo u6e-test; }
 wifi_psk() { cat ~/.config/u6e/wifi-psk; }
 # 802.11r key the radios hand roaming keys over with (64 hex digits).
 wifi_ft_key() { cat ~/.config/u6e/wifi-ft-key; }
+# Optional enterprise SSID: WPA3-Enterprise over RadSec (RADIUS over TLS,
+# RFC 6614). The RADIUS server's name, its CA and this AP's client certificate
+# and (encrypted) key. Leave wifi_ent_ssid out to run without it.
+# wifi_ent_ssid() { echo u6e-test-ent; }
+# WIFI_RADSEC_SERVER=radius.example.org
+# radsec_ca() { cat ~/.config/u6e/radsec-ca.pem; }
+# radsec_cert() { cat ~/.config/u6e/radsec-client.pem; }
+# radsec_key() { cat ~/.config/u6e/radsec-client.key; }
+# radsec_key_pass() { cat ~/.config/u6e/radsec-client-key-pass; }
 WIFI_24="hw_mode=g
 channel=13"
 # no_pri_sec_switch: keep primary 149; hostapd's 20/40 coexistence scan would

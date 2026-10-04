@@ -1,26 +1,24 @@
 #!/bin/bash
-# Start the test SSID on all three radios of the AP running our image, bridged
-# into the client VLAN's bridge. The passphrase comes from the site's
-# wifi_psk (site.conf) and only ever lands in /run on the AP.
+# Start the test SSIDs on all three radios of the AP running our image, bridged
+# into the client VLAN's bridge: WPA3-Personal, and, when the site defines
+# wifi_ent_ssid, a WPA3-Enterprise SSID that authenticates over RadSec (RADIUS
+# over TLS, RFC 6614). Passphrases, keys and certificates come from the site's
+# functions (site.conf) and only ever land in /run on the AP.
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 SSID=$(wifi_ssid) PSK=$(wifi_psk) FTKEY=$(wifi_ft_key)
-# 802.11r: every AP serving the SSID derives the same mobility domain from it.
-MDID=$(printf %s "$SSID" | md5sum | cut -c1-4)
+# 802.11r: every AP serving an SSID derives the same mobility domain from it.
+mdid() { printf %s "$1" | md5sum | cut -c1-4; }
 # OCE IP Subnet Identifier: the same for every AP that serves this SSID on the
 # client VLAN, without revealing the subnet
 SUBNET_ID=$(printf '%s/%s' "$SSID" "$CLIENT_VLAN" | md5sum | cut -c1-12)
 
-common="ctrl_interface=/run/hostapd
-bridge=br$CLIENT_VLAN
-ssid=$SSID
-country_code=$WIFI_COUNTRY
+# Per radio.
+radio="country_code=$WIFI_COUNTRY
 ieee80211d=1
 ieee80211h=1
 local_pwr_constraint=0
 spectrum_mgmt_required=1
-wmm_enabled=1
-uapsd_advertisement_enabled=1
 ieee80211n=1
 ieee80211ax=1
 he_su_beamformer=1
@@ -28,16 +26,18 @@ he_su_beamformee=1
 he_mu_beamformer=1
 he_twt_responder=1
 he_spr_sr_control=5
-he_spr_non_srg_obss_pd_max_offset=10
+he_spr_non_srg_obss_pd_max_offset=10"
+# Per BSS, the same for every SSID.
+bss="ctrl_interface=/run/hostapd
+bridge=br$CLIENT_VLAN
+wmm_enabled=1
+uapsd_advertisement_enabled=1
 wpa=2
 rsn_pairwise=CCMP GCMP-256
-sae_password=$PSK
 group_mgmt_cipher=AES-128-CMAC
-mobility_domain=$MDID
 r0kh=ff:ff:ff:ff:ff:ff * $FTKEY
 r1kh=00:00:00:00:00:00 00:00:00:00:00:00 $FTKEY
 ft_over_ds=0
-transition_disable=0x01
 ocv=1
 ssid_protection=1
 stationary_ap=1
@@ -91,10 +91,46 @@ qos_map_set=8,1,18,3,20,3,22,3,24,4,26,4,28,4,30,4,32,4,34,4,36,4,38,4,40,5,44,6
 # SAE-EXT-KEY (AKMs 24/25, WPA3 3.5) with GCMP-256 and SAE groups 20/21 next
 # to SAE/CCMP: clients that support it use it, the rest keep SAE; group
 # traffic stays CCMP-128 and BIP-CMAC-128, which every client supports.
-sae="wpa_key_mgmt=SAE SAE-EXT-KEY FT-SAE FT-SAE-EXT-KEY
+sae="ssid=$SSID
+sae_password=$PSK
+mobility_domain=$(mdid "$SSID")
+transition_disable=0x01
+wpa_key_mgmt=SAE SAE-EXT-KEY FT-SAE FT-SAE-EXT-KEY
 sae_groups=19 20 21
 ieee80211w=2
 sae_pwe=1"
+
+# WPA3-Enterprise Only Mode (WPA3 3.5 3.2): 802.1X with SHA-256 plus FT,
+# never SHA-1; PMF required. hostapd speaks RADIUS/TLS itself, mutually
+# authenticated with the site's RadSec client certificate; hostapd takes only
+# addresses, so the server's name is resolved here.
+ent=
+if declare -F wifi_ent_ssid >/dev/null; then
+	ENT_SSID=$(wifi_ent_ssid)
+	RADSEC=$(getent ahostsv4 "$WIFI_RADSEC_SERVER" | awk 'NR == 1 {print $1}')
+	[ -n "$RADSEC" ] || { echo "$WIFI_RADSEC_SERVER: no IPv4 address" >&2; exit 1; }
+	RADSEC_PASS=$(radsec_key_pass)
+	tls=
+	for s in auth acct; do
+		tls="$tls
+${s}_server_addr=$RADSEC
+${s}_server_port=2083
+${s}_server_type=TLS
+${s}_server_shared_secret=radsec
+${s}_server_ca_cert=/run/hostapd-u6e/radsec/ca.pem
+${s}_server_client_cert=/run/hostapd-u6e/radsec/client.pem
+${s}_server_private_key=/run/hostapd-u6e/radsec/client.key
+${s}_server_private_key_passwd=$RADSEC_PASS"
+	done
+	ent="ssid=$ENT_SSID
+mobility_domain=$(mdid "$ENT_SSID")
+transition_disable=0x04
+wpa_key_mgmt=WPA-EAP-SHA256 FT-EAP
+ieee80211w=2
+ieee8021x=1
+own_ip_addr=$AP
+radius_request_cui=1$tls"
+fi
 
 # The radios' HT/VHT capabilities (iw phy): hostapd advertises only what is
 # listed, and without them Wi-Fi 4/5 clients get no LDPC, STBC, short guard
@@ -109,14 +145,29 @@ ht() { # <band lines> <capabilities>: append them to the site's ht_capab
 	fi
 }
 
-conf() { # <iface> <band lines>
+conf() { # <iface> <radio lines> <BSS lines>
 	echo "cat > /run/hostapd-u6e/$1.conf <<'EOF'"
-	printf 'interface=%s\n%s\n%s\n' "$1" "$common" "$2"
+	printf 'interface=%s\n%s\n%s\n%s\n%s\n%s\nnas_identifier=%s-%s\n' \
+		"$1" "$radio" "$2" "$bss" "$sae" "$3" "$AP" "$1"
+	# The enterprise SSID: a second BSS on a locally administered address
+	# derived from the radio's (set on the AP).
+	[ -z "$ent" ] || printf 'bss=%s-ent\nbssid=@LA@\n%s\n%s\n%s\nnas_identifier=%s-%s-ent\n' \
+		"$1" "$bss" "$ent" "$3" "$AP" "$1"
 	echo "EOF"
 }
 
 {
 	echo "mkdir -p /run/hostapd-u6e && chmod 700 /run/hostapd-u6e"
+	if [ -n "$ent" ]; then
+		echo "mkdir -p /run/hostapd-u6e/radsec"
+		for f in ca:radsec_ca client:radsec_cert client.key:radsec_key; do
+			n=${f%%:*}; [ "$n" = client.key ] || n=$n.pem
+			echo "cat > /run/hostapd-u6e/radsec/$n <<'EOF'"
+			"${f#*:}"
+			echo "EOF"
+		done
+		echo "chmod 600 /run/hostapd-u6e/radsec/*"
+	fi
 	# The radios regulate themselves (firmware default: US); move them to the
 	# site's country before hostapd reads its channel list. ath11k only passes a
 	# country to a radio's firmware once that radio is started, i.e. has an
@@ -131,26 +182,21 @@ iw reg get | grep -E '^(phy|country)' | paste - - | sed 's/^/reg: /'"
 	# beacons and management frames go at 6 Mbit/s rather than 1 (Wi-Fi Optimized
 	# Connectivity wants at least 5.5).
 	conf wlan24 "$(ht "$WIFI_24" "$HT_CAPS")
-$sae
-nas_identifier=${AP}-wlan24
 he_bss_color=11
 supported_rates=60 90 120 180 240 360 480 540
-basic_rates=60 120 240
-rnr=1"
+basic_rates=60 120 240" "rnr=1"
 	conf wlan5 "$(ht "$WIFI_5" "${HT_CAPS}[MAX-AMSDU-7935]")
 vht_capab=$VHT_CAPS_5
-$sae
-nas_identifier=${AP}-wlan5
-he_bss_color=22
-rnr=1"
+he_bss_color=22" "rnr=1"
 	# FILS Discovery (802.11ai) every 20 ms between beacons speeds up 6 GHz
 	# scans.
 	conf wlan6 "$WIFI_6
-$sae
-nas_identifier=${AP}-wlan6
-he_bss_color=33
-fils_discovery_max_interval=20"
-	echo "chmod 600 /run/hostapd-u6e/*.conf"
+he_bss_color=33" "fils_discovery_max_interval=20"
+	echo 'for i in wlan24 wlan5 wlan6; do
+	set -- $(sed "s/:/ /g" /sys/class/net/$i/address)
+	sed -i "s/^bssid=@LA@$/bssid=$(printf %02x $((0x$1 | 2))):$2:$3:$4:$5:$6/" /run/hostapd-u6e/$i.conf
+done
+chmod 600 /run/hostapd-u6e/*.conf' 
 	# A rerun stops the previous instance and waits until its BSSs are gone from
 	# the radios, which outlast the process: a radio that still has one refuses
 	# the new beacon.
@@ -158,7 +204,7 @@ fils_discovery_max_interval=20"
 	# terminate imminently (BSS Termination TSF 0, back in about a minute).
 	echo 'old=$(cat /run/hostapd-u6e/hostapd.pid 2>/dev/null)
 if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
-	for i in wlan24 wlan5 wlan6; do
+	for i in $(ls /run/hostapd); do
 		for sta in $(hostapd_cli -p /run/hostapd -i $i list_sta 2>/dev/null); do
 			hostapd_cli -p /run/hostapd -i $i bss_tm_req $sta bss_term=0,1 mbo=0:0 >/dev/null
 		done
@@ -195,6 +241,6 @@ for i in wlan24 wlan5 wlan6; do
 	done
 done
 for i in wlan24 wlan5 wlan6; do
-	echo "== $i: $(hostapd_cli -p /run/hostapd -i $i status 2>/dev/null | grep -E "^(state|freq|channel|num_sta\[0\]|ssid\[0\])=" | tr "\n" " ")"
+	echo "== $i: $(hostapd_cli -p /run/hostapd -i $i status 2>/dev/null | grep -E "^(state|freq|channel|ssid\[[0-9]\]|num_sta\[[0-9]\])=" | tr "\n" " ")"
 done'
 } | T=120 ap_root sh
