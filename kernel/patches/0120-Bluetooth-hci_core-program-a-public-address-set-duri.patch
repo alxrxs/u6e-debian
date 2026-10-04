@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Mon, 5 Oct 2026 00:23:59 +0300
+Subject: [PATCH] Bluetooth: hci_core: program a public address set during auto
+ off
+
+When a controller with a set_bdaddr callback registers configured, it is
+powered on, mgmt adds its index, and HCI_AUTO_OFF powers it off two
+seconds later unless something powers it. Within that window mgmt counts
+it as not powered, so Set Public Address is accepted: it sets HCI_CONFIG
+and HCI_AUTO_OFF, removes the index and queues power_on. hci_power_on()
+then finds the device up with HCI_AUTO_OFF set and takes the "already
+up" path: it never opens the device again, so set_bdaddr() is never
+called, and HCI_CONFIG is never cleared, so the index is never added
+back. The controller stays up, invisible to mgmt, with its old address.
+
+Close the device first when HCI_CONFIG is set, keeping HCI_AUTO_OFF, so
+the open procedure programs the address and the configured index is
+added as after any configuration change.
+
+Seen on the IPQ5018 Bluetooth controller of a UniFi U6 Enterprise, whose
+NVM carries a placeholder address: setting the board's address with
+btmgmt right after boot left hci0 up with no mgmt index (bluetoothd saw
+no controller); with this change the address is programmed and the
+index comes back.
+
+Assisted-by: LLM
+Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
+---
+ net/bluetooth/hci_core.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/net/bluetooth/hci_core.c b/net/bluetooth/hci_core.c
+index 3ea5ea726..f37f10936 100644
+--- a/net/bluetooth/hci_core.c
++++ b/net/bluetooth/hci_core.c
+@@ -908,6 +908,16 @@ static void hci_power_on(struct work_struct *work)
+ 
+ 	BT_DBG("%s", hdev->name);
+ 
++	/* A public address set while the controller was still up from its
++	 * initial power on, which mgmt counts as off until the auto off, is
++	 * only programmed by the open procedure: close it to open it again.
++	 */
++	if (test_bit(HCI_UP, &hdev->flags) &&
++	    hci_dev_test_flag(hdev, HCI_CONFIG)) {
++		hci_dev_do_close(hdev);
++		hci_dev_set_flag(hdev, HCI_AUTO_OFF);
++	}
++
+ 	if (test_bit(HCI_UP, &hdev->flags) &&
+ 	    hci_dev_test_flag(hdev, HCI_MGMT) &&
+ 	    hci_dev_test_and_clear_flag(hdev, HCI_AUTO_OFF)) {
