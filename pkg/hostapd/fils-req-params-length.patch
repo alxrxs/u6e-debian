@@ -1,4 +1,4 @@
-From d9c0474c35541c9360e72415ea3fda4cb42b783b Mon Sep 17 00:00:00 2001
+From 3a80b38c5ba1ac5c9c1d49079d5025bab67d4562 Mon Sep 17 00:00:00 2001
 From: Andrei-Alexandru Bleortu <me@andrei-z.com>
 Date: Sun, 4 Oct 2026 03:13:10 +0300
 Subject: [PATCH] Accept FILS Request Parameters elements with only the
@@ -10,6 +10,7 @@ Element ID Extension, Parameter Control Bitmap and Max Channel Time
 octets, so it dropped the element as wpa_supplicant and other STAs send
 it when no optional field is present.
 
+Assisted-by: LLM
 Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
 ---
  src/common/ieee802_11_common.c | 3 ++-

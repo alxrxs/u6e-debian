@@ -1,4 +1,4 @@
-From 982bec640afe858d6dd7b1f190a8097ff73997a0 Mon Sep 17 00:00:00 2001
+From 9d4730c7a573d3ab647e1638d11668876f7055c1 Mon Sep 17 00:00:00 2001
 From: Andrei-Alexandru Bleortu <me@andrei-z.com>
 Date: Sun, 4 Oct 2026 03:15:08 +0300
 Subject: [PATCH] OCE: Probe Request frame handling of an OCE AP
@@ -23,6 +23,7 @@ Also define the remaining OCE attribute IDs and update the OCE Control
 field bits to Wi-Fi Optimized Connectivity v2.0, where bit 4 indicates
 an 11b-only AP and bit 6 a non-OCE AP.
 
+Assisted-by: LLM
 Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
 ---
  src/ap/beacon.c              | 83 +++++++++++++++++++++++++++++++--

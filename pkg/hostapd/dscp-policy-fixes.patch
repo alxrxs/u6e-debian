@@ -1,4 +1,4 @@
-From c942cefbfe21e425fe1ecce4f4778358ec40d66b Mon Sep 17 00:00:00 2001
+From f7e8908867a758541792d0dfe6b9050d5e62ae5e Mon Sep 17 00:00:00 2001
 From: Andrei-Alexandru Bleortu <me@andrei-z.com>
 Date: Sat, 3 Oct 2026 22:23:21 +0300
 Subject: [PATCH] DSCP: Fix policy invalidation and empty unsolicited requests
@@ -16,10 +16,12 @@ longer than that, so a request with neither Reset nor any QoS Management
 element went out. Wi-Fi QoS Management 3.4.3 requires at least one
 element when Reset is not set; compare against the header length.
 
+Assisted-by: LLM
 Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
 ---
- src/ap/robust_av.c | 17 +++++++++++------
- 1 file changed, 11 insertions(+), 6 deletions(-)
+ src/ap/robust_av.c          | 17 +++++++++++------
+ tests/hwsim/test_ap_dscp.py | 33 +++++++++++++++++++++++++++++++++
+ 2 files changed, 44 insertions(+), 6 deletions(-)
 
 diff --git a/src/ap/robust_av.c b/src/ap/robust_av.c
 index 775b8b8b7..3aa4ab099 100644
@@ -70,6 +72,54 @@ index 775b8b8b7..3aa4ab099 100644
  			break;
  		}
  	}
+diff --git a/tests/hwsim/test_ap_dscp.py b/tests/hwsim/test_ap_dscp.py
+index 56aaa1174..1dcd5f5dd 100644
+--- a/tests/hwsim/test_ap_dscp.py
++++ b/tests/hwsim/test_ap_dscp.py
+@@ -5,6 +5,7 @@
+ # See README for more details.
+ 
+ import hostapd
++import time
+ from utils import *
+ 
+ 
+@@ -237,3 +238,35 @@ def test_ap_dscp_add_send_remove_send(dev, apdev):
+     expect_dscp_event_contains(dev[0], "add policy_id=2 dscp=34")
+     expect_dscp_event_contains(dev[0], "add policy_id=4 dscp=50")
+     expect_dscp_event_contains(dev[0], "request_end")
++
++def test_ap_dscp_rejected_policy_then_query(dev, apdev):
++    """AP DSCP: STA rejects a policy, then sends a wildcard query"""
++
++    hapd = ap_client_connect(dev, apdev, enable_dscp=True)
++    sta = dev[0].own_addr()
++
++    set_ap_dscp_policy(hapd, sta,
++                       "policy_id=1 request_type=Add dscp=46 "
++                       "classifier_mask=0x51 ip_version=4 "
++                       "dst_port=5002 protocol=17")
++    set_ap_dscp_policy(hapd, sta,
++                       "policy_id=2 request_type=Add dscp=34 "
++                       "domain_name=video.wifitest.org")
++    send_unsolicited_dscp_req(hapd, sta, 0, [1, 2])
++    expect_dscp_event_contains(dev[0], "request_start")
++    expect_dscp_event_contains(dev[0], "add policy_id=1")
++    expect_dscp_event_contains(dev[0], "add policy_id=2")
++    expect_dscp_event_contains(dev[0], "request_end")
++
++    if "OK" not in dev[0].request("DSCP_RESP policy_id=1 status=1 policy_id=2 status=0"):
++        raise Exception("DSCP_RESP failed")
++    time.sleep(0.1)
++
++    # The rejected policy is gone; the query gets the other one
++    if "OK" not in dev[0].request("DSCP_QUERY wildcard"):
++        raise Exception("DSCP_QUERY failed")
++    expect_dscp_event_contains(dev[0], "request_start")
++    expect_dscp_event_contains(dev[0], "add policy_id=2")
++    expect_dscp_event_contains(dev[0], "request_end")
++    if "PONG" not in hapd.request("PING"):
++        raise Exception("hostapd did not survive the query")
 -- 
 2.47.3
 

@@ -1,4 +1,4 @@
-From 7355ad987df7435529126483ab658b9a7be3d452 Mon Sep 17 00:00:00 2001
+From 7aabd3031f2f615244367334be24bd260cbae86f Mon Sep 17 00:00:00 2001
 From: Andrei-Alexandru Bleortu <me@andrei-z.com>
 Date: Sat, 3 Oct 2026 21:53:11 +0300
 Subject: [PATCH] AP: Set the RNR 20 MHz PSD subfield for co-located 6 GHz APs
@@ -18,10 +18,12 @@ regulatory client EIRP, if any, spread over 20 MHz. The configured or
 default Default category PSD now comes from one helper shared with the
 Transmit Power Envelope element.
 
+Assisted-by: LLM
 Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
 ---
- src/ap/ieee802_11.c | 68 +++++++++++++++++++++++++++++++++++++++------
- 1 file changed, 59 insertions(+), 9 deletions(-)
+ src/ap/ieee802_11.c    | 68 ++++++++++++++++++++++++++++++++++++------
+ tests/hwsim/test_he.py | 49 ++++++++++++++++++++++++++++++
+ 2 files changed, 108 insertions(+), 9 deletions(-)
 
 diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
 index 219a94b0f..8243cfaac 100644
@@ -123,6 +125,63 @@ index 219a94b0f..8243cfaac 100644
  
  #ifdef CONFIG_IEEE80211BE
  	/* Include the MLD parameters only when TBTT length is for ML RNR */
+diff --git a/tests/hwsim/test_he.py b/tests/hwsim/test_he.py
+index 1b1ed664d..d624de693 100644
+--- a/tests/hwsim/test_he.py
++++ b/tests/hwsim/test_he.py
+@@ -2138,3 +2138,52 @@ def test_he_6ghz_incumbt_sig_intf_sec40(dev, apdev):
+                                           expectation)
+     he_6ghz_incumbt_sig_intf_bw_reduction(dev, apdev, params, '0xC',
+                                           expectation)
++
++def test_he_6ghz_rnr_psd(dev, apdev):
++    """RNR 20 MHz PSD for a co-located 6 GHz AP"""
++    check_sae_capab(dev[0])
++    hapd = None
++    hapd6 = None
++    try:
++        params = {"ssid": "rnr", "country_code": "DE", "hw_mode": "g",
++                  "channel": "1", "ieee80211ax": "1", "wpa": "2",
++                  "rsn_pairwise": "CCMP", "wpa_key_mgmt": "SAE",
++                  "sae_pwe": "1", "sae_password": "password",
++                  "ieee80211w": "2", "rnr": "1",
++                  "he_6ghz_reg_pwr_type": "0",
++                  "reg_def_cli_eirp_psd": "4", "reg_sub_cli_eirp_psd": "2"}
++        hapd = hostapd.add_ap(apdev[0], params)
++        params6 = dict(params)
++        del params6["hw_mode"]
++        params6.update({"op_class": "131", "channel": "5"})
++        hapd6 = hostapd.add_ap(apdev[1], params6, set_channel=False)
++        bssid6 = hapd6.own_addr()
++
++        dev[0].scan_for_bss(hapd.own_addr(), freq="2412", force_scan=True)
++        ie = bytes.fromhex(dev[0].get_bss(hapd.own_addr())['ie'])
++        tbtts = []
++        while len(ie) >= 2:
++            eid, data = ie[0], ie[2:2 + ie[1]]
++            ie = ie[2 + ie[1]:]
++            if eid != 201:
++                continue
++            while len(data) >= 4:
++                count = (data[0] >> 4) + 1
++                tlen = data[1]
++                info = data[4:]
++                for k in range(count):
++                    tbtt = info[k * tlen:(k + 1) * tlen]
++                    if len(tbtt) >= 13:
++                        tbtts.append((tbtt[1:7].hex(':'), tbtt[12]))
++                data = info[count * tlen:]
++        logger.info("RNR entries: " + str(tbtts))
++        # The lowest regulatory client limit: the subordinate one, 1 dBm/MHz
++        if (bssid6, 2) not in tbtts:
++            raise Exception("Unexpected RNR entries: " + str(tbtts))
++    except Exception as e:
++        if isinstance(e, Exception) and str(e) == "AP startup failed":
++            if not he_supported():
++                raise HwsimSkip("HE 6 GHz channel not supported in regulatory information")
++        raise
++    finally:
++        clear_regdom(hapd, dev)
 -- 
 2.47.3
 

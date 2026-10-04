@@ -1,4 +1,4 @@
-From 5947a37938fb03130e9ed787992cadc331a4d9fe Mon Sep 17 00:00:00 2001
+From 64d535ff397829a3c033595ad9139d3381b4df27 Mon Sep 17 00:00:00 2001
 From: Andrei-Alexandru Bleortu <me@andrei-z.com>
 Date: Sat, 3 Oct 2026 20:43:31 +0300
 Subject: [PATCH] hostapd: Allow the primary/secondary channel switch to be
@@ -16,12 +16,14 @@ it skips the whole scan, which IEEE Std 802.11-2024, 11.15.3.2 otherwise
 requires. Since the scan is what records the secondary channel to return
 to after a 20/40 MHz coexistence fallback, record it when skipping too.
 
+Assisted-by: LLM
 Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
 ---
- hostapd/config_file.c |  2 ++
- hostapd/hostapd.conf  | 10 ++++++++++
- src/ap/hw_features.c  |  7 ++++++-
- 3 files changed, 18 insertions(+), 1 deletion(-)
+ hostapd/config_file.c     |  2 ++
+ hostapd/hostapd.conf      | 10 ++++++++++
+ src/ap/hw_features.c      |  7 ++++++-
+ tests/hwsim/test_ap_ht.py | 36 ++++++++++++++++++++++++++++++++++++
+ 4 files changed, 54 insertions(+), 1 deletion(-)
 
 diff --git a/hostapd/config_file.c b/hostapd/config_file.c
 index 59827966e..d5ab87403 100644
@@ -76,6 +78,53 @@ index 9fe84f70a..8555fe754 100644
  
  	hostapd_set_state(iface, HAPD_IFACE_HT_SCAN);
  	wpa_printf(MSG_DEBUG, "Scan for neighboring BSSes prior to enabling "
+diff --git a/tests/hwsim/test_ap_ht.py b/tests/hwsim/test_ap_ht.py
+index 516b09e2e..f00bacdf7 100644
+--- a/tests/hwsim/test_ap_ht.py
++++ b/tests/hwsim/test_ap_ht.py
+@@ -490,6 +490,42 @@ def test_ap_ht40_5ghz_switch(dev, apdev):
+             hapd2.request("DISABLE")
+         set_world_reg(apdev[0], apdev[1], dev[0])
+ 
++def test_ap_ht40_5ghz_no_pri_sec_switch(dev, apdev):
++    """HT40 on 5 GHz keeps the configured channels with no_pri_sec_switch"""
++    clear_scan_cache(apdev[0])
++    try:
++        hapd = None
++        hapd2 = None
++        params = {"ssid": "test-ht40",
++                  "hw_mode": "a",
++                  "channel": "36",
++                  "country_code": "US",
++                  "ht_capab": "[HT40+]"}
++        hapd2 = hostapd.add_ap(apdev[1], params)
++
++        # Without the option, the scan switches this to primary 36
++        params = {"ssid": "test-ht40",
++                  "hw_mode": "a",
++                  "channel": "40",
++                  "ht_capab": "[HT40-]",
++                  "no_pri_sec_switch": "1"}
++        hapd = hostapd.add_ap(apdev[0], params)
++
++        pri = hapd.get_status_field("channel")
++        if pri != "40":
++            raise Exception("Unexpected primary channel: " + pri)
++        sec = hapd.get_status_field("secondary_channel")
++        if sec != "-1":
++            raise Exception("Unexpected secondary channel: " + sec)
++        dev[0].connect("test-ht40", key_mgmt="NONE", scan_freq="5200")
++    finally:
++        dev[0].request("DISCONNECT")
++        if hapd:
++            hapd.request("DISABLE")
++        if hapd2:
++            hapd2.request("DISABLE")
++        set_world_reg(apdev[0], apdev[1], dev[0])
++
+ def test_ap_ht40_5ghz_switch2(dev, apdev):
+     """HT40 co-ex scan on 5 GHz switching pri/sec channel (2)"""
+     clear_scan_cache(apdev[0])
 -- 
 2.47.3
 
