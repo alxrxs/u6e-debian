@@ -46,6 +46,9 @@ rrm_neighbor_report=1
 rrm_link_measurement_report=1
 bss_transition=1
 wnm_sleep_mode=1
+proxy_arp=1
+na_mcast_to_ucast=1
+ap_isolate=1
 bss_load_update_period=50
 esp=1
 mbo=1
@@ -75,6 +78,10 @@ qos_map_set=8,1,18,3,20,3,22,3,24,4,26,4,28,4,30,4,32,4,34,4,36,4,38,4,40,5,44,6
 # clients can range to the AP for indoor location.
 # oce=4: Wi-Fi Optimized Connectivity AP (hostapd answers the probes here);
 # esp: Estimated Service Parameters, so clients can estimate their throughput.
+# proxy_arp (802.11v): the bridge answers ARP and IPv6 neighbor solicitations
+# for the clients, so broadcast ARP stays off the air; it hairpins client to
+# client traffic, so ap_isolate leaves that forwarding to the bridge alone
+# (otherwise multicast goes out twice).
 # WPA3 on every band: 6 GHz admits nothing else, and clients (iOS) only treat
 # the 6 GHz BSS as the same network when 2.4/5 GHz offer the same security.
 # SAE-EXT-KEY (AKMs 24/25, WPA3 3.5) with GCMP-256 and SAE groups 20/21 next
