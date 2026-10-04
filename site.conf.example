@@ -61,9 +61,11 @@ channel=13"
 # Transmit power per radio (2.4, 5, 6 GHz) in dBm.
 WIFI_TXPOWER="22 26 26"
 
-# Per AP: U6E_AP (default ap1) picks one for every script. AP_LED: the status
-# LED, off, blue or white. WIFI_COLORS: each radio's HE BSS colour (2.4, 5, 6
-# GHz), different from any AP in range on the same channel.
+# Per AP: U6E_AP (default ap1) picks one for every script; U6E_APS lists them
+# all (wifi-up.sh gives each AP's neighbor reports the others' BSSs). AP_LED:
+# the status LED, off, blue or white. WIFI_COLORS: each radio's HE BSS colour
+# (2.4, 5, 6 GHz), different from any AP in range on the same channel.
+U6E_APS="ap1"
 case ${U6E_AP:-ap1} in
 ap1)
 	AP_HOSTNAME=u6e-ap1
