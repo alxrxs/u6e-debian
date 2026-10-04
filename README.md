@@ -71,6 +71,15 @@ Each boot `go8.sh` arms is one-shot: `bootcmd_real` disarms itself before it sta
 - Installed for the SSIDs, not yet configured: `tc` from `pkg/iproute2-nss` drives the NSS qdiscs (`nsshtb`, `nsstbl`, `nssfq_codel`, …; `accel_mode 0` shapes in the firmware), with the kernel's HTB/TBF/u32/police/skbedit/connmark modules for traffic the firmware hands back to Linux; `radsecproxy` carries hostapd's RADIUS (UDP only) over RadSec, and stays disabled until it has a configuration.
 - `fastfetch` shows the board with the UniFi logo.
 
+## Testing
+
+`test/` checks the APs on air from a test client (`TEST_CLIENT` in `site.conf`: an SSH target whose Wi-Fi card sits in its own network namespace):
+
+- `test/join.sh "<SSID>" [<BSSID>]` joins one of the site's SSIDs as its kind requires, with beacon protection enforced where PMF is on, gets an address, pings the gateway and reports the association; `KEYS=1` also prints the BIGTK.
+- `test/sniff.sh <MHz> <width> [<center MHz>] <seconds> <out.pcap>` captures with the client's card in monitor mode.
+- `test/bip-verify.py <pcap> <BSSID> <BIGTK>` checks every beacon's BIP-CMAC-128 MIC as IEEE Std 802.11-2024 12.5.3 defines it.
+- `U6E_AP=<ap> test/oce-retry.sh <interface> [<count>]` measures how often a radio sends an unacknowledged probe response and action frame (`mgmtsend.c` on the AP, the firmware's over-the-air attempt counter).
+
 ## Licence
 
 The scripts are GPL-2.0-only; patches keep their authors' licences. `fw/ath11k-bdencoder` is qca-swiss-army-knife's (ISC).

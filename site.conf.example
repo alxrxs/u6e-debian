@@ -56,6 +56,13 @@ radsec_ca() { cat ~/.config/u6e/radsec-ca.pem; }
 radsec_cert() { cat ~/.config/u6e/radsec-client.pem; }
 radsec_key() { cat ~/.config/u6e/radsec-client.key; }
 radsec_key_pass() { cat ~/.config/u6e/radsec-client-key-pass; }
+# test/: a client with a Wi-Fi card (SSH target, its network namespace and
+# interface, its wpa_supplicant, 2.11 or newer), a RADIUS account to join the
+# ent SSIDs with (identity and password, one per line) and the EAP server's CA.
+TEST_CLIENT=user@192.0.2.50 TEST_NETNS=wifi TEST_IFACE=wlan0
+TEST_SUPPLICANT=/usr/sbin/wpa_supplicant
+wifi_test_eap() { cat ~/.config/u6e/test-eap; }
+wifi_eap_ca() { cat ~/.config/u6e/eap-ca.pem; }
 WIFI_24="hw_mode=g
 channel=13"
 # Transmit power per radio (2.4, 5, 6 GHz) in dBm.
