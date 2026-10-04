@@ -19,13 +19,12 @@ Neighbor Report and the Reduced Neighbor Report elements of co-located
 Assisted-by: LLM
 Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
 ---
- hostapd/config_file.c  |  2 ++
- hostapd/hostapd.conf   | 13 +++++++++
- src/ap/ap_config.h     |  3 ++
- src/ap/ieee802_11.c    |  4 +++
- src/ap/neighbor_db.c   |  3 ++
- tests/hwsim/test_he.py | 62 ++++++++++++++++++++++++++++++++++++++++++
- 6 files changed, 87 insertions(+)
+ hostapd/config_file.c |  2 ++
+ hostapd/hostapd.conf  | 13 +++++++++++++
+ src/ap/ap_config.h    |  3 +++
+ src/ap/ieee802_11.c   |  4 ++++
+ src/ap/neighbor_db.c  |  3 +++
+ 5 files changed, 25 insertions(+)
 
 diff --git a/hostapd/config_file.c b/hostapd/config_file.c
 index 59827966e..98aa7a9c0 100644
@@ -107,3 +106,6 @@ index fd4f881df..d20347257 100644
  	width = hostapd_get_nr_chan_width(hapd, ht, vht, he, oper_chwidth,
  					  secondary_channel);
  
+-- 
+2.47.3
+

@@ -1,0 +1,117 @@
+From b2014d5cb72fa1f07d13671ed6a3ad08fe036831 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Sun, 4 Oct 2026 19:13:40 +0300
+Subject: [PATCH] AP: Mobility Domain element in a nontransmitted BSSID profile
+
+A nontransmitted BSSID profile carried RSN, RSNX and Extended
+Capabilities of its own but no Mobility Domain element, so a
+nontransmitted BSS with FT inherited the transmitted BSS's: with two
+mobility domains (one per SSID) an FT client of the nontransmitted BSS
+associated with the wrong MDID and was rejected, and one without FT was
+shown the transmitted BSS's. IEEE Std 802.11-2024, 11.1.3.8.4, requires
+the profile to include every element specific to the nontransmitted
+BSS.
+
+Include the nontransmitted BSS's Mobility Domain element when it differs
+from the transmitted BSS's, and list the element in the Non-Inheritance
+element when only the transmitted BSS has one.
+
+Assisted-by: LLM
+Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
+---
+ src/ap/ieee802_11.c | 37 ++++++++++++++++++++++++++++++++++---
+ 1 file changed, 34 insertions(+), 3 deletions(-)
+
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index 219a94b0f..0d414148d 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -11167,6 +11167,21 @@ static size_t hostapd_mbssid_ext_capa(struct hostapd_data *bss,
+ }
+ 
+ 
++/* The Mobility Domain element of a nontransmitted BSS, when it differs from
++ * the transmitted BSS's, so that an FT client gets the right MDID. */
++static const u8 * hostapd_mbssid_mde(struct hostapd_data *bss,
++				     struct hostapd_data *tx_bss)
++{
++	const u8 *mde = hostapd_wpa_ie(bss, WLAN_EID_MOBILITY_DOMAIN);
++	const u8 *tx_mde = hostapd_wpa_ie(tx_bss, WLAN_EID_MOBILITY_DOMAIN);
++
++	if (!mde || (tx_mde && mde[1] == tx_mde[1] &&
++		     os_memcmp(mde + 2, tx_mde + 2, mde[1]) == 0))
++		return NULL;
++	return mde;
++}
++
++
+ static size_t hostapd_eid_mbssid_elem_len(struct hostapd_data *hapd,
+ 					  u32 frame_type, size_t *bss_index,
+ 					  const u8 *known_bss,
+@@ -11191,7 +11206,7 @@ static size_t hostapd_eid_mbssid_elem_len(struct hostapd_data *hapd,
+ 
+ 	for (i = *bss_index; i < hapd->iface->num_bss; i++) {
+ 		struct hostapd_data *bss = hapd->iface->bss[i];
+-		const u8 *auth, *rsn = NULL, *rsnx = NULL;
++		const u8 *auth, *rsn = NULL, *rsnx = NULL, *mde;
+ 		size_t nontx_profile_len, auth_len, xrate_len;
+ 		u8 ie_count = 0;
+ 
+@@ -11223,6 +11238,10 @@ static size_t hostapd_eid_mbssid_elem_len(struct hostapd_data *hapd,
+ 				nontx_profile_len += 2 + rsnx[1];
+ 		}
+ 
++		mde = hostapd_mbssid_mde(bss, tx_bss);
++		if (mde)
++			nontx_profile_len += 2 + mde[1];
++
+ 		nontx_profile_len += hostapd_mbssid_ext_capa(bss, tx_bss,
+ 							     ext_capa);
+ 
+@@ -11230,6 +11249,9 @@ static size_t hostapd_eid_mbssid_elem_len(struct hostapd_data *hapd,
+ 			ie_count++;
+ 		if (!rsnx && hostapd_wpa_ie(tx_bss, WLAN_EID_RSNX))
+ 			ie_count++;
++		if (!hostapd_wpa_ie(bss, WLAN_EID_MOBILITY_DOMAIN) &&
++		    hostapd_wpa_ie(tx_bss, WLAN_EID_MOBILITY_DOMAIN))
++			ie_count++;
+ 
+ 		xrate_len = hostapd_eid_ext_supp_rates(bss, buf) - buf;
+ 
+@@ -11353,8 +11375,8 @@ static u8 * hostapd_eid_mbssid_elem(struct hostapd_data *hapd, u8 *eid, u8 *end,
+ 		struct hostapd_bss_config *conf;
+ 		struct hostapd_bss_config *tx_conf = tx_bss->conf;
+ 		u8 *eid_len_pos, *nontx_bss_start = eid;
+-		const u8 *auth, *rsn = NULL, *rsnx = NULL;
+-		u8 ie_count = 0, non_inherit_ie[3];
++		const u8 *auth, *rsn = NULL, *rsnx = NULL, *mde;
++		u8 ie_count = 0, non_inherit_ie[4];
+ 		size_t auth_len = 0, xrate_len;
+ 		u16 capab_info;
+ 		u8 mbssindex = i;
+@@ -11412,6 +11434,12 @@ static u8 * hostapd_eid_mbssid_elem(struct hostapd_data *hapd, u8 *eid, u8 *end,
+ 				eid += 2 + rsn[1];
+ 			}
+ 
++			mde = hostapd_mbssid_mde(bss, tx_bss);
++			if (mde) {
++				os_memcpy(eid, mde, 2 + mde[1]);
++				eid += 2 + mde[1];
++			}
++
+ 			rsnx = get_ie(auth, auth_len, WLAN_EID_RSNX);
+ 			if (rsnx) {
+ 				os_memcpy(eid, rsnx, 2 + rsnx[1]);
+@@ -11428,6 +11456,9 @@ static u8 * hostapd_eid_mbssid_elem(struct hostapd_data *hapd, u8 *eid, u8 *end,
+ 			non_inherit_ie[ie_count++] = WLAN_EID_RSN;
+ 		if (tx_xrate_len && !xrate_len)
+ 			non_inherit_ie[ie_count++] = WLAN_EID_EXT_SUPP_RATES;
++		if (!hostapd_wpa_ie(bss, WLAN_EID_MOBILITY_DOMAIN) &&
++		    hostapd_wpa_ie(tx_bss, WLAN_EID_MOBILITY_DOMAIN))
++			non_inherit_ie[ie_count++] = WLAN_EID_MOBILITY_DOMAIN;
+ 		if (!rsnx && hostapd_wpa_ie(tx_bss, WLAN_EID_RSNX))
+ 			non_inherit_ie[ie_count++] = WLAN_EID_RSNX;
+ #ifdef CONFIG_IEEE80211BE
+-- 
+2.47.3
+

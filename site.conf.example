@@ -60,6 +60,9 @@ WIFI_24="hw_mode=g
 channel=13"
 # Transmit power per radio (2.4, 5, 6 GHz) in dBm.
 WIFI_TXPOWER="22 26 26"
+# 6 GHz BSSs as one Multiple BSSID set (one beacon for all; every 6 GHz
+# client parses it): 1 or 0.
+WIFI_6_MBSSID=1
 
 # Per AP: U6E_AP (default ap1) picks one for every script; U6E_APS lists them
 # all (wifi-up.sh gives each AP's neighbor reports the others' BSSs). AP_LED:

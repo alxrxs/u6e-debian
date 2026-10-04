@@ -218,17 +218,22 @@ radio_lines() { # <band>
 	case $1 in
 	24) printf '%s\nhe_bss_color=%s\n' "$(ht "$WIFI_24" "$HT_CAPS")" "$COLOR_24" ;;
 	5) printf '%s\nvht_capab=%s\nhe_bss_color=%s\n' "$(ht "$WIFI_5" "${HT_CAPS}[MAX-AMSDU-7935]")" "$VHT_CAPS_5" "$COLOR_5" ;;
-	6) printf '%s\nhe_bss_color=%s\n' "$WIFI_6" "$COLOR_6" ;;
+	6) printf '%s\nhe_bss_color=%s\n' "$WIFI_6" "$COLOR_6"
+	   [ "${WIFI_6_MBSSID:-0}" = 0 ] || echo mbssid=1 ;;
 	esac
 }
-bss_extra() { # <band> <kind>
+bss_extra() { # <band> <kind> <BSS number on the radio>
 	case $1 in
 	24)
 		printf 'rnr=1\ndtim_period=1\n'
 		[ "$2" = psk-mab ] ||
 			printf 'supported_rates=60 90 120 180 240 360 480 540\nbasic_rates=60 120 240\n' ;;
 	5) printf 'rnr=1\ndtim_period=3\n' ;;
-	6) printf 'fils_discovery_max_interval=20\ndtim_period=3\nmember_of_colocated_6ghz_ess=1\n' ;;
+	6)
+		printf 'dtim_period=3\nmember_of_colocated_6ghz_ess=1\n'
+		# In a Multiple BSSID set only the transmitted BSS sends FILS Discovery.
+		[ "${WIFI_6_MBSSID:-0}" = 0 ] || [ "$3" = 0 ] &&
+			echo fils_discovery_max_interval=20 ;;
 	esac
 }
 
@@ -250,10 +255,15 @@ radio_conf() { # <band>
 			printf 'interface=%s\n%s\n%s\n' $iface "$radio" "$(radio_lines $1)"
 		else
 			iface=wlan$1-$n
-			printf 'bss=%s\nbssid=@LA%s@\n' $iface $n
+			printf 'bss=%s\n' $iface
+		fi
+		if [ "$1:${WIFI_6_MBSSID:-0}" = 6:1 ]; then
+			echo "bssid=@MB$n@"
+		elif [ $n != 0 ]; then
+			echo "bssid=@LA$n@"
 		fi
 		printf '%s\n%s\n%s\nnas_identifier=%s-%s\n' "$bss" "$(kind "$name" $kind $vlan $iface)" \
-			"$(bss_extra $1 $kind)" "$AP" $iface
+			"$(bss_extra $1 $kind $n)" "$AP" $iface
 		group[$i]="${group[$i]:-} $iface"
 		n=$((n + 1))
 	done
@@ -290,7 +300,11 @@ for _ in \$(seq 20); do [ \"\$(iw reg get | grep -c '^country $WIFI_COUNTRY')\" 
 iw reg get | grep -E '^(phy|country)' | paste - - | sed 's/^/reg: /'"
 	for b in 24 5 6; do radio_conf $b; done
 	# The BSSIDs: the radio's address with the locally administered bit set and
-	# the BSS's number in its fifth octet. The VLAN files: a RADIUS-assigned
+	# the BSS's number in its fifth octet; with WIFI_6_MBSSID, the 6 GHz BSSs
+	# form a Multiple BSSID set, whose BSSID n is the transmitted one's plus n
+	# in its low bits (802.11 9.4.2.44), so they take the radio's address with
+	# the locally administered bit, the fifth octet XOR 3 (clear of the others)
+	# and those low bits cleared, plus n. The VLAN files: a RADIUS-assigned
 	# client's interface goes into that VLAN's bridge.
 	echo "WIFI_VLANS='$WIFI_VLANS'"
 	echo 'for b in 24 5 6; do
@@ -299,6 +313,17 @@ iw reg get | grep -E '^(phy|country)' | paste - - | sed 's/^/reg: /'"
 	for n in $(sed -n "s/^bssid=@LA\([0-9]*\)@$/\1/p" $c); do
 		sed -i "s/^bssid=@LA$n@$/bssid=$(printf %02x:%s:%s:%s:%02x:%s $((0x$1 | 2)) $2 $3 $4 $((0x$5 ^ n)) $6)/" $c
 	done
+	k=0
+	while [ $((1 << k)) -lt "$(grep -c "^bssid=@MB" $c)" ]; do k=$((k + 1)); done
+	for n in $(sed -n "s/^bssid=@MB\([0-9]*\)@$/\1/p" $c); do
+		sed -i "s/^bssid=@MB$n@$/bssid=$(printf %02x:%s:%s:%s:%02x:%02x $((0x$1 | 2)) $2 $3 $4 $((0x$5 ^ 3)) $(((0x$6 & ~((1 << k) - 1)) + n)))/" $c
+	done
+	# hostapd takes the transmitted BSS'"'"'s address from the interface.
+	if [ $k -gt 0 ]; then
+		ip link set wlan$b down
+		ip link set wlan$b address "$(sed -n "s/^bssid=//p" $c | head -1)"
+		ip link set wlan$b up
+	fi
 	for v in $(sed -n "s#^vlan_file=/run/hostapd-u6e/\(.*\)\.vlan\$#\1#p" $c); do
 		for id in $WIFI_VLANS; do echo "$id $v.$id br$id"; done > /run/hostapd-u6e/$v.vlan
 	done
