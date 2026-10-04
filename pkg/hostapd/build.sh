@@ -7,7 +7,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 REV=5b156e272a0266ca6be0f394192bad42b0ff176c  # hostap main, 2026-10-01
-UP=2.13~git20261001 DEBVER=2.11-2 VER=2:2.13~git20261001-0+u6e3
+UP=2.13~git20261001 DEBVER=2.11-2 VER=2:2.13~git20261001-0+u6e5
 [ ! -e work ] || { echo "work exists; remove it first" >&2; exit 1; }
 mkdir work; mkdir -p out
 git clone -q https://w1.fi/hostap.git work/src
@@ -22,18 +22,22 @@ sed -i '/^Bump-DEFAULT_BSS_MAX_COUNT-to-1000.patch$/d; /^CVE-2024-5290-lib_engin
 	/^upstream-fixes\/0001-nl80211-add-extra-ies-only-if-allowed-by-driver.patch$/d;
 	/^0014-sae_pk_gen-needs-random_get_bytes-wpa_key_mgmt_txt-w.patch$/d;
 	/^systemd-add-reload-support.patch$/d; /^wpa_service_netdev.patch$/d' $D/patches/series
-# Ours, for upstream: refresh co-located beacons once an interface is set up,
-# so the 2.4/5 GHz RNR carries the 6 GHz BSSID; make no_pri_sec_switch a
-# config option, so a planned primary channel stays put; set the RNR 20 MHz
-# PSD from the 6 GHz client limit; answer a BSS TM Query with the candidate
-# list (Agile Multiband); answer Link Measurement Requests (802.11k); fix a
-# DSCP policy crash; set the Mobility Domain bit in the own neighbor report.
-for p in rnr-refresh-colocated-beacons.patch no-pri-sec-switch-option.patch \
-	rnr-6ghz-psd.patch btm-query-candidates.patch \
-	rrm-link-measurement-responder.patch dscp-policy-fixes.patch \
-	nr-mobility-domain.patch; do
-	cp $p $D/patches/
-	echo $p >> $D/patches/series
+# Ours, for upstream (each patch's message says what and why): co-located
+# beacon refresh, no_pri_sec_switch, RNR 6 GHz PSD, BSS TM Query candidates,
+# Link Measurement responder, DSCP policy fixes, the Mobility Domain bit, the
+# ESP element, the Neighbor Report ANQP-element, FILS Request Parameters
+# parsing, and OCE AP: probe handling, Transmit Power and IP Subnet attributes,
+# co-located RNR and AP Channel Report, and a single MBO-OCE element on RSSI
+# rejection; the BTM cellular preference only for cellular STAs; and a zero
+# Medium Time for downlink TSPECs.
+for p in rnr-refresh-colocated-beacons no-pri-sec-switch-option rnr-6ghz-psd \
+	btm-query-candidates rrm-link-measurement-responder dscp-policy-fixes \
+	nr-mobility-domain esp-element anqp-neighbor-report fils-req-params-length \
+	oce-ap-probe-handling oce-tx-power-ip-subnet \
+	oce-colocated-rnr-ap-channel-report oce-rssi-reject-single-ie \
+	mbo-cell-pref-optional wmm-downlink-medium-time; do
+	cp $p.patch $D/patches/
+	echo $p.patch >> $D/patches/series
 done
 cat hostapd.config >> $D/config/hostapd/linux
 # nodoc installs no examples, which this rule's glob assumes.

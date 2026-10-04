@@ -1,0 +1,518 @@
+From 1304a58fe734234808599024d5b337fca6dd2c29 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Sun, 4 Oct 2026 03:04:25 +0300
+Subject: [PATCH] AP: Generate the Neighbor Report ANQP-element
+
+Wi-Fi Agile Multiband 3.5.1.1 and 4.3.3 require an AP that receives an
+ANQP request for the Neighbor Report ANQP-element to answer with the
+BSSs it considers candidates, its own BSS included, each with a BSS
+Transition Candidate Preference subelement, the most preferred at 255.
+hostapd could only return a static anqp_elem=272 value, which cannot
+follow the neighbor report database.
+
+Move the candidate list built for BSS Transition Management Query
+responses to neighbor_db.c and, unless anqp_elem=272 is configured,
+answer the Neighbor Report ANQP-element from it when the neighbor
+report database has the own BSS (rrm_neighbor_report=1). With no STA
+associated, the preferences come from the database alone. The element
+is also listed in the ANQP Capability List then.
+
+Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
+---
+ src/ap/gas_serv.c       |  49 +++++++++++++-
+ src/ap/neighbor_db.c    | 140 ++++++++++++++++++++++++++++++++++++++++
+ src/ap/neighbor_db.h    |   3 +
+ src/ap/wnm_ap.c         | 139 +--------------------------------------
+ tests/hwsim/test_mbo.py |  47 ++++++++++++++
+ 5 files changed, 240 insertions(+), 138 deletions(-)
+
+diff --git a/src/ap/gas_serv.c b/src/ap/gas_serv.c
+index 9c2c7fe2f..061849261 100644
+--- a/src/ap/gas_serv.c
++++ b/src/ap/gas_serv.c
+@@ -19,6 +19,7 @@
+ #include "dpp_hostapd.h"
+ #include "sta_info.h"
+ #include "gas_serv.h"
++#include "neighbor_db.h"
+ 
+ 
+ static void gas_serv_peer_timeout(void *eloop_ctx, void *timeout_ctx);
+@@ -288,6 +289,17 @@ static int anqp_add_override(struct hostapd_data *hapd, struct wpabuf **buf,
+ }
+ 
+ 
++/* The Neighbor Report ANQP-element from the neighbor report database, unless
++ * configured with anqp_elem */
++static bool anqp_local_neighbor_report(struct hostapd_data *hapd)
++{
++	return !get_anqp_elem(hapd, ANQP_NEIGHBOR_REPORT) &&
++		(hapd->conf->radio_measurements[0] &
++		 WLAN_RRM_CAPS_NEIGHBOR_REPORT) &&
++		!dl_list_empty(&hapd->nr_db);
++}
++
++
+ static void anqp_add_capab_list(struct hostapd_data *hapd,
+ 				struct wpabuf **_buf)
+ {
+@@ -334,7 +346,8 @@ static void anqp_add_capab_list(struct hostapd_data *hapd,
+ 		wpabuf_put_le16(buf, ANQP_TDLS_CAPABILITY);
+ 	if (get_anqp_elem(hapd, ANQP_EMERGENCY_NAI))
+ 		wpabuf_put_le16(buf, ANQP_EMERGENCY_NAI);
+-	if (get_anqp_elem(hapd, ANQP_NEIGHBOR_REPORT))
++	if (get_anqp_elem(hapd, ANQP_NEIGHBOR_REPORT) ||
++	    anqp_local_neighbor_report(hapd))
+ 		wpabuf_put_le16(buf, ANQP_NEIGHBOR_REPORT);
+ #ifdef CONFIG_FILS
+ 	if (!dl_list_empty(&hapd->conf->fils_realms) ||
+@@ -401,6 +414,26 @@ static void anqp_add_venue_name(struct hostapd_data *hapd, struct wpabuf **buf)
+ }
+ 
+ 
++static void anqp_add_neighbor_report(struct hostapd_data *hapd,
++				     struct wpabuf **buf)
++{
++	u8 nr[1400];
++	size_t nr_len;
++	u8 *len;
++
++	/* The candidates with preferences, the own BSS included (Wi-Fi Agile
++	 * Multiband 3.5.1.1, 4.3.3); no STA is associated yet */
++	nr_len = hostapd_neighbor_candidates(hapd, NULL, nr, sizeof(nr));
++	if (!nr_len)
++		return;
++	if (wpabuf_resize(buf, 4 + nr_len) < 0)
++		return;
++	len = gas_anqp_add_element(*buf, ANQP_NEIGHBOR_REPORT);
++	wpabuf_put_data(*buf, nr, nr_len);
++	gas_anqp_set_element_len(*buf, len);
++}
++
++
+ static void anqp_add_venue_url(struct hostapd_data *hapd, struct wpabuf **buf)
+ {
+ 	if (anqp_add_override(hapd, buf, ANQP_VENUE_URL))
+@@ -1114,6 +1147,16 @@ gas_serv_build_gas_resp_payload(struct hostapd_data *hapd,
+ 			continue;
+ 		}
+ #endif /* CONFIG_FILS */
++		if (extra_req[i] == ANQP_NEIGHBOR_REPORT &&
++		    anqp_local_neighbor_report(hapd)) {
++			anqp_add_neighbor_report(hapd, &buf);
++			if (wpabuf_len(buf) > max_len) {
++				wpa_printf(MSG_INFO,
++					   "ANQP: ANQP-element would go beyond maximum GAS response length - skip");
++				buf->used = prev_len;
++			}
++			continue;
++		}
+ 		if (extra_req[i] == ANQP_VENUE_URL) {
+ 			anqp_add_venue_url(hapd, &buf);
+ 			if (wpabuf_len(buf) > max_len) {
+@@ -1307,6 +1350,10 @@ static void rx_anqp_query_list_id(struct hostapd_data *hapd, u16 info_id,
+ 		if (info_id == ANQP_VENUE_URL && hapd->conf->venue_url) {
+ 			wpa_printf(MSG_DEBUG,
+ 				   "ANQP: Venue URL (local)");
++		} else if (info_id == ANQP_NEIGHBOR_REPORT &&
++			   anqp_local_neighbor_report(hapd)) {
++			wpa_printf(MSG_DEBUG,
++				   "ANQP: Neighbor Report (local)");
+ 		} else if (!get_anqp_elem(hapd, info_id)) {
+ 			wpa_printf(MSG_DEBUG, "ANQP: Unsupported Info Id %u",
+ 				   info_id);
+diff --git a/src/ap/neighbor_db.c b/src/ap/neighbor_db.c
+index 93203c5d2..ce29c1f04 100644
+--- a/src/ap/neighbor_db.c
++++ b/src/ap/neighbor_db.c
+@@ -11,8 +11,10 @@
+ 
+ #include "utils/common.h"
+ #include "utils/crc32.h"
++#include "common/ieee802_11_common.h"
+ #include "hostapd.h"
+ #include "ieee802_11.h"
++#include "sta_info.h"
+ #include "neighbor_db.h"
+ 
+ 
+@@ -374,3 +376,141 @@ int hostapd_neighbor_sync_own_report(struct hostapd_data *hapd)
+ 
+ 	return 0;
+ }
++
++
++/*
++ * Preference for a candidate before normalization: 0 excludes it, -1 skips it.
++ * The STA's operating classes and, with MBO, its non-preferred channel
++ * reports (Wi-Fi Agile Multiband 3.2) decide.
++ */
++static int neighbor_cand_pref(struct hostapd_data *hapd, struct sta_info *sta,
++			      const u8 *nr)
++{
++	u8 op_class = nr[10], chan = nr[11];
++#ifdef CONFIG_MBO
++	struct mbo_non_pref_chan_info *info;
++#endif /* CONFIG_MBO */
++
++	/* Neighbor Report elements in the list use global operating classes */
++	if (!get_oper_class(NULL, op_class))
++		return -1;
++
++	if (sta && sta->supp_op_classes) {
++		const u8 *pos = &sta->supp_op_classes[1];
++		const u8 *end = pos + sta->supp_op_classes[0];
++
++		/* Current Operating Class and the Operating Classes list, up
++		 * to the first delimiter */
++		while (pos < end && *pos != 130 && *pos != 0 &&
++		       *pos != op_class)
++			pos++;
++		if (pos == end || *pos != op_class)
++			return -1;
++	}
++
++#ifdef CONFIG_MBO
++	for (info = sta ? sta->non_pref_chan : NULL; info; info = info->next) {
++		unsigned int i;
++
++		if (info->op_class != op_class)
++			continue;
++		for (i = 0; i < info->num_channels; i++) {
++			if (info->channels[i] == chan)
++				return info->pref == 0 ? 0 : 254;
++		}
++	}
++#endif /* CONFIG_MBO */
++
++	return 255;
++}
++
++
++/*
++ * Candidate BSSs for a STA to transition to, as Neighbor Report elements: for
++ * a BSS Transition Management Request that answers a query (IEEE Std
++ * 802.11-2024, 11.21.7.3; Wi-Fi Agile Multiband 3.5.1.2) or for the Neighbor
++ * Report ANQP-element (Wi-Fi Agile Multiband 3.5.1.1, 4.3.3), sta then being
++ * NULL. Every BSS of this ESS in the neighbor report database, the own BSS
++ * included, gets an element with a BSS Transition Candidate Preference
++ * subelement. A preference configured in the database is used, else one from
++ * neighbor_cand_pref(); the values are then renumbered so that the most
++ * preferred is 255 and each lower level is one less, 0 staying 0. Without the
++ * own BSS in the database (rrm_neighbor_report=0), there is no list.
++ */
++size_t hostapd_neighbor_candidates(struct hostapd_data *hapd,
++				   struct sta_info *sta, u8 *pos,
++				   size_t max_len)
++{
++	struct hostapd_neighbor_entry *nr;
++	u8 used[256 / 8];
++	bool own = false;
++	u8 *start = pos;
++	int pass;
++
++	os_memset(used, 0, sizeof(used));
++	for (pass = 0; pass < 2; pass++) {
++		dl_list_for_each(nr, &hapd->nr_db,
++				 struct hostapd_neighbor_entry, list) {
++			const u8 *nr_pos, *sub;
++			size_t len;
++			int pref, v, higher;
++
++			if (!nr->nr || wpabuf_len(nr->nr) < 13 ||
++			    nr->ssid.ssid_len != hapd->conf->ssid.ssid_len ||
++			    os_memcmp(nr->ssid.ssid, hapd->conf->ssid.ssid,
++				      nr->ssid.ssid_len) != 0)
++				continue;
++
++			nr_pos = wpabuf_head_u8(nr->nr);
++			len = wpabuf_len(nr->nr);
++			pref = neighbor_cand_pref(hapd, sta, nr_pos);
++			if (pref < 0)
++				continue;
++			sub = get_ie(nr_pos + 13, len - 13,
++				     WNM_NEIGHBOR_BSS_TRANSITION_CANDIDATE);
++			if (sub && sub[1] >= 1)
++				pref = sub[2];
++
++			if (pass == 0) {
++				used[pref / 8] |= BIT(pref % 8);
++				if (ether_addr_equal(nr->bssid,
++						     hapd->own_addr))
++					own = true;
++				continue;
++			}
++
++			/* Renumber: one level below 255 per higher value */
++			higher = 0;
++			for (v = pref + 1; pref && v < 256; v++)
++				if (used[v / 8] & BIT(v % 8))
++					higher++;
++			if (pref)
++				pref = 255 - higher;
++
++			if (!sub)
++				len += 3;
++			if (len > 255 ||
++			    (size_t) (pos - start) + 2 + len > max_len)
++				continue;
++
++			*pos++ = WLAN_EID_NEIGHBOR_REPORT;
++			*pos++ = len;
++			os_memcpy(pos, nr_pos, wpabuf_len(nr->nr));
++			if (sub)
++				pos[sub - nr_pos + 2] = pref;
++			pos += wpabuf_len(nr->nr);
++			if (!sub) {
++				*pos++ = WNM_NEIGHBOR_BSS_TRANSITION_CANDIDATE;
++				*pos++ = 1;
++				*pos++ = pref;
++			}
++		}
++
++		/* The list has to include the own BSS (Wi-Fi Agile Multiband
++		 * 3.5.1.2); the database has it when rrm_neighbor_report=1 */
++		if (pass == 0 && !own)
++			return 0;
++	}
++
++	return pos - start;
++}
+diff --git a/src/ap/neighbor_db.h b/src/ap/neighbor_db.h
+index 53f714203..050b9cd8c 100644
+--- a/src/ap/neighbor_db.h
++++ b/src/ap/neighbor_db.h
+@@ -24,5 +24,8 @@ int hostapd_neighbor_sync_own_report(struct hostapd_data *hapd);
+ int hostapd_neighbor_remove(struct hostapd_data *hapd, const u8 *bssid,
+ 			    const struct wpa_ssid_value *ssid);
+ void hostapd_free_neighbor_db(struct hostapd_data *hapd);
++size_t hostapd_neighbor_candidates(struct hostapd_data *hapd,
++				   struct sta_info *sta, u8 *pos,
++				   size_t max_len);
+ 
+ #endif /* NEIGHBOR_DB_H */
+diff --git a/src/ap/wnm_ap.c b/src/ap/wnm_ap.c
+index 09fcc6584..90f6b1a53 100644
+--- a/src/ap/wnm_ap.c
++++ b/src/ap/wnm_ap.c
+@@ -21,6 +21,7 @@
+ #include "ap/wpa_auth.h"
+ #include "mbo_ap.h"
+ #include "wnm_ap.h"
++#include "neighbor_db.h"
+ 
+ #define MAX_TFS_IE_LEN  1024
+ 
+@@ -380,142 +381,6 @@ static void ieee802_11_rx_wnmsleep_req(struct hostapd_data *hapd,
+ }
+ 
+ 
+-/*
+- * Preference for a candidate before normalization: 0 excludes it, -1 skips it.
+- * The STA's operating classes and, with MBO, its non-preferred channel
+- * reports (Wi-Fi Agile Multiband 3.2) decide.
+- */
+-static int wnm_bss_tm_cand_pref(struct hostapd_data *hapd, struct sta_info *sta,
+-				const u8 *nr)
+-{
+-	u8 op_class = nr[10], chan = nr[11];
+-#ifdef CONFIG_MBO
+-	struct mbo_non_pref_chan_info *info;
+-#endif /* CONFIG_MBO */
+-
+-	/* Neighbor Report elements in the list use global operating classes */
+-	if (!get_oper_class(NULL, op_class))
+-		return -1;
+-
+-	if (sta && sta->supp_op_classes) {
+-		const u8 *pos = &sta->supp_op_classes[1];
+-		const u8 *end = pos + sta->supp_op_classes[0];
+-
+-		/* Current Operating Class and the Operating Classes list, up
+-		 * to the first delimiter */
+-		while (pos < end && *pos != 130 && *pos != 0 &&
+-		       *pos != op_class)
+-			pos++;
+-		if (pos == end || *pos != op_class)
+-			return -1;
+-	}
+-
+-#ifdef CONFIG_MBO
+-	for (info = sta ? sta->non_pref_chan : NULL; info; info = info->next) {
+-		unsigned int i;
+-
+-		if (info->op_class != op_class)
+-			continue;
+-		for (i = 0; i < info->num_channels; i++) {
+-			if (info->channels[i] == chan)
+-				return info->pref == 0 ? 0 : 254;
+-		}
+-	}
+-#endif /* CONFIG_MBO */
+-
+-	return 255;
+-}
+-
+-
+-/*
+- * BSS Transition Candidate List Entries for a BSS Transition Management
+- * Request that answers a BSS Transition Management Query (IEEE Std
+- * 802.11-2024, 11.21.7.3; Wi-Fi Agile Multiband 3.5.1.2): a Neighbor Report
+- * element for every BSS of this ESS in the neighbor report database, the own
+- * BSS included, each with a BSS Transition Candidate Preference subelement. A
+- * preference configured in the database is used, else one from
+- * wnm_bss_tm_cand_pref(); the values are then renumbered so that the most
+- * preferred is 255 and each lower level is one less, 0 staying 0.
+- */
+-static size_t wnm_bss_tm_candidates(struct hostapd_data *hapd,
+-				    struct sta_info *sta, u8 *pos,
+-				    size_t max_len)
+-{
+-	struct hostapd_neighbor_entry *nr;
+-	u8 used[256 / 8];
+-	bool own = false;
+-	u8 *start = pos;
+-	int pass;
+-
+-	os_memset(used, 0, sizeof(used));
+-	for (pass = 0; pass < 2; pass++) {
+-		dl_list_for_each(nr, &hapd->nr_db,
+-				 struct hostapd_neighbor_entry, list) {
+-			const u8 *nr_pos, *sub;
+-			size_t len;
+-			int pref, v, higher;
+-
+-			if (!nr->nr || wpabuf_len(nr->nr) < 13 ||
+-			    nr->ssid.ssid_len != hapd->conf->ssid.ssid_len ||
+-			    os_memcmp(nr->ssid.ssid, hapd->conf->ssid.ssid,
+-				      nr->ssid.ssid_len) != 0)
+-				continue;
+-
+-			nr_pos = wpabuf_head_u8(nr->nr);
+-			len = wpabuf_len(nr->nr);
+-			pref = wnm_bss_tm_cand_pref(hapd, sta, nr_pos);
+-			if (pref < 0)
+-				continue;
+-			sub = get_ie(nr_pos + 13, len - 13,
+-				     WNM_NEIGHBOR_BSS_TRANSITION_CANDIDATE);
+-			if (sub && sub[1] >= 1)
+-				pref = sub[2];
+-
+-			if (pass == 0) {
+-				used[pref / 8] |= BIT(pref % 8);
+-				if (ether_addr_equal(nr->bssid,
+-						     hapd->own_addr))
+-					own = true;
+-				continue;
+-			}
+-
+-			/* Renumber: one level below 255 per higher value */
+-			higher = 0;
+-			for (v = pref + 1; pref && v < 256; v++)
+-				if (used[v / 8] & BIT(v % 8))
+-					higher++;
+-			if (pref)
+-				pref = 255 - higher;
+-
+-			if (!sub)
+-				len += 3;
+-			if (len > 255 ||
+-			    (size_t) (pos - start) + 2 + len > max_len)
+-				continue;
+-
+-			*pos++ = WLAN_EID_NEIGHBOR_REPORT;
+-			*pos++ = len;
+-			os_memcpy(pos, nr_pos, wpabuf_len(nr->nr));
+-			if (sub)
+-				pos[sub - nr_pos + 2] = pref;
+-			pos += wpabuf_len(nr->nr);
+-			if (!sub) {
+-				*pos++ = WNM_NEIGHBOR_BSS_TRANSITION_CANDIDATE;
+-				*pos++ = 1;
+-				*pos++ = pref;
+-			}
+-		}
+-
+-		/* The list has to include the own BSS (Wi-Fi Agile Multiband
+-		 * 3.5.1.2); the database has it when rrm_neighbor_report=1 */
+-		if (pass == 0 && !own)
+-			return 0;
+-	}
+-
+-	return pos - start;
+-}
+-
+-
+ static int ieee802_11_send_bss_trans_mgmt_request(struct hostapd_data *hapd,
+ 						  const u8 *addr,
+ 						  u8 dialog_token)
+@@ -547,7 +412,7 @@ static int ieee802_11_send_bss_trans_mgmt_request(struct hostapd_data *hapd,
+ 	mgmt->u.action.u.bss_tm_req.validity_interval = 1;
+ 	pos = mgmt->u.action.u.bss_tm_req.variable;
+ 
+-	cand_len = wnm_bss_tm_candidates(hapd, sta, pos,
++	cand_len = hostapd_neighbor_candidates(hapd, sta, pos,
+ 					 (u8 *) mgmt + IEEE80211_MAX_MMPDU_SIZE -
+ 					 pos);
+ 	if (cand_len) {
+diff --git a/tests/hwsim/test_mbo.py b/tests/hwsim/test_mbo.py
+index a530e0f35..c814bc860 100644
+--- a/tests/hwsim/test_mbo.py
++++ b/tests/hwsim/test_mbo.py
+@@ -623,6 +623,53 @@ def check_mbo_anqp(dev, bssid, cell_data_conn_pref):
+ 
+     dev.dump_monitor()
+ 
++def test_mbo_anqp_neighbor_report(dev, apdev):
++    """MBO ANQP Neighbor Report from the neighbor report database"""
++    params = {'ssid': "test-wnm-mbo",
++              'mbo': '1',
++              'interworking': '1',
++              'rrm_neighbor_report': '1'}
++    hapd = hostapd.add_ap(apdev[0], params)
++    bssid = hapd.own_addr()
++    # A neighbor with a configured preference that is not 255
++    nr = "020000009900" + "0f000000" + "51" + "01" + "07" + "030164"
++    if "OK" not in hapd.request("SET_NEIGHBOR 02:00:00:00:99:00 ssid=\"test-wnm-mbo\" nr=" + nr):
++        raise Exception("SET_NEIGHBOR failed")
++
++    dev[0].scan_for_bss(bssid, freq="2412", force_scan=True)
++    if "OK" not in dev[0].request("ANQP_GET " + bssid + " 257,272"):
++        raise Exception("ANQP_GET command failed")
++    ev = dev[0].wait_event(["GAS-QUERY-DONE"], timeout=10)
++    if ev is None:
++        raise Exception("GAS query timed out")
++
++    bss = dev[0].get_bss(bssid)
++    capab = bytes.fromhex(bss['anqp_capability_list'])
++    if b'\x10\x01' not in capab:
++        raise Exception("Neighbor Report not in the ANQP Capability List")
++    if 'anqp[272]' not in bss:
++        raise Exception("No Neighbor Report ANQP-element received")
++    buf = bytes.fromhex(bss['anqp[272]'])
++    prefs = {}
++    while len(buf) >= 2:
++        eid, elen = buf[0], buf[1]
++        elem = buf[2:2 + elen]
++        buf = buf[2 + elen:]
++        if eid != 52 or elen < 13:
++            raise Exception("Unexpected element %d in the Neighbor Report" % eid)
++        sub = elem[13:]
++        pref = None
++        while len(sub) >= 2:
++            if sub[0] == 3 and sub[1] >= 1:
++                pref = sub[2]
++            sub = sub[2 + sub[1]:]
++        prefs[elem[0:6].hex(':')] = pref
++    logger.info("Candidate preferences: " + str(prefs))
++    if prefs.get(bssid) != 255:
++        raise Exception("Own BSS not the most preferred candidate")
++    if prefs.get("02:00:00:00:99:00") != 254:
++        raise Exception("Neighbor preference not renumbered to 254")
++
+ def test_mbo_anqp(dev, apdev):
+     """MBO ANQP"""
+     params = {'ssid': "test-wnm-mbo",
+-- 
+2.47.3
+

@@ -1,0 +1,60 @@
+From ecd7cffada47132b68f656104a33c85316034c8f Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Sun, 4 Oct 2026 04:05:24 +0300
+Subject: [PATCH] WMM: Medium Time zero for an admitted downlink TS
+
+WMM v1.2.0, 3.5.2 requires an AP to return a Medium Time equal to zero
+when it accepts a unidirectional downlink TS request: the medium time
+is what the STA itself may use, and a downlink stream uses none of it.
+hostapd returned the medium time it estimated for the stream.
+
+Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
+---
+ src/ap/wmm.c                    |  8 ++++++--
+ tests/hwsim/test_wpas_wmm_ac.py | 11 +++++++++++
+ 2 files changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/src/ap/wmm.c b/src/ap/wmm.c
+index 8e2212263..d4e6b3d10 100644
+--- a/src/ap/wmm.c
++++ b/src/ap/wmm.c
+@@ -277,8 +277,12 @@ int wmm_process_tspec(struct wmm_tspec_element *tspec)
+ 		return WMM_ADDTS_STATUS_REFUSED;
+ 	}
+ 
+-	/* Convert to 32 microseconds per second unit */
+-	tspec->medium_time = host_to_le16(medium_time / 32);
++	/* Convert to 32 microseconds per second unit; a unidirectional
++	 * downlink TS gets a Medium Time of zero (WMM v1.2.0, 3.5.2) */
++	if (dir == 1)
++		tspec->medium_time = 0;
++	else
++		tspec->medium_time = host_to_le16(medium_time / 32);
+ 
+ 	return WMM_ADDTS_STATUS_ADMISSION_ACCEPTED;
+ }
+diff --git a/tests/hwsim/test_wpas_wmm_ac.py b/tests/hwsim/test_wpas_wmm_ac.py
+index 32e6afe64..20666eca2 100644
+--- a/tests/hwsim/test_wpas_wmm_ac.py
++++ b/tests/hwsim/test_wpas_wmm_ac.py
+@@ -116,6 +116,17 @@ def test_tspec(dev, apdev):
+     if "FAIL" not in dev[0].request("WMM_AC_ADDTS foo"):
+         raise Exception("Invalid WMM_AC_ADDTS command accepted")
+ 
++def test_tspec_downlink_medium_time(dev, apdev):
++    """Downlink TS admitted with a Medium Time of zero"""
++    hapd = add_wmm_ap(apdev[0], ["VO", "VI"])
++    dev[0].connect("wmm_ac", key_mgmt="NONE", scan_freq="2462")
++    dev[0].add_ts(5, 6, direction="downlink")
++    status = dev[0].request("WMM_AC_STATUS")
++    if "Total admitted time = 0\n" not in status:
++        raise Exception("Downlink TS admitted with medium time: " + status)
++    dev[0].del_ts(5)
++
++
+ def test_tspec_protocol(dev, apdev):
+     """Protocol tests for addts/delts"""
+     # configure ap with VO and VI requiring admission-control
+-- 
+2.47.3
+

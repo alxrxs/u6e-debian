@@ -1,4 +1,4 @@
-From a5f121ef95cdb9a2aa25cbe320640801584e5ae1 Mon Sep 17 00:00:00 2001
+From 5dfcc28e21ca02177a859f5c568b1499e335b0c6 Mon Sep 17 00:00:00 2001
 From: Andrei-Alexandru Bleortu <me@andrei-z.com>
 Date: Sat, 3 Oct 2026 19:18:20 +0300
 Subject: [PATCH] AP: Refresh co-located beacons once an interface is set up

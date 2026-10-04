@@ -1,0 +1,305 @@
+From 11e9839c41ec11f62c8ef817e6eba8b4e04e27a1 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Sun, 4 Oct 2026 03:18:18 +0300
+Subject: [PATCH] OCE: Transmit Power and IP Subnet Identifier attributes
+
+Wi-Fi Optimized Connectivity 3.17 requires an OCE AP to include the
+Transmit Power attribute, the power used to transmit the frame, in the
+MBO-OCE element of its Beacon and Probe Response frames, and, when
+configured, the IP Subnet Identifier attribute, which tells a STA that
+it can keep its IP configuration when it moves between APs that share
+the identifier.
+
+Add a get_tx_power() driver operation, which nl80211 implements with
+the interface's NL80211_ATTR_WIPHY_TX_POWER_LEVEL, read it whenever the
+Beacon frame is built, and include the Transmit Power attribute with it
+when it is known. Add oce_ip_subnet_id to configure the IP Subnet
+Identifier attribute.
+
+Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
+---
+ hostapd/config_file.c        |  9 +++++++++
+ hostapd/hostapd.conf         | 12 ++++++++++++
+ src/ap/ap_config.h           |  2 ++
+ src/ap/ap_drv_ops.h          |  8 ++++++++
+ src/ap/beacon.c              |  9 +++++++++
+ src/ap/hostapd.h             |  3 +++
+ src/ap/ieee802_11_shared.c   | 19 ++++++++++++++++++-
+ src/drivers/driver.h         |  8 ++++++++
+ src/drivers/driver_nl80211.c | 27 +++++++++++++++++++++++++++
+ tests/hwsim/test_oce.py      | 29 +++++++++++++++++++++++++++++
+ 10 files changed, 125 insertions(+), 1 deletion(-)
+
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index b93822f8c..34d58a517 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -4479,6 +4479,15 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 		bss->mbo_cell_data_conn_pref = atoi(pos);
+ 	} else if (os_strcmp(buf, "oce") == 0) {
+ 		bss->oce = atoi(pos);
++	} else if (os_strcmp(buf, "oce_ip_subnet_id") == 0) {
++		if (hexstr2bin(pos, bss->oce_ip_subnet_id, ETH_ALEN) ||
++		    pos[2 * ETH_ALEN] != '\0') {
++			wpa_printf(MSG_ERROR,
++				   "Line %d: invalid oce_ip_subnet_id '%s'",
++				   line, pos);
++			return 1;
++		}
++		bss->oce_ip_subnet_id_set = true;
+ #endif /* CONFIG_MBO */
+ #ifdef CONFIG_TESTING_OPTIONS
+ #define PARSE_TEST_PROBABILITY(_val)				\
+diff --git a/hostapd/hostapd.conf b/hostapd/hostapd.conf
+index b8c269263..3bc416393 100644
+--- a/hostapd/hostapd.conf
++++ b/hostapd/hostapd.conf
+@@ -3486,8 +3486,20 @@ own_ip_addr=127.0.0.1
+ # Set BIT(1) (= 2) to enable OCE in STA-CFON mode
+ # Set BIT(2) (= 4) to enable OCE in AP mode
+ # Default is 0 = OCE disabled
++# An OCE AP needs a driver that handles Probe Request frames as OCE requires,
++# or one that leaves them to hostapd (no Probe Response offload). Wi-Fi
++# Optimized Connectivity also expects, among others, no 802.11b rates on 2.4 GHz
++# (basic_rates and supported_rates without 10/20/55/110), the BSS Load element
++# (bss_load_update_period) and the Estimated Service Parameters element (esp).
+ #oce=0
+ 
++# OCE IP Subnet Identifier (Wi-Fi Optimized Connectivity v2.0, 4.2.8)
++# A 6-octet identifier, unique to the set of APs that give access to the same
++# IP subnet(s), so that a STA moving between them can keep its IP
++# configuration. It should not reveal the subnet, e.g., use the BSSID of one of
++# the APs.
++#oce_ip_subnet_id=020000000100
++
+ # RSSI-based association rejection
+ #
+ # Reject STA association if RSSI is below given threshold (in dBm)
+diff --git a/src/ap/ap_config.h b/src/ap/ap_config.h
+index 32dad4602..8b91a9d3f 100644
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -764,6 +764,8 @@ struct hostapd_bss_config {
+ 	 */
+ 	unsigned int oce;
+ 	int mbo_cell_data_conn_pref;
++	u8 oce_ip_subnet_id[ETH_ALEN];
++	bool oce_ip_subnet_id_set;
+ #endif /* CONFIG_MBO */
+ 
+ 	int ftm_responder;
+diff --git a/src/ap/ap_drv_ops.h b/src/ap/ap_drv_ops.h
+index cd86fb762..f4821531b 100644
+--- a/src/ap/ap_drv_ops.h
++++ b/src/ap/ap_drv_ops.h
+@@ -291,6 +291,14 @@ static inline int hostapd_drv_get_survey(struct hostapd_data *hapd,
+ 	return hapd->driver->get_survey(hapd->drv_priv, freq);
+ }
+ 
++static inline int hostapd_drv_get_tx_power(struct hostapd_data *hapd,
++					   int *tx_power)
++{
++	if (!hapd->driver || !hapd->driver->get_tx_power)
++		return -1;
++	return hapd->driver->get_tx_power(hapd->drv_priv, tx_power);
++}
++
+ static inline int hostapd_get_country(struct hostapd_data *hapd, char *alpha2)
+ {
+ 	if (hapd->driver == NULL || hapd->driver->get_country == NULL)
+diff --git a/src/ap/beacon.c b/src/ap/beacon.c
+index 1e523ea56..3f5a44ce3 100644
+--- a/src/ap/beacon.c
++++ b/src/ap/beacon.c
+@@ -2373,6 +2373,15 @@ int ieee802_11_build_ap_params(struct hostapd_data *hapd,
+ 
+ 	os_memset(params, 0, sizeof(*params));
+ 
++#ifdef CONFIG_MBO
++	/* For the Transmit Power attribute of Beacon and Probe Response
++	 * frames */
++	if (OCE_AP_ENABLED(hapd))
++		hapd->iface->tx_power_known =
++			hostapd_drv_get_tx_power(hapd,
++						 &hapd->iface->tx_power) == 0;
++#endif /* CONFIG_MBO */
++
+ #ifdef NEED_AP_MLME
+ #define BEACON_HEAD_BUF_SIZE 256
+ #define BEACON_TAIL_BUF_SIZE 1500
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index e349ef2df..b5d6532f7 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -713,6 +713,9 @@ struct hostapd_iface {
+ 	u8 channel_utilization;
+ 	/* Share of the channel time the radio itself transmitted (0..255) */
+ 	u8 channel_utilization_tx;
++	/* Transmit power in dBm as last read from the driver */
++	int tx_power;
++	bool tx_power_known;
+ 
+ 	unsigned int chan_util_samples_sum;
+ 	unsigned int chan_util_num_sample_periods;
+diff --git a/src/ap/ieee802_11_shared.c b/src/ap/ieee802_11_shared.c
+index 7f1f34c8d..d99f5d012 100644
+--- a/src/ap/ieee802_11_shared.c
++++ b/src/ap/ieee802_11_shared.c
+@@ -809,7 +809,7 @@ u8 * hostapd_eid_mbo_rssi_assoc_rej(struct hostapd_data *hapd, u8 *eid,
+ 
+ u8 * hostapd_eid_mbo(struct hostapd_data *hapd, u8 *eid, size_t len)
+ {
+-	u8 mbo[9], *mbo_pos = mbo;
++	u8 mbo[20], *mbo_pos = mbo;
+ 	u8 *pos = eid;
+ 
+ 	if (!hapd->conf->mbo_enabled &&
+@@ -841,6 +841,19 @@ u8 * hostapd_eid_mbo(struct hostapd_data *hapd, u8 *eid, size_t len)
+ 		*mbo_pos++ = ctrl;
+ 	}
+ 
++	if (OCE_AP_ENABLED(hapd) && hapd->iface->tx_power_known) {
++		*mbo_pos++ = OCE_ATTR_ID_TX_POWER;
++		*mbo_pos++ = 1;
++		*mbo_pos++ = (u8) (s8) hapd->iface->tx_power;
++	}
++
++	if (OCE_AP_ENABLED(hapd) && hapd->conf->oce_ip_subnet_id_set) {
++		*mbo_pos++ = OCE_ATTR_ID_IP_SUBNET_ID;
++		*mbo_pos++ = ETH_ALEN;
++		os_memcpy(mbo_pos, hapd->conf->oce_ip_subnet_id, ETH_ALEN);
++		mbo_pos += ETH_ALEN;
++	}
++
+ 	pos += mbo_add_ie(pos, len, mbo, mbo_pos - mbo);
+ 
+ 	return pos;
+@@ -867,6 +880,10 @@ u8 hostapd_mbo_ie_len(struct hostapd_data *hapd)
+ 	if (OCE_STA_CFON_ENABLED(hapd) || OCE_AP_ENABLED(hapd))
+ 		len += 3;
+ 
++	/* Transmit Power (3) and IP Subnet Identifier (8) attributes */
++	if (OCE_AP_ENABLED(hapd))
++		len += 3 + (hapd->conf->oce_ip_subnet_id_set ? 8 : 0);
++
+ 	return len;
+ }
+ 
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index e957a56ae..9485f1856 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -5211,6 +5211,14 @@ struct wpa_driver_ops {
+ 	 */
+ 	int (*get_survey)(void *priv, unsigned int freq);
+ 
++	/**
++	 * get_tx_power - Get the current transmit power of the interface
++	 * @priv: Private driver interface data
++	 * @tx_power: Buffer for the transmit power in dBm
++	 * Returns: 0 on success, -1 on failure (e.g., not known)
++	 */
++	int (*get_tx_power)(void *priv, int *tx_power);
++
+ 	/**
+ 	 * status - Get driver interface status information
+ 	 * @priv: Private driver interface data
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index e3d731f3d..0c983243e 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -909,6 +909,8 @@ struct wiphy_idx_data {
+ 	u8 use_4addr;
+ 	u64 wdev_id;
+ 	bool wdev_id_set;
++	int tx_power; /* mBm */
++	bool tx_power_set;
+ };
+ 
+ 
+@@ -939,6 +941,12 @@ static int netdev_info_handler(struct nl_msg *msg, void *arg)
+ 		info->wdev_id_set = true;
+ 	}
+ 
++	if (tb[NL80211_ATTR_WIPHY_TX_POWER_LEVEL]) {
++		info->tx_power =
++			nla_get_u32(tb[NL80211_ATTR_WIPHY_TX_POWER_LEVEL]);
++		info->tx_power_set = true;
++	}
++
+ 	return NL_SKIP;
+ }
+ 
+@@ -960,6 +968,24 @@ int nl80211_get_wiphy_index(struct i802_bss *bss)
+ }
+ 
+ 
++static int nl80211_get_tx_power(void *priv, int *tx_power)
++{
++	struct i802_bss *bss = priv;
++	struct nl_msg *msg;
++	struct wiphy_idx_data data = {
++		.wiphy_idx = -1,
++	};
++
++	msg = nl80211_cmd_msg(bss, 0, NL80211_CMD_GET_INTERFACE);
++	if (!msg ||
++	    send_and_recv_resp(bss->drv, msg, netdev_info_handler, &data) ||
++	    !data.tx_power_set)
++		return -1;
++	*tx_power = data.tx_power / 100;
++	return 0;
++}
++
++
+ static enum nl80211_iftype nl80211_get_ifmode(struct i802_bss *bss)
+ {
+ 	struct nl_msg *msg;
+@@ -16903,6 +16929,7 @@ const struct wpa_driver_ops wpa_driver_nl80211_ops = {
+ 	.update_dh_ie = nl80211_update_dh_ie,
+ 	.get_mac_addr = wpa_driver_nl80211_get_macaddr,
+ 	.get_survey = wpa_driver_nl80211_get_survey,
++	.get_tx_power = nl80211_get_tx_power,
+ 	.status = wpa_driver_nl80211_status,
+ 	.switch_channel = nl80211_switch_channel,
+ #ifdef CONFIG_IEEE80211AX
+diff --git a/tests/hwsim/test_oce.py b/tests/hwsim/test_oce.py
+index 75ce3a6fc..55df8af3b 100644
+--- a/tests/hwsim/test_oce.py
++++ b/tests/hwsim/test_oce.py
+@@ -272,3 +272,32 @@ def test_oce_ap_probe_max_channel_time(dev, apdev, params):
+     da = oce_probe_resp_da(dev[0], hapd, params, "ff0302000a")
+     if dev[0].own_addr() not in da:
+         raise Exception("No Probe Response frame with a short Max Channel Time")
++
++def oce_ap_attrs(dev, bssid):
++    ie = bytes.fromhex(dev.get_bss(bssid)['ie'])
++    attrs = {}
++    while len(ie) >= 2:
++        eid, elen, data = ie[0], ie[1], ie[2:2 + ie[1]]
++        ie = ie[2 + elen:]
++        if eid == 221 and data[0:4] == b'\x50\x6f\x9a\x16':
++            buf = data[4:]
++            while len(buf) >= 2:
++                attrs[buf[0]] = buf[2:2 + buf[1]]
++                buf = buf[2 + buf[1]:]
++    return attrs
++
++def test_oce_ap_tx_power_ip_subnet(dev, apdev):
++    """OCE AP Transmit Power and IP Subnet Identifier attributes"""
++    params = oce_ap_params("test-oce")
++    params["oce_ip_subnet_id"] = "020000000100"
++    hapd = hostapd.add_ap(apdev[0], params)
++    dev[0].scan_for_bss(hapd.own_addr(), freq="2412")
++    attrs = oce_ap_attrs(dev[0], hapd.own_addr())
++    if 107 not in attrs or len(attrs[107]) != 1:
++        raise Exception("No Transmit Power attribute")
++    tx_power = struct.unpack('b', attrs[107])[0]
++    logger.info("Transmit Power: %d dBm" % tx_power)
++    if tx_power <= 0:
++        raise Exception("Unexpected Transmit Power: %d dBm" % tx_power)
++    if attrs.get(108) != bytes.fromhex("020000000100"):
++        raise Exception("No IP Subnet Identifier attribute")
+-- 
+2.47.3
+

@@ -1,0 +1,316 @@
+From 982bec640afe858d6dd7b1f190a8097ff73997a0 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Sun, 4 Oct 2026 03:15:08 +0300
+Subject: [PATCH] OCE: Probe Request frame handling of an OCE AP
+
+hostapd enabled OCE AP only with drivers that report the QCA vendor OCE
+AP capability, whose firmware implements the Wi-Fi Optimized
+Connectivity rules for Probe Request frames. With drivers that leave
+Probe Request frames to hostapd (hostapd SME, no Probe Response
+offload), hostapd can follow these rules itself, so enable OCE AP for
+them too and implement, for non-6 GHz bands:
+- 3.5: no response to a Probe Request frame whose Probe Suppression
+  SSIDs attribute lists the BSS's short SSID, or to a broadcast one
+  whose Probe Suppression BSSIDs attribute is empty or lists the BSSID;
+- 3.6: a broadcast Probe Response frame to a broadcast Probe Request
+  frame from an OCE STA (with the OCE Capability Indication attribute);
+- 3.9: no response when the Max Channel Time of the FILS Request
+  Parameters element is at least a beacon interval, since a Beacon
+  frame is then always transmitted within it, unless a Request element
+  asks for elements.
+
+Also define the remaining OCE attribute IDs and update the OCE Control
+field bits to Wi-Fi Optimized Connectivity v2.0, where bit 4 indicates
+an 11b-only AP and bit 6 a non-OCE AP.
+
+Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
+---
+ src/ap/beacon.c              | 83 +++++++++++++++++++++++++++++++--
+ src/ap/hostapd.h             |  6 ++-
+ src/common/ieee802_11_defs.h | 11 ++++-
+ tests/hwsim/test_oce.py      | 89 ++++++++++++++++++++++++++++++++++++
+ 4 files changed, 182 insertions(+), 7 deletions(-)
+
+diff --git a/src/ap/beacon.c b/src/ap/beacon.c
+index fb2be12fc..1e523ea56 100644
+--- a/src/ap/beacon.c
++++ b/src/ap/beacon.c
+@@ -749,6 +749,7 @@ struct probe_resp_params {
+ 	u8 *ecsa_pos;
+ 	const u8 *known_bss;
+ 	u8 known_bss_len;
++	bool bcast_resp;
+ 
+ #ifdef CONFIG_IEEE80211AX
+ 	u8 *cca_pos;
+@@ -1119,8 +1120,9 @@ static void hostapd_gen_probe_resp(struct hostapd_data *hapd,
+ 	 * Std 802.11ax-2021, 26.17.2.3.2. Broadcast address is also used for
+ 	 * the Probe Response frame template for the unsolicited (i.e., not as
+ 	 * a response to a specific request) case. */
+-	if (params->req && (!is_6ghz_op_class(hapd->iconf->op_class) ||
+-		    hapd->conf->ignore_broadcast_ssid))
++	if (params->req && !params->bcast_resp &&
++	    (!is_6ghz_op_class(hapd->iconf->op_class) ||
++	     hapd->conf->ignore_broadcast_ssid))
+ 		os_memcpy(params->resp->da, params->req->sa, ETH_ALEN);
+ 	else
+ 		os_memset(params->resp->da, 0xff, ETH_ALEN);
+@@ -1500,6 +1502,67 @@ static bool parse_ml_probe_req(const struct ieee80211_eht_ml *ml, size_t ml_len,
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ 
++#ifdef CONFIG_MBO
++/*
++ * Wi-Fi Optimized Connectivity rules for a Probe Request frame received in a
++ * non-6 GHz band: -1 for no response (Probe Suppression SSIDs and BSSIDs,
++ * 3.5; a Beacon frame within the Max Channel Time replaces the response, 3.9),
++ * 1 for a broadcast response (to a broadcast Probe Request frame from an OCE
++ * STA, 3.6), 0 otherwise.
++ */
++static int oce_probe_resp_mode(struct hostapd_data *hapd,
++			       const struct ieee80211_mgmt *mgmt,
++			       const u8 *ie, size_t ie_len,
++			       const struct ieee802_11_elems *elems)
++{
++	bool bcast = is_broadcast_ether_addr(mgmt->da);
++	const u8 *attrs = NULL, *attr;
++	size_t attrs_len = 0;
++	unsigned int i;
++
++	if (!OCE_AP_ENABLED(hapd) || is_6ghz_op_class(hapd->iconf->op_class))
++		return 0;
++
++	if (elems->mbo && elems->mbo_len >= 4) {
++		attrs = elems->mbo + 4;
++		attrs_len = elems->mbo_len - 4;
++	}
++
++	attr = attrs ? get_ie(attrs, attrs_len,
++			      OCE_ATTR_ID_PROBE_SUPPRESS_SSIDS) : NULL;
++	for (i = 0; attr && i + 4 <= attr[1]; i += 4) {
++		if (WPA_GET_LE32(&attr[2 + i]) == hapd->conf->ssid.short_ssid)
++			return -1;
++	}
++
++	attr = attrs ? get_ie(attrs, attrs_len,
++			      OCE_ATTR_ID_PROBE_SUPPRESS_BSSIDS) : NULL;
++	if (attr && bcast) {
++		if (attr[1] == 0)
++			return -1; /* all OCE APs */
++		for (i = 0; i + ETH_ALEN <= attr[1]; i += ETH_ALEN) {
++			if (ether_addr_equal(&attr[2 + i], hapd->own_addr))
++				return -1;
++		}
++	}
++
++	/* A TBTT is always within a beacon interval; a Request element can ask
++	 * for elements that Beacon frames do not carry */
++	if (elems->fils_req_params && elems->fils_req_params[1] != 255 &&
++	    elems->fils_req_params[1] >= hapd->iconf->beacon_int &&
++	    !hapd->conf->ignore_broadcast_ssid &&
++	    !get_ie(ie, ie_len, WLAN_EID_REQUEST))
++		return -1;
++
++	if (bcast && attrs && get_ie(attrs, attrs_len, OCE_ATTR_ID_CAPA_IND) &&
++	    !hapd->conf->ignore_broadcast_ssid)
++		return 1;
++
++	return 0;
++}
++#endif /* CONFIG_MBO */
++
++
+ void handle_probe_req(struct hostapd_data *hapd,
+ 		      const struct ieee80211_mgmt *mgmt, size_t len,
+ 		      int ssi_signal)
+@@ -1786,6 +1849,18 @@ void handle_probe_req(struct hostapd_data *hapd,
+ 
+ 	os_memset(&params, 0, sizeof(params));
+ 
++#ifdef CONFIG_MBO
++	switch (oce_probe_resp_mode(hapd, mgmt, ie, ie_len, &elems)) {
++	case -1:
++		wpa_printf(MSG_MSGDUMP, "OCE: No Probe Response frame to " MACSTR,
++			   MAC2STR(mgmt->sa));
++		return;
++	case 1:
++		params.bcast_resp = true;
++		break;
++	}
++#endif /* CONFIG_MBO */
++
+ #ifdef CONFIG_IEEE80211BE
+ 	if (hapd->conf->mld_ap && elems.probe_req_mle &&
+ 	    parse_ml_probe_req((struct ieee80211_eht_ml *) elems.probe_req_mle,
+@@ -1811,8 +1886,8 @@ void handle_probe_req(struct hostapd_data *hapd,
+ 	 * If this is a broadcast probe request, apply no ack policy to avoid
+ 	 * excessive retries.
+ 	 */
+-	noack = !!(res == WILDCARD_SSID_MATCH &&
+-		   is_broadcast_ether_addr(mgmt->da));
++	noack = !!((res == WILDCARD_SSID_MATCH &&
++		    is_broadcast_ether_addr(mgmt->da)) || params.bcast_resp);
+ 
+ 	csa_offs_len = 0;
+ 	if (hapd->csa_in_progress) {
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index d1d78df2d..e349ef2df 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -24,9 +24,13 @@
+ #define OCE_STA_CFON_ENABLED(hapd) \
+ 	((hapd->conf->oce & OCE_STA_CFON) && \
+ 	 (hapd->iface->drv_flags & WPA_DRIVER_FLAGS_OCE_STA_CFON))
++/* An OCE AP needs a driver that implements its Probe Request frame handling,
++ * or hostapd to handle Probe Request frames itself */
+ #define OCE_AP_ENABLED(hapd) \
+ 	((hapd->conf->oce & OCE_AP) && \
+-	 (hapd->iface->drv_flags & WPA_DRIVER_FLAGS_OCE_AP))
++	 ((hapd->iface->drv_flags & WPA_DRIVER_FLAGS_OCE_AP) || \
++	  ((hapd->iface->drv_flags2 & WPA_DRIVER_FLAGS2_AP_SME) && \
++	   !(hapd->iface->drv_flags & WPA_DRIVER_FLAGS_PROBE_RESP_OFFLOAD))))
+ 
+ struct wpa_ctrl_dst;
+ struct radius_server_data;
+diff --git a/src/common/ieee802_11_defs.h b/src/common/ieee802_11_defs.h
+index b5d8211a8..59462a59a 100644
+--- a/src/common/ieee802_11_defs.h
++++ b/src/common/ieee802_11_defs.h
+@@ -1769,6 +1769,10 @@ enum mbo_attr_id {
+ 	OCE_ATTR_ID_RSSI_BASED_ASSOC_REJECT = 102,
+ 	OCE_ATTR_ID_REDUCED_WAN_METRICS = 103,
+ 	OCE_ATTR_ID_RNR_COMPLETENESS = 104,
++	OCE_ATTR_ID_PROBE_SUPPRESS_BSSIDS = 105,
++	OCE_ATTR_ID_PROBE_SUPPRESS_SSIDS = 106,
++	OCE_ATTR_ID_TX_POWER = 107,
++	OCE_ATTR_ID_IP_SUBNET_ID = 108,
+ };
+ 
+ /* MBO v0.0_r19, 4.2.1: MBO AP Capability Indication Attribute */
+@@ -1843,11 +1847,14 @@ enum mbo_transition_reject_reason {
+ #define MBO_ANQP_SUBTYPE_CELL_CONN_PREF 2
+ #define MAX_MBO_ANQP_SUBTYPE MBO_ANQP_SUBTYPE_CELL_CONN_PREF
+ 
+-/* OCE v0.0.10, 4.2.1: OCE Capability Indication Attribute */
++/* Wi-Fi Optimized Connectivity v2.0, 4.2.1: OCE Capability Indication
++ * attribute, OCE Control field */
+ #define OCE_RELEASE 1
+ #define OCE_RELEASE_MASK (BIT(0) | BIT(1) | BIT(2))
+ #define OCE_IS_STA_CFON BIT(3)
+-#define OCE_IS_NON_OCE_AP_PRESENT BIT(4)
++#define OCE_11B_ONLY_AP_PRESENT BIT(4)
++#define OCE_HLP_ENABLED BIT(5)
++#define OCE_NON_OCE_AP_PRESENT BIT(6)
+ 
+ /* Wi-Fi Direct (P2P) */
+ 
+diff --git a/tests/hwsim/test_oce.py b/tests/hwsim/test_oce.py
+index 39ec5df5a..75ce3a6fc 100644
+--- a/tests/hwsim/test_oce.py
++++ b/tests/hwsim/test_oce.py
+@@ -12,9 +12,12 @@ from wpasupplicant import WpaSupplicant
+ 
+ from hwsim_utils import set_rx_rssi, reset_rx_rssi
+ import time
++import binascii
++import struct
+ import os
+ from datetime import datetime
+ from utils import HwsimSkip
++from tshark import run_tshark
+ 
+ def check_set_tx_power(dev, apdev):
+     hapd = hostapd.add_ap(apdev[0], {'ssid': 'check_tx_power'})
+@@ -183,3 +186,89 @@ def test_oce_ap_open_connect_cmd(dev, apdev):
+     wpas = WpaSupplicant(global_iface='/tmp/wpas-wlan5')
+     wpas.interface_add("wlan5", drv_params="force_connect_cmd=1")
+     wpas.connect(ssid, key_mgmt="NONE", scan_freq="2412")
++
++def oce_probe_resp_da(dev, hapd, params, elems):
++    """Scan with elements added to the Probe Request frames and return the
++    destination addresses of the Probe Response frames from hapd"""
++    dev.request("VENDOR_ELEM_ADD 14 " + elems)
++    try:
++        dev.scan(freq="2412", only_new=True)
++    finally:
++        dev.request("VENDOR_ELEM_REMOVE 14 *")
++    time.sleep(0.1)
++    out = run_tshark(os.path.join(params['logdir'], "hwsim0.pcapng"),
++                     "wlan.fc.type_subtype == 5 && wlan.sa == " +
++                     hapd.own_addr(), display=["wlan.da"])
++    return out.splitlines()
++
++def oce_ap_params(ssid):
++    return {"ssid": ssid, "mbo": "1", "oce": "4", "beacon_int": "100"}
++
++def test_oce_ap_capab(dev, apdev):
++    """OCE AP advertises the OCE Capability Indication attribute"""
++    hapd = hostapd.add_ap(apdev[0], oce_ap_params("test-oce"))
++    dev[0].scan_for_bss(hapd.own_addr(), freq="2412")
++    ie = bytes.fromhex(dev[0].get_bss(hapd.own_addr())['ie'])
++    found = False
++    while len(ie) >= 2:
++        eid, elen, data = ie[0], ie[1], ie[2:2 + ie[1]]
++        ie = ie[2 + elen:]
++        if eid == 221 and data[0:4] == b'\x50\x6f\x9a\x16':
++            attrs = data[4:]
++            while len(attrs) >= 2:
++                if attrs[0] == 101 and attrs[1] == 1:
++                    if attrs[2] & 0x07 != 1:
++                        raise Exception("Unexpected OCE release")
++                    found = True
++                attrs = attrs[2 + attrs[1]:]
++    if not found:
++        raise Exception("No OCE Capability Indication attribute")
++
++def test_oce_ap_probe_suppress_ssid(dev, apdev, params):
++    """OCE AP and Probe Suppression SSIDs attribute"""
++    ssid = "test-oce"
++    hapd = hostapd.add_ap(apdev[0], oce_ap_params(ssid))
++    short_ssid = struct.pack('<I', binascii.crc32(ssid.encode()) & 0xffffffff)
++    da = oce_probe_resp_da(dev[0], hapd, params,
++                           "dd0a506f9a16" + "6a04" + short_ssid.hex())
++    if dev[0].own_addr() in da:
++        raise Exception("Probe Response frame sent despite suppression")
++    other = struct.pack('<I', binascii.crc32(b"other") & 0xffffffff)
++    da = oce_probe_resp_da(dev[0], hapd, params,
++                           "dd0a506f9a16" + "6a04" + other.hex())
++    if dev[0].own_addr() not in da:
++        raise Exception("No Probe Response frame for another short SSID")
++
++def test_oce_ap_probe_suppress_bssid(dev, apdev, params):
++    """OCE AP and Probe Suppression BSSIDs attribute"""
++    hapd = hostapd.add_ap(apdev[0], oce_ap_params("test-oce"))
++    bssid = hapd.own_addr().replace(':', '')
++    da = oce_probe_resp_da(dev[0], hapd, params,
++                           "dd0c506f9a16" + "6906" + bssid)
++    if dev[0].own_addr() in da:
++        raise Exception("Probe Response frame sent despite suppression")
++    # An empty list suppresses the responses from all OCE APs
++    da = oce_probe_resp_da(dev[0], hapd, params, "dd06506f9a16" + "6900")
++    if dev[0].own_addr() in da:
++        raise Exception("Probe Response frame sent despite suppression")
++
++def test_oce_ap_bcast_probe_resp(dev, apdev, params):
++    """OCE AP sends broadcast Probe Response to an OCE STA"""
++    hapd = hostapd.add_ap(apdev[0], oce_ap_params("test-oce"))
++    da = oce_probe_resp_da(dev[0], hapd, params,
++                           "dd07506f9a16" + "650101")
++    if "ff:ff:ff:ff:ff:ff" not in da:
++        raise Exception("No broadcast Probe Response frame")
++    if dev[0].own_addr() in da:
++        raise Exception("Unexpected unicast Probe Response frame")
++
++def test_oce_ap_probe_max_channel_time(dev, apdev, params):
++    """OCE AP leaves Probe Request with a long Max Channel Time to Beacons"""
++    hapd = hostapd.add_ap(apdev[0], oce_ap_params("test-oce"))
++    # FILS Request Parameters: no criteria, Max Channel Time 100 TUs
++    da = oce_probe_resp_da(dev[0], hapd, params, "ff03020064")
++    if dev[0].own_addr() in da:
++        raise Exception("Probe Response frame sent despite Beacon within Max Channel Time")
++    da = oce_probe_resp_da(dev[0], hapd, params, "ff0302000a")
++    if dev[0].own_addr() not in da:
++        raise Exception("No Probe Response frame with a short Max Channel Time")
+-- 
+2.47.3
+

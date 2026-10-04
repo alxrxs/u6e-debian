@@ -1,0 +1,177 @@
+From 5463bf5d4591a77976b6bf23f4bf65e315f8ae77 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Sun, 4 Oct 2026 03:32:36 +0300
+Subject: [PATCH] OCE: Put the RSSI-based rejection attribute in the MBO-OCE
+ element
+
+A (Re)Association Response frame that rejected a STA for its RSSI
+carried the RSSI-based (Re)Association Rejection attribute in an
+MBO-OCE element of its own, in addition to the MBO-OCE element with the
+MBO and OCE capability attributes. Wi-Fi Optimized Connectivity 3.2
+requires all MBO and OCE attributes of a frame in a single MBO-OCE
+element. Include the rejection attribute in the one element.
+
+Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
+---
+ src/ap/ieee802_11.c        | 20 +++++++--------
+ src/ap/ieee802_11_shared.c | 52 ++++++++++++++++++++++++--------------
+ tests/hwsim/test_oce.py    | 29 +++++++++++++++++++++
+ 3 files changed, 71 insertions(+), 30 deletions(-)
+
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index 705168045..8cac72cb0 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -7487,16 +7487,6 @@ static u16 send_assoc_resp(struct hostapd_data *hapd, struct sta_info *sta,
+ 	/* Radio measurement capabilities */
+ 	p = hostapd_eid_rm_enabled_capab(hapd, p, buf + buflen - p);
+ 
+-#ifdef CONFIG_MBO
+-	if (status_code == WLAN_STATUS_DENIED_POOR_CHANNEL_CONDITIONS &&
+-	    rssi != 0) {
+-		int delta = hapd->iconf->rssi_reject_assoc_rssi - rssi;
+-
+-		p = hostapd_eid_mbo_rssi_assoc_rej(hapd, p, buf + buflen - p,
+-						   delta);
+-	}
+-#endif /* CONFIG_MBO */
+-
+ #ifdef CONFIG_IEEE80211R_AP
+ 	if (sta && status_code == WLAN_STATUS_SUCCESS) {
+ 		/* IEEE 802.11r: Mobility Domain Information, Fast BSS
+@@ -7810,7 +7800,15 @@ rsnxe_done:
+ 		p = hostapd_eid_p2p_manage(hapd, p);
+ #endif /* CONFIG_P2P_MANAGER */
+ 
+-	p = hostapd_eid_mbo(hapd, p, buf + buflen - p);
++#ifdef CONFIG_MBO
++	if (status_code == WLAN_STATUS_DENIED_POOR_CHANNEL_CONDITIONS &&
++	    rssi != 0)
++		p = hostapd_eid_mbo_rssi_assoc_rej(
++			hapd, p, buf + buflen - p,
++			hapd->iconf->rssi_reject_assoc_rssi - rssi);
++	else
++#endif /* CONFIG_MBO */
++		p = hostapd_eid_mbo(hapd, p, buf + buflen - p);
+ 	p = hostapd_eid_wfa_capab(hapd, sta, p);
+ 
+ 	if (hapd->conf->assocresp_elements &&
+diff --git a/src/ap/ieee802_11_shared.c b/src/ap/ieee802_11_shared.c
+index d99f5d012..c33798a67 100644
+--- a/src/ap/ieee802_11_shared.c
++++ b/src/ap/ieee802_11_shared.c
+@@ -791,31 +791,31 @@ u8 * hostapd_eid_bss_max_idle_period(struct hostapd_data *hapd, u8 *eid,
+ 
+ #ifdef CONFIG_MBO
+ 
+-u8 * hostapd_eid_mbo_rssi_assoc_rej(struct hostapd_data *hapd, u8 *eid,
+-				    size_t len, int delta)
+-{
+-	u8 mbo[4];
+-
+-	mbo[0] = OCE_ATTR_ID_RSSI_BASED_ASSOC_REJECT;
+-	mbo[1] = 2;
+-	/* Delta RSSI */
+-	mbo[2] = delta;
+-	/* Retry delay */
+-	mbo[3] = hapd->iconf->rssi_reject_assoc_timeout;
+-
+-	return eid + mbo_add_ie(eid, len, mbo, 4);
+-}
+-
+-
+-u8 * hostapd_eid_mbo(struct hostapd_data *hapd, u8 *eid, size_t len)
++/*
++ * The MBO-OCE element; with a delta, an (Re)Association Response frame that
++ * rejects the STA for its RSSI, which carries the RSSI-based (Re)Association
++ * Rejection attribute in the same element (Wi-Fi Optimized Connectivity 3.2,
++ * 3.14)
++ */
++static u8 * hostapd_eid_mbo_attrs(struct hostapd_data *hapd, u8 *eid,
++				  size_t len, int rssi_rej_delta)
+ {
+-	u8 mbo[20], *mbo_pos = mbo;
++	u8 mbo[24], *mbo_pos = mbo;
+ 	u8 *pos = eid;
+ 
+-	if (!hapd->conf->mbo_enabled &&
++	if (!hapd->conf->mbo_enabled && !rssi_rej_delta &&
+ 	    !OCE_STA_CFON_ENABLED(hapd) && !OCE_AP_ENABLED(hapd))
+ 		return eid;
+ 
++	if (rssi_rej_delta) {
++		*mbo_pos++ = OCE_ATTR_ID_RSSI_BASED_ASSOC_REJECT;
++		*mbo_pos++ = 2;
++		/* Delta RSSI */
++		*mbo_pos++ = rssi_rej_delta;
++		/* Retry delay */
++		*mbo_pos++ = hapd->iconf->rssi_reject_assoc_timeout;
++	}
++
+ 	if (hapd->conf->mbo_enabled) {
+ 		*mbo_pos++ = MBO_ATTR_ID_AP_CAPA_IND;
+ 		*mbo_pos++ = 1;
+@@ -860,6 +860,20 @@ u8 * hostapd_eid_mbo(struct hostapd_data *hapd, u8 *eid, size_t len)
+ }
+ 
+ 
++u8 * hostapd_eid_mbo(struct hostapd_data *hapd, u8 *eid, size_t len)
++{
++	return hostapd_eid_mbo_attrs(hapd, eid, len, 0);
++}
++
++
++u8 * hostapd_eid_mbo_rssi_assoc_rej(struct hostapd_data *hapd, u8 *eid,
++				    size_t len, int delta)
++{
++	/* A delta of 0 would not be a rejection for the RSSI */
++	return hostapd_eid_mbo_attrs(hapd, eid, len, delta > 0 ? delta : 1);
++}
++
++
+ u8 hostapd_mbo_ie_len(struct hostapd_data *hapd)
+ {
+ 	u8 len;
+diff --git a/tests/hwsim/test_oce.py b/tests/hwsim/test_oce.py
+index 7992d9405..ec7c69828 100644
+--- a/tests/hwsim/test_oce.py
++++ b/tests/hwsim/test_oce.py
+@@ -91,6 +91,35 @@ def test_rssi_based_assoc_rej_timeout(dev, apdev, params):
+         reset_rx_rssi(dev[0])
+         dev[0].request("SCAN_INTERVAL 5")
+ 
++def test_rssi_based_assoc_rej_single_mbo_ie(dev, apdev, params):
++    """RSSI-based association rejection in a single MBO-OCE element"""
++    check_set_tx_power(dev, apdev)
++    try:
++        ap_params = {'ssid': "test-RSSI-ar", 'mbo': '1', 'oce': '4',
++                     'rssi_reject_assoc_rssi': '-45',
++                     'rssi_reject_assoc_timeout': '5'}
++        hapd = hostapd.add_ap(apdev[0], ap_params)
++        set_rx_rssi(dev[0], -50)
++        dev[0].connect("test-RSSI-ar", key_mgmt="NONE", scan_freq="2412",
++                       wait_connect=False)
++        ev = dev[0].wait_event(['CTRL-EVENT-ASSOC-REJECT'], 2)
++        if ev is None or 'status_code=34' not in ev:
++            raise Exception("Association not rejected for the RSSI")
++        dev[0].request("DISCONNECT")
++    finally:
++        reset_rx_rssi(dev[0])
++    time.sleep(0.1)
++    out = run_tshark(os.path.join(params['logdir'], "hwsim0.pcapng"),
++                     "wlan.fc.type_subtype == 1 && wlan.fixed.status_code == 34",
++                     display=["wlan.tag.vendor.oui.type"])
++    lines = out.splitlines()
++    if not lines:
++        raise Exception("No rejecting (Re)Association Response frame seen")
++    for line in lines:
++        if line.split(',').count("22") != 1:
++            raise Exception("Not exactly one MBO-OCE element: " + line)
++
++
+ def run_rssi_based_assoc_rej_good_rssi(dev, apdev):
+     ap_params = {'ssid': "test-RSSI-ar-to",
+                  'rssi_reject_assoc_rssi': '-45',
+-- 
+2.47.3
+

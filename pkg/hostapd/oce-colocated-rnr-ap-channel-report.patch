@@ -1,0 +1,413 @@
+From db6dc2b151ec3a7b7b15aafbadd2c703bfc4de50 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Sun, 4 Oct 2026 03:28:27 +0300
+Subject: [PATCH] OCE: Report co-located 2.4/5 GHz BSSs and neighbor AP
+ channels
+
+Wi-Fi Optimized Connectivity 3.4 requires an OCE AP operating in the
+2.4 or 5 GHz band to include in its Reduced Neighbor Report element at
+least the BSSs it operates on other channels of these bands, and to
+report the channels on which it identified neighboring APs in AP
+Channel Report elements. hostapd reported only co-located 6 GHz BSSs
+and had no AP Channel Report element.
+
+For an OCE AP in these bands, report the co-located interfaces on other
+2.4/5 GHz channels too, and refresh the co-located Beacon frames when
+one of them starts, as for 6 GHz co-location. Report each such BSS with
+the 20 MHz operating class of its primary channel, since the operating
+class is to identify the primary channel together with the channel
+number (IEEE Std 802.11-2024, 11.49), which a class for wider channels
+does not do in these bands.
+
+Add AP Channel Report elements, one per 20 MHz operating class, with the
+channels of the APs in the neighbor report database other than the own
+channel and co-located 6 GHz APs (which the Reduced Neighbor Report
+element covers), and set the AP Channel Report capability in the RM
+Enabled Capabilities element when there are any.
+
+Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
+---
+ src/ap/beacon.c              |  13 ++-
+ src/ap/ieee802_11.c          | 152 ++++++++++++++++++++++++++++++++---
+ src/ap/ieee802_11.h          |   3 +
+ src/common/ieee802_11_defs.h |   2 +
+ tests/hwsim/test_oce.py      |  56 +++++++++++++
+ 5 files changed, 213 insertions(+), 13 deletions(-)
+
+diff --git a/src/ap/beacon.c b/src/ap/beacon.c
+index 3f5a44ce3..2b6eabcf8 100644
+--- a/src/ap/beacon.c
++++ b/src/ap/beacon.c
+@@ -844,6 +844,7 @@ static size_t hostapd_probe_resp_elems_len(struct hostapd_data *hapd,
+ 					 params->known_bss_len, NULL);
+ 	buflen += hostapd_eid_rnr_len(hapd, WLAN_FC_STYPE_PROBE_RESP, true);
+ 	buflen += 6; /* Estimated Service Parameters Inbound element */
++	buflen += hostapd_eid_ap_channel_report_len(hapd);
+ 
+ #ifdef CONFIG_IEEE80211BN
+ 	if (hostapd_is_uhr_enabled(hapd)) {
+@@ -909,6 +910,7 @@ static u8 * hostapd_probe_resp_fill_elems(struct hostapd_data *hapd,
+ 
+ 	pos = hostapd_get_rsne(hapd, pos, epos - pos);
+ 	pos = hostapd_eid_bss_load(hapd, pos, epos - pos);
++	pos = hostapd_eid_ap_channel_report(hapd, pos);
+ 	pos = hostapd_eid_mbssid(hapd_probed, pos, epos,
+ 				 WLAN_FC_STYPE_PROBE_RESP, 0,
+ 				 NULL, params->known_bss, params->known_bss_len,
+@@ -2440,6 +2442,7 @@ int ieee802_11_build_ap_params(struct hostapd_data *hapd,
+ 		tail_len += 5; /* Multiple BSSID Configuration element */
+ 	tail_len += hostapd_eid_rnr_len(hapd, WLAN_FC_STYPE_BEACON, true);
+ 	tail_len += 6; /* Estimated Service Parameters Inbound element */
++	tail_len += hostapd_eid_ap_channel_report_len(hapd);
+ 
+ #ifdef CONFIG_IEEE80211BN
+ 	if (hostapd_is_uhr_enabled(hapd))
+@@ -2520,6 +2523,7 @@ int ieee802_11_build_ap_params(struct hostapd_data *hapd,
+ 
+ 	tailpos = hostapd_get_rsne(hapd, tailpos, tailend - tailpos);
+ 	tailpos = hostapd_eid_bss_load(hapd, tailpos, tailend - tailpos);
++	tailpos = hostapd_eid_ap_channel_report(hapd, tailpos);
+ 	tailpos = hostapd_eid_rm_enabled_capab(hapd, tailpos,
+ 					       tailend - tailpos);
+ 	tailpos = hostapd_get_mde(hapd, tailpos, tailend - tailpos);
+@@ -3503,7 +3507,8 @@ int ieee802_11_set_beacon(struct hostapd_data *hapd)
+ 	hapd_mld = hapd->conf->mld_ap;
+ #endif /* CONFIG_IEEE80211BE */
+ 
+-	/* Update Beacon frames in case of 6 GHz colocation or AP MLD */
++	/* Update Beacon frames in case of 6 GHz colocation, AP MLD, or OCE APs
++	 * reporting each other in the 2.4 and 5 GHz bands */
+ 	is_6g = is_6ghz_op_class(iface->conf->op_class);
+ 	for (j = 0; j < iface->interfaces->count; j++) {
+ 		struct hostapd_iface *other;
+@@ -3515,14 +3520,16 @@ int ieee802_11_set_beacon(struct hostapd_data *hapd)
+ 
+ 		other_iface_6g = is_6ghz_op_class(other->conf->op_class);
+ 
+-		if (is_6g == other_iface_6g && !hapd_mld)
++		if (is_6g == other_iface_6g && !hapd_mld &&
++		    (is_6g || !hostapd_oce_lower_band(other->bss[0])))
+ 			continue;
+ 
+ 		for (i = 0; i < other->num_bss; i++) {
+ #ifdef CONFIG_IEEE80211BE
+ 			if (is_6g == other_iface_6g &&
+ 			    !(hapd_mld && other->bss[i]->conf->mld_ap &&
+-			      hostapd_is_ml_partner(hapd, other->bss[i])))
++			      hostapd_is_ml_partner(hapd, other->bss[i])) &&
++			    (is_6g || !hostapd_oce_lower_band(other->bss[i])))
+ 				continue;
+ #endif /* CONFIG_IEEE80211BE */
+ 
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index 8243cfaac..705168045 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -558,13 +558,120 @@ u8 * hostapd_eid_ext_supp_rates(struct hostapd_data *hapd, u8 *eid)
+ }
+ 
+ 
++/* An OCE AP in the 2.4 or 5 GHz band */
++bool hostapd_oce_lower_band(struct hostapd_data *hapd)
++{
++#ifdef CONFIG_MBO
++	return OCE_AP_ENABLED(hapd) && !is_6ghz_op_class(hapd->iconf->op_class);
++#else /* CONFIG_MBO */
++	return false;
++#endif /* CONFIG_MBO */
++}
++
++
++/*
++ * Channels of the neighbor APs in the neighbor report database for the AP
++ * Channel Report elements of an OCE AP in the 2.4 or 5 GHz band (Wi-Fi Optimized
++ * Connectivity 3.4): other than the own channel and co-located 6 GHz APs,
++ * which the Reduced Neighbor Report element covers, by 20 MHz operating class.
++ */
++static size_t hostapd_ap_channels(struct hostapd_data *hapd, u8 *op_classes,
++				  u8 *channels, size_t max)
++{
++	struct hostapd_neighbor_entry *nr;
++	size_t n = 0, i;
++
++	if (!hostapd_oce_lower_band(hapd))
++		return 0;
++
++	dl_list_for_each(nr, &hapd->nr_db, struct hostapd_neighbor_entry,
++			 list) {
++		const u8 *pos;
++		u8 op_class, channel;
++		int freq;
++
++		if (!nr->nr || wpabuf_len(nr->nr) < 13 || n == max)
++			continue;
++		pos = wpabuf_head_u8(nr->nr);
++		freq = ieee80211_chan_to_freq(NULL, pos[10], pos[11]);
++		if (freq <= 0 || freq == hapd->iface->freq ||
++		    (is_6ghz_freq(freq) &&
++		     (WPA_GET_LE32(&pos[6]) & NEI_REP_BSSID_INFO_COLOCATED_AP)))
++			continue;
++		if (ieee80211_freq_to_channel_ext(freq, 0,
++						  CONF_OPER_CHWIDTH_USE_HT,
++						  &op_class, &channel) ==
++		    NUM_HOSTAPD_MODES)
++			continue;
++		for (i = 0; i < n; i++) {
++			if (op_classes[i] == op_class && channels[i] == channel)
++				break;
++		}
++		if (i == n) {
++			op_classes[n] = op_class;
++			channels[n++] = channel;
++		}
++	}
++
++	return n;
++}
++
++
++size_t hostapd_eid_ap_channel_report_len(struct hostapd_data *hapd)
++{
++	u8 op_classes[32], channels[32];
++	size_t n;
++
++	n = hostapd_ap_channels(hapd, op_classes, channels, 32);
++	/* An element per operating class at most */
++	return n * 3 + n;
++}
++
++
++u8 * hostapd_eid_ap_channel_report(struct hostapd_data *hapd, u8 *eid)
++{
++	u8 op_classes[32], channels[32];
++	size_t n, i, j;
++	bool done[32];
++
++	n = hostapd_ap_channels(hapd, op_classes, channels, 32);
++	os_memset(done, 0, sizeof(done));
++	for (i = 0; i < n; i++) {
++		u8 *len;
++
++		if (done[i])
++			continue;
++		*eid++ = WLAN_EID_AP_CHANNEL_REPORT;
++		len = eid++;
++		*eid++ = op_classes[i];
++		for (j = i; j < n; j++) {
++			if (op_classes[j] != op_classes[i])
++				continue;
++			*eid++ = channels[j];
++			done[j] = true;
++		}
++		*len = eid - len - 1;
++	}
++
++	return eid;
++}
++
++
+ u8 * hostapd_eid_rm_enabled_capab(struct hostapd_data *hapd, u8 *eid,
+ 				  size_t len)
+ {
++	u8 capab[RRM_CAPABILITIES_IE_LEN];
++	u8 op_class, channel;
+ 	size_t i;
+ 
++	os_memcpy(capab, hapd->conf->radio_measurements,
++		  RRM_CAPABILITIES_IE_LEN);
++	/* dot11RMAPChannelReportActivated with AP Channel Report elements */
++	if (hostapd_ap_channels(hapd, &op_class, &channel, 1))
++		capab[2] |= WLAN_RRM_CAPS_AP_CHANNEL_REPORT;
++
+ 	for (i = 0; i < RRM_CAPABILITIES_IE_LEN; i++) {
+-		if (hapd->conf->radio_measurements[i])
++		if (capab[i])
+ 			break;
+ 	}
+ 
+@@ -573,7 +680,7 @@ u8 * hostapd_eid_rm_enabled_capab(struct hostapd_data *hapd, u8 *eid,
+ 
+ 	*eid++ = WLAN_EID_RRM_ENABLED_CAPABILITIES;
+ 	*eid++ = RRM_CAPABILITIES_IE_LEN;
+-	os_memcpy(eid, hapd->conf->radio_measurements, RRM_CAPABILITIES_IE_LEN);
++	os_memcpy(eid, capab, RRM_CAPABILITIES_IE_LEN);
+ 
+ 	return eid + RRM_CAPABILITIES_IE_LEN;
+ }
+@@ -10473,6 +10580,14 @@ static bool hostapd_rnr_get_bss_info(struct hostapd_data *hapd,
+ 	    bss_chwidth == CONF_OPER_CHWIDTH_USE_HT)
+ 		secondary_channel = 0;
+ 
++	/* The operating class identifies the primary channel together with
++	 * the channel number (IEEE Std 802.11-2024, 11.49): in the 2.4 and
++	 * 5 GHz bands, the 20 MHz operating class */
++	if (!is_6ghz_freq(bss->iface->freq)) {
++		secondary_channel = 0;
++		bss_chwidth = CONF_OPER_CHWIDTH_USE_HT;
++	}
++
+ 	if (ieee80211_freq_to_channel_ext(
+ 		    bss->iface->freq,
+ 		    secondary_channel, bss_chwidth,
+@@ -10654,6 +10769,27 @@ static enum colocation_mode get_colocation_mode(struct hostapd_data *hapd)
+ }
+ 
+ 
++/* Whether to report a co-located interface: a 6 GHz one, and for an OCE AP in
++ * the 2.4 or 5 GHz band also those on other 2.4/5 GHz channels (Wi-Fi Optimized
++ * Connectivity 3.4) */
++static bool hostapd_rnr_colocated(struct hostapd_data *hapd,
++				  struct hostapd_iface *iface)
++{
++	if (!iface || iface == hapd->iface ||
++	    iface->state != HAPD_IFACE_ENABLED)
++		return false;
++	if (is_6ghz_op_class(iface->conf->op_class))
++		return true;
++#ifdef CONFIG_MBO
++	return OCE_AP_ENABLED(hapd) &&
++		!is_6ghz_op_class(hapd->iconf->op_class) &&
++		iface->freq != hapd->iface->freq;
++#else /* CONFIG_MBO */
++	return false;
++#endif /* CONFIG_MBO */
++}
++
++
+ static size_t hostapd_eid_rnr_colocation_len(struct hostapd_data *hapd,
+ 					     size_t *current_len)
+ {
+@@ -10667,9 +10803,7 @@ static size_t hostapd_eid_rnr_colocation_len(struct hostapd_data *hapd,
+ 	for (i = 0; i < hapd->iface->interfaces->count; i++) {
+ 		iface = hapd->iface->interfaces->iface[i];
+ 
+-		if (!iface || iface == hapd->iface ||
+-		    iface->state != HAPD_IFACE_ENABLED ||
+-		    !is_6ghz_op_class(iface->conf->op_class))
++		if (!hostapd_rnr_colocated(hapd, iface))
+ 			continue;
+ 
+ 		len += hostapd_eid_rnr_iface_len(iface->bss[0], hapd,
+@@ -10725,7 +10859,7 @@ size_t hostapd_eid_rnr_len(struct hostapd_data *hapd, u32 type,
+ 			total_len += hostapd_eid_nr_db_len(hapd, &current_len);
+ 		/* fallthrough */
+ 	case WLAN_FC_STYPE_PROBE_RESP:
+-		if (mode == COLOCATED_LOWER_BAND)
++		if (mode == COLOCATED_LOWER_BAND || hostapd_oce_lower_band(hapd))
+ 			total_len +=
+ 				hostapd_eid_rnr_colocation_len(hapd,
+ 							       &current_len);
+@@ -11096,9 +11230,7 @@ static u8 * hostapd_eid_rnr_colocation(struct hostapd_data *hapd, u8 *eid,
+ 	for (i = 0; i < hapd->iface->interfaces->count; i++) {
+ 		iface = hapd->iface->interfaces->iface[i];
+ 
+-		if (!iface || iface == hapd->iface ||
+-		    iface->state != HAPD_IFACE_ENABLED ||
+-		    !is_6ghz_op_class(iface->conf->op_class))
++		if (!hostapd_rnr_colocated(hapd, iface))
+ 			continue;
+ 
+ 		eid = hostapd_eid_rnr_iface(iface->bss[0], hapd, eid,
+@@ -11154,7 +11286,7 @@ u8 * hostapd_eid_rnr(struct hostapd_data *hapd, u8 *eid, u32 type,
+ 			eid = hostapd_eid_nr_db(hapd, eid, &current_len);
+ 		/* fallthrough */
+ 	case WLAN_FC_STYPE_PROBE_RESP:
+-		if (mode == COLOCATED_LOWER_BAND)
++		if (mode == COLOCATED_LOWER_BAND || hostapd_oce_lower_band(hapd))
+ 			eid = hostapd_eid_rnr_colocation(hapd, eid,
+ 							 &current_len);
+ 
+diff --git a/src/ap/ieee802_11.h b/src/ap/ieee802_11.h
+index 9eb258ffb..d5fbb2c22 100644
+--- a/src/ap/ieee802_11.h
++++ b/src/ap/ieee802_11.h
+@@ -235,6 +235,9 @@ void ap_copy_sta_supp_op_classes(struct sta_info *sta,
+ 
+ u8 * hostapd_eid_fils_indic(struct hostapd_data *hapd, u8 *eid, int hessid);
+ u8 * hostapd_eid_esp(struct hostapd_data *hapd, u8 *eid);
++bool hostapd_oce_lower_band(struct hostapd_data *hapd);
++size_t hostapd_eid_ap_channel_report_len(struct hostapd_data *hapd);
++u8 * hostapd_eid_ap_channel_report(struct hostapd_data *hapd, u8 *eid);
+ void ieee802_11_finish_fils_auth(struct hostapd_data *hapd,
+ 				 struct sta_info *sta, int success,
+ 				 struct wpabuf *erp_resp,
+diff --git a/src/common/ieee802_11_defs.h b/src/common/ieee802_11_defs.h
+index 59462a59a..f1d49c0f3 100644
+--- a/src/common/ieee802_11_defs.h
++++ b/src/common/ieee802_11_defs.h
+@@ -890,6 +890,8 @@ static inline bool sec_prof_is_sae(int p)
+ #define WLAN_RRM_CAPS_BEACON_REPORT_TABLE BIT(6)
+ /* byte 2 (out of 5) */
+ #define WLAN_RRM_CAPS_LCI_MEASUREMENT BIT(4)
++/* byte 3 (out of 5) */
++#define WLAN_RRM_CAPS_AP_CHANNEL_REPORT BIT(0)
+ /* byte 5 (out of 5) */
+ #define WLAN_RRM_CAPS_FTM_RANGE_REPORT BIT(2)
+ #define WLAN_RRM_CAPS_CIVIC_LOCATION_MEASUREMENT BIT(3)
+diff --git a/tests/hwsim/test_oce.py b/tests/hwsim/test_oce.py
+index 55df8af3b..7992d9405 100644
+--- a/tests/hwsim/test_oce.py
++++ b/tests/hwsim/test_oce.py
+@@ -301,3 +301,59 @@ def test_oce_ap_tx_power_ip_subnet(dev, apdev):
+         raise Exception("Unexpected Transmit Power: %d dBm" % tx_power)
+     if attrs.get(108) != bytes.fromhex("020000000100"):
+         raise Exception("No IP Subnet Identifier attribute")
++
++def oce_bss_elems(dev, bssid):
++    ie = bytes.fromhex(dev.get_bss(bssid)['ie'])
++    elems = []
++    while len(ie) >= 2:
++        elems.append((ie[0], ie[2:2 + ie[1]]))
++        ie = ie[2 + ie[1]:]
++    return elems
++
++def test_oce_ap_colocated_rnr(dev, apdev):
++    """OCE AP reports co-located 2.4/5 GHz BSSs and their channels"""
++    params = oce_ap_params("test-oce")
++    params["rrm_neighbor_report"] = "1"
++    params["channel"] = "1"
++    hapd0 = hostapd.add_ap(apdev[0], params)
++    params["channel"] = "11"
++    hapd1 = hostapd.add_ap(apdev[1], params)
++
++    own = hapd1.request("SHOW_NEIGHBOR").split()
++    if "OK" not in hapd0.request("SET_NEIGHBOR " + own[0] + " " + own[1] +
++                                 " " + own[2]):
++        raise Exception("SET_NEIGHBOR failed")
++    hapd0.request("UPDATE_BEACON")
++    bssid0 = hapd0.own_addr()
++    bssid1 = hapd1.own_addr()
++    dev[0].scan_for_bss(bssid0, freq="2412", force_scan=True)
++    elems = oce_bss_elems(dev[0], bssid0)
++
++    rnr = [e for i, e in elems if i == 201]
++    if not rnr:
++        raise Exception("No Reduced Neighbor Report element")
++    found = False
++    for e in rnr:
++        pos = e
++        while len(pos) >= 4:
++            count = (pos[0] >> 4) + 1
++            tlen = pos[1]
++            op_class, chan = pos[2], pos[3]
++            info = pos[4:]
++            for k in range(count):
++                tbtt = info[k * tlen:(k + 1) * tlen]
++                if len(tbtt) >= 7 and tbtt[1:7].hex(':') == bssid1:
++                    if op_class != 81 or chan != 11:
++                        raise Exception("Unexpected op class/channel %d/%d"
++                                        % (op_class, chan))
++                    found = True
++            pos = info[count * tlen:]
++    if not found:
++        raise Exception("Co-located BSS not in the RNR")
++
++    acr = [e for i, e in elems if i == 51]
++    if acr != [bytes([81, 11])]:
++        raise Exception("Unexpected AP Channel Report: " + str(acr))
++    rm = [e for i, e in elems if i == 70]
++    if not rm or not rm[0][2] & 0x01:
++        raise Exception("AP Channel Report capability not set")
+-- 
+2.47.3
+

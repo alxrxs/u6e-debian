@@ -1,0 +1,121 @@
+From a08ecbeb76963629efe78cf084769666c6f9b8df Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Sun, 4 Oct 2026 04:00:37 +0300
+Subject: [PATCH] MBO: Cellular Data Connection Preference only for cellular
+ capable STAs
+
+BSS_TM_REQ mbo=<reason>:<reassoc_delay>:<cell_pref> always added the
+Cellular Data Connection Preference attribute to the request, and the
+preference could not be left out. Wi-Fi Agile Multiband 3.5.2 lets the
+AP include it only for a STA that has indicated an available cellular
+data connection; for any other STA it says something about a
+connection the STA does not have, yet the Transition Reason Code
+attribute is mandatory in every BSS Transition Management Request.
+
+Accept mbo=<reason>:<reassoc_delay> without a preference, and include a
+given preference only for a STA that indicated a cellular data
+connection. Since hostapd learns that only with MBO enabled, the test
+that expects the preference now enables MBO on its AP.
+
+Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
+---
+ src/ap/ctrl_iface_ap.c  | 18 ++++++++++++------
+ tests/hwsim/test_wnm.py | 28 ++++++++++++++++++++++++++--
+ 2 files changed, 38 insertions(+), 8 deletions(-)
+
+diff --git a/src/ap/ctrl_iface_ap.c b/src/ap/ctrl_iface_ap.c
+index 57ec4f6ec..110ea3fb3 100644
+--- a/src/ap/ctrl_iface_ap.c
++++ b/src/ap/ctrl_iface_ap.c
+@@ -1793,17 +1793,19 @@ int hostapd_ctrl_iface_bss_tm_req(struct hostapd_data *hapd,
+ #ifdef CONFIG_MBO
+ 	pos = os_strstr(cmd, "mbo=");
+ 	if (pos) {
+-		unsigned int mbo_reason, cell_pref, reassoc_delay;
++		unsigned int mbo_reason, cell_pref = 0, reassoc_delay;
++		bool cell_pref_set;
+ 		u8 *mbo_pos = mbo;
+ 
+ 		ret = sscanf(pos, "mbo=%u:%u:%u", &mbo_reason,
+ 			     &reassoc_delay, &cell_pref);
+-		if (ret != 3) {
++		if (ret != 2 && ret != 3) {
+ 			wpa_printf(MSG_DEBUG,
+-				   "MBO requires three arguments: mbo=<reason>:<reassoc_delay>:<cell_pref>");
++				   "MBO requires two or three arguments: mbo=<reason>:<reassoc_delay>[:<cell_pref>]");
+ 			ret = -1;
+ 			goto fail;
+ 		}
++		cell_pref_set = ret == 3;
+ 
+ 		if (mbo_reason > MBO_TRANSITION_REASON_PREMIUM_AP) {
+ 			wpa_printf(MSG_DEBUG,
+@@ -1834,9 +1836,13 @@ int hostapd_ctrl_iface_bss_tm_req(struct hostapd_data *hapd,
+ 		*mbo_pos++ = MBO_ATTR_ID_TRANSITION_REASON;
+ 		*mbo_pos++ = 1;
+ 		*mbo_pos++ = mbo_reason;
+-		*mbo_pos++ = MBO_ATTR_ID_CELL_DATA_PREF;
+-		*mbo_pos++ = 1;
+-		*mbo_pos++ = cell_pref;
++		/* Only for a STA that indicated a cellular data connection
++		 * (Wi-Fi Agile Multiband 3.5.2) */
++		if (cell_pref_set && sta->cell_capa == MBO_CELL_CAPA_AVAILABLE) {
++			*mbo_pos++ = MBO_ATTR_ID_CELL_DATA_PREF;
++			*mbo_pos++ = 1;
++			*mbo_pos++ = cell_pref;
++		}
+ 
+ 		if (reassoc_delay) {
+ 			*mbo_pos++ = MBO_ATTR_ID_ASSOC_RETRY_DELAY;
+diff --git a/tests/hwsim/test_wnm.py b/tests/hwsim/test_wnm.py
+index 1591719ac..7daa875ba 100644
+--- a/tests/hwsim/test_wnm.py
++++ b/tests/hwsim/test_wnm.py
+@@ -1162,7 +1162,7 @@ def test_wnm_bss_tm_errors(dev, apdev):
+              "BSS_TM_REQ %s neighbor=02:11:22:33:44:55,0,0,0,0,q" % addr,
+              "BSS_TM_REQ %s neighbor=02:11:22:33:44:55,0,0,0,0,0q" % addr,
+              "BSS_TM_REQ " + addr + " url=" + 256*'a',
+-             "BSS_TM_REQ %s url=foo mbo=1:2" % addr,
++             "BSS_TM_REQ %s url=foo mbo=1" % addr,
+              "BSS_TM_REQ %s url=foo mbo=100000:0:0" % addr,
+              "BSS_TM_REQ %s url=foo mbo=0:0:254" % addr,
+              "BSS_TM_REQ %s url=foo mbo=0:100000:0" % addr]
+@@ -1877,10 +1877,34 @@ def test_wnm_action_proto_no_pmf(dev, apdev):
+     if ev is None:
+         raise Exception("Key Data not ignored")
+ 
++def test_wnm_bss_tm_req_mbo_no_cell(dev, apdev):
++    """WNM BSS transition request with MBO IE to a STA without cellular data"""
++    ssid = "test-wnm-mbo"
++    hapd = start_wnm_ap(apdev[0], rsn=True, pmf=True, ssid=ssid)
++    dev[0].connect(ssid, psk="12345678", key_mgmt="WPA-PSK-SHA256",
++                   proto="WPA2", ieee80211w="2", scan_freq="2412")
++    addr = dev[0].own_addr()
++
++    # The Cellular Data Connection Preference is only for STAs that
++    # indicated a cellular data connection
++    for mbo in ("mbo=4:0:1", "mbo=4:0"):
++        if "OK" not in hapd.request("BSS_TM_REQ " + addr + " " + mbo):
++            raise Exception("BSS_TM_REQ with " + mbo + " failed")
++        ev = dev[0].wait_event(['MBO-TRANSITION-REASON',
++                                'MBO-CELL-PREFERENCE'], 1)
++        if ev is None or "MBO-TRANSITION-REASON" not in ev or \
++           "reason=4" not in ev:
++            raise Exception("No MBO-TRANSITION-REASON event: " + str(ev))
++        ev = dev[0].wait_event(['MBO-CELL-PREFERENCE'], 0.2)
++        if ev is not None:
++            raise Exception("Unexpected MBO-CELL-PREFERENCE event")
++        hapd.wait_event(['BSS-TM-RESP'], timeout=5)
++        dev[0].dump_monitor()
++
+ def test_wnm_bss_tm_req_with_mbo_ie(dev, apdev):
+     """WNM BSS transition request with MBO IE and reassociation delay attribute"""
+     ssid = "test-wnm-mbo"
+-    hapd = start_wnm_ap(apdev[0], rsn=True, pmf=True, ssid=ssid)
++    hapd = start_wnm_ap(apdev[0], rsn=True, pmf=True, ssid=ssid, mbo=True)
+     bssid = apdev[0]['bssid']
+     if "OK" not in dev[0].request("SET mbo_cell_capa 1"):
+         raise Exception("Failed to set STA as cellular data capable")
+-- 
+2.47.3
+

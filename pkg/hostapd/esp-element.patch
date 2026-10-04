@@ -1,0 +1,279 @@
+From 7a20e2b965e506131d6bdff1c18352de59d9b390 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Sun, 4 Oct 2026 03:01:10 +0300
+Subject: [PATCH] AP: Add the Estimated Service Parameters Inbound element
+
+The Estimated Service Parameters Inbound element (IEEE Std 802.11-2024,
+9.4.2.172) lets a STA estimate the throughput it would get from an AP
+before associating (11.44); Wi-Fi Optimized Connectivity 3.15 requires
+it, with the AC_BE parameters, in the Beacon and Probe Response frames
+of an OCE AP. hostapd did not have it.
+
+Add esp=1 to include the element. It carries the AC_BE parameters:
+A-MPDU with a 64 MPDU block ack window and a 4 ms PPDU duration target
+when HT is enabled, and, as the estimated air time fraction, the
+channel time not used by other BSSs (channel busy time minus the
+radio's own transmit time, from the survey data that the BSS Load
+element uses) shared equally between a new STA and the associated STAs,
+the model Wi-Fi Optimized Connectivity 3.15 describes. The element
+therefore needs bss_load_update_period.
+
+Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
+---
+ hostapd/config_file.c       |  2 ++
+ hostapd/hostapd.conf        | 11 +++++++++
+ src/ap/ap_config.h          |  1 +
+ src/ap/beacon.c             |  4 ++++
+ src/ap/drv_callbacks.c      | 11 +++++++++
+ src/ap/hostapd.h            |  3 +++
+ src/ap/ieee802_11.h         |  1 +
+ src/ap/ieee802_11_shared.c  | 40 ++++++++++++++++++++++++++++++++
+ tests/hwsim/test_ap_open.py | 46 +++++++++++++++++++++++++++++++++++++
+ 9 files changed, 119 insertions(+)
+
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index d5ab87403..b93822f8c 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -3457,6 +3457,8 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 			return 1;
+ 		}
+ 		bss->bss_load_update_period = val;
++	} else if (os_strcmp(buf, "esp") == 0) {
++		bss->esp = atoi(pos);
+ 	} else if (os_strcmp(buf, "chan_util_avg_period") == 0) {
+ 		int val = atoi(pos);
+ 
+diff --git a/hostapd/hostapd.conf b/hostapd/hostapd.conf
+index 6918591f9..b8c269263 100644
+--- a/hostapd/hostapd.conf
++++ b/hostapd/hostapd.conf
+@@ -582,6 +582,17 @@ wmm_ac_vo_acm=0
+ # Beacon and Probe Response frames.
+ #bss_load_update_period=50
+ 
++# Estimated Service Parameters Inbound element (IEEE Std 802.11-2024, 9.4.2.172)
++# This adds the element to Beacon and Probe Response frames, so that STAs can
++# estimate their throughput before associating (also used by Wi-Fi Optimized
++# Connectivity). It carries the AC_BE parameters, with an estimate of the air
++# time a new STA would get from the channel time not used by other BSSs, shared
++# equally between it and the associated STAs. This requires
++# bss_load_update_period to be set.
++# 0 = disabled (default)
++# 1 = enabled
++#esp=0
++
+ # Channel utilization averaging period (in BUs)
+ # This field is used to enable and configure channel utilization average
+ # calculation with bss_load_update_period. This should be in multiples of
+diff --git a/src/ap/ap_config.h b/src/ap/ap_config.h
+index c96481df7..32dad4602 100644
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -301,6 +301,7 @@ struct hostapd_bss_config {
+ 	int dtim_period;
+ 	unsigned int bss_load_update_period;
+ 	unsigned int chan_util_avg_period;
++	bool esp; /* Estimated Service Parameters Inbound element */
+ 
+ 	int ieee802_1x; /* use IEEE 802.1X */
+ 	int eapol_version;
+diff --git a/src/ap/beacon.c b/src/ap/beacon.c
+index be8e1153d..fb2be12fc 100644
+--- a/src/ap/beacon.c
++++ b/src/ap/beacon.c
+@@ -842,6 +842,7 @@ static size_t hostapd_probe_resp_elems_len(struct hostapd_data *hapd,
+ 					 params->known_bss,
+ 					 params->known_bss_len, NULL);
+ 	buflen += hostapd_eid_rnr_len(hapd, WLAN_FC_STYPE_PROBE_RESP, true);
++	buflen += 6; /* Estimated Service Parameters Inbound element */
+ 
+ #ifdef CONFIG_IEEE80211BN
+ 	if (hostapd_is_uhr_enabled(hapd)) {
+@@ -965,6 +966,7 @@ static u8 * hostapd_probe_resp_fill_elems(struct hostapd_data *hapd,
+ 	pos = hostapd_eid_chsw_wrapper(hapd, pos);
+ 
+ 	pos = hostapd_eid_rnr(hapd, pos, WLAN_FC_STYPE_PROBE_RESP, true);
++	pos = hostapd_eid_esp(hapd, pos);
+ 	pos = hostapd_eid_fils_indic(hapd, pos, 0);
+ 
+ 	/* Max Channel Switch Time element */
+@@ -2353,6 +2355,7 @@ int ieee802_11_build_ap_params(struct hostapd_data *hapd,
+ 	    hapd == hostapd_mbssid_get_tx_bss(hapd))
+ 		tail_len += 5; /* Multiple BSSID Configuration element */
+ 	tail_len += hostapd_eid_rnr_len(hapd, WLAN_FC_STYPE_BEACON, true);
++	tail_len += 6; /* Estimated Service Parameters Inbound element */
+ 
+ #ifdef CONFIG_IEEE80211BN
+ 	if (hostapd_is_uhr_enabled(hapd))
+@@ -2500,6 +2503,7 @@ int ieee802_11_build_ap_params(struct hostapd_data *hapd,
+ 	tailpos = hostapd_eid_chsw_wrapper(hapd, tailpos);
+ 
+ 	tailpos = hostapd_eid_rnr(hapd, tailpos, WLAN_FC_STYPE_BEACON, true);
++	tailpos = hostapd_eid_esp(hapd, tailpos);
+ 	tailpos = hostapd_eid_fils_indic(hapd, tailpos, 0);
+ 
+ 	/* Max Channel Switch Time element */
+diff --git a/src/ap/drv_callbacks.c b/src/ap/drv_callbacks.c
+index 7f2ef4b0d..5677ec3fa 100644
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -2229,9 +2229,20 @@ static void hostapd_single_channel_get_survey(struct hostapd_iface *iface,
+ 		iface->channel_utilization = dividend * 255 / divisor;
+ 		wpa_printf(MSG_DEBUG, "Channel Utilization: %d",
+ 			   iface->channel_utilization);
++
++		if ((survey->filled & SURVEY_HAS_CHAN_TIME_TX) &&
++		    survey->channel_time_tx >= iface->last_channel_time_tx &&
++		    survey->channel_time_tx - iface->last_channel_time_tx <=
++		    divisor)
++			iface->channel_utilization_tx =
++				(survey->channel_time_tx -
++				 iface->last_channel_time_tx) * 255 / divisor;
++		else
++			iface->channel_utilization_tx = 0;
+ 	}
+ 	iface->last_channel_time = survey->channel_time;
+ 	iface->last_channel_time_busy = survey->channel_time_busy;
++	iface->last_channel_time_tx = survey->channel_time_tx;
+ }
+ 
+ 
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index 6ce29653b..d1d78df2d 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -705,7 +705,10 @@ struct hostapd_iface {
+ 	/* channel utilization calculation */
+ 	u64 last_channel_time;
+ 	u64 last_channel_time_busy;
++	u64 last_channel_time_tx;
+ 	u8 channel_utilization;
++	/* Share of the channel time the radio itself transmitted (0..255) */
++	u8 channel_utilization_tx;
+ 
+ 	unsigned int chan_util_samples_sum;
+ 	unsigned int chan_util_num_sample_periods;
+diff --git a/src/ap/ieee802_11.h b/src/ap/ieee802_11.h
+index da87f0b29..9eb258ffb 100644
+--- a/src/ap/ieee802_11.h
++++ b/src/ap/ieee802_11.h
+@@ -234,6 +234,7 @@ void ap_copy_sta_supp_op_classes(struct sta_info *sta,
+ 				 size_t supp_op_classes_len);
+ 
+ u8 * hostapd_eid_fils_indic(struct hostapd_data *hapd, u8 *eid, int hessid);
++u8 * hostapd_eid_esp(struct hostapd_data *hapd, u8 *eid);
+ void ieee802_11_finish_fils_auth(struct hostapd_data *hapd,
+ 				 struct sta_info *sta, int success,
+ 				 struct wpabuf *erp_resp,
+diff --git a/src/ap/ieee802_11_shared.c b/src/ap/ieee802_11_shared.c
+index f10d816b5..7f1f34c8d 100644
+--- a/src/ap/ieee802_11_shared.c
++++ b/src/ap/ieee802_11_shared.c
+@@ -980,6 +980,46 @@ void ap_copy_sta_supp_op_classes(struct sta_info *sta,
+ }
+ 
+ 
++u8 * hostapd_eid_esp(struct hostapd_data *hapd, u8 *eid)
++{
++	struct hostapd_iface *iface = hapd->iface;
++	unsigned int other, avail, fraction;
++	u8 ac_info;
++	bool ht;
++
++	if (!hapd->conf->esp || !hapd->conf->bss_load_update_period)
++		return eid;
++
++	ht = hapd->iconf->ieee80211n && !hapd->conf->disable_11n;
++
++	/* Air time a new STA would get: the channel time other BSSs do not
++	 * use, shared equally with the associated STAs (Wi-Fi Optimized
++	 * Connectivity 3.15) */
++	other = iface->channel_utilization > iface->channel_utilization_tx ?
++		iface->channel_utilization - iface->channel_utilization_tx : 0;
++	avail = 255 - other;
++	fraction = avail / (hapd->num_sta + 1);
++	if (!fraction)
++		fraction = 1;
++
++	ac_info = 1; /* AC_BE */
++	if (ht) {
++		ac_info |= 2 << 3; /* Data Format: A-MPDU */
++		ac_info |= 7 << 5; /* BA Window Size: 64 */
++	}
++
++	*eid++ = WLAN_EID_EXTENSION;
++	*eid++ = 4;
++	*eid++ = WLAN_EID_EXT_ESTIMATED_SERVICE_PARAMS;
++	*eid++ = ac_info;
++	*eid++ = fraction;
++	/* Data PPDU Duration Target in units of 50 us: 4 ms with A-MPDU */
++	*eid++ = ht ? 80 : 20;
++
++	return eid;
++}
++
++
+ u8 * hostapd_eid_fils_indic(struct hostapd_data *hapd, u8 *eid, int hessid)
+ {
+ 	u8 *pos = eid;
+diff --git a/tests/hwsim/test_ap_open.py b/tests/hwsim/test_ap_open.py
+index 8e90683b4..40d2f9015 100644
+--- a/tests/hwsim/test_ap_open.py
++++ b/tests/hwsim/test_ap_open.py
+@@ -251,6 +251,52 @@ def test_ap_bss_load(dev, apdev):
+     if avg is None:
+         raise Exception("No STATUS chan_util_avg seen")
+ 
++def test_ap_esp(dev, apdev):
++    """AP with the Estimated Service Parameters Inbound element"""
++    hapd = hostapd.add_ap(apdev[0],
++                          {"ssid": "open",
++                           "bss_load_update_period": "10",
++                           "esp": "1"})
++    bssid = hapd.own_addr()
++    dev[0].scan_for_bss(bssid, freq="2412")
++    bss = dev[0].get_bss(bssid)
++    ies = parse_ie(bss['ie'])
++    if 255 not in ies:
++        raise Exception("No element with the Extension ID seen")
++    esp = None
++    pos = bytes.fromhex(bss['ie'])
++    while len(pos) >= 3:
++        eid, elen = pos[0], pos[1]
++        if eid == 255 and elen >= 1 and pos[2] == 11:
++            esp = pos[3:2 + elen]
++        pos = pos[2 + elen:]
++    if esp is None:
++        raise Exception("No ESP element seen")
++    logger.info("ESP Information: " + esp.hex())
++    if len(esp) != 3:
++        raise Exception("Unexpected ESP Information length: %d" % len(esp))
++    if esp[0] & 0x03 != 1:
++        raise Exception("ESP Information is not for AC_BE")
++    if esp[0] >> 3 & 0x03 != 2 or esp[0] >> 5 != 7:
++        raise Exception("Unexpected data format or BA window size")
++    if esp[1] == 0:
++        raise Exception("No estimated air time")
++
++    dev[0].connect("open", key_mgmt="NONE", scan_freq="2412")
++    hwsim_utils.test_connectivity(dev[0], hapd)
++
++def test_ap_esp_disabled(dev, apdev):
++    """AP without the Estimated Service Parameters Inbound element"""
++    hapd = hostapd.add_ap(apdev[0],
++                          {"ssid": "open", "bss_load_update_period": "10"})
++    bssid = hapd.own_addr()
++    dev[0].scan_for_bss(bssid, freq="2412")
++    pos = bytes.fromhex(dev[0].get_bss(bssid)['ie'])
++    while len(pos) >= 3:
++        if pos[0] == 255 and pos[1] >= 1 and pos[2] == 11:
++            raise Exception("Unexpected ESP element")
++        pos = pos[2 + pos[1]:]
++
+ def test_ap_bss_load_fail(dev, apdev):
+     """BSS Load update failing to get survey data"""
+     hapd = hostapd.add_ap(apdev[0],
+-- 
+2.47.3
+
