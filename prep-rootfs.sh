@@ -145,6 +145,25 @@ WantedBy=multi-user.target
 UNIT
 ln -sf /etc/systemd/system/u6e-netconsole.service $RF/etc/systemd/system/multi-user.target.wants/u6e-netconsole.service
 
+# LEDs off: the DTS lights the blue status LED from boot (default-state "on").
+cat > $RF/etc/systemd/system/u6e-leds-off.service <<'UNIT'
+[Unit]
+Description=U6E LEDs off
+DefaultDependencies=no
+After=systemd-udev-settle.service systemd-udevd.service
+Before=sysinit.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'for l in /sys/class/leds/*; do echo none > $l/trigger; echo 0 > $l/brightness; done'
+
+[Install]
+WantedBy=sysinit.target
+UNIT
+install -d $RF/etc/systemd/system/sysinit.target.wants
+ln -sf /etc/systemd/system/u6e-leds-off.service $RF/etc/systemd/system/sysinit.target.wants/u6e-leds-off.service
+
 # The boot that brought this image up was one-shot: U-Boot disarmed it before
 # starting us. u6e-arm re-arms it from the steps go8.sh staged, or with "disarm"
 # hands the next boot to stock; fw_setenv writes only the U-Boot env (mtd6).
