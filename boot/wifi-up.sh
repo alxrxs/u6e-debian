@@ -94,6 +94,7 @@ mbo=1
 oce=4
 oce_ip_subnet_id=$(subnet_id "$1")
 enable_dscp_policy_capa=1
+beacon_prot=1
 PMF
 }
 # ocv (802.11-2020) and ssid_protection (802.11-2024) bind the channel and SSID
@@ -102,7 +103,9 @@ PMF
 # client's keys from the one it came from (r0kh/r1kh wildcards with one shared
 # key); the R0KH-ID (nas_identifier) is unique per BSS in the mobility domain.
 # oce=4: Wi-Fi Optimized Connectivity AP (hostapd answers the probes here).
-# enable_dscp_policy_capa: Wi-Fi QoS Management DSCP policies.
+# enable_dscp_policy_capa: Wi-Fi QoS Management DSCP policies. beacon_prot:
+# hostapd drops it on a radio whose firmware cannot sign beacons (the driver
+# advertises it from WLAN.HK.2.12 on), so it takes effect on 5 and 6 GHz only.
 
 # RADIUS over TLS (ent, psk-mab): hostapd speaks it itself, mutually
 # authenticated with the site's RadSec client certificate; hostapd takes only
