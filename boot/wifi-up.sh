@@ -53,7 +53,6 @@ proxy_arp=1
 na_mcast_to_ucast=1
 ap_isolate=1
 multicast_to_unicast=1
-wpa_strict_rekey=1
 wpa_deny_ptk0_rekey=2
 bss_load_update_period=50
 esp=1
@@ -71,7 +70,9 @@ qos_map_set=8,1,18,3,20,3,22,3,24,4,26,4,28,4,30,4,32,4,34,4,36,4,38,4,40,5,44,6
 # client traffic, so ap_isolate leaves that forwarding to the bridge alone
 # (otherwise multicast goes out twice). multicast_to_unicast: group frames
 # (mDNS, SSDP, IPv6) reach each client as unicast at its own rate, not the
-# basic rate. wpa_strict_rekey: a new group key whenever a client leaves.
+# basic rate. No wpa_strict_rekey: a group rekey on every departure (dozens an
+# hour) has to wake every client, and sleeping phones that miss hostapd's ~3.5 s
+# of retries are disconnected.
 # wpa_deny_ptk0_rekey=2: never rekey a client's pairwise key in place (the
 # driver can't replace it safely: traffic stops until the client is dropped);
 # a client asking for one is disconnected and reconnects instead.
