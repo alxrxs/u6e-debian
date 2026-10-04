@@ -199,6 +199,30 @@ printf '[Unit]\nDescription=U6E state to the log every 5 minutes\n\n[Timer]\nOnB
 install -d $RF/etc/systemd/system/timers.target.wants
 ln -sf /etc/systemd/system/u6e-stats.timer $RF/etc/systemd/system/timers.target.wants/u6e-stats.timer
 
+# Wi-Fi comes up on its own on every boot: u6e-wifi is boot/wifi-up.sh's AP
+# side (with the site's Wi-Fi secrets, so root-only, as is the image), and the
+# unit runs hostapd under it, restarted if it exits.
+(umask 077; boot/wifi-up.sh --print > $RF/usr/local/sbin/u6e-wifi)
+chmod 0700 $RF/usr/local/sbin/u6e-wifi
+cat > $RF/etc/systemd/system/u6e-wifi.service <<'UNIT'
+[Unit]
+Description=U6E Wi-Fi (hostapd)
+After=u6e-nss.service systemd-networkd.service
+
+[Service]
+ExecStartPre=/usr/local/sbin/u6e-wifi prepare
+ExecStart=/usr/local/sbin/u6e-wifi run
+ExecStartPost=-/usr/local/sbin/u6e-wifi post
+ExecStop=/usr/local/sbin/u6e-wifi stop
+Restart=always
+RestartSec=5
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+ln -sf /etc/systemd/system/u6e-wifi.service $W/u6e-wifi.service
+
 # The boot that brought this image up was one-shot: U-Boot disarmed it before
 # starting us. u6e-arm re-arms it from the steps go8.sh staged, or with "disarm"
 # hands the next boot to stock; fw_setenv writes only the U-Boot env (mtd6).
@@ -467,13 +491,13 @@ fi
 # Pack: a reproducible zstd initrd (fixed mtimes, renumbered inodes) with the
 # paths this script rewrites last, so go8.sh's chunk compare only rewrites the
 # tail of the image on the eMMC; and the DTB carrying its location.
-rm -rf $OUT; install -d $OUT
+rm -rf $OUT; install -d -m 0700 $OUT
 TAIL='usr/lib/firmware usr/lib/modules etc usr/local'
 find $RF -exec touch -h -d @1767225600 {} +
 (cd $RF && {
 	find . -print0 | sort -z | grep -zvE "^\./(${TAIL// /|})(/|\$)"
 	for d in $TAIL; do find ./$d -print0 | sort -z; done
-} | cpio --null -o -H newc --quiet --reproducible) | zstd -q -19 -T0 > $OUT/u6e.initrd
+} | cpio --null -o -H newc --quiet --reproducible) | (umask 077; zstd -q -19 -T0 > $OUT/u6e.initrd)
 if [ $MODE = arm ]; then
 	cp $K/$IMG $OUT/zImage
 else
@@ -496,7 +520,7 @@ g() { git -c safe.directory='*' -C "$1" log -1 --format='%h %s'; }
 A=images/$(date +%Y%m%d-%H%M%S)-$MODE-$(git -c safe.directory='*' -C $K rev-parse --short HEAD)
 [ $MODE = nss ] && A=$A-$(git -c safe.directory='*' -C backports-7.2 rev-parse --short HEAD)
 A=$A-${U6E_AP:-default}
-install -d "$A"; cp -a $OUT/. "$A"/
+install -d -m 0700 "$A"; cp -a $OUT/. "$A"/
 { echo "ap:        ${U6E_AP:-default} ($AP_HOSTNAME, $MGMT_ADDR)"
   echo "kernel:    $(g $K)"
   [ $MODE = nss ] && echo "backports: $(g backports-7.2)"

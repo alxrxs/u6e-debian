@@ -7,7 +7,7 @@
 # rootfs takes iproute2 from pkg/iproute2-nss (tc with the NSS qdiscs) and
 # hostapd from pkg/hostapd (pinned upstream main, every feature), both held so apt cannot swap
 # them for Debian's; radsecproxy stays off until it is configured, and so does
-# hostapd's own unit, since boot/wifi-up.sh runs hostapd.
+# hostapd's own unit, since u6e-wifi.service (prep-rootfs.sh) runs hostapd.
 # shellcheck disable=SC2016 # each mmdebstrap hook gets the chroot as its own $1
 set -euo pipefail
 cd "$(dirname "$0")"
