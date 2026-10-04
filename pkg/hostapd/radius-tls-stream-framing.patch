@@ -1,0 +1,329 @@
+From 77a5a58b17a6ad4c3fe9a9e824dde7551687c608 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Sun, 4 Oct 2026 14:53:21 +0300
+Subject: [PATCH 2/2] RADIUS client: Frame RADIUS/TLS messages by their length
+
+RADIUS over TLS is a byte stream (RFC 6614, 3.4): a decrypted chunk can
+hold several RADIUS messages or part of one. radius_client_receive()
+took each chunk as one message, so a second response in it was dropped
+("Ignored N extra bytes after RADIUS message") and a message split over
+two chunks was rejected ("Invalid message length").
+
+Collect the decrypted data per connection and process every complete
+message by its Length field, keeping the rest for the next chunk. The
+message processing moves to radius_client_handle_msg() so the stream
+and the UDP paths share it.
+
+Assisted-by: LLM
+Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
+---
+ src/radius/radius_client.c | 238 +++++++++++++++++++++++--------------
+ 1 file changed, 148 insertions(+), 90 deletions(-)
+
+diff --git a/src/radius/radius_client.c b/src/radius/radius_client.c
+index 16284e1fe..b0ac89f4e 100644
+--- a/src/radius/radius_client.c
++++ b/src/radius/radius_client.c
+@@ -200,6 +200,16 @@ struct radius_client_data {
+ 	 */
+ 	bool acct_tls_ready;
+ 
++	/**
++	 * auth_tls_rx - Decrypted authentication data not yet processed
++	 */
++	struct wpabuf *auth_tls_rx;
++
++	/**
++	 * acct_tls_rx - Decrypted accounting data not yet processed
++	 */
++	struct wpabuf *acct_tls_rx;
++
+ 	/**
+ 	 * auth_handlers - Authentication message handlers
+ 	 */
+@@ -875,6 +885,8 @@ static void radius_close_auth_socket(struct radius_client_data *radius)
+ 		close(radius->auth_sock);
+ 		radius->auth_sock = -1;
+ 	}
++	wpabuf_free(radius->auth_tls_rx);
++	radius->auth_tls_rx = NULL;
+ }
+ 
+ 
+@@ -890,6 +902,8 @@ static void radius_close_acct_socket(struct radius_client_data *radius)
+ 		close(radius->acct_sock);
+ 		radius->acct_sock = -1;
+ 	}
++	wpabuf_free(radius->acct_tls_rx);
++	radius->acct_tls_rx = NULL;
+ }
+ 
+ 
+@@ -1183,15 +1197,10 @@ fail:
+ #endif /* CONFIG_RADIUS_TLS */
+ 
+ 
+-static void radius_client_receive(int sock, void *eloop_ctx, void *sock_ctx)
++static void radius_client_handle_msg(struct radius_client_data *radius,
++				     RadiusType msg_type, const u8 *buf,
++				     size_t len)
+ {
+-	struct radius_client_data *radius = eloop_ctx;
+-	struct hostapd_radius_servers *conf = radius->conf;
+-	RadiusType msg_type = (uintptr_t) sock_ctx;
+-	int len, roundtrip;
+-	unsigned char buf[RADIUS_MAX_MSG_LEN];
+-	struct msghdr msghdr = {0};
+-	struct iovec iov;
+ 	struct radius_msg *msg;
+ 	struct radius_hdr *hdr;
+ 	struct radius_rx_handler *handlers;
+@@ -1200,99 +1209,22 @@ static void radius_client_receive(int sock, void *eloop_ctx, void *sock_ctx)
+ 	struct os_reltime now;
+ 	struct hostapd_radius_server *rconf;
+ 	int invalid_authenticator = 0;
+-#ifdef CONFIG_RADIUS_TLS
+-	struct tls_connection *conn = NULL;
+-	bool tls, tls_ready;
+-#endif /* CONFIG_RADIUS_TLS */
++	int roundtrip;
+ 
+ 	if (msg_type == RADIUS_ACCT) {
+-#ifdef CONFIG_RADIUS_TLS
+-		if (radius->acct_tls)
+-			conn = radius->acct_tls_conn;
+-		tls = radius->acct_tls;
+-		tls_ready = radius->acct_tls_ready;
+-#endif /* CONFIG_RADIUS_TLS */
+ 		handlers = radius->acct_handlers;
+ 		num_handlers = radius->num_acct_handlers;
+-		rconf = conf->acct_server;
++		rconf = radius->conf->acct_server;
+ 	} else {
+-#ifdef CONFIG_RADIUS_TLS
+-		if (radius->auth_tls)
+-			conn = radius->auth_tls_conn;
+-		tls = radius->auth_tls;
+-		tls_ready = radius->auth_tls_ready;
+-#endif /* CONFIG_RADIUS_TLS */
+ 		handlers = radius->auth_handlers;
+ 		num_handlers = radius->num_auth_handlers;
+-		rconf = conf->auth_server;
+-	}
+-
+-	iov.iov_base = buf;
+-	iov.iov_len = RADIUS_MAX_MSG_LEN;
+-	msghdr.msg_iov = &iov;
+-	msghdr.msg_iovlen = 1;
+-	msghdr.msg_flags = 0;
+-	len = recvmsg(sock, &msghdr, MSG_DONTWAIT);
+-	if (len < 0) {
+-		wpa_printf(MSG_INFO, "recvmsg[RADIUS]: %s", strerror(errno));
+-		return;
+-	}
+-#ifdef CONFIG_RADIUS_TLS
+-	if (tls && len == 0) {
+-		wpa_printf(MSG_DEBUG, "RADIUS: No TCP data available");
+-		goto close_tcp;
+-	}
+-
+-	if (tls && !tls_ready) {
+-		radius_client_process_tls_handshake(radius, sock, msg_type,
+-						    buf, len);
+-		return;
+-	}
+-
+-	if (conn) {
+-		struct wpabuf *out, *in;
+-
+-		in = wpabuf_alloc_copy(buf, len);
+-		if (!in)
+-			return;
+-		wpa_printf(MSG_DEBUG,
+-			   "RADIUS: Process %d bytes of encrypted TLS data",
+-			   len);
+-		out = tls_connection_decrypt(radius->tls_ctx, conn, in);
+-		wpabuf_free(in);
+-		if (!out) {
+-			wpa_printf(MSG_INFO,
+-				   "RADIUS: Failed to decrypt TLS data");
+-			goto close_tcp;
+-		}
+-		if (wpabuf_len(out) == 0) {
+-			wpa_printf(MSG_DEBUG,
+-				   "RADIUS: Full message not yet received - continue waiting for additional TLS data");
+-			wpabuf_free(out);
+-			return;
+-		}
+-		if (wpabuf_len(out) > RADIUS_MAX_MSG_LEN) {
+-			wpa_printf(MSG_INFO,
+-				   "RADIUS: Too long RADIUS message from TLS: %zu",
+-				   wpabuf_len(out));
+-			wpabuf_free(out);
+-			goto close_tcp;
+-		}
+-		os_memcpy(buf, wpabuf_head(out), wpabuf_len(out));
+-		len = wpabuf_len(out);
+-		wpabuf_free(out);
++		rconf = radius->conf->auth_server;
+ 	}
+-#endif /* CONFIG_RADIUS_TLS */
+ 
+ 	hostapd_logger(radius->ctx, NULL, HOSTAPD_MODULE_RADIUS,
+-		       HOSTAPD_LEVEL_DEBUG, "Received %d bytes from RADIUS "
++		       HOSTAPD_LEVEL_DEBUG, "Received %zu bytes from RADIUS "
+ 		       "server", len);
+ 
+-	if (msghdr.msg_flags & MSG_TRUNC) {
+-		wpa_printf(MSG_INFO, "RADIUS: Possibly too long UDP frame for our buffer - dropping it");
+-		return;
+-	}
+-
+ 	msg = radius_msg_parse(buf, len);
+ 	if (msg == NULL) {
+ 		wpa_printf(MSG_INFO, "RADIUS: Parsing incoming frame failed");
+@@ -1303,7 +1235,7 @@ static void radius_client_receive(int sock, void *eloop_ctx, void *sock_ctx)
+ 
+ 	hostapd_logger(radius->ctx, NULL, HOSTAPD_MODULE_RADIUS,
+ 		       HOSTAPD_LEVEL_DEBUG, "Received RADIUS message");
+-	if (conf->msg_dumps)
++	if (radius->conf->msg_dumps)
+ 		radius_msg_dump(msg);
+ 
+ 	switch (hdr->code) {
+@@ -1401,6 +1333,132 @@ static void radius_client_receive(int sock, void *eloop_ctx, void *sock_ctx)
+ 
+  fail:
+ 	radius_msg_free(msg);
++}
++
++
++#ifdef CONFIG_RADIUS_TLS
++/*
++ * RADIUS over TLS (RFC 6614) is a byte stream: a decrypted chunk can hold
++ * several RADIUS messages or part of one. Collect it and process every
++ * complete message, framed by its Length field.
++ */
++static int radius_client_tls_rx(struct radius_client_data *radius,
++				RadiusType msg_type, const struct wpabuf *data)
++{
++	struct wpabuf **rx = msg_type == RADIUS_ACCT ? &radius->acct_tls_rx :
++		&radius->auth_tls_rx;
++	u8 msg[RADIUS_MAX_MSG_LEN];
++	size_t len;
++
++	if (wpabuf_resize(rx, wpabuf_len(data)))
++		return -1;
++	wpabuf_put_buf(*rx, data);
++
++	while (*rx && wpabuf_len(*rx) >= sizeof(struct radius_hdr)) {
++		len = WPA_GET_BE16(wpabuf_head_u8(*rx) + 2);
++		if (len < sizeof(struct radius_hdr) ||
++		    len > RADIUS_MAX_MSG_LEN) {
++			wpa_printf(MSG_INFO,
++				   "RADIUS: Invalid message length %zu from TLS",
++				   len);
++			return -1;
++		}
++		if (wpabuf_len(*rx) < len) {
++			wpa_printf(MSG_DEBUG,
++				   "RADIUS: Full message not yet received - continue waiting for additional TLS data");
++			break;
++		}
++		os_memcpy(msg, wpabuf_head(*rx), len);
++		os_memmove(wpabuf_mhead(*rx), wpabuf_head_u8(*rx) + len,
++			   wpabuf_len(*rx) - len);
++		(*rx)->used -= len;
++		/* The handler can close the connection and free *rx. */
++		radius_client_handle_msg(radius, msg_type, msg, len);
++	}
++
++	return 0;
++}
++#endif /* CONFIG_RADIUS_TLS */
++
++
++static void radius_client_receive(int sock, void *eloop_ctx, void *sock_ctx)
++{
++	struct radius_client_data *radius = eloop_ctx;
++	RadiusType msg_type = (uintptr_t) sock_ctx;
++	int len;
++	unsigned char buf[RADIUS_MAX_MSG_LEN];
++	struct msghdr msghdr = {0};
++	struct iovec iov;
++#ifdef CONFIG_RADIUS_TLS
++	struct tls_connection *conn = NULL;
++	bool tls, tls_ready;
++
++	if (msg_type == RADIUS_ACCT) {
++		if (radius->acct_tls)
++			conn = radius->acct_tls_conn;
++		tls = radius->acct_tls;
++		tls_ready = radius->acct_tls_ready;
++	} else {
++		if (radius->auth_tls)
++			conn = radius->auth_tls_conn;
++		tls = radius->auth_tls;
++		tls_ready = radius->auth_tls_ready;
++	}
++#endif /* CONFIG_RADIUS_TLS */
++
++	iov.iov_base = buf;
++	iov.iov_len = RADIUS_MAX_MSG_LEN;
++	msghdr.msg_iov = &iov;
++	msghdr.msg_iovlen = 1;
++	msghdr.msg_flags = 0;
++	len = recvmsg(sock, &msghdr, MSG_DONTWAIT);
++	if (len < 0) {
++		wpa_printf(MSG_INFO, "recvmsg[RADIUS]: %s", strerror(errno));
++		return;
++	}
++#ifdef CONFIG_RADIUS_TLS
++	if (tls && len == 0) {
++		wpa_printf(MSG_DEBUG, "RADIUS: No TCP data available");
++		goto close_tcp;
++	}
++
++	if (tls && !tls_ready) {
++		radius_client_process_tls_handshake(radius, sock, msg_type,
++						    buf, len);
++		return;
++	}
++
++	if (conn) {
++		struct wpabuf *out, *in;
++		int res;
++
++		in = wpabuf_alloc_copy(buf, len);
++		if (!in)
++			return;
++		wpa_printf(MSG_DEBUG,
++			   "RADIUS: Process %d bytes of encrypted TLS data",
++			   len);
++		out = tls_connection_decrypt(radius->tls_ctx, conn, in);
++		wpabuf_free(in);
++		if (!out) {
++			wpa_printf(MSG_INFO,
++				   "RADIUS: Failed to decrypt TLS data");
++			goto close_tcp;
++		}
++		res = radius_client_tls_rx(radius, msg_type, out);
++		wpabuf_free(out);
++		if (res < 0)
++			goto close_tcp;
++		return;
++	}
++#endif /* CONFIG_RADIUS_TLS */
++
++	if (msghdr.msg_flags & MSG_TRUNC) {
++		wpa_printf(MSG_INFO, "RADIUS: Possibly too long UDP frame for our buffer - dropping it");
++		return;
++	}
++
++	radius_client_handle_msg(radius, msg_type, buf, len);
+ 	return;
+ 
+ #ifdef CONFIG_RADIUS_TLS
+-- 
+2.47.3
+

@@ -1,0 +1,92 @@
+From c24fe09c78e73f7124272ccb8dd5b8dbc23f7eed Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Sun, 4 Oct 2026 14:52:42 +0300
+Subject: [PATCH 1/2] OpenSSL: Keep pending received TLS data when encrypting
+
+tls_connection_encrypt() reset ssl_in, the memory BIO with the received
+TLS data OpenSSL has not consumed yet, and tls_connection_decrypt() read
+only one record with a single SSL_read(). In EAP the peers take turns,
+so neither mattered, but RADIUS/TLS (RFC 6614) carries several requests
+and responses in flight on one connection: a second record that arrived
+with the first stayed in ssl_in until the server sent more, and was
+discarded if a request was encrypted before that. The next record then
+failed the record MAC check ("decryption failed or bad record mac") and
+the connection was closed, the responses in it lost.
+
+Leave ssl_in alone when encrypting and read every complete record when
+decrypting.
+
+Assisted-by: LLM
+Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
+---
+ src/crypto/tls_openssl.c | 43 ++++++++++++++++++++++++++--------------
+ 1 file changed, 28 insertions(+), 15 deletions(-)
+
+diff --git a/src/crypto/tls_openssl.c b/src/crypto/tls_openssl.c
+index 275ddd1d2..7cc14b3e9 100644
+--- a/src/crypto/tls_openssl.c
++++ b/src/crypto/tls_openssl.c
+@@ -5136,9 +5136,12 @@ struct wpabuf * tls_connection_encrypt(void *tls_ctx,
+ 	if (conn == NULL)
+ 		return NULL;
+ 
+-	/* Give plaintext data for OpenSSL to encrypt into the TLS tunnel. */
+-	if ((res = BIO_reset(conn->ssl_in)) < 0 ||
+-	    (res = BIO_reset(conn->ssl_out)) < 0) {
++	/*
++	 * Give plaintext data for OpenSSL to encrypt into the TLS tunnel.
++	 * ssl_in is left alone: it can hold received records that have not
++	 * been decrypted yet.
++	 */
++	if ((res = BIO_reset(conn->ssl_out)) < 0) {
+ 		tls_show_errors(MSG_INFO, __func__, "BIO_reset failed");
+ 		return NULL;
+ 	}
+@@ -5196,22 +5199,32 @@ struct wpabuf * tls_connection_decrypt(void *tls_ctx,
+ 	buf = wpabuf_alloc((wpabuf_len(in_data) + 500) * 3);
+ 	if (buf == NULL)
+ 		return NULL;
+-	res = SSL_read(conn->ssl, wpabuf_mhead(buf), wpabuf_size(buf));
+-	if (res < 0) {
+-		int err = SSL_get_error(conn->ssl, res);
+-
+-		if (err == SSL_ERROR_WANT_READ) {
+-			wpa_printf(MSG_DEBUG,
+-				   "SSL: SSL_connect - want more data");
+-			res = 0;
+-		} else {
+-			tls_show_errors(MSG_INFO, __func__,
+-					"Decryption failed - SSL_read");
++	/*
++	 * Read every complete record: one SSL_read() returns at most one, and
++	 * a record left behind would wait for the peer's next data.
++	 */
++	for (;;) {
++		if (wpabuf_tailroom(buf) < 500 &&
++		    wpabuf_resize(&buf, wpabuf_size(buf))) {
+ 			wpabuf_free(buf);
+ 			return NULL;
+ 		}
++		res = SSL_read(conn->ssl, wpabuf_put(buf, 0),
++			       wpabuf_tailroom(buf));
++		if (res > 0) {
++			wpabuf_put(buf, res);
++			continue;
++		}
++		if (res == 0 ||
++		    SSL_get_error(conn->ssl, res) == SSL_ERROR_WANT_READ)
++			break;
++		tls_show_errors(MSG_INFO, __func__,
++				"Decryption failed - SSL_read");
++		wpabuf_free(buf);
++		return NULL;
+ 	}
+-	wpabuf_put(buf, res);
++	if (wpabuf_len(buf) == 0)
++		wpa_printf(MSG_DEBUG, "SSL: SSL_read - want more data");
+ 
+ 	if (conn->invalid_hb_used) {
+ 		wpa_printf(MSG_INFO, "TLS: Heartbeat attack detected - do not send response");
+-- 
+2.47.3
+

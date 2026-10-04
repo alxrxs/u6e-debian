@@ -7,7 +7,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 REV=5b156e272a0266ca6be0f394192bad42b0ff176c  # hostap main, 2026-10-01
-UP=2.13~git20261001 DEBVER=2.11-2 VER=2:2.13~git20261001-0+u6e6
+UP=2.13~git20261001 DEBVER=2.11-2 VER=2:2.13~git20261001-0+u6e7
 [ ! -e work ] || { echo "work exists; remove it first" >&2; exit 1; }
 mkdir work; mkdir -p out
 git clone -q https://w1.fi/hostap.git work/src
@@ -27,14 +27,16 @@ sed -i '/^Bump-DEFAULT_BSS_MAX_COUNT-to-1000.patch$/d; /^CVE-2024-5290-lib_engin
 # ESP element, the Neighbor Report ANQP-element, FILS Request Parameters
 # parsing, and OCE AP: probe handling, Transmit Power and IP Subnet attributes,
 # co-located RNR and AP Channel Report, and a single MBO-OCE element on RSSI
-# rejection; the BTM cellular preference only for cellular STAs; and a zero
-# Medium Time for downlink TSPECs.
+# rejection; the BTM cellular preference only for cellular STAs; a zero
+# Medium Time for downlink TSPECs; and RADIUS/TLS with several messages in
+# flight (OpenSSL keeps pending records, the client frames the stream).
 for p in no-pri-sec-switch-option rnr-6ghz-psd \
 	btm-query-candidates rrm-link-measurement-responder dscp-policy-fixes \
 	nr-mobility-domain esp-element anqp-neighbor-report fils-req-params-length \
 	oce-ap-probe-handling oce-tx-power-ip-subnet \
 	oce-colocated-rnr-ap-channel-report oce-rssi-reject-single-ie \
-	mbo-cell-pref-optional wmm-downlink-medium-time; do
+	mbo-cell-pref-optional wmm-downlink-medium-time \
+	openssl-keep-pending-tls-data radius-tls-stream-framing; do
 	cp $p.patch $D/patches/
 	echo $p.patch >> $D/patches/series
 done
