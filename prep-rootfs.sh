@@ -9,7 +9,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 . ./site.conf
-MGMT_IF=vlan$MGMT_VLAN CLIENT_IF=vlan$CLIENT_VLAN CLIENT_BR=br$CLIENT_VLAN
+MGMT_IF=vlan$MGMT_VLAN CLIENT_IF=vlan$CLIENT_VLAN
+WIFI_VLANS=${WIFI_VLANS:-$CLIENT_VLAN}
+case " $WIFI_VLANS " in *" $CLIENT_VLAN "*) ;; *) echo "WIFI_VLANS must include CLIENT_VLAN" >&2; exit 1 ;; esac
 MGMT_IP=${MGMT_ADDR%/*}
 MGMT_BCAST=$(python3 -c 'import ipaddress, sys; print(ipaddress.ip_interface(sys.argv[1]).network.broadcast_address)' "$MGMT_ADDR")
 INITRD_ADDR=0x52200000   # must match go8.sh
@@ -39,12 +41,19 @@ ln -s /sbin/init $RF/init
 # controller's static config (no address on the untagged side).
 N=$RF/etc/systemd/network
 rm -f $N/*.network $N/*.netdev $N/*.link
-printf '[Match]\nType=ether\n\n[Network]\nVLAN=%s\nVLAN=%s\nLinkLocalAddressing=no\n' $MGMT_IF $CLIENT_IF > $N/10-uplink.network
-# Wi-Fi clients: their VLAN is bridged, unaddressed; hostapd adds the radios.
-printf '[NetDev]\nName=%s\nKind=vlan\n\n[VLAN]\nId=%s\n' $CLIENT_IF $CLIENT_VLAN > $N/20-$CLIENT_IF.netdev
-printf '[Match]\nName=%s\n\n[Network]\nBridge=%s\nLinkLocalAddressing=no\n' $CLIENT_IF $CLIENT_BR > $N/20-$CLIENT_IF.network
-printf '[NetDev]\nName=%s\nKind=bridge\n' $CLIENT_BR > $N/25-$CLIENT_BR.netdev
-printf '[Match]\nName=%s\n\n[Network]\nLinkLocalAddressing=no\nConfigureWithoutCarrier=yes\n' $CLIENT_BR > $N/25-$CLIENT_BR.network
+{
+	printf '[Match]\nType=ether\n\n[Network]\nVLAN=%s\n' $MGMT_IF
+	printf 'VLAN=vlan%s\n' $WIFI_VLANS
+	printf 'LinkLocalAddressing=no\n'
+} > $N/10-uplink.network
+# Wi-Fi clients: each VLAN they can land in is bridged, unaddressed; hostapd
+# adds the radios (and RADIUS-assigned clients' interfaces) to the bridges.
+for v in $WIFI_VLANS; do
+	printf '[NetDev]\nName=vlan%s\nKind=vlan\n\n[VLAN]\nId=%s\n' $v $v > $N/20-vlan$v.netdev
+	printf '[Match]\nName=vlan%s\n\n[Network]\nBridge=br%s\nLinkLocalAddressing=no\n' $v $v > $N/20-vlan$v.network
+	printf '[NetDev]\nName=br%s\nKind=bridge\n' $v > $N/25-br$v.netdev
+	printf '[Match]\nName=br%s\n\n[Network]\nLinkLocalAddressing=no\nConfigureWithoutCarrier=yes\n' $v > $N/25-br$v.network
+done
 # Stable names by device path (PCI domains are pinned in the DT): the uplink
 # GMAC is lan, which the NSS glue arms by name; nss mode creates the radio
 # interfaces under these names itself.

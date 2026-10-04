@@ -1,17 +1,23 @@
 #!/bin/bash
-# Start the test SSIDs on all three radios of the AP running our image, bridged
-# into the client VLAN's bridge: WPA3-Personal, and, when the site defines
-# wifi_ent_ssid, a WPA3-Enterprise SSID that authenticates over RadSec (RADIUS
-# over TLS, RFC 6614). Passphrases, keys and certificates come from the site's
-# functions (site.conf) and only ever land in /run on the AP.
+# Start the site's SSIDs (WIFI_SSIDS in site.conf) on the radios of the AP
+# running our image, each a line name|kind|bands|VLAN:
+#   sae      WPA3-Personal with FT
+#   ent      WPA3-Enterprise with FT, authenticated over RadSec (RADIUS over
+#            TLS, RFC 6614) to the site's RADIUS server
+#   psk-mab  WPA2-Personal plus RADIUS MAC authentication, for clients that can
+#            do nothing newer
+# on the bands named (24 5 6), bridged into br<VLAN>; RADIUS can move an ent
+# or psk-mab client into another of WIFI_VLANS. Passphrases, keys and
+# certificates come from the site's functions and only ever land in /run on
+# the AP.
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
-SSID=$(wifi_ssid) PSK=$(wifi_psk) FTKEY=$(wifi_ft_key)
+FTKEY=$(wifi_ft_key)
 # 802.11r: every AP serving an SSID derives the same mobility domain from it.
 mdid() { printf %s "$1" | md5sum | cut -c1-4; }
-# OCE IP Subnet Identifier: the same for every AP that serves this SSID on the
-# client VLAN, without revealing the subnet
-SUBNET_ID=$(printf '%s/%s' "$SSID" "$CLIENT_VLAN" | md5sum | cut -c1-12)
+# OCE IP Subnet Identifier: the same for every BSS on a VLAN, on every AP,
+# without revealing the subnet.
+subnet_id() { printf 'vlan/%s' "$1" | md5sum | cut -c1-12; }
 
 # Per radio.
 radio="country_code=$WIFI_COUNTRY
@@ -27,19 +33,16 @@ he_mu_beamformer=1
 he_twt_responder=1
 he_spr_sr_control=5
 he_spr_non_srg_obss_pd_max_offset=10"
-# Per BSS, the same for every SSID.
+# local_pwr_constraint + spectrum_mgmt_required: 802.11h (spectrum management,
+# a 0 dB Power Constraint) outside DFS channels too, where hostapd sets it only
+# on its own. he_spr_sr_control=5: non-SRG OBSS-PD spatial reuse at
+# he_spr_non_srg_obss_pd_max_offset (parameterized SR disallowed).
+
+# Every BSS.
 bss="ctrl_interface=/run/hostapd
-bridge=br$CLIENT_VLAN
 wmm_enabled=1
 uapsd_advertisement_enabled=1
 wpa=2
-rsn_pairwise=CCMP GCMP-256
-group_mgmt_cipher=AES-128-CMAC
-r0kh=ff:ff:ff:ff:ff:ff * $FTKEY
-r1kh=00:00:00:00:00:00 00:00:00:00:00:00 $FTKEY
-ft_over_ds=0
-ocv=1
-ssid_protection=1
 stationary_ap=1
 ftm_responder=1
 rrm_neighbor_report=1
@@ -54,33 +57,15 @@ wpa_strict_rekey=1
 wpa_deny_ptk0_rekey=2
 bss_load_update_period=50
 esp=1
-mbo=1
-oce=4
-oce_ip_subnet_id=$SUBNET_ID
-enable_dscp_policy_capa=1
 interworking=1
 access_network_type=0
 internet=1
 qos_map_set=8,1,18,3,20,3,22,3,24,4,26,4,28,4,30,4,32,4,34,4,36,4,38,4,40,5,44,6,46,6,0,63,255,255,255,255,255,255,255,255,255,255,255,255,255,255"
-# local_pwr_constraint + spectrum_mgmt_required: 802.11h (spectrum management,
-# a 0 dB Power Constraint) outside DFS channels too, where hostapd sets it only
-# on its own. qos_map_set: RFC 8325's DSCP to user priority mapping (CS6/CS7 stay best
-# effort), so clients mark their uplink the way the network does.
-# transition_disable: clients never fall back to WPA2 here; ocv (802.11-2020)
-# and ssid_protection (802.11-2024) bind the channel and SSID into the key
-# exchange; ft_over_ds=0 keeps 802.11r roaming over the air only;
-# enable_dscp_policy_capa: Wi-Fi QoS Management DSCP policies (hostapd main). FT-SAE's
-# PMK comes from each SAE exchange, so a radio pulls a roaming client's keys
-# from the one it came from (r0kh/r1kh wildcards with one shared key); the
-# R0KH-ID (nas_identifier) is unique per AP in the mobility domain.
-# he_spr_sr_control=5: non-SRG OBSS-PD spatial reuse at
-# he_spr_non_srg_obss_pd_max_offset (parameterized SR disallowed).
-# SAE hash-to-element only (sae_pwe=1) on every band: 6 GHz admits no
-# hunting-and-pecking, and every client here does H2E.
 # ftm_responder: Fine Timing Measurement responder (802.11-2024 11.21.6), so
-# clients can range to the AP for indoor location.
-# oce=4: Wi-Fi Optimized Connectivity AP (hostapd answers the probes here);
-# esp: Estimated Service Parameters, so clients can estimate their throughput.
+# clients can range to the AP for indoor location. esp: Estimated Service
+# Parameters, so clients can estimate their throughput. qos_map_set: RFC
+# 8325's DSCP to user priority mapping (CS6/CS7 stay best effort), so clients
+# mark their uplink the way the network does.
 # proxy_arp (802.11v): the bridge answers ARP and IPv6 neighbor solicitations
 # for the clients, so broadcast ARP stays off the air; it hairpins client to
 # client traffic, so ap_isolate leaves that forwarding to the bridge alone
@@ -90,34 +75,47 @@ qos_map_set=8,1,18,3,20,3,22,3,24,4,26,4,28,4,30,4,32,4,34,4,36,4,38,4,40,5,44,6
 # wpa_deny_ptk0_rekey=2: never rekey a client's pairwise key in place (the
 # driver can't replace it safely: traffic stops until the client is dropped);
 # a client asking for one is disconnected and reconnects instead.
-# WPA3 on every band: 6 GHz admits nothing else, and clients (iOS) only treat
-# the 6 GHz BSS as the same network when 2.4/5 GHz offer the same security.
-# SAE-EXT-KEY (AKMs 24/25, WPA3 3.5) with GCMP-256 and SAE groups 20/21 next
-# to SAE/CCMP: clients that support it use it, the rest keep SAE; group
-# traffic stays CCMP-128 and BIP-CMAC-128, which every client supports.
-sae="ssid=$SSID
-sae_password=$PSK
-mobility_domain=$(mdid "$SSID")
-transition_disable=0x01
-wpa_key_mgmt=SAE SAE-EXT-KEY FT-SAE FT-SAE-EXT-KEY
-sae_groups=19 20 21
-ieee80211w=2
-sae_pwe=1"
 
-# WPA3-Enterprise Only Mode (WPA3 3.5 3.2): 802.1X with SHA-256 plus FT,
-# never SHA-1; PMF required. hostapd speaks RADIUS/TLS itself, mutually
+# Every BSS with protected management frames (sae, ent): Agile Multiband and
+# Optimized Connectivity require them.
+pmf() { # <VLAN>
+	cat <<PMF
+rsn_pairwise=CCMP GCMP-256
+group_mgmt_cipher=AES-128-CMAC
+ieee80211w=2
+ocv=1
+ssid_protection=1
+ft_over_ds=0
+r0kh=ff:ff:ff:ff:ff:ff * $FTKEY
+r1kh=00:00:00:00:00:00 00:00:00:00:00:00 $FTKEY
+mbo=1
+oce=4
+oce_ip_subnet_id=$(subnet_id "$1")
+enable_dscp_policy_capa=1
+PMF
+}
+# ocv (802.11-2020) and ssid_protection (802.11-2024) bind the channel and SSID
+# into the key exchange; ft_over_ds=0 keeps 802.11r roaming over the air only.
+# FT's PMK-R0 comes from each SAE or EAP exchange, so a radio pulls a roaming
+# client's keys from the one it came from (r0kh/r1kh wildcards with one shared
+# key); the R0KH-ID (nas_identifier) is unique per BSS in the mobility domain.
+# oce=4: Wi-Fi Optimized Connectivity AP (hostapd answers the probes here).
+# enable_dscp_policy_capa: Wi-Fi QoS Management DSCP policies.
+
+# RADIUS over TLS (ent, psk-mab): hostapd speaks it itself, mutually
 # authenticated with the site's RadSec client certificate; hostapd takes only
-# addresses, so the server's name is resolved here. No periodic EAP
-# reauthentication: each one ends in an in-place pairwise rekey.
-ent=
-if declare -F wifi_ent_ssid >/dev/null; then
-	ENT_SSID=$(wifi_ent_ssid)
+# addresses, so the server's name is resolved here.
+radius=
+for e in "${WIFI_SSIDS[@]}"; do
+	case $e in *"|ent|"* | *"|psk-mab|"*) radius=y ;; esac
+done
+if [ -n "$radius" ]; then
 	RADSEC=$(getent ahostsv4 "$WIFI_RADSEC_SERVER" | awk 'NR == 1 {print $1}')
 	[ -n "$RADSEC" ] || { echo "$WIFI_RADSEC_SERVER: no IPv4 address" >&2; exit 1; }
 	RADSEC_PASS=$(radsec_key_pass)
-	tls=
+	radius="own_ip_addr=$AP"
 	for s in auth acct; do
-		tls="$tls
+		radius="$radius
 ${s}_server_addr=$RADSEC
 ${s}_server_port=2083
 ${s}_server_type=TLS
@@ -127,16 +125,64 @@ ${s}_server_client_cert=/run/hostapd-u6e/radsec/client.pem
 ${s}_server_private_key=/run/hostapd-u6e/radsec/client.key
 ${s}_server_private_key_passwd=$RADSEC_PASS"
 	done
-	ent="ssid=$ENT_SSID
-mobility_domain=$(mdid "$ENT_SSID")
+fi
+
+# One SSID's own lines, by kind.
+kind() { # <name> <kind> <VLAN> <iface>
+	echo "ssid=$1"
+	echo "bridge=br$3"
+	case $2 in
+	sae)
+		# WPA3-Personal on every band: 6 GHz admits nothing else, and clients
+		# (iOS) only treat the 6 GHz BSS as the same network when 2.4/5 GHz
+		# offer the same security. SAE-EXT-KEY (AKMs 24/25, WPA3 3.5) with
+		# GCMP-256 and SAE groups 20/21 next to SAE/CCMP: clients that support
+		# it use it, the rest keep SAE; group traffic stays CCMP-128 and
+		# BIP-CMAC-128, which every client supports. Hash-to-element only
+		# (sae_pwe=1): 6 GHz admits no hunting-and-pecking.
+		cat <<SAE
+sae_password=$(wifi_psk "$1")
+mobility_domain=$(mdid "$1")
+transition_disable=0x01
+wpa_key_mgmt=SAE SAE-EXT-KEY FT-SAE FT-SAE-EXT-KEY
+sae_groups=19 20 21
+sae_pwe=1
+SAE
+		pmf "$3" ;;
+	ent)
+		# WPA3-Enterprise Only Mode (WPA3 3.5 3.2): 802.1X with SHA-256 plus
+		# FT, never SHA-1. No periodic EAP reauthentication: each one ends in
+		# an in-place pairwise rekey.
+		cat <<ENT
+mobility_domain=$(mdid "$1")
 transition_disable=0x04
 wpa_key_mgmt=WPA-EAP-SHA256 FT-EAP
-ieee80211w=2
 ieee8021x=1
 eap_reauth_period=0
-own_ip_addr=$AP
-radius_request_cui=1$tls"
-fi
+radius_request_cui=1
+dynamic_vlan=1
+vlan_file=/run/hostapd-u6e/$4.vlan
+$radius
+ENT
+		pmf "$3" ;;
+	psk-mab)
+		# WPA2-Personal without PMF, plus RADIUS MAC authentication (which
+		# also assigns the VLAN): for clients that can do nothing newer, so no
+		# Agile Multiband, Optimized Connectivity or FT either.
+		cat <<MAB
+wpa_passphrase=$(wifi_psk "$1")
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+ieee80211w=0
+macaddr_acl=2
+dynamic_vlan=1
+vlan_file=/run/hostapd-u6e/$4.vlan
+$radius
+MAB
+		;;
+	*) echo "unknown SSID kind: $2" >&2; exit 1 ;;
+	esac
+}
 
 # The radios' HT/VHT capabilities (iw phy): hostapd advertises only what is
 # listed, and without them Wi-Fi 4/5 clients get no LDPC, STBC, short guard
@@ -151,20 +197,60 @@ ht() { # <band lines> <capabilities>: append them to the site's ht_capab
 	fi
 }
 
-conf() { # <iface> <radio lines> <BSS lines>
-	echo "cat > /run/hostapd-u6e/$1.conf <<'EOF'"
-	printf 'interface=%s\n%s\n%s\n%s\n%s\n%s\nnas_identifier=%s-%s\n' \
-		"$1" "$radio" "$2" "$bss" "$sae" "$3" "$AP" "$1"
-	# The enterprise SSID: a second BSS on a locally administered address
-	# derived from the radio's (set on the AP).
-	[ -z "$ent" ] || printf 'bss=%s-ent\nbssid=@LA@\n%s\n%s\n%s\nnas_identifier=%s-%s-ent\n' \
-		"$1" "$bss" "$ent" "$3" "$AP" "$1"
+# Each radio's own lines and its BSS extras (DTIM as on the UniFi controller).
+# 2.4 GHz is OFDM only, so beacons and management frames go at 6 Mbit/s rather
+# than 1 (Wi-Fi Optimized Connectivity wants at least 5.5). rnr: 2.4 and 5 GHz
+# beacons announce the 6 GHz BSSs (Reduced Neighbor Report), which is how most
+# clients find 6 GHz at all; hostapd only reports a 6 GHz BSS it runs in the
+# same process. FILS Discovery (802.11ai) every 20 ms between beacons speeds
+# up 6 GHz scans.
+radio_lines() { # <band>
+	case $1 in
+	24) printf '%s\nhe_bss_color=11\nsupported_rates=60 90 120 180 240 360 480 540\nbasic_rates=60 120 240\n' \
+		"$(ht "$WIFI_24" "$HT_CAPS")" ;;
+	5) printf '%s\nvht_capab=%s\nhe_bss_color=22\n' "$(ht "$WIFI_5" "${HT_CAPS}[MAX-AMSDU-7935]")" "$VHT_CAPS_5" ;;
+	6) printf '%s\nhe_bss_color=33\n' "$WIFI_6" ;;
+	esac
+}
+bss_extra() { # <band>
+	case $1 in
+	24) printf 'rnr=1\ndtim_period=1\n' ;;
+	5) printf 'rnr=1\ndtim_period=3\n' ;;
+	6) printf 'fils_discovery_max_interval=20\ndtim_period=3\n' ;;
+	esac
+}
+
+# A radio's config: its first SSID on the radio's own interface, every further
+# one a BSS on a locally administered address derived from the radio's (set on
+# the AP). Prints the AP-side commands; collects each SSID's interfaces in
+# group[] for the neighbor reports.
+declare -a group
+radio_conf() { # <band>
+	local n=0 e name kind bands vlan iface
+	echo "cat > /run/hostapd-u6e/wlan$1.conf <<'EOF'"
+	for i in "${!WIFI_SSIDS[@]}"; do
+		e=${WIFI_SSIDS[$i]}
+		IFS='|' read -r name kind bands vlan <<<"$e"
+		case " $bands " in *" $1 "*) ;; *) continue ;; esac
+		[ "$1:$kind" != 6:psk-mab ] || { echo "$name: 6 GHz admits only WPA3" >&2; exit 1; }
+		if [ $n = 0 ]; then
+			iface=wlan$1
+			printf 'interface=%s\n%s\n%s\n' $iface "$radio" "$(radio_lines $1)"
+		else
+			iface=wlan$1-$n
+			printf 'bss=%s\nbssid=@LA%s@\n' $iface $n
+		fi
+		printf '%s\n%s\n%s\nnas_identifier=%s-%s\n' "$bss" "$(kind "$name" $kind $vlan $iface)" \
+			"$(bss_extra $1)" "$AP" $iface
+		group[$i]="${group[$i]:-} $iface"
+		n=$((n + 1))
+	done
 	echo "EOF"
 }
 
 {
-	echo "mkdir -p /run/hostapd-u6e && chmod 700 /run/hostapd-u6e"
-	if [ -n "$ent" ]; then
+	echo "mkdir -p /run/hostapd-u6e && chmod 700 /run/hostapd-u6e && rm -f /run/hostapd-u6e/*.conf /run/hostapd-u6e/*.vlan"
+	if [ -n "$radius" ]; then
 		echo "mkdir -p /run/hostapd-u6e/radsec"
 		for f in ca:radsec_ca client:radsec_cert client.key:radsec_key; do
 			n=${f%%:*}; [ "$n" = client.key ] || n=$n.pem
@@ -182,27 +268,22 @@ conf() { # <iface> <radio lines> <BSS lines>
 iw reg set $WIFI_COUNTRY
 for _ in \$(seq 20); do [ \"\$(iw reg get | grep -c '^country $WIFI_COUNTRY')\" -ge 3 ] && break; sleep 0.5; done
 iw reg get | grep -E '^(phy|country)' | paste - - | sed 's/^/reg: /'"
-	# rnr: 2.4 and 5 GHz beacons announce the 6 GHz BSS (Reduced Neighbor
-	# Report), which is how most clients find 6 GHz at all; hostapd only
-	# reports a 6 GHz BSS it runs in the same process. 2.4 GHz is OFDM only, so
-	# beacons and management frames go at 6 Mbit/s rather than 1 (Wi-Fi Optimized
-	# Connectivity wants at least 5.5).
-	conf wlan24 "$(ht "$WIFI_24" "$HT_CAPS")
-he_bss_color=11
-supported_rates=60 90 120 180 240 360 480 540
-basic_rates=60 120 240" "rnr=1"
-	conf wlan5 "$(ht "$WIFI_5" "${HT_CAPS}[MAX-AMSDU-7935]")
-vht_capab=$VHT_CAPS_5
-he_bss_color=22" "rnr=1"
-	# FILS Discovery (802.11ai) every 20 ms between beacons speeds up 6 GHz
-	# scans.
-	conf wlan6 "$WIFI_6
-he_bss_color=33" "fils_discovery_max_interval=20"
-	echo 'for i in wlan24 wlan5 wlan6; do
-	set -- $(sed "s/:/ /g" /sys/class/net/$i/address)
-	sed -i "s/^bssid=@LA@$/bssid=$(printf %02x $((0x$1 | 2))):$2:$3:$4:$5:$6/" /run/hostapd-u6e/$i.conf
+	for b in 24 5 6; do radio_conf $b; done
+	# The BSSIDs: the radio's address with the locally administered bit set and
+	# the BSS's number in its fifth octet. The VLAN files: a RADIUS-assigned
+	# client's interface goes into that VLAN's bridge.
+	echo "WIFI_VLANS='$WIFI_VLANS'"
+	echo 'for b in 24 5 6; do
+	c=/run/hostapd-u6e/wlan$b.conf
+	set -- $(sed "s/:/ /g" /sys/class/net/wlan$b/address)
+	for n in $(sed -n "s/^bssid=@LA\([0-9]*\)@$/\1/p" $c); do
+		sed -i "s/^bssid=@LA$n@$/bssid=$(printf %02x:%s:%s:%s:%02x:%s $((0x$1 | 2)) $2 $3 $4 $((0x$5 ^ n)) $6)/" $c
+	done
+	for v in $(sed -n "s#^vlan_file=/run/hostapd-u6e/\(.*\)\.vlan\$#\1#p" $c); do
+		for id in $WIFI_VLANS; do echo "$id $v.$id br$id"; done > /run/hostapd-u6e/$v.vlan
+	done
 done
-chmod 600 /run/hostapd-u6e/*.conf' 
+chmod 600 /run/hostapd-u6e/*.conf'
 	# A rerun stops the previous instance and waits until its BSSs are gone from
 	# the radios, which outlast the process: a radio that still has one refuses
 	# the new beacon.
@@ -231,22 +312,26 @@ for i in wlan6 wlan24 wlan5; do
 	[ -e /sys/class/net/$i ] && confs="$confs /run/hostapd-u6e/$i.conf" || echo "$i: no such radio"
 done
 hostapd -B -P /run/hostapd-u6e/hostapd.pid -f /run/hostapd-u6e/hostapd.log $confs || echo "hostapd failed"
-sleep 8
-# 802.11k: each radio also reports the other two in its neighbor reports,
-# marked co-located (BSSID Information bit 16) and, for 2.4/5 GHz, co-located
-# with the 6 GHz AP they announce (bit 20) or, for 6 GHz, a member of an ESS
-# with 2.4/5 GHz co-located APs (bit 18): byte 8 of the report.
-for i in wlan24 wlan5 wlan6; do
+sleep 8'
+	# 802.11k: each of an SSID's BSSs also reports its others in its neighbor
+	# reports, marked co-located (BSSID Information bit 16) and, for 2.4/5 GHz,
+	# co-located with the 6 GHz AP they announce (bit 20) or, for 6 GHz, a
+	# member of an ESS with 2.4/5 GHz co-located APs (bit 18): byte 8 of the
+	# report.
+	for g in "${group[@]}"; do
+		echo "ifs='${g# }'"
+		echo 'for i in $ifs; do
 	own=$(hostapd_cli -p /run/hostapd -i $i show_neighbor 2>/dev/null | grep " stat$") || continue
 	nr=${own#*nr=}; nr=${nr%% *}
-	[ $i = wlan6 ] && bits=0x05 || bits=0x11
+	case $i in wlan6*) bits=0x05 ;; *) bits=0x11 ;; esac
 	b8=$(printf %02x $((0x$(echo "$nr" | cut -c17-18) | bits)))
 	nr=$(echo "$nr" | cut -c1-16)$b8$(echo "$nr" | cut -c19-)
-	for j in wlan24 wlan5 wlan6; do
+	for j in $ifs; do
 		[ $j = $i ] || hostapd_cli -p /run/hostapd -i $j set_neighbor ${own%% *} ssid=$(echo "$own" | sed "s/.*ssid=\([0-9a-f]*\).*/\1/") nr=$nr >/dev/null
 	done
-done
-for i in wlan24 wlan5 wlan6; do
+done'
+	done
+	echo 'for i in wlan24 wlan5 wlan6; do
 	echo "== $i: $(hostapd_cli -p /run/hostapd -i $i status 2>/dev/null | grep -E "^(state|freq|channel|ssid\[[0-9]\]|num_sta\[[0-9]\])=" | tr "\n" " ")"
 done'
 } | T=120 ap_root sh

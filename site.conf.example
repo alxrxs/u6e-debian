@@ -15,6 +15,9 @@ MGMT_NTP=192.0.2.123
 # Wi-Fi clients: a VLAN bridged, unaddressed, into br<vid>; hostapd adds the
 # radios to it.
 CLIENT_VLAN=42
+# Every VLAN a client can land in (RADIUS assigns some), CLIENT_VLAN the
+# default; each is bridged the same way.
+WIFI_VLANS="42 43"
 # root's authorized_keys in the image.
 ROOT_AUTHORIZED_KEYS=/root/.ssh/id_ed25519.pub
 # Proprietary inputs (Wi-Fi firmware, the stock board data): see README.md.
@@ -34,23 +37,29 @@ stock_password() { cat ~/.config/u6e/stock-password; }
 power_off() { echo "power_off: not configured" >&2; return 1; }
 power_on() { echo "power_on: not configured" >&2; return 1; }
 
-# boot/wifi-up.sh: the test SSID, the regulatory country and each radio's
-# channel (hostapd lines). The example is stock's plan in South Korea (KR);
-# check what your country allows.
+# boot/wifi-up.sh: the SSIDs, the regulatory country and each radio's channel
+# (hostapd lines). The example is stock's plan in South Korea (KR); check what
+# your country allows.
 WIFI_COUNTRY=KR
-wifi_ssid() { echo u6e-test; }
-wifi_psk() { cat ~/.config/u6e/wifi-psk; }
+# One SSID per line: name|kind|bands|VLAN. kind: sae (WPA3-Personal), ent
+# (WPA3-Enterprise over RadSec) or psk-mab (WPA2-Personal plus RADIUS MAC
+# authentication); bands: any of 24 5 6 (6 GHz: WPA3 only); VLAN: the default
+# one, RADIUS may assign another of WIFI_VLANS.
+WIFI_SSIDS=(
+	"example-enterprise|ent|5 6|42"
+	"example-iot|psk-mab|24 5|42"
+	"example|sae|24 5 6|42"
+)
+wifi_psk() { cat ~/.config/u6e/"$1".psk; } # <SSID>
 # 802.11r key the radios hand roaming keys over with (64 hex digits).
 wifi_ft_key() { cat ~/.config/u6e/wifi-ft-key; }
-# Optional enterprise SSID: WPA3-Enterprise over RadSec (RADIUS over TLS,
-# RFC 6614). The RADIUS server's name, its CA and this AP's client certificate
-# and (encrypted) key. Leave wifi_ent_ssid out to run without it.
-# wifi_ent_ssid() { echo u6e-test-ent; }
-# WIFI_RADSEC_SERVER=radius.example.org
-# radsec_ca() { cat ~/.config/u6e/radsec-ca.pem; }
-# radsec_cert() { cat ~/.config/u6e/radsec-client.pem; }
-# radsec_key() { cat ~/.config/u6e/radsec-client.key; }
-# radsec_key_pass() { cat ~/.config/u6e/radsec-client-key-pass; }
+# RADIUS over TLS (RadSec, RFC 6614) for the ent and psk-mab SSIDs: the
+# server's name, its CA and this AP's client certificate and (encrypted) key.
+WIFI_RADSEC_SERVER=radius.example.org
+radsec_ca() { cat ~/.config/u6e/radsec-ca.pem; }
+radsec_cert() { cat ~/.config/u6e/radsec-client.pem; }
+radsec_key() { cat ~/.config/u6e/radsec-client.key; }
+radsec_key_pass() { cat ~/.config/u6e/radsec-client-key-pass; }
 WIFI_24="hw_mode=g
 channel=13"
 # no_pri_sec_switch: keep primary 149; hostapd's 20/40 coexistence scan would
