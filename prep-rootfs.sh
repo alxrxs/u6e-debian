@@ -45,13 +45,11 @@ for v in $WIFI_VLANS; do
 	printf '[NetDev]\nName=br%s\nKind=bridge\n' $v > $N/25-br$v.netdev
 	printf '[Match]\nName=br%s\n\n[Network]\nLinkLocalAddressing=no\nConfigureWithoutCarrier=yes\n' $v > $N/25-br$v.network
 done
-# Stable names by device path (PCI domains are pinned in the DT): the uplink
-# GMAC is lan, which the NSS glue arms by name; the udev rule below creates the radio
-# interfaces under these names itself.
+# The uplink GMAC is lan, which the NSS glue arms by name. The radios need no
+# .link: the udev rule below creates each one's interface under its name, and a
+# .link matching the radio's path would also try to rename its BSS and VLAN
+# interfaces.
 printf '[Match]\nPath=platform-39d00000.ethernet\n\n[Link]\nName=lan\n' > $N/30-lan.link
-printf '[Match]\nPath=platform-c000000.wifi\n\n[Link]\nName=wlan24\n' > $N/30-wlan24.link
-printf '[Match]\nPath=*-pci-0000:01:00.0\nType=wlan\n\n[Link]\nName=wlan5\n' > $N/30-wlan5.link
-printf '[Match]\nPath=*-pci-0001:01:00.0\nType=wlan\n\n[Link]\nName=wlan6\n' > $N/30-wlan6.link
 printf '[NetDev]\nName=%s\nKind=vlan\n\n[VLAN]\nId=%s\n' $MGMT_IF $MGMT_VLAN > $N/20-$MGMT_IF.netdev
 printf '[Match]\nName=%s\n\n[Network]\nAddress=%s\nGateway=%s\nDNS=%s\nDomains=%s\nNTP=%s\n' \
 	$MGMT_IF "$MGMT_ADDR" "$MGMT_GW" "$MGMT_DNS" "$MGMT_DOMAIN" "$MGMT_NTP" > $N/20-$MGMT_IF.network
@@ -121,6 +119,11 @@ ln -sf /etc/systemd/system/u6e-bootmark.service $RF/etc/systemd/system/sysinit.t
 install -d $RF/etc/systemd/system.conf.d
 printf '[Manager]\nRuntimeWatchdogSec=30s\nRebootWatchdogSec=2min\n' > $RF/etc/systemd/system.conf.d/u6e-watchdog.conf
 printf 'kernel.panic_on_oops = 1\n' > $RF/etc/sysctl.d/u6e-panic.conf
+# hostapd's netlink sockets take the default receive buffer, which the burst of
+# link events at Wi-Fi start-up (every BSS, VLAN and bridge port) overruns.
+printf 'net.core.rmem_default = 1048576\n' > $RF/etc/sysctl.d/u6e-netlink.conf
+# pam_env reads it on every login.
+echo LANG=C.UTF-8 > $RF/etc/default/locale
 
 # Kernel log live on the wire: netconsole to the management VLAN's broadcast
 # address, so a hang that ends in the vendor's crash-dump mode (no reset, no
@@ -284,6 +287,8 @@ printf '[Unit]\nDescription=U6E neighbor report entries for the other APs\n\n[So
 cat > $RF/etc/systemd/system/u6e-nr@.service <<'UNIT'
 [Unit]
 Description=U6E neighbor report entries for another AP
+# Until u6e-neighbors has published this AP's entries, the peer gets none.
+ConditionPathExists=/run/u6e-neighbors/own
 
 [Service]
 ExecStart=/bin/cat /run/u6e-neighbors/own

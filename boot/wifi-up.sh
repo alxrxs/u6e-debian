@@ -293,8 +293,12 @@ wifi_script() {
 	# The radios regulate themselves (firmware default: US); move them to the
 	# site's country before hostapd reads its channel list. ath11k only passes a
 	# country to a radio's firmware once that radio is started, i.e. has an
-	# interface up.
-	echo "for i in wlan24 wlan5 wlan6; do ip link set \$i up; done
+	# interface up. udev creates the interfaces as the radios register, which
+	# can be after u6e-nss has loaded the drivers.
+	echo "for i in wlan24 wlan5 wlan6; do
+	for _ in \$(seq 60); do [ -e /sys/class/net/\$i ] && break; sleep 0.5; done
+	ip link set \$i up
+done
 iw reg set $WIFI_COUNTRY
 for _ in \$(seq 20); do [ \"\$(iw reg get | grep -c '^country $WIFI_COUNTRY')\" -ge 3 ] && break; sleep 0.5; done
 iw reg get | grep -E '^(phy|country)' | paste - - | sed 's/^/reg: /'"
