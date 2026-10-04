@@ -43,6 +43,8 @@ sudo ./prep-rootfs.sh nss          # -> out-nss/{shim.bin,Image,u6e.dtb,u6e.init
 
 `prep-rootfs.sh` packs the initrd reproducibly (fixed mtimes, the paths it rewrites last), so a rebuild changes only the tail of the image. It also keeps every image it makes under `images/<time>-<mode>-<kernel>[-<backports>]/` with a `MANIFEST` (commits, hostapd version, checksums), so an earlier build can be staged again with `go8.sh` without rebuilding.
 
+`sudo ./deploy.sh [<ap>...]` does the rest for the APs in `U6E_APS` (or those named): it builds the hostapd package when its version has no `.deb` yet, rebuilds the rootfs when it does not carry that version, then for each AP in turn builds its image, boots it with `boot/stage.sh` and waits until the AP has brought all three radios up by itself. Build logs go to `log/`.
+
 ## Booting
 
 Ubiquiti's U-Boot is AArch32 and only `bootm`s its own signed FIT images, but `bootz` runs any armv7 zImage. `shim/` is a 208-byte zImage that makes the QSDK TrustZone call (`smc` 0x0200010F, `jump_kernel64`) which restarts the core in AArch64 EL1 at the arm64 `Image`.
@@ -54,6 +56,8 @@ What is ever written: files in `/tmp/log`, raw eMMC sectors past the last partit
 ### Persistent mode
 
 Each boot `go8.sh` arms is one-shot: `bootcmd_real` disarms itself before it starts the image, so any reboot lands in stock. With `U6E_PERSIST=1` in `site.conf`, `u6e-netcheck` re-arms it (`u6e-arm`) the first time the management network is reachable after a boot, so reboots and power cuts come back into Debian. A boot that never reaches the network is not re-armed, and losing the network later disarms (`u6e-arm disarm`) before the netcheck reboot, so a broken image always falls back to stock instead of looping. `u6e-arm disarm` by hand hands the next boot to stock. Each Debian boot costs two writes of the 64 KiB environment: U-Boot's disarm and the re-arm. The payloads stay where `go8.sh` staged them, in stock's `/tmp/log`, which only stock writes to.
+
+`U6E_AP=<ap> boot/stage.sh [<image dir>]` boots one image (default `out-nss/`, or one under `images/`) from either system: from ours it disarms the next boot and reboots into stock, then runs `go8.sh` there, reboots and waits until our image answers.
 
 ## On the AP
 
