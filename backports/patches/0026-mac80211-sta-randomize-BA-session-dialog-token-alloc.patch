@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Johannes Berg <johannes.berg@intel.com>
 Date: Tue, 29 Oct 2019 10:25:25 +0100
-Subject: [PATCH 026/192] mac80211: sta: randomize BA session dialog token
- allocator
+Subject: [PATCH] mac80211: sta: randomize BA session dialog token allocator
 
 We currently always start the dialog token generator at zero,
 so the first dialog token we use is always 1. This would be

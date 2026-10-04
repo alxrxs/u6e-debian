@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Felix Fietkau <nbd@nbd.name>
 Date: Tue, 4 Aug 2026 08:26:08 +0000
-Subject: [PATCH 038/192] wifi: mac80211: skip default WMM setup for AP_VLAN
- links
+Subject: [PATCH] wifi: mac80211: skip default WMM setup for AP_VLAN links
 
 AP_VLAN interfaces are never passed to the driver, so setting default WMM
 parameters on their links trips the check-sdata-in-driver warning in

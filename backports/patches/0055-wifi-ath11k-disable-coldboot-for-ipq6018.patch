@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Mantas Pucka <mantas@8devices.com>
 Date: Mon, 22 Jan 2024 11:38:28 +0200
-Subject: [PATCH 055/192] wifi: ath11k: disable coldboot for ipq6018
+Subject: [PATCH] wifi: ath11k: disable coldboot for ipq6018
 
 Coldboot calibration does not work at the moment and causes failure during
 wifi startup.

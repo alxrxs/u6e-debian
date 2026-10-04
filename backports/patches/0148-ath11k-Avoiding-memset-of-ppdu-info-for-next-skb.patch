@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuvasree Sivasankaran <quic_ysivasan@quicinc.com>
 Date: Mon, 28 Aug 2023 14:48:41 +0530
-Subject: [PATCH 148/192] ath11k: Avoiding memset of ppdu-info for next skb
+Subject: [PATCH] ath11k: Avoiding memset of ppdu-info for next skb
 
 While parsing mon status from skb, ppdu_info got memset with zero during
 next skb fetch from queue or mon ring in case a single PPDU is more than

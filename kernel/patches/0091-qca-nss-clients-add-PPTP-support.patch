@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Sean Khan <datapronix@protonmail.com>
 Date: Fri, 2 Oct 2026 09:40:13 +0300
-Subject: [PATCH 091/119] qca-nss-clients-add-PPTP-support
+Subject: [PATCH] qca-nss-clients-add-PPTP-support
 
 Imported from https://github.com/qosmio/openwrt-ipq.git target/linux/qualcommax/patches-6.12/0603-3-qca-nss-clients-add-PPTP-support.patch (added in 2f34da0af7); the patch file carries no author or description.
 [Andrei: Ported to 7.2: pptp_rcv() now hands the frame over with sk_receive_skb(&po->sk, ...); the skb_iif assignment goes before it as in the patch, and the new pptp_xmit() locals join the 7.2 declaration block. The session lookups reference the socket as &sock->sk (sk_pppox() is gone).

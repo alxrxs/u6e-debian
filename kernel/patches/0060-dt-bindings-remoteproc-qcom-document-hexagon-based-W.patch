@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Manikanta Mylavarapu <quic_mmanikan@quicinc.com>
 Date: Tue, 21 Oct 2025 15:38:29 +0400
-Subject: [PATCH 060/119] dt-bindings: remoteproc: qcom: document hexagon based
- WCSS secure PIL
+Subject: [PATCH] dt-bindings: remoteproc: qcom: document hexagon based WCSS
+ secure PIL
 
 Add new binding document for hexagon based WCSS secure PIL remoteproc.
 IPQ5018, IPQ5332, IPQ5424 and IPQ9574 follow secure PIL remoteproc.

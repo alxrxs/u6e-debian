@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Christian Marangi <ansuelsmth@gmail.com>
 Date: Mon, 8 Dec 2025 20:50:47 +0100
-Subject: [PATCH 035/119] wifi: ath11k: fix wrong usage of resource_size()
- causing firmware panic
+Subject: [PATCH] wifi: ath11k: fix wrong usage of resource_size() causing
+ firmware panic
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

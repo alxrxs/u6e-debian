@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ziyang Huang <hzyitc@outlook.com>
 Date: Thu, 1 Oct 2026 19:04:01 +0300
-Subject: [PATCH 057/119] firmware: qcom_scm: support MPD
+Subject: [PATCH] firmware: qcom_scm: support MPD
 
 Add SCM calls to power up / down the SoC's internal WiFi radio and to
 load PIL segments to support the MPD architecture.

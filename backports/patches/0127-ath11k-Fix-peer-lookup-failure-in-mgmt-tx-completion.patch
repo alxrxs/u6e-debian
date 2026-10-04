@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Rameshkumar Sundaram <ramess@codeaurora.org>
 Date: Fri, 2 Oct 2026 10:06:18 +0300
-Subject: [PATCH 127/192] ath11k: Fix peer lookup failure in mgmt tx completion
+Subject: [PATCH] ath11k: Fix peer lookup failure in mgmt tx completion
 
 In mgmt tx completion handler, peer lookup is done using address 2
 of transmitted frame to find arvif and update mgmt tx completion stats.

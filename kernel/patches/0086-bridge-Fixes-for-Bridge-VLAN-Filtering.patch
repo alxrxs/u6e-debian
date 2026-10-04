@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Vishnu Vardhan Bantanahal <quic_vishvard@quicinc.com>
 Date: Mon, 15 May 2023 17:56:04 +0530
-Subject: [PATCH 086/119] bridge: Fixes for Bridge VLAN Filtering
+Subject: [PATCH] bridge: Fixes for Bridge VLAN Filtering
 
 1. Fix function to check for bridge master status while checking
 for Bridge VLAN filter feature is enabled on bridge slave ports.

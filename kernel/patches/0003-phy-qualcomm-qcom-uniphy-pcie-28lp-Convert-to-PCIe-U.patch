@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: George Moussalem <george.moussalem@outlook.com>
 Date: Wed, 19 Aug 2026 10:31:40 +0400
-Subject: [PATCH 003/119] phy: qualcomm: qcom-uniphy-pcie-28lp: Convert to
- PCIe/USB3 combo PHY driver
+Subject: [PATCH] phy: qualcomm: qcom-uniphy-pcie-28lp: Convert to PCIe/USB3
+ combo PHY driver
 
 This PHY found in IPQ5332 and IPQ5018 SoCs is actually a multi-purpose
 PCIe/USB3 combo PHY. The driver was initially created for PCIe PHY

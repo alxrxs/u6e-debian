@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tamizh Chelvam Raja <quic_tamizhr@quicinc.com>
 Date: Thu, 30 Mar 2023 22:12:56 +0530
-Subject: [PATCH 159/192] ath11k: Check skb_headroom before using skb_push
+Subject: [PATCH] ath11k: Check skb_headroom before using skb_push
 
 Below kernel panic may occur if there is no
 skb_headroom available for performing skb_push.

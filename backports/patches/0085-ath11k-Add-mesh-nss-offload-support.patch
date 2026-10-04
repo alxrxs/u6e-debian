@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Karthikeyan Kathirvel <kathirve@codeaurora.org>
 Date: Fri, 2 Oct 2026 10:01:40 +0300
-Subject: [PATCH 085/192] ath11k: Add mesh nss offload support
+Subject: [PATCH] ath11k: Add mesh nss offload support
 
 - New capability advertising nss offload support for mesh type
 - Mesh obj vap and link vap registration/clean up

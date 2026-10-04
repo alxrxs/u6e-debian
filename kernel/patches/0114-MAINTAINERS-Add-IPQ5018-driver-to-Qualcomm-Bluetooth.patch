@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: George Moussalem <george.moussalem@outlook.com>
 Date: Thu, 9 Jul 2026 13:18:32 +0400
-Subject: [PATCH 114/119] MAINTAINERS: Add IPQ5018 driver to Qualcomm Bluetooth
- driver entry
+Subject: [PATCH] MAINTAINERS: Add IPQ5018 driver to Qualcomm Bluetooth driver
+ entry
 
 Add the Qualcomm IPQ5018 Bluetooth driver to the existing entry for
 Qualcomm Bluetooth drivers.

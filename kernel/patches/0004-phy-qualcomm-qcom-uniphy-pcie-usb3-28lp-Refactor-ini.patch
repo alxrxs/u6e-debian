@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: George Moussalem <george.moussalem@outlook.com>
 Date: Mon, 17 Aug 2026 16:13:47 +0400
-Subject: [PATCH 004/119] phy: qualcomm: qcom-uniphy-pcie-usb3-28lp: Refactor
- init regs table definitions
+Subject: [PATCH] phy: qualcomm: qcom-uniphy-pcie-usb3-28lp: Refactor init regs
+ table definitions
 
 Refactor the IPQ5018/IPQ5332 UNIPHY PCIe init data by introducing a
 helper macro for register/value entries and converting open-coded struct

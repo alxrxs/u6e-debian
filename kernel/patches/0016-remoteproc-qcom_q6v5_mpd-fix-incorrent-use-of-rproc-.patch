@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ziyang Huang <hzyitc@outlook.com>
 Date: Sun, 8 Sep 2024 16:40:12 +0800
-Subject: [PATCH 016/119] remoteproc: qcom_q6v5_mpd: fix incorrent use of
- rproc->node
+Subject: [PATCH] remoteproc: qcom_q6v5_mpd: fix incorrent use of rproc->node
 
     1.817524] list_add corruption. next->prev should be prev (ffffffc0814bbfc8), but was ffffffc0814bc358. (next=ffffff8003b56800).
 [    1.822435] WARNING: CPU: 1 PID: 24 at lib/list_debug.c:29 __list_add_valid_or_report+0x8c/0xdc

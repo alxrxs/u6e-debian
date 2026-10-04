@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Felix Fietkau <nbd@nbd.name>
 Date: Thu, 14 Sep 2023 13:17:16 +0200
-Subject: [PATCH 031/192] cfg80211: allow grace period for DFS available after
- beacon shutdown
+Subject: [PATCH] cfg80211: allow grace period for DFS available after beacon
+ shutdown
 
 In non-ETSI regulatory domains, DFS channel availability from completed CAC
 expires after REG_PRE_CAC_EXPIRY_GRACE_MS (2 seconds) when no longer in use.

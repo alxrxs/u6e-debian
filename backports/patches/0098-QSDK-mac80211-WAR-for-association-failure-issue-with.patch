@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Balamurugan Ramar <quic_bramar@quicinc.com>
 Date: Wed, 8 May 2024 23:01:34 +0530
-Subject: [PATCH 098/192] QSDK: mac80211: WAR for association failure issue
- with WDS
+Subject: [PATCH] QSDK: mac80211: WAR for association failure issue with WDS
 
 Every 100 milliseconds, the station sends an "association request" and
 the AP adds the peer and the AP responds to the station with an

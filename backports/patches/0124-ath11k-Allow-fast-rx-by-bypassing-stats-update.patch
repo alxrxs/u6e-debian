@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: P Praneesh <ppranees@codeaurora.org>
 Date: Fri, 2 Oct 2026 10:03:49 +0300
-Subject: [PATCH 124/192] ath11k: Allow fast rx by bypassing stats update
+Subject: [PATCH] ath11k: Allow fast rx by bypassing stats update
 
 Add a provision to disable stats and enable fast rx support
 for a peer when it is connected to an AP with ethernet decap support.

@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Sathishkumar Muruganandam <murugana@codeaurora.org>
 Date: Fri, 8 Jan 2021 00:34:09 +0530
-Subject: [PATCH 121/192] ath11k: extend ext vdev in NSS for dynamic VLAN
- handling
+Subject: [PATCH] ath11k: extend ext vdev in NSS for dynamic VLAN handling
 
 - add ext vdev NSS API callbacks required for dynamic AP_VLAN vif
 - existing ext vdev NSS API callbacks are used for both WDS and

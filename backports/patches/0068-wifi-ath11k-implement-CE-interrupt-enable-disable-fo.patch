@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Julius Bairaktaris <julius@bairaktaris.de>
 Date: Mon, 27 Jul 2026 00:19:07 +0200
-Subject: [PATCH 068/192] wifi: ath11k: implement CE interrupt enable/disable
- for AHB
+Subject: [PATCH] wifi: ath11k: implement CE interrupt enable/disable for AHB
 
 ath11k_core_reset() calls ath11k_hif_ce_irq_disable() right before it
 powers the target down, but ath11k_ahb_hif_ops_ipq8074 never set the

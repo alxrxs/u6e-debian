@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ziyang Huang <hzyitc@outlook.com>
 Date: Thu, 1 Oct 2026 19:05:03 +0300
-Subject: [PATCH 058/119] soc: qcom: mdt_loader: support MPD
+Subject: [PATCH] soc: qcom: mdt_loader: support MPD
 
 Add support for loading user PD specific PIL segments as required by the
 MPD architecture.

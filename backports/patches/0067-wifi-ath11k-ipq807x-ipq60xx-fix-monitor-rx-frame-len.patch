@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ruslan Isaev <legale.legale@gmail.com>
 Date: Sun, 1 Mar 2026 00:00:00 +0000
-Subject: [PATCH 067/192] wifi: ath11k: ipq807x; ipq60xx: fix monitor rx frame
- length (+8 tail)
+Subject: [PATCH] wifi: ath11k: ipq807x; ipq60xx: fix monitor rx frame length
+ (+8 tail)
 
 OpenWrt issue:
 https://github.com/openwrt/openwrt/issues/16183

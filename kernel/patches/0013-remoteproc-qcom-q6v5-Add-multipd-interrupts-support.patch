@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Manikanta Mylavarapu <quic_mmanikan@quicinc.com>
 Date: Fri, 10 Nov 2023 14:49:36 +0530
-Subject: [PATCH 013/119] remoteproc: qcom: q6v5: Add multipd interrupts
- support
+Subject: [PATCH] remoteproc: qcom: q6v5: Add multipd interrupts support
 
 In multipd model, root & user pd remoteproc's interrupts are
 different. User pd needs additional interrupts like spawn.

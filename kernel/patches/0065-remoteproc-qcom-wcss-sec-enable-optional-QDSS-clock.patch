@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Robert Marko <robimarko@gmail.com>
 Date: Wed, 16 Sep 2026 18:15:00 +0200
-Subject: [PATCH 065/119] remoteproc: qcom: wcss-sec: enable optional QDSS
- clock
+Subject: [PATCH] remoteproc: qcom: wcss-sec: enable optional QDSS clock
 
 Enable the optional QDSS clock while the secure WCSS remote processor is
 running. Some platforms require this clock for WCSS firmware loading.

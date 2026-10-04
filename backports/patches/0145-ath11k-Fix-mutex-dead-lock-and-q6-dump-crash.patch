@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Rajat Soni <quic_rajson@quicinc.com>
 Date: Wed, 12 Apr 2023 18:06:54 +0530
-Subject: [PATCH 145/192] ath11k: Fix mutex dead lock and q6 dump crash
+Subject: [PATCH] ath11k: Fix mutex dead lock and q6 dump crash
 
 Issue 1:
 Currently for HOST_DDR_REGION_TYPE memory, we are facing crash

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Sathishkumar Muruganandam <murugana@codeaurora.org>
 Date: Fri, 8 Jan 2021 00:39:47 +0530
-Subject: [PATCH 122/192] ath11k: add dynamic VLAN support in NSS offload
+Subject: [PATCH] ath11k: add dynamic VLAN support in NSS offload
 
 Driver should advertise NL80211_EXT_FEATURE_VLAN_OFFLOAD to enable
 vlan offload in hostapd.

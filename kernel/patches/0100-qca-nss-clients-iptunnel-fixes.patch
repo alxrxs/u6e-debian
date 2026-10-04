@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Sean Khan <datapronix@protonmail.com>
 Date: Fri, 2 Oct 2026 09:42:29 +0300
-Subject: [PATCH 100/119] qca-nss-clients-iptunnel-fixes
+Subject: [PATCH] qca-nss-clients-iptunnel-fixes
 
 Imported from https://github.com/qosmio/openwrt-ipq.git target/linux/qualcommax/patches-6.12/0607-1-qca-nss-clients-iptunnel-fixes.patch (added in 2f34da0af7); the patch file carries no author or description.
 [Andrei: Ported to a 7.2 kernel.org tree: the four ip6_tunnel.c hunks on OpenWrt's MAP-E FMR code are dropped (that code is not here); ip6tunnel_xmit() gained a flags argument and sit.c context moved.]

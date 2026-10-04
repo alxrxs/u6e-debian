@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tamizh Chelvam <tamizhr@codeaurora.org>
 Date: Fri, 2 Oct 2026 09:52:40 +0300
-Subject: [PATCH 084/192] backport: Compile fix
+Subject: [PATCH] backport: Compile fix
 
 Adding these changes to fix compilation issue due to
 package upgrade

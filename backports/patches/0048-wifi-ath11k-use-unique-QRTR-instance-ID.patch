@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Robert Marko <robimarko@gmail.com>
 Date: Sat, 5 Nov 2022 20:15:40 +0100
-Subject: [PATCH 048/192] wifi: ath11k: use unique QRTR instance ID
+Subject: [PATCH] wifi: ath11k: use unique QRTR instance ID
 
 Currently, trying to use AHB + PCI/MHI cards or multiple PCI/MHI cards
 will cause a clash in the QRTR instance node ID and prevent the driver

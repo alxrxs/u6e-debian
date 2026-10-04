@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Gabor Juhos <j4g8y7@gmail.com>
 Date: Fri, 18 Sep 2026 11:27:49 +0200
-Subject: [PATCH 001/119] clk: qcom: gcc-ipq5018: mark 'gpll0_main' clock as
- critical
+Subject: [PATCH] clk: qcom: gcc-ipq5018: mark 'gpll0_main' clock as critical
 
 On IPQ5018, the APCS core clock feeds the CPUs. It can use
 different clocks as its parent, but during system boot it

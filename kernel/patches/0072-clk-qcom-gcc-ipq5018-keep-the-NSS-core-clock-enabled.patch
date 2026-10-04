@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Stanislaw Pal <kuncy7@gmail.com>
 Date: Sat, 5 Sep 2026 14:30:00 +0200
-Subject: [PATCH 072/119] clk: qcom: gcc-ipq5018: keep the NSS core clock
- enabled
+Subject: [PATCH] clk: qcom: gcc-ipq5018: keep the NSS core clock enabled
 
 The bootloader leaves gcc_ubi0_core_clk (the clock branch feeding the
 UBI32 network subsystem core) enabled. Linux has no consumer for it

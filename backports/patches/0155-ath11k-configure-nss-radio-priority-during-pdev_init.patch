@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Seevalamuthu Mariappan <seevalam@codeaurora.org>
 Date: Fri, 21 May 2021 14:16:22 +0530
-Subject: [PATCH 155/192] ath11k: configure nss radio priority during pdev_init
+Subject: [PATCH] ath11k: configure nss radio priority during pdev_init
 
 pdev's priority value is read from dts. Get scheme_id
 using pdev priority. Configure scheme_id during pdev_init.

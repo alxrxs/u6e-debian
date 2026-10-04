@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuvasree Sivasankaran <quic_ysivasan@quicinc.com>
 Date: Thu, 31 Aug 2023 10:59:33 +0530
-Subject: [PATCH 096/192] wifi: mac80211: Add mac hw flag to avoid queue skb
+Subject: [PATCH] wifi: mac80211: Add mac hw flag to avoid queue skb
 
 Queue SKB in mac80211 become mandatory from latest 6.1 kernel. Because of
 this queuing, there will be performance degradation. Add hw flag option

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Manikanta Pubbisetty <mpubbise@codeaurora.org>
 Date: Fri, 2 Oct 2026 09:56:07 +0300
-Subject: [PATCH 103/192] ath11k: add rx histogram stats
+Subject: [PATCH] ath11k: add rx histogram stats
 
 Adding rx rate table and byte level peer rx statistics. Also,
 adding a debugfs knob to reset rx stats specific to the peer.

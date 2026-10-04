@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Sathishkumar Muruganandam <murugana@codeaurora.org>
 Date: Fri, 2 Oct 2026 09:51:58 +0300
-Subject: [PATCH 083/192] mac80211: add dynamic VLAN support on NSS offload
+Subject: [PATCH] mac80211: add dynamic VLAN support on NSS offload
 
 NSS requires dynamic AP_VLAN vif ifnum and its corresponding VLAN ID
 and group key index to configure dynamic VLAN ext VDEV in NSS.

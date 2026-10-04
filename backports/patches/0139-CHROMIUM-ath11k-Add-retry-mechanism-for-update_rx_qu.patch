@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Manish Dharanenthiran <quic_mdharane@quicinc.com>
 Date: Fri, 2 Oct 2026 10:10:55 +0300
-Subject: [PATCH 139/192] CHROMIUM: ath11k: Add retry mechanism for
- update_rx_queue reo cmd
+Subject: [PATCH] CHROMIUM: ath11k: Add retry mechanism for update_rx_queue reo
+ cmd
 
 While reo_cmd ring is full, peer delete update rx queue
 will be failed as there is no space to send the command

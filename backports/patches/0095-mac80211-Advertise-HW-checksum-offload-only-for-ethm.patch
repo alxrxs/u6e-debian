@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tamizh Chelvam Raja <quic_tamizhr@quicinc.com>
 Date: Fri, 21 Apr 2023 12:28:21 +0530
-Subject: [PATCH 095/192] mac80211: Advertise HW checksum offload only for
- ethmode
+Subject: [PATCH] mac80211: Advertise HW checksum offload only for ethmode
 
 Upper(NSS/SFE) layer might remove checksum offset from a skb
 for the net device which advertise HW checksum offload

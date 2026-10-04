@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Sathishkumar Muruganandam <murugana@codeaurora.org>
 Date: Fri, 20 Nov 2020 11:41:11 +0530
-Subject: [PATCH 119/192] ath11k: add support for ext vdev in NSS for AP_VLAN
- vif handling
+Subject: [PATCH] ath11k: add support for ext vdev in NSS for AP_VLAN vif
+ handling
 
 - add ext vdev NSS API callbacks required for AP_VLAN vif
 - invoke ieee80211_rx_nss_notify_4addr on WDS Rx path for 4addr frames until

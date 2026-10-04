@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Maharaja Kennadyrajan <quic_mkenna@quicinc.com>
 Date: Tue, 18 Apr 2023 14:41:05 +0530
-Subject: [PATCH 094/192] mac80211: Get valid last_rate for rx_bitrate from cpu
- stats
+Subject: [PATCH] mac80211: Get valid last_rate for rx_bitrate from cpu stats
 
 Get the valid last_rate from the cpu rx_stats while filling the
 rx_bitrate in the station dump. This helps to avoid the missing

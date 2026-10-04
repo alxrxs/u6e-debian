@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Felix Fietkau <nbd@nbd.name>
 Date: Sun, 26 Jun 2022 11:43:25 +0200
-Subject: [PATCH 030/192] mac80211: increase quantum for airtime scheduler
+Subject: [PATCH] mac80211: increase quantum for airtime scheduler
 
 Given the typical AQL budget and queue length, a quantum of 256 with the
 default station weight often requires iterating over all queues frequently,

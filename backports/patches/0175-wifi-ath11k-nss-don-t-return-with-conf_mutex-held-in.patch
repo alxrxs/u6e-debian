@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Adriel Santos <adriel@adriel.eu>
 Date: Fri, 2 Oct 2026 10:18:08 +0300
-Subject: [PATCH 175/192] wifi: ath11k: nss: don't return with conf_mutex held
- in sta_state
+Subject: [PATCH] wifi: ath11k: nss: don't return with conf_mutex held in
+ sta_state
 
 357-ath11k-fix-clear-peer-keys-during-disassoc.patch moved
 ath11k_clear_peer_keys() into the AUTH -> ASSOC branch of

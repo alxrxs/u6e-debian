@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Manikanta Mylavarapu <quic_mmanikan@quicinc.com>
 Date: Fri, 10 Nov 2023 14:49:37 +0530
-Subject: [PATCH 014/119] remoteproc: qcom: Add Hexagon based multipd rproc
- driver
+Subject: [PATCH] remoteproc: qcom: Add Hexagon based multipd rproc driver
 
 It adds support to bring up remoteproc's on multipd model.
 Pd means protection domain. It's similar to process in Linux.

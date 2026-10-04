@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Felix Fietkau <nbd@nbd.name>
 Date: Wed, 6 Aug 2025 10:52:03 +0200
-Subject: [PATCH 036/192] mac80211: estimate expected throughput if not
- provided by driver/rc
+Subject: [PATCH] mac80211: estimate expected throughput if not provided by
+ driver/rc
 
 Estimate the tx throughput based on the expected per-packet tx time.
 This is useful for mesh implementations that rely on expected throughput,

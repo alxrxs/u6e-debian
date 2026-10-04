@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Sathishkumar Muruganandam <murugana@codeaurora.org>
 Date: Fri, 20 Nov 2020 11:57:36 +0530
-Subject: [PATCH 120/192] ath11k: add AP_VLAN vif support for WDS offload in
- NSS offload
+Subject: [PATCH] ath11k: add AP_VLAN vif support for WDS offload in NSS
+ offload
 
 - AP_VLAN vif support is required for WDS offload to interop with mac80211
   based 4addr STA and also for multicast-to-unicast conversion of 3addr

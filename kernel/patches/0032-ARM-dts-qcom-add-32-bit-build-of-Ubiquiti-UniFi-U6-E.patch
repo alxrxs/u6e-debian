@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Andrei-Alexandru Bleortu <me@andrei-z.com>
 Date: Thu, 1 Oct 2026 17:41:13 +0300
-Subject: [PATCH 032/119] ARM: dts: qcom: add 32-bit build of Ubiquiti UniFi U6
+Subject: [PATCH] ARM: dts: qcom: add 32-bit build of Ubiquiti UniFi U6
  Enterprise
 
 The board U-Boot only boots 32-bit kernels (bootz), so build the arm64

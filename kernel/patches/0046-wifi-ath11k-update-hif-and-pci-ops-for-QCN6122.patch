@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: George Moussalem <george.moussalem@outlook.com>
 Date: Sun, 27 Oct 2024 16:34:11 +0400
-Subject: [PATCH 046/119] wifi: ath11k: update hif and pci ops for QCN6122
+Subject: [PATCH] wifi: ath11k: update hif and pci ops for QCN6122
 
 Add HIF and PCI ops for QCN6122. QCN6122 by default uses DP window 3.
 However, this is configurable, so let's introduce a function to do that and

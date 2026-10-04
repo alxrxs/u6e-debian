@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Sathishkumar Muruganandam <murugana@codeaurora.org>
 Date: Thu, 1 Jul 2021 13:08:54 +0530
-Subject: [PATCH 129/192] ath11k: fix double free of peer rx_tid during reo cmd
- failure
+Subject: [PATCH] ath11k: fix double free of peer rx_tid during reo cmd failure
 
 Peer rx_tid is locally copied thrice during peer_rx_tid_cleanup to send
 REO_CMD_UPDATE_RX_QUEUE followed by REO_CMD_FLUSH_CACHE to flush all

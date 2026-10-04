@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Aishwarya R <quic_aisr@quicinc.com>
 Date: Fri, 2 Oct 2026 10:15:37 +0300
-Subject: [PATCH 152/192] wifi: ath11k: Add lock when accessing idr_pool of
- tx_ring
+Subject: [PATCH] wifi: ath11k: Add lock when accessing idr_pool of tx_ring
 
 Lock is missed while accessing idr_pool of tx_ring which
 causes Use after free crash in dp_free path when unloading

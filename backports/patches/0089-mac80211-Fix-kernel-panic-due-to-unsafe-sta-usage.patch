@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tamizh Chelvam <quic_tamizhr@quicinc.com>
 Date: Fri, 2 Oct 2026 09:53:34 +0300
-Subject: [PATCH 089/192] mac80211: Fix kernel panic due to unsafe sta usage
+Subject: [PATCH] mac80211: Fix kernel panic due to unsafe sta usage
 
 Observing below crash in dynamic vlan scneario when
 abruptly killing hostapd while ping or any traffic to stations

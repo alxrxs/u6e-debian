@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: "Hardik S. Panchal" <hpanchal@codeaurora.org>
 Date: Fri, 2 Oct 2026 09:43:05 +0300
-Subject: [PATCH 101/119] net: Add API to update L4 protocol registrant.
+Subject: [PATCH] net: Add API to update L4 protocol registrant.
 
 Change-Id: I0d01fe33a590bb3eec596de621f86537f60c7071
 Signed-off-by: Hardik S. Panchal <hpanchal@codeaurora.org>

@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Christian Marangi <ansuelsmth@gmail.com>
 Date: Tue, 25 Nov 2025 14:56:08 +0100
-Subject: [PATCH 065/192] wifi: ath11k: fix rssi station dump for IPQ5018 and
- QCN6122
+Subject: [PATCH] wifi: ath11k: fix rssi station dump for IPQ5018 and QCN6122
 
 Commit 031ffa6c2cd3 ("wifi: ath11k: fix rssi station dump not updated in
 QCN9074") didn't account for IPQ5018 and QCN6122 WiFi card that are

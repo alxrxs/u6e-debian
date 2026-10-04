@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hari Chandrakanthan <quic_haric@quicinc.com>
 Date: Mon, 10 Jan 2022 12:38:10 +0530
-Subject: [PATCH 135/192] ath11k: provide access of the dma buffer back to dma
- device
+Subject: [PATCH] ath11k: provide access of the dma buffer back to dma device
 
 In ath11k_dbring_bufs_replenish, after accessing paddr which is a member of
 ath11k_dbring_element, provide the access of the buffer back to

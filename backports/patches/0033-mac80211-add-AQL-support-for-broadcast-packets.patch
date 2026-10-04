@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Felix Fietkau <nbd@nbd.name>
 Date: Fri, 9 Feb 2024 19:43:40 +0100
-Subject: [PATCH 033/192] mac80211: add AQL support for broadcast packets
+Subject: [PATCH] mac80211: add AQL support for broadcast packets
 
 Excessive broadcast traffic with little competing unicast traffic can easily
 flood hardware queues, leading to throughput issues. Additionally, filling

@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ziyang Huang <hzyitc@outlook.com>
 Date: Sun, 8 Sep 2024 16:40:12 +0800
-Subject: [PATCH 015/119] rproc: qcom_q6v5_mpd: split q6_wcss to rootpd and
- userpd
+Subject: [PATCH] rproc: qcom_q6v5_mpd: split q6_wcss to rootpd and userpd
 
 Split the q6_wcss structure and create a separate userpd struct to clearly
 differentiate between the process to bring up the QDSP6 processor vs

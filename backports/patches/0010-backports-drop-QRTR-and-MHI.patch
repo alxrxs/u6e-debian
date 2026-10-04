@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Robert Marko <robimarko@gmail.com>
 Date: Mon, 17 Oct 2022 11:35:36 +0200
-Subject: [PATCH 010/192] backports: drop QRTR and MHI
+Subject: [PATCH] backports: drop QRTR and MHI
 
 Backports currently include QRTR and MHI due to ath11k-pci requiring them,
 however this at the same time prevents us from adding ath11k-ahb as it

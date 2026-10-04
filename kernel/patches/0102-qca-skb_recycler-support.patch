@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Sean Khan <datapronix@protonmail.com>
 Date: Fri, 2 Oct 2026 09:45:06 +0300
-Subject: [PATCH 102/119] qca-skb_recycler-support
+Subject: [PATCH] qca-skb_recycler-support
 
 Imported from https://github.com/qosmio/openwrt-ipq.git target/linux/qualcommax/patches-6.12/0981-1-qca-skb_recycler-support.patch (added in 123fa4c212); the patch file carries no author or description.
 [Andrei: Ported to 7.2: kmalloc_reserve() now reports pfmemalloc through the skb, so the recycler caches fall back to their own reserves the same way; all three head caches honour KMALLOC_NOT_NORMAL_BITS (the patch served DMA-zone requests of ~2K from a normal cache). The patch's SKB_HEAD_ALIGN() before each kmalloc_reserve() call is dropped: kmalloc_reserve() aligns the size itself since 6.3, and aligning twice reserved a second skb_shared_info per buffer and pushed 2K heads out of the recycler's own size class. skb_kfree_head() is a plain kfree() in 7.2, which frees objects of any slab cache.]

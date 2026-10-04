@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Felix Fietkau <nbd@nbd.name>
 Date: Sat, 6 Feb 2021 16:33:14 +0100
-Subject: [PATCH 029/192] mac80211: minstrel_ht: rework rate downgrade code and
+Subject: [PATCH] mac80211: minstrel_ht: rework rate downgrade code and
  max_prob rate selection
 
 The current fallback code for fast rate switching on potentially failing rates

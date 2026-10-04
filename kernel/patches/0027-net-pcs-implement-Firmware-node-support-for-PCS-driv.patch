@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Christian Marangi <ansuelsmth@gmail.com>
 Date: Thu, 13 Aug 2026 10:35:08 +0200
-Subject: [PATCH 027/119] net: pcs: implement Firmware node support for PCS
- driver
+Subject: [PATCH] net: pcs: implement Firmware node support for PCS driver
 
 Implement the foundation of Firmware node support for PCS driver.
 

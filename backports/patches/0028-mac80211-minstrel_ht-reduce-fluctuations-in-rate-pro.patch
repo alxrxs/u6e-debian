@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Felix Fietkau <nbd@nbd.name>
 Date: Sat, 6 Feb 2021 16:08:01 +0100
-Subject: [PATCH 028/192] mac80211: minstrel_ht: reduce fluctuations in rate
+Subject: [PATCH] mac80211: minstrel_ht: reduce fluctuations in rate
  probability stats
 
 In some scenarios when there is a lot of fluctuation in packet error rates,

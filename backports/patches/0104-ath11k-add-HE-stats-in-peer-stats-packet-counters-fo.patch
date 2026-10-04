@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Miles Hu <milehu@codeaurora.org>
 Date: Fri, 2 Oct 2026 09:56:41 +0300
-Subject: [PATCH 104/192] ath11k: add HE stats in peer stats packet counters
- for MIMO and OFDMA
+Subject: [PATCH] ath11k: add HE stats in peer stats packet counters for MIMO
+ and OFDMA
 
 Signed-off-by: Miles Hu <milehu@codeaurora.org>
 [Andrei: Ported to 7.2: the bar_num_users count goes to the USR_COMPLTN_COMMON case, the one at the patch's line (the identical user lookup appears in three cases).]

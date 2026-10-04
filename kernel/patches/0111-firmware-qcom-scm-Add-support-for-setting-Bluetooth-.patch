@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: George Moussalem <george.moussalem@outlook.com>
 Date: Thu, 9 Jul 2026 13:18:29 +0400
-Subject: [PATCH 111/119] firmware: qcom: scm: Add support for setting
- Bluetooth power modes
+Subject: [PATCH] firmware: qcom: scm: Add support for setting Bluetooth power
+ modes
 
 The Bluetooth subsystem (BTSS) on the IPQ5018 SoC supports setting power
 modes which are required to be configured through a Secure Channel

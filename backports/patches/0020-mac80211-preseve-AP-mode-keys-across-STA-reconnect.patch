@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Felix Fietkau <nbd@nbd.name>
 Date: Mon, 27 Oct 2014 00:00:00 +0100
-Subject: [PATCH 020/192] mac80211: preseve AP mode keys across STA reconnect
+Subject: [PATCH] mac80211: preseve AP mode keys across STA reconnect
 
 Used for AP+STA support in OpenWrt - preserve AP mode keys across STA reconnect
 ---

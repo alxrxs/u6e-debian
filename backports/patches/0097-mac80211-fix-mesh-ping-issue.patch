@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Aaradhana Sahu <quic_aarasahu@quicinc.com>
 Date: Fri, 2 Oct 2026 09:55:27 +0300
-Subject: [PATCH 097/192] mac80211: fix mesh ping issue
+Subject: [PATCH] mac80211: fix mesh ping issue
 
 Signed-off-by: Aaradhana Sahu <quic_aarasahu@quicinc.com>
 [Andrei: Ported to 7.2: the locals it drops follow encoded_rate there.]

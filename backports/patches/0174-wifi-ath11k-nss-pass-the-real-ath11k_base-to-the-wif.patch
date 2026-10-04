@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Adriel Santos <adriel@adriel.eu>
 Date: Fri, 2 Oct 2026 10:18:08 +0300
-Subject: [PATCH 174/192] wifi: ath11k: nss: pass the real ath11k_base to the
- wifili ext callback
+Subject: [PATCH] wifi: ath11k: nss: pass the real ath11k_base to the wifili
+ ext callback
 
 999-904 wrapped ath11k_nss_wifili_ext_callback_fn() to avoid a function
 pointer cast, but it gets ab back with netdev_priv(netdev). The "netdev"

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Julius Bairaktaris <julius@bairaktaris.de>
 Date: Fri, 2 Oct 2026 10:16:16 +0300
-Subject: [PATCH 160/192] ath11k-Add-threaded-napi
+Subject: [PATCH] ath11k-Add-threaded-napi
 
 Imported from https://github.com/kuncy7/openwrt-nss-edma package/kernel/mac80211/patches/nss/ath11k/999-800-ath11k-Add-threaded-napi.patch (added in 82c7d2cde8); the patch file carries no author or description.
 ---

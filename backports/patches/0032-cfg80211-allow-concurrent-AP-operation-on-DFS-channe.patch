@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Felix Fietkau <nbd@nbd.name>
 Date: Sun, 1 Feb 2026 18:29:51 +0000
-Subject: [PATCH 032/192] cfg80211: allow concurrent AP operation on DFS
- channels with connected STA
+Subject: [PATCH] cfg80211: allow concurrent AP operation on DFS channels with
+ connected STA
 
 When a station interface is connected to an AP on a DFS channel, the
 station is already performing radar detection as required by the

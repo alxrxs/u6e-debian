@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Stanislaw Pal <kuncy7@gmail.com>
 Date: Fri, 2 Oct 2026 09:35:23 +0300
-Subject: [PATCH 071/119] Import ipq5018-nss.dtsi
+Subject: [PATCH] Import ipq5018-nss.dtsi
 
 From https://github.com/kuncy7/openwrt-nss-edma target/linux/qualcommax/files/ at b16de08072; first added in adc0d0ba5d ("qualcommax: ipq5018: add the NSS core node and reserved memory").
 ---

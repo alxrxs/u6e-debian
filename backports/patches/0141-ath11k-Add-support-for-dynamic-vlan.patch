@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Seevalamuthu Mariappan <seevalam@codeaurora.org>
 Date: Fri, 2 Oct 2026 10:14:24 +0300
-Subject: [PATCH 141/192] ath11k: Add support for dynamic vlan
+Subject: [PATCH] ath11k: Add support for dynamic vlan
 
 This patch adds support for dynamic vlan. VLAN group traffics
 are encrypted in software. vlan unicast packets shall be taking

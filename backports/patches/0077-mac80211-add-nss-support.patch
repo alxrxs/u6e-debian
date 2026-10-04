@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Sriram R <srirrama@codeaurora.org>
 Date: Fri, 2 Oct 2026 09:50:25 +0300
-Subject: [PATCH 077/192] mac80211: add nss support
+Subject: [PATCH] mac80211: add nss support
 
 Add Support for NSS Offload if the HW supports it.
 New flag is introduced to indicate HW support for NSS

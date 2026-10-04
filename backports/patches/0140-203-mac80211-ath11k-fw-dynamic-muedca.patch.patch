@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Muna Sinada <msinada@codeaurora.org>
 Date: Fri, 2 Oct 2026 10:13:36 +0300
-Subject: [PATCH 140/192] 203-mac80211-ath11k-fw-dynamic-muedca.patch
+Subject: [PATCH] 203-mac80211-ath11k-fw-dynamic-muedca.patch
 
 mac80211/ath11k:FW Initiated Dynamic MU-EDCA
 

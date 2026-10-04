@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: kuncy7 <noreply@example.com>
 Date: Fri, 2 Oct 2026 10:18:08 +0300
-Subject: [PATCH 176/192] ath11k: nss: account each peer's stats on its own
+Subject: [PATCH] ath11k: nss: account each peer's stats on its own
 
 ath11k_nss_get_peer_stats() walks the per-peer entries of one wifili
 stats message, but two things leak from one entry into the next:

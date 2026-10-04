@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: kuncy7 <noreply@example.com>
 Date: Fri, 2 Oct 2026 09:37:57 +0300
-Subject: [PATCH 087/119] net: bridge: keep the default PVID of a new bridge
+Subject: [PATCH] net: bridge: keep the default PVID of a new bridge
 
 0966 (QSDK "bridge: Fixes for Bridge VLAN Filtering") disables the
 default PVID of every bridge at NETDEV_REGISTER, so each bridge starts

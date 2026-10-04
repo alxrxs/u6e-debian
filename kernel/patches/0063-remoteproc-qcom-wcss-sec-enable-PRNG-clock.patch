@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Robert Marko <robimarko@gmail.com>
 Date: Wed, 16 Sep 2026 14:26:38 +0200
-Subject: [PATCH 063/119] remoteproc: qcom: wcss-sec: enable PRNG clock
+Subject: [PATCH] remoteproc: qcom: wcss-sec: enable PRNG clock
 
 The IPQ8074 WCSS secure PIL requires the PRNG clock while the remote
 processor is running. Acquire and enable the optional PRNG clock at

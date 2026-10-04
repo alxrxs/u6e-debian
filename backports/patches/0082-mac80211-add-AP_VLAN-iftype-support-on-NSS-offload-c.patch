@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Sathishkumar Muruganandam <murugana@codeaurora.org>
 Date: Fri, 2 Oct 2026 09:51:26 +0300
-Subject: [PATCH 082/192] mac80211: add AP_VLAN iftype support on NSS offload
- case
+Subject: [PATCH] mac80211: add AP_VLAN iftype support on NSS offload case
 
 - allow AP_VLAN iftype to get added, removed
 - add new callback for 4addr rx_notify to get AP_VLAN created from hostapd

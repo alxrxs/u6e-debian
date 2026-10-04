@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: George Moussalem <george.moussalem@outlook.com>
 Date: Sun, 27 Oct 2024 16:34:11 +0400
-Subject: [PATCH 059/192] wifi: ath11k: add hal regs for QCN6122
+Subject: [PATCH] wifi: ath11k: add hal regs for QCN6122
 
 Add HAL changes required to support QCN6122. Offsets are similar to those of
 WCN6750 but QCN6122 does not use the hal_shadow_base_addr, so add platform

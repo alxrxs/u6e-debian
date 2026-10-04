@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Venkateswara Naralasetty <quic_vnaralas@quicinc.com>
 Date: Fri, 2 Oct 2026 10:10:26 +0300
-Subject: [PATCH 132/192] ath11k: use DECLARE_BITMAP for idr operations
+Subject: [PATCH] ath11k: use DECLARE_BITMAP for idr operations
 
 Use DECLARE_BITMAP for declaring bit map for idrs. And use APIs
 find_first_zero_bit, set_bit and clear bit instead of idr_alloc

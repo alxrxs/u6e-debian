@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Robert Marko <robimarko@gmail.com>
 Date: Wed, 16 Sep 2026 14:30:17 +0200
-Subject: [PATCH 064/119] remoteproc: qcom: wcss-sec: add IPQ8074 compatible
+Subject: [PATCH] remoteproc: qcom: wcss-sec: add IPQ8074 compatible
 
 Match the IPQ8074 WCSS secure PIL node and use the same PAS ID and
 subsystem name as IPQ9574.

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Julius Bairaktaris <julius@bairaktaris.de>
 Date: Fri, 2 Oct 2026 10:18:08 +0300
-Subject: [PATCH 168/192] ath11k: fix two lock leaks in the wifili path
+Subject: [PATCH] ath11k: fix two lock leaks in the wifili path
 
 Two spinlocks in nss.c are released wrongly or not at all. Both leave
 softirqs disabled on the CPU that took them, so the next acquisition of

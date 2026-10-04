@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Aaradhana Sahu <quic_aarasahu@quicinc.com>
 Date: Fri, 2 Oct 2026 09:55:14 +0300
-Subject: [PATCH 092/192] mac80211: Avoid encapsulation of EAPOL frames if
+Subject: [PATCH] mac80211: Avoid encapsulation of EAPOL frames if
  OFFLOAD_ENCAP is enabled
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

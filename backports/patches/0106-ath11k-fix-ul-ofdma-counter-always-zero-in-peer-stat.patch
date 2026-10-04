@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Miles Hu <milehu@codeaurora.org>
 Date: Mon, 25 Nov 2019 10:24:41 -0800
-Subject: [PATCH 106/192] ath11k: fix ul-ofdma counter always zero in peer
- stats
+Subject: [PATCH] ath11k: fix ul-ofdma counter always zero in peer stats
 
 The problem is caused by RSSI_LEGACY tlv is not handled properly.
 All ul mu receiption information need to be extracted from the tlv.

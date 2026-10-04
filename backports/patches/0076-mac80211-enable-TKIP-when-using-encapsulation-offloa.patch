@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Stanislaw Pal <kuncy7@gmail.com>
 Date: Fri, 2 Oct 2026 09:49:57 +0300
-Subject: [PATCH 076/192] 
- mac80211-enable-TKIP-when-using-encapsulation-offloading
+Subject: [PATCH] mac80211-enable-TKIP-when-using-encapsulation-offloading
 
 Imported from https://github.com/kuncy7/openwrt-nss-edma package/kernel/mac80211/patches/nss/subsys/146-mac80211-enable-TKIP-when-using-encapsulation-offloading.patch (added in aaacdca9a1); the patch file carries no author or description.
 [Andrei: Context drifted; hunks placed by unique match (1 with trimmed context).]

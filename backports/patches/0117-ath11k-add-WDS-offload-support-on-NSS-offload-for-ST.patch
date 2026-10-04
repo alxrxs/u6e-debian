@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Sathishkumar Muruganandam <murugana@codeaurora.org>
 Date: Fri, 2 Oct 2026 10:03:22 +0300
-Subject: [PATCH 117/192] ath11k: add WDS offload support on NSS offload for
- STA mode
+Subject: [PATCH] ath11k: add WDS offload support on NSS offload for STA mode
 
 When 4addr is set ON for STA interface along with NSS enabled case, WDS
 offload is enabled for ethernet mode.

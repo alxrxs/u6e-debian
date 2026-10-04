@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Robert Marko <robimarko@gmail.com>
 Date: Wed, 16 Sep 2026 18:16:00 +0200
-Subject: [PATCH 066/119] remoteproc: qcom: wcss-sec: add IPQ6018 support
+Subject: [PATCH] remoteproc: qcom: wcss-sec: add IPQ6018 support
 
 IPQ6018 uses the secure WCSS PIL remoteproc driver, but its SSR subsystem
 name is "wcnss" rather than the "q6wcss" name used by IPQ9574. Add a

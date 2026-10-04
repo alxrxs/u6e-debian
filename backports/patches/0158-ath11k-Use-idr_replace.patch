@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tamizh Chelvam <quic_tamizhr@quicinc.com>
 Date: Fri, 2 Oct 2026 10:16:16 +0300
-Subject: [PATCH 158/192] ath11k: Use idr_replace
+Subject: [PATCH] ath11k: Use idr_replace
 
 idr_alloc has been done multiple times upon reaping the msdu
 using idr_remove. This idr_alloc would take more cpu, to redue

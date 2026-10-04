@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Gustavo Foletto Mora <gusfmora@gmail.com>
 Date: Fri, 2 Oct 2026 10:18:08 +0300
-Subject: [PATCH 178/192] ath11k: give the 256M memory profile smaller RXDMA
- rings
+Subject: [PATCH] ath11k: give the 256M memory profile smaller RXDMA rings
 
 ATH11K_MEM_PROFILE_256M exists in Kconfig but nothing in the driver
 tests it, so selecting it gives a board the 1G defaults. Make it mean

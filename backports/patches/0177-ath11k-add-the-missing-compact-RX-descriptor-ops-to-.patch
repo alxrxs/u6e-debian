@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: kuncy7 <noreply@example.com>
 Date: Fri, 2 Oct 2026 10:18:08 +0300
-Subject: [PATCH 177/192] ath11k: add the missing compact RX descriptor ops to
+Subject: [PATCH] ath11k: add the missing compact RX descriptor ops to
  ipq5018_ops
 
 With the 256/512MB memory profiles the rx header TLV is off, so

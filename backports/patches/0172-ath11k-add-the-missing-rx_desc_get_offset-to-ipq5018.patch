@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: kuncy7 <noreply@example.com>
 Date: Fri, 2 Oct 2026 10:18:08 +0300
-Subject: [PATCH 172/192] ath11k: add the missing rx_desc_get_offset to
- ipq5018_ops
+Subject: [PATCH] ath11k: add the missing rx_desc_get_offset to ipq5018_ops
 
 Selecting the 512MB ath11k memory profile panics every IPQ5018 board at
 radio bring-up:

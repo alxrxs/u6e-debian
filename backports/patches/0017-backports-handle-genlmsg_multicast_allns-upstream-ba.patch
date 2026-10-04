@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Christian Marangi <ansuelsmth@gmail.com>
 Date: Sat, 29 Mar 2025 12:50:55 +0100
-Subject: [PATCH 017/192] backports: handle genlmsg_multicast_allns upstream
- backport changes
+Subject: [PATCH] backports: handle genlmsg_multicast_allns upstream backport
+ changes
 
 Better handle genlmsg_multicast_allns upstream backport changes that
 dropped a flag to the function middle version. Use a backport function

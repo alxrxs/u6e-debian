@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Sowmiya Sree Elavalagan <ssreeela@codeaurora.org>
 Date: Fri, 2 Oct 2026 09:51:07 +0300
-Subject: [PATCH 081/192] ath11k : Add NSS redirect support
+Subject: [PATCH] ath11k : Add NSS redirect support
 
 Add NSS Redirect support for ath11k. Tested on ipq8074
 Most of the changes are similar to the one done for ath10k with

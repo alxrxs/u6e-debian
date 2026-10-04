@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: P Praneesh <ppranees@codeaurora.org>
 Date: Fri, 2 Oct 2026 10:06:18 +0300
-Subject: [PATCH 125/192] ath11k: dp_tx perf improvements
+Subject: [PATCH] ath11k: dp_tx perf improvements
 
  Contains below changes,
 	1. Add branch prediction in tx path

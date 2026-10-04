@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Felix Fietkau <nbd@nbd.name>
 Date: Wed, 28 Apr 2021 21:03:13 +0200
-Subject: [PATCH 027/192] mac80211: minstrel_ht: fix MINSTREL_FRAC macro
+Subject: [PATCH] mac80211: minstrel_ht: fix MINSTREL_FRAC macro
 
 Add missing braces to avoid issues with e.g. using additions in the
 div expression

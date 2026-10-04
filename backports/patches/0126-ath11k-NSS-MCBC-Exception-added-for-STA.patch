@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Karthikeyan Kathirvel <kathirve@codeaurora.org>
 Date: Fri, 2 Oct 2026 10:06:18 +0300
-Subject: [PATCH 126/192] ath11k: NSS MCBC Exception added for STA
+Subject: [PATCH] ath11k: NSS MCBC Exception added for STA
 
 Since NSS FW is not supporting PN check for MCBC pkts, those pkts are
 excepted from NSS offload to pass through mac80211 PN check.

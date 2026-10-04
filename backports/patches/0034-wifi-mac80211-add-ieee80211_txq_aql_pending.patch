@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Felix Fietkau <nbd@nbd.name>
 Date: Mon, 23 Mar 2026 10:14:22 +0000
-Subject: [PATCH 034/192] wifi: mac80211: add ieee80211_txq_aql_pending()
+Subject: [PATCH] wifi: mac80211: add ieee80211_txq_aql_pending()
 
 Add a function to allow drivers to query the pending AQL airtime
 for a given txq, for both unicast and broadcast.

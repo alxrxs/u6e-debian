@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Stanislaw Pal <kuncy7@gmail.com>
 Date: Fri, 2 Oct 2026 10:17:27 +0300
-Subject: [PATCH 164/192] ath11k-use-ath11k_sta_to_arsta
+Subject: [PATCH] ath11k-use-ath11k_sta_to_arsta
 
 Imported from https://github.com/kuncy7/openwrt-nss-edma package/kernel/mac80211/patches/nss/ath11k/999-903-ath11k-use-ath11k_sta_to_arsta.patch (added in aaacdca9a1); the patch file carries no author or description.
 ---

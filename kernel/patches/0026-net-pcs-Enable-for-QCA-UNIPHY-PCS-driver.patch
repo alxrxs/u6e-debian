@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: George Moussalem <george.moussalem@outlook.com>
 Date: Wed, 30 Sep 2026 18:51:04 +0300
-Subject: [PATCH 026/119] net: pcs: Enable for QCA UNIPHY PCS driver
+Subject: [PATCH] net: pcs: Enable for QCA UNIPHY PCS driver
 
 Enable the QCA UNIPHY PCS driver for Qualcomm IPQ platforms.
 

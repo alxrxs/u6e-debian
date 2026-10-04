@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Anilkumar Kolli <quic_akolli@quicinc.com>
 Date: Fri, 17 Dec 2021 17:16:11 +0530
-Subject: [PATCH 133/192] ath11k: Fix updating rx stats with monitor vif
- enabled
+Subject: [PATCH] ath11k: Fix updating rx stats with monitor vif enabled
 
 Rx stats update fails when monitor vif is enabled.
 Current code does not update rx stats from monitor

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Felix Fietkau <nbd@nbd.name>
 Date: Fri, 2 Oct 2026 09:59:52 +0300
-Subject: [PATCH 007/192] crypto_aes
+Subject: [PATCH] crypto_aes
 
 Imported from https://github.com/openwrt/openwrt.git package/kernel/mac80211/patches/build/006-crypto_aes.patch (added in bf44cb5fb0); the patch file carries no author or description.
 ---

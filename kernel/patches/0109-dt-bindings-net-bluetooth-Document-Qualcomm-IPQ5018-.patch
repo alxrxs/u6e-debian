@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: George Moussalem <george.moussalem@outlook.com>
 Date: Thu, 9 Jul 2026 13:18:27 +0400
-Subject: [PATCH 109/119] dt-bindings: net: bluetooth: Document Qualcomm
- IPQ5018 Bluetooth controller
+Subject: [PATCH] dt-bindings: net: bluetooth: Document Qualcomm IPQ5018
+ Bluetooth controller
 
 Document the Qualcomm IPQ5018 Bluetooth controller.
 

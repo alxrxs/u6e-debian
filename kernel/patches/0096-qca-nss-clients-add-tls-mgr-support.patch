@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Sean Khan <datapronix@protonmail.com>
 Date: Fri, 2 Oct 2026 09:40:36 +0300
-Subject: [PATCH 096/119] qca-nss-clients-add-tls-mgr-support
+Subject: [PATCH] qca-nss-clients-add-tls-mgr-support
 
 Imported from https://github.com/qosmio/openwrt-ipq.git target/linux/qualcommax/patches-6.12/0603-8-qca-nss-clients-add-tls-mgr-support.patch (added in 2f34da0af7); the patch file carries no author or description.
 ---

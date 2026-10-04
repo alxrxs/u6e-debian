@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Sean Khan <datapronix@protonmail.com>
 Date: Fri, 2 Oct 2026 09:37:55 +0300
-Subject: [PATCH 082/119] qca-nss-ecm-support-net-bonding-over-LAG-interface
+Subject: [PATCH] qca-nss-ecm-support-net-bonding-over-LAG-interface
 
 Imported from https://github.com/qosmio/openwrt-ipq.git target/linux/qualcommax/patches-6.12/0600-4-qca-nss-ecm-support-net-bonding-over-LAG-interface.patch (added in 527c31de29); the patch file carries no author or description.
 [Andrei: Ported to 7.2 (every hunk placed with zero fuzz or by hand): ad_enable_collecting_distributing() reads the aggregator through RCU and now sets the carrier and peer notification; the 802.3ad case of __bond_start_xmit() broadcasts neighbour traffic first, then XOR and 802.3ad split as in the patch; bond_3ad_xor_xmit() drops through bond_tx_drop(); the new declarations follow bond_peer_notify_work_rearm().]

@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: kuncy7 <stefdo61@gmail.com>
 Date: Fri, 2 Oct 2026 09:35:42 +0300
-Subject: [PATCH 077/119] net: stmmac: expose DMA status and an RX poll kick
- for the NSS data-plane owner
+Subject: [PATCH] net: stmmac: expose DMA status and an RX poll kick for the
+ NSS data-plane owner
 
 E181 (2026-08-30): with the NSS firmware owning the GMAC ring, a burst of
 egress through a wifili STA vdev can leave the receive DMA parked in

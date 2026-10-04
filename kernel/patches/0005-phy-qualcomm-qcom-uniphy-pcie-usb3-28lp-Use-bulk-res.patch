@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: George Moussalem <george.moussalem@outlook.com>
 Date: Tue, 18 Aug 2026 19:40:13 +0400
-Subject: [PATCH 005/119] phy: qualcomm: qcom-uniphy-pcie-usb3-28lp: Use bulk
+Subject: [PATCH] phy: qualcomm: qcom-uniphy-pcie-usb3-28lp: Use bulk
  reset_control API
 
 Switch to using bulk reset_control functions to prepare the driver for

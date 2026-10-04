@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Stanislaw Pal <kuncy7@gmail.com>
 Date: Fri, 2 Oct 2026 09:35:42 +0300
-Subject: [PATCH 076/119] net: stmmac: add a data-plane claim API for the NSS
- firmware
+Subject: [PATCH] net: stmmac: add a data-plane claim API for the NSS firmware
 
 The NSS (UBI32) firmware on IPQ5018 accelerates ethernet by driving the
 Synopsys GMAC DMA directly with its own descriptor rings. Add a small

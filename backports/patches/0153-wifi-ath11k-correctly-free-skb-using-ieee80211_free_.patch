@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Sarika Sharma <quic_sarishar@quicinc.com>
 Date: Fri, 2 Oct 2026 10:15:37 +0300
-Subject: [PATCH 153/192] wifi: ath11k: correctly free skb using
- ieee80211_free_txskb()
+Subject: [PATCH] wifi: ath11k: correctly free skb using ieee80211_free_txskb()
 
 While freeing skb in tx completion path for status reinject, inspect
 or vdevid mismatch, dev_kfree_skb_any() is used but when a function

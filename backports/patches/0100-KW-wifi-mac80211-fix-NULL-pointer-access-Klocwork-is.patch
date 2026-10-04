@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Monika Korada <quic_koramoni@quicinc.com>
 Date: Fri, 2 Oct 2026 09:55:41 +0300
-Subject: [PATCH 100/192] KW: wifi: mac80211: fix NULL pointer access, Klocwork
- issue
+Subject: [PATCH] KW: wifi: mac80211: fix NULL pointer access, Klocwork issue
 
 Currently we are dereferencing dev pointer without a NULL
 check.

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Julius Bairaktaris <julius@bairaktaris.de>
 Date: Fri, 2 Oct 2026 10:17:23 +0300
-Subject: [PATCH 162/192] bss-transition-handling
+Subject: [PATCH] bss-transition-handling
 
 Imported from https://github.com/kuncy7/openwrt-nss-edma package/kernel/mac80211/patches/nss/ath11k/999-900-bss-transition-handling.patch (added in 82c7d2cde8); the patch file carries no author or description.
 [Andrei: Four sites hand-converted where 7.2 differs: find_peer has no peer_id guard, complete_msdu tests the peer without unlikely(), the mon-status MPDU_START reads mpdu_len through an optional hook, and sta_state's peer cleanup is followed by the CFR peer count.]

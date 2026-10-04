@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Robert Marko <robimarko@gmail.com>
 Date: Sat, 5 Nov 2022 20:02:56 +0100
-Subject: [PATCH 033/119] bus: mhi: core: add SBL state callback
+Subject: [PATCH] bus: mhi: core: add SBL state callback
 
 Add support for SBL state callback in MHI core.
 

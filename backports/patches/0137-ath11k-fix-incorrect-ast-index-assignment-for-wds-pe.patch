@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Raj Kumar Bhagat <quic_rajkbhag@quicinc.com>
 Date: Mon, 7 Nov 2022 21:49:20 +0530
-Subject: [PATCH 137/192] ath11k: fix incorrect ast index assignment for wds
- peer
+Subject: [PATCH] ath11k: fix incorrect ast index assignment for wds peer
 
 Currently, same ast index is assigned for different nss wds peer mac
 addresses which is incorrect. However, firmware provides the correct

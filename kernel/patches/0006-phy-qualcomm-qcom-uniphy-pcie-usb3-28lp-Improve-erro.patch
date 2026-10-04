@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: George Moussalem <george.moussalem@outlook.com>
 Date: Fri, 21 Aug 2026 17:08:00 +0400
-Subject: [PATCH 006/119] phy: qualcomm: qcom-uniphy-pcie-usb3-28lp: Improve
- error handling in power_on
+Subject: [PATCH] phy: qualcomm: qcom-uniphy-pcie-usb3-28lp: Improve error
+ handling in power_on
 
 When the PHY fails the enable clocks, it leaves the PHY out of reset.
 Fix this by asserting the reset before returning the error.

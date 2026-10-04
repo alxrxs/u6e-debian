@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Adriel Santos <adriel@adriel.eu>
 Date: Fri, 2 Oct 2026 10:18:08 +0300
-Subject: [PATCH 173/192] ath11k: nss: deliver EAPOL to hostapd on VLAN-aware
- bridges
+Subject: [PATCH] ath11k: nss: deliver EAPOL to hostapd on VLAN-aware bridges
 
 With NSS offload mac80211 does not advertise EAPOL over nl80211, so hostapd
 receives EAPOL on a packet socket and only accepts frames whose ingress

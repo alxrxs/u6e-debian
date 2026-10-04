@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: P Praneesh <ppranees@codeaurora.org>
 Date: Mon, 14 Dec 2020 20:22:22 +0530
-Subject: [PATCH 123/192] ath11k: allocate dst ring descriptors from cacheable
- memory
+Subject: [PATCH] ath11k: allocate dst ring descriptors from cacheable memory
 
 tcl_data and reo_dst rings are currently being allocated
 using dma_allocate_coherent() which is non cachable.

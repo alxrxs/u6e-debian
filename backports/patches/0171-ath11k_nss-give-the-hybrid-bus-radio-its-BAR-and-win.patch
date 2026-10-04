@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Stefan <stefdo61@gmail.com>
 Date: Fri, 2 Oct 2026 10:18:08 +0300
-Subject: [PATCH 171/192] ath11k_nss: give the hybrid-bus radio its BAR and
- window offsets
+Subject: [PATCH] ath11k_nss: give the hybrid-bus radio its BAR and window
+ offsets
 
 The wifili init message hands the NSS firmware physical register
 addresses: hssm.dev_base_addr is ab->mem_pa, and every ring's

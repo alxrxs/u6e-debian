@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tamizh Chelvam <quic_tamizhr@quicinc.com>
 Date: Mon, 15 Nov 2021 17:51:43 +0530
-Subject: [PATCH 157/192] ath11k: idr optimization
+Subject: [PATCH] ath11k: idr optimization
 
 Replace idr_find and idr_remove with idr_remove. As idr_remove
 itself will do idr_find. And use dma low level api.

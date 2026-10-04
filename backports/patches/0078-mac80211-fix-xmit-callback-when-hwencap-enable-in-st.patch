@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: P Praneesh <ppranees@codeaurora.org>
 Date: Thu, 18 Jun 2020 00:07:15 +0530
-Subject: [PATCH 078/192] mac80211: fix xmit callback when hwencap enable in
- sta
+Subject: [PATCH] mac80211: fix xmit callback when hwencap enable in sta
 
 Since transmit control port uses same callback for both
 (ieee80211_subif_start_xmit) ethernet mode and native

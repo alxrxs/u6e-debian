@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Felix Fietkau <nbd@nbd.name>
 Date: Wed, 19 Aug 2026 12:31:49 +0000
-Subject: [PATCH 039/192] wifi: mac80211: fix station lookup for management
- frames on 4-address VLANs
+Subject: [PATCH] wifi: mac80211: fix station lookup for management frames on
+ 4-address VLANs
 
 A 4-address station is moved to its own AP_VLAN interface, but management
 frames for it are still transmitted on the AP interface. In that case the

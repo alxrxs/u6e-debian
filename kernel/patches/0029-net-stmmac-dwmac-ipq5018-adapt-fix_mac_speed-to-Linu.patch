@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Andrei-Alexandru Bleortu <me@andrei-z.com>
 Date: Wed, 30 Sep 2026 18:51:04 +0300
-Subject: [PATCH 029/119] net: stmmac: dwmac-ipq5018: adapt fix_mac_speed to
- Linux 7.x
+Subject: [PATCH] net: stmmac: dwmac-ipq5018: adapt fix_mac_speed to Linux 7.x
 
 stmmac passes the PHY interface to fix_mac_speed since 7.x. Use the new
 signature and drop the LINUX_VERSION_CODE switch.

@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hari Chandrakanthan <quic_haric@quicinc.com>
 Date: Thu, 22 Jun 2023 00:45:47 +0530
-Subject: [PATCH 146/192] ath11k : flush management frames to firmware before
- waiting for tx completion
+Subject: [PATCH] ath11k : flush management frames to firmware before waiting
+ for tx completion
 
 warning print "ath11k c000000.wifi: failed to flush mgmt transmit queue 0"
 is observed during interface down.

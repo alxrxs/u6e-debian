@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Sathishkumar Muruganandam <murugana@codeaurora.org>
 Date: Thu, 10 Sep 2020 15:58:53 +0530
-Subject: [PATCH 116/192] ath11k: add WDS offload changes to NSS driver
- interface
+Subject: [PATCH] ath11k: add WDS offload changes to NSS driver interface
 
 add WDS and MEC AST handling to NSS
 

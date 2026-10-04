@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Sean Khan <datapronix@protonmail.com>
 Date: Fri, 2 Oct 2026 09:42:09 +0300
-Subject: [PATCH 099/119] qca-nss-cfi-support
+Subject: [PATCH] qca-nss-cfi-support
 
 Imported from https://github.com/qosmio/openwrt-ipq.git target/linux/qualcommax/patches-6.12/0605-1-qca-nss-cfi-support.patch (added in df16b5d9a9); the patch file carries no author or description.
 ---

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Murat Sezgin <msezgin@codeaurora.org>
 Date: Wed, 5 Aug 2020 13:21:27 -0700
-Subject: [PATCH 085/119] net:ipv6: Fix IPv6 user route change event calls
+Subject: [PATCH] net:ipv6: Fix IPv6 user route change event calls
 
 These events should be called only when the route table is
 changed by the userspace. So, we should call them in the

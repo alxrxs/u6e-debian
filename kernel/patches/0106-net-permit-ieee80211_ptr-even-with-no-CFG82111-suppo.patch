@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Christian Marangi <ansuelsmth@gmail.com>
 Date: Fri, 2 Oct 2026 10:00:41 +0300
-Subject: [PATCH 106/119] net: permit ieee80211_ptr even with no CFG82111
- support
+Subject: [PATCH] net: permit ieee80211_ptr even with no CFG82111 support
 
 Introduce a new flag CONFIG_CFG80211_HEADERS to compile in ieee80211_ptr
 even if CFG80211 support is not compiled in. This is needed for the

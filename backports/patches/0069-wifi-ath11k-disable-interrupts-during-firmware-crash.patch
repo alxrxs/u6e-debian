@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Julius Bairaktaris <julius@bairaktaris.de>
 Date: Mon, 27 Jul 2026 00:19:08 +0200
-Subject: [PATCH 069/192] wifi: ath11k: disable interrupts during firmware
- crash recovery
+Subject: [PATCH] wifi: ath11k: disable interrupts during firmware crash
+ recovery
 
 On IPQ8074 a firmware assert reboots the SoC:
 

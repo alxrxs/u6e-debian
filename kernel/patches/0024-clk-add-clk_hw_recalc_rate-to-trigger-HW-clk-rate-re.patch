@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Christian Marangi <ansuelsmth@gmail.com>
 Date: Tue, 17 Mar 2026 17:41:45 +0100
-Subject: [PATCH 024/119] clk: add clk_hw_recalc_rate() to trigger HW clk rate
+Subject: [PATCH] clk: add clk_hw_recalc_rate() to trigger HW clk rate
  recalculation
 
 There is currently a latent problem with HW clk that only expose a

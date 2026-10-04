@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Manikanta Mylavarapu <quic_mmanikan@quicinc.com>
 Date: Fri, 10 Nov 2023 14:49:29 +0530
-Subject: [PATCH 012/119] dt-bindings: remoteproc: qcom: Add support for
- multipd model
+Subject: [PATCH] dt-bindings: remoteproc: qcom: Add support for multipd model
 
 Add new binding document for multipd model remoteproc.
 IPQ5332, IPQ9574 follows multipd model.

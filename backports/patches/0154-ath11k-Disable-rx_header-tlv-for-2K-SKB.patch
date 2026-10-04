@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ramya Gnanasekar <rgnanase@codeaurora.org>
 Date: Fri, 25 Dec 2020 16:11:06 +0530
-Subject: [PATCH 154/192] ath11k: Disable rx_header tlv for 2K SKB
+Subject: [PATCH] ath11k: Disable rx_header tlv for 2K SKB
 
 On low memory platform hdr_status in hal_rx_desc is not subscribed to
 get a savings of 128bytes in skb. This is required to reduce the skb

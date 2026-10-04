@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ziyang Huang <hzyitc@outlook.com>
 Date: Sun, 8 Sep 2024 16:40:12 +0800
-Subject: [PATCH 010/119] clk: gcc-ipq5018: remove the unsupported clk
- combination for gmac
+Subject: [PATCH] clk: gcc-ipq5018: remove the unsupported clk combination for
+ gmac
 
 Comment out the unsupported clock combination in the frequency table
 for GMAC1.

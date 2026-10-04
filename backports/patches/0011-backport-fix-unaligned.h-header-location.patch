@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Shiji Yang <yangshiji66@outlook.com>
 Date: Mon, 28 Apr 2025 22:03:18 +0800
-Subject: [PATCH 011/192] backport: fix unaligned.h header location
+Subject: [PATCH] backport: fix unaligned.h header location
 
 unaligned.h was moved from include/asm-generic/ to include/linux/
 in 6.12-rc2 kernel.

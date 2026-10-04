@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tamizh Chelvam Raja <quic_tamizhr@quicinc.com>
 Date: Wed, 21 Jun 2023 20:26:02 +0530
-Subject: [PATCH 144/192] ath11k: Add nss event handler support for link desc
+Subject: [PATCH] ath11k: Add nss event handler support for link desc
 
 Add NSS event handler support for NSS_WIFILI_LINK_DESC_INFO_MSG.
 This event will be given to host from NSS for releasing

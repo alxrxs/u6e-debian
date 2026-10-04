@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Manikanta Mylavarapu <quic_mmanikan@quicinc.com>
 Date: Thu, 1 Oct 2026 19:03:49 +0300
-Subject: [PATCH 056/119] firmware: qcom_scm: ipq5332: add msa lock/unlock
- support
+Subject: [PATCH] firmware: qcom_scm: ipq5332: add msa lock/unlock support
 
 IPQ5332 user pd remoteproc firmwares need to be locked
 with MSA(modem secure access) features. This patch add

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: David Bauer <mail@david-bauer.net>
 Date: Thu, 30 Nov 2023 07:32:52 +0100
-Subject: [PATCH 025/192] mac80211: avoid crashing on invalid band info
+Subject: [PATCH] mac80211: avoid crashing on invalid band info
 
 Frequent crashes have been observed on MT7916 based platforms. While the
 root of these crashes are currently unknown, they happen when decoding

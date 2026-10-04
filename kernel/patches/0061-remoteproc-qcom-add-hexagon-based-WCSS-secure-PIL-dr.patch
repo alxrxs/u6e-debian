@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Vignesh Viswanathan <vignesh.viswanathan@oss.qualcomm.com>
 Date: Tue, 21 Oct 2025 15:38:30 +0400
-Subject: [PATCH 061/119] remoteproc: qcom: add hexagon based WCSS secure PIL
- driver
+Subject: [PATCH] remoteproc: qcom: add hexagon based WCSS secure PIL driver
 
 Add support to bring up hexagon based WCSS using secure PIL. All IPQxxxx
 SoCs support secure Peripheral Image Loading (PIL).

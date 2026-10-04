@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Zeyu Dong <dzy201415@gmail.com>
 Date: Fri, 2 Oct 2026 09:59:52 +0300
-Subject: [PATCH 005/192] fix-kconf-compiling
+Subject: [PATCH] fix-kconf-compiling
 
 Imported from https://github.com/openwrt/openwrt.git package/kernel/mac80211/patches/build/004-fix-kconf-compiling.patch (added in 4b0b90d3fa); the patch file carries no author or description.
 ---

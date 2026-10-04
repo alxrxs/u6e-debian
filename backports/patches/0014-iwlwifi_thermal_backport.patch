@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Felix Fietkau <nbd@nbd.name>
 Date: Fri, 2 Oct 2026 09:59:53 +0300
-Subject: [PATCH 014/192] iwlwifi_thermal_backport
+Subject: [PATCH] iwlwifi_thermal_backport
 
 Imported from https://github.com/openwrt/openwrt.git package/kernel/mac80211/patches/build/200-iwlwifi_thermal_backport.patch (added in 1bfcc1ea8a); the patch file carries no author or description.
 ---

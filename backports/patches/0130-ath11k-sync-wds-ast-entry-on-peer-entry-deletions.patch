@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Rameshkumar Sundaram <ramess@codeaurora.org>
 Date: Fri, 2 Oct 2026 10:06:19 +0300
-Subject: [PATCH 130/192] ath11k: sync wds ast entry on peer/entry deletions
+Subject: [PATCH] ath11k: sync wds ast entry on peer/entry deletions
 
 Peer specific ast entries list is shared between
 peer_unmap_event(softirq) and peer_ast_wds_wmi_wk

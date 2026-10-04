@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Julius Bairaktaris <julius@bairaktaris.de>
 Date: Fri, 2 Oct 2026 09:35:21 +0300
-Subject: [PATCH 069/119] Import nf_conntrack_dscpremark_ext.h,
+Subject: [PATCH] Import nf_conntrack_dscpremark_ext.h,
  nf_conntrack_dscpremark_ext.c
 
 From https://github.com/kuncy7/openwrt-nss-edma target/linux/qualcommax/files/ at b16de08072; first added in be0fb2aa69 ("qualcommax: add the qca-nss-ecm kernel support patches").

@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Sricharan Ramabadhran <quic_srichara@quicinc.com>
 Date: Thu, 1 Oct 2026 19:21:53 +0300
-Subject: [PATCH 067/119] mailbox: tmelite-qmp: Introduce TMEL QMP mailbox
- driver
+Subject: [PATCH] mailbox: tmelite-qmp: Introduce TMEL QMP mailbox driver
 
 This mailbox facilitates the communication between the TMEL server
 subsystem (Trust Management Engine Lite) and the TMEL client

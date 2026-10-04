@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ziyang Huang <hzyitc@outlook.com>
 Date: Thu, 29 Jun 2023 06:12:45 +0000
-Subject: [PATCH 036/119] wifi: ath11k: Support setting bdf-addr and caldb-addr
- via DT
+Subject: [PATCH] wifi: ath11k: Support setting bdf-addr and caldb-addr via DT
 
 Signed-off-by: Ziyang Huang <hzyitc@outlook.com>
 ---

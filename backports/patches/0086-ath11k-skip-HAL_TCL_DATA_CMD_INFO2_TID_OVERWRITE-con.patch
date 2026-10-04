@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Venkateswara Naralasetty <quic_vnaralas@quicinc.com>
 Date: Fri, 2 Oct 2026 09:53:09 +0300
-Subject: [PATCH 086/192] ath11k: skip HAL_TCL_DATA_CMD_INFO2_TID_OVERWRITE
- config
+Subject: [PATCH] ath11k: skip HAL_TCL_DATA_CMD_INFO2_TID_OVERWRITE config
 
 Don't set HAL_TCL_DATA_CMD_INFO2_TID_OVERWRITE flag to TCL,
 HW only take care of tid classification if this flag is not set.

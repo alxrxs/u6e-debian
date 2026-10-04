@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Sowmiya Sree Elavalagan <ssreeela@codeaurora.org>
 Date: Fri, 2 Oct 2026 10:03:49 +0300
-Subject: [PATCH 118/192] ath11k: QOS null frame tx over wmi
+Subject: [PATCH] ath11k: QOS null frame tx over wmi
 
 Added support to send qos null frame through FW.
 NSS driver does not support QOS null frame tx.

@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Karthikeyan Kathirvel <quic_kathirve@quicinc.com>
 Date: Thu, 11 Aug 2022 21:27:16 +0530
-Subject: [PATCH 136/192] ath11k: fix clearing peer keys during sta state auth
- to assoc
+Subject: [PATCH] ath11k: fix clearing peer keys during sta state auth to assoc
 
 During station state change from AUTHORIZED to ASSOC, driver must clear its key
 from hw. Ath11k clearing the keys during ASSOC to AUTH which is not a

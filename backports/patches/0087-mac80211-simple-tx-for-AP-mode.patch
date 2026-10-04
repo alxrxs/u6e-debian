@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Venkateswara Naralasetty <quic_vnaralas@quicinc.com>
 Date: Fri, 2 Oct 2026 09:53:10 +0300
-Subject: [PATCH 087/192] mac80211: simple tx for AP mode
+Subject: [PATCH] mac80211: simple tx for AP mode
 
 Introduced new API ieee80211_8023_xmit_ap to make tx simple and
 to avoid unnecessary checks for AP mode.

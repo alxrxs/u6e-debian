@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: George Moussalem <george.moussalem@outlook.com>
 Date: Fri, 21 Aug 2026 17:16:20 +0400
-Subject: [PATCH 007/119] phy: qualcomm: qcom-uniphy-pcie-usb3-28lp: Add
- support for USB3 PHY on IPQ5018
+Subject: [PATCH] phy: qualcomm: qcom-uniphy-pcie-usb3-28lp: Add support for
+ USB3 PHY on IPQ5018
 
 Add support for the USB3 PHY on IPQ5018 chipsets.
 

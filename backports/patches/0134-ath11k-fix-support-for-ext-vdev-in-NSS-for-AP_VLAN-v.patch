@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Aditya Kumar Singh <quic_adisi@quicinc.com>
 Date: Thu, 30 Dec 2021 17:44:40 +0530
-Subject: [PATCH 134/192] ath11k: fix support for ext vdev in NSS for AP_VLAN
- vif during recovery
+Subject: [PATCH] ath11k: fix support for ext vdev in NSS for AP_VLAN vif
+ during recovery
 
 When driver is recovering, it tears down nss connection and sets
 ab->nss.enabled as false. However, this is not set back to its original

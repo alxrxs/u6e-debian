@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Robert Marko <robimarko@gmail.com>
 Date: Thu, 15 Dec 2022 12:20:52 +0100
-Subject: [PATCH 052/192] ath11k: control thermal support via symbol
+Subject: [PATCH] ath11k: control thermal support via symbol
 
 Currently, thermal support will get built if CONFIG_THERMAL is reachable,
 however this is not suitable for OpenWrt as with ALL_KMODS being set to y
