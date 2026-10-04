@@ -154,10 +154,12 @@ WantedBy=multi-user.target
 UNIT
 ln -sf /etc/systemd/system/u6e-netconsole.service $RF/etc/systemd/system/multi-user.target.wants/u6e-netconsole.service
 
-# LEDs off: the DTS lights the blue status LED from boot (default-state "on").
-cat > $RF/etc/systemd/system/u6e-leds-off.service <<'UNIT'
+# Status LED as the site sets it (AP_LED: off, blue or white); the DTS lights
+# the blue one from boot (default-state "on").
+case $AP_LED in off | blue | white) ;; *) echo "AP_LED must be off, blue or white" >&2; exit 1 ;; esac
+cat > $RF/etc/systemd/system/u6e-leds.service <<'UNIT'
 [Unit]
-Description=U6E LEDs off
+Description=U6E status LED
 DefaultDependencies=no
 After=systemd-udev-settle.service systemd-udevd.service
 Before=sysinit.target
@@ -165,13 +167,37 @@ Before=sysinit.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/sh -c 'for l in /sys/class/leds/*; do echo none > $l/trigger; echo 0 > $l/brightness; done'
+ExecStart=/bin/sh -c 'for l in /sys/class/leds/*; do echo none > $l/trigger; echo 0 > $l/brightness; done; [ @LED@ = off ] || echo 1 > /sys/class/leds/@LED@:status/brightness'
 
 [Install]
 WantedBy=sysinit.target
 UNIT
 install -d $RF/etc/systemd/system/sysinit.target.wants
-ln -sf /etc/systemd/system/u6e-leds-off.service $RF/etc/systemd/system/sysinit.target.wants/u6e-leds-off.service
+sed -i "s/@LED@/$AP_LED/g" $RF/etc/systemd/system/u6e-leds.service
+ln -sf /etc/systemd/system/u6e-leds.service $RF/etc/systemd/system/sysinit.target.wants/u6e-leds.service
+
+# The AP keeps no logs (the journal is in RAM): systemd-netlogd sends the whole
+# journal to the site's syslog collector (LOG_SERVER, address:port), and a
+# timer logs the AP's state every 5 minutes, so a long run can be read back.
+install -d $RF/etc/systemd/netlogd.conf.d
+printf '[Network]\nAddress=%s\nProtocol=udp\nLogFormat=rfc5424\n' "$LOG_SERVER" \
+	> $RF/etc/systemd/netlogd.conf.d/u6e.conf
+ln -sf /usr/lib/systemd/system/systemd-netlogd.service $W/systemd-netlogd.service
+cat > $RF/usr/local/sbin/u6e-stats <<'STATS'
+#!/bin/sh
+# One line of the AP's state for the syslog collector: load, free memory, the
+# clients of each BSS, the thermal zones and the Wi-Fi firmware crashes so far.
+sta=$(for c in /run/hostapd/*; do i=${c##*/}; printf '%s=%s ' $i "$(hostapd_cli -p /run/hostapd -i $i list_sta 2>/dev/null | wc -l)"; done)
+temp=$(for z in /sys/class/thermal/thermal_zone*; do printf '%s=%s ' "$(cat $z/type)" $(($(cat $z/temp) / 1000)); done)
+logger -t u6e-stats "load=$(cut -d' ' -f1 /proc/loadavg) memavail_kb=$(awk '/MemAvailable/ {print $2}' /proc/meminfo) fw_crashes=$(dmesg | grep -c 'firmware crashed') clients: ${sta}temps: $temp"
+STATS
+chmod 0755 $RF/usr/local/sbin/u6e-stats
+printf '[Unit]\nDescription=U6E state to the log\n\n[Service]\nType=oneshot\nExecStart=/usr/local/sbin/u6e-stats\n' \
+	> $RF/etc/systemd/system/u6e-stats.service
+printf '[Unit]\nDescription=U6E state to the log every 5 minutes\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=5min\n\n[Install]\nWantedBy=timers.target\n' \
+	> $RF/etc/systemd/system/u6e-stats.timer
+install -d $RF/etc/systemd/system/timers.target.wants
+ln -sf /etc/systemd/system/u6e-stats.timer $RF/etc/systemd/system/timers.target.wants/u6e-stats.timer
 
 # The boot that brought this image up was one-shot: U-Boot disarmed it before
 # starting us. u6e-arm re-arms it from the steps go8.sh staged, or with "disarm"
@@ -464,13 +490,15 @@ fdtput -t x $OUT/u6e.dtb /chosen linux,initrd-end "$(printf '%#x' $((INITRD_ADDR
 echo "release $R, modules $(wc -l < modules.keep), rootfs $(du -sh $RF | cut -f1)"
 ls -la $OUT; sha256sum $OUT/*
 
-# Keep every image (~85 MB): images/<time>-<kernel>-<backports>/ can be staged
+# Keep every image (~85 MB): images/<time>-<kernel>-<backports>-<AP>/ can be staged
 # again with go8.sh without a rebuild; MANIFEST records what went into it.
 g() { git -c safe.directory='*' -C "$1" log -1 --format='%h %s'; }
 A=images/$(date +%Y%m%d-%H%M%S)-$MODE-$(git -c safe.directory='*' -C $K rev-parse --short HEAD)
 [ $MODE = nss ] && A=$A-$(git -c safe.directory='*' -C backports-7.2 rev-parse --short HEAD)
+A=$A-${U6E_AP:-default}
 install -d "$A"; cp -a $OUT/. "$A"/
-{ echo "kernel:    $(g $K)"
+{ echo "ap:        ${U6E_AP:-default} ($AP_HOSTNAME, $MGMT_ADDR)"
+  echo "kernel:    $(g $K)"
   [ $MODE = nss ] && echo "backports: $(g backports-7.2)"
   echo "debian-ap: $(g .)"
   echo "hostapd:   $(dpkg-query --admindir=$RF/var/lib/dpkg -W -f '${Version}' hostapd)"

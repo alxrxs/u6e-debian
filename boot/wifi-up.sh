@@ -204,12 +204,13 @@ ht() { # <band lines> <capabilities>: append them to the site's ht_capab
 # clients find 6 GHz at all; hostapd only reports a 6 GHz BSS it runs in the
 # same process. FILS Discovery (802.11ai) every 20 ms between beacons speeds
 # up 6 GHz scans.
+read -r COLOR_24 COLOR_5 COLOR_6 <<<"$WIFI_COLORS"
 radio_lines() { # <band>
 	case $1 in
-	24) printf '%s\nhe_bss_color=11\nsupported_rates=60 90 120 180 240 360 480 540\nbasic_rates=60 120 240\n' \
-		"$(ht "$WIFI_24" "$HT_CAPS")" ;;
-	5) printf '%s\nvht_capab=%s\nhe_bss_color=22\n' "$(ht "$WIFI_5" "${HT_CAPS}[MAX-AMSDU-7935]")" "$VHT_CAPS_5" ;;
-	6) printf '%s\nhe_bss_color=33\n' "$WIFI_6" ;;
+	24) printf '%s\nhe_bss_color=%s\nsupported_rates=60 90 120 180 240 360 480 540\nbasic_rates=60 120 240\n' \
+		"$(ht "$WIFI_24" "$HT_CAPS")" "$COLOR_24" ;;
+	5) printf '%s\nvht_capab=%s\nhe_bss_color=%s\n' "$(ht "$WIFI_5" "${HT_CAPS}[MAX-AMSDU-7935]")" "$VHT_CAPS_5" "$COLOR_5" ;;
+	6) printf '%s\nhe_bss_color=%s\n' "$WIFI_6" "$COLOR_6" ;;
 	esac
 }
 bss_extra() { # <band>
@@ -311,8 +312,11 @@ confs=
 for i in wlan6 wlan24 wlan5; do
 	[ -e /sys/class/net/$i ] && confs="$confs /run/hostapd-u6e/$i.conf" || echo "$i: no such radio"
 done
-hostapd -B -P /run/hostapd-u6e/hostapd.pid -f /run/hostapd-u6e/hostapd.log $confs || echo "hostapd failed"
+hostapd -B -s -P /run/hostapd-u6e/hostapd.pid $confs || echo "hostapd failed"
 sleep 8'
+	# The site's transmit power per radio (the regulatory limit still applies).
+	read -r tx24 tx5 tx6 <<<"$WIFI_TXPOWER"
+	echo "iw dev wlan24 set txpower fixed $((tx24 * 100)); iw dev wlan5 set txpower fixed $((tx5 * 100)); iw dev wlan6 set txpower fixed $((tx6 * 100))"
 	# 802.11k: each of an SSID's BSSs also reports its others in its neighbor
 	# reports, marked co-located (BSSID Information bit 16) and, for 2.4/5 GHz,
 	# co-located with the 6 GHz AP they announce (bit 20) or, for 6 GHz, a
