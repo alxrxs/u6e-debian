@@ -51,6 +51,7 @@ na_mcast_to_ucast=1
 ap_isolate=1
 multicast_to_unicast=1
 wpa_strict_rekey=1
+wpa_deny_ptk0_rekey=2
 bss_load_update_period=50
 esp=1
 mbo=1
@@ -86,6 +87,9 @@ qos_map_set=8,1,18,3,20,3,22,3,24,4,26,4,28,4,30,4,32,4,34,4,36,4,38,4,40,5,44,6
 # (otherwise multicast goes out twice). multicast_to_unicast: group frames
 # (mDNS, SSDP, IPv6) reach each client as unicast at its own rate, not the
 # basic rate. wpa_strict_rekey: a new group key whenever a client leaves.
+# wpa_deny_ptk0_rekey=2: never rekey a client's pairwise key in place (the
+# driver can't replace it safely: traffic stops until the client is dropped);
+# a client asking for one is disconnected and reconnects instead.
 # WPA3 on every band: 6 GHz admits nothing else, and clients (iOS) only treat
 # the 6 GHz BSS as the same network when 2.4/5 GHz offer the same security.
 # SAE-EXT-KEY (AKMs 24/25, WPA3 3.5) with GCMP-256 and SAE groups 20/21 next
@@ -103,7 +107,8 @@ sae_pwe=1"
 # WPA3-Enterprise Only Mode (WPA3 3.5 3.2): 802.1X with SHA-256 plus FT,
 # never SHA-1; PMF required. hostapd speaks RADIUS/TLS itself, mutually
 # authenticated with the site's RadSec client certificate; hostapd takes only
-# addresses, so the server's name is resolved here.
+# addresses, so the server's name is resolved here. No periodic EAP
+# reauthentication: each one ends in an in-place pairwise rekey.
 ent=
 if declare -F wifi_ent_ssid >/dev/null; then
 	ENT_SSID=$(wifi_ent_ssid)
@@ -128,6 +133,7 @@ transition_disable=0x04
 wpa_key_mgmt=WPA-EAP-SHA256 FT-EAP
 ieee80211w=2
 ieee8021x=1
+eap_reauth_period=0
 own_ip_addr=$AP
 radius_request_cui=1$tls"
 fi
