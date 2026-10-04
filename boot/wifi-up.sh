@@ -82,6 +82,19 @@ sae="wpa_key_mgmt=SAE FT-SAE
 ieee80211w=2
 sae_pwe=1"
 
+# The radios' HT/VHT capabilities (iw phy): hostapd advertises only what is
+# listed, and without them Wi-Fi 4/5 clients get no LDPC, STBC, short guard
+# interval or beamforming. The site's ht_capab carries the channel width.
+HT_CAPS="[LDPC][SHORT-GI-20][SHORT-GI-40][TX-STBC][RX-STBC1]"
+VHT_CAPS_5="[MAX-MPDU-11454][RXLDPC][SHORT-GI-80][TX-STBC-2BY1][RX-STBC-1][SU-BEAMFORMER][SU-BEAMFORMEE][MU-BEAMFORMER][BF-ANTENNA-4][SOUNDING-DIMENSION-4][MAX-A-MPDU-LEN-EXP7][RX-ANTENNA-PATTERN][TX-ANTENNA-PATTERN]"
+ht() { # <band lines> <capabilities>: append them to the site's ht_capab
+	if grep -q '^ht_capab=' <<<"$1"; then
+		sed "s/^ht_capab=.*/&$2/" <<<"$1"
+	else
+		printf '%s\nht_capab=%s\n' "$1" "$2"
+	fi
+}
+
 conf() { # <iface> <band lines>
 	echo "cat > /run/hostapd-u6e/$1.conf <<'EOF'"
 	printf 'interface=%s\n%s\n%s\n' "$1" "$common" "$2"
@@ -103,14 +116,15 @@ iw reg get | grep -E '^(phy|country)' | paste - - | sed 's/^/reg: /'"
 	# reports a 6 GHz BSS it runs in the same process. 2.4 GHz is OFDM only, so
 	# beacons and management frames go at 6 Mbit/s rather than 1 (Wi-Fi Optimized
 	# Connectivity wants at least 5.5).
-	conf wlan24 "$WIFI_24
+	conf wlan24 "$(ht "$WIFI_24" "$HT_CAPS")
 $sae
 nas_identifier=${AP}-wlan24
 he_bss_color=11
 supported_rates=60 90 120 180 240 360 480 540
 basic_rates=60 120 240
 rnr=1"
-	conf wlan5 "$WIFI_5
+	conf wlan5 "$(ht "$WIFI_5" "${HT_CAPS}[MAX-AMSDU-7935]")
+vht_capab=$VHT_CAPS_5
 $sae
 nas_identifier=${AP}-wlan5
 he_bss_color=22

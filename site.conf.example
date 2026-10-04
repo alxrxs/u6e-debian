@@ -51,7 +51,7 @@ channel=13"
 WIFI_5="hw_mode=a
 channel=149
 no_pri_sec_switch=1
-ht_capab=[HT40+][SHORT-GI-20][SHORT-GI-40]
+ht_capab=[HT40+]
 ieee80211ac=1
 vht_oper_chwidth=1
 vht_oper_centr_freq_seg0_idx=155
