@@ -29,22 +29,22 @@ Inputs:
 | `wifi/board/stock-a654/bdwlan.{b23,ba3,ba4}` | the stock firmware's `/lib/firmware/platforms/a654/` |
 | `bt/firmware/` (`bt_fw_patch.mdt` + `.b00`-`.b02`, `mpnv10.bin`) | the stock firmware's `/lib/firmware/IPQ5018/` |
 
-Then, on an x86 host with the aarch64/armhf cross toolchains, `mmdebstrap`, `qemu-user-static` and `u-boot-tools`:
+Then, on an x86 host with the aarch64/armhf cross toolchains, `mmdebstrap`, `qemu-user-static` and `u-boot-tools`, `sudo ./deploy.sh [<ap>...]` builds whatever the checked-out commits need and boots it on the APs in `U6E_APS` (or those named). Each step runs only when its inputs changed since it last ran (`stamps/` records the commits each was built from); in order, they are:
 
 ```sh
-sudo pkg/iproute2-nss/build.sh     # Debian's iproute2 with the NSS qdiscs in tc -> pkg/iproute2-nss/out/
-sudo pkg/hostapd/build.sh          # hostapd (pinned upstream main) with every feature -> pkg/hostapd/out/
-sudo ./mkrootfs.sh arm64           # Debian rootfs -> rootfs/
 fw/mk-board2.sh                    # board-2.bin with the U6-E variants -> fw/out/
 ./config-u6e.sh nss                # kernel .config (also arm64 / arm without NSS)
 make -C linux-7.2.8 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image modules qcom/ipq5018-ubnt-u6-enterprise.dtb
 nss/build.sh                       # NSS drivers, the wireless stack, NSS firmware
-sudo ./prep-rootfs.sh nss          # -> out-nss/{shim.bin,Image,u6e.dtb,u6e.initrd}
+sudo pkg/hostapd/build.sh          # hostapd (pinned upstream main) with every feature -> pkg/hostapd/out/
+sudo pkg/iproute2-nss/build.sh     # Debian's iproute2 with the NSS qdiscs in tc -> pkg/iproute2-nss/out/
+sudo ./mkrootfs.sh arm64           # Debian rootfs -> rootfs/
+sudo ./prep-rootfs.sh nss          # per AP -> out-nss/{shim.bin,Image,u6e.dtb,u6e.initrd}
 ```
 
 `prep-rootfs.sh` packs the initrd reproducibly (fixed mtimes, the paths it rewrites last), so a rebuild changes only the tail of the image. It also keeps every image it makes under `images/<time>-<mode>-<kernel>[-<backports>]/` with a `MANIFEST` (commits, hostapd version, checksums), so an earlier build can be staged again with `go8.sh` without rebuilding.
 
-`sudo ./deploy.sh [<ap>...]` does the rest for the APs in `U6E_APS` (or those named): it builds the hostapd package when its version has no `.deb` yet, rebuilds the rootfs when it does not carry that version, then for each AP in turn builds its image, boots it with `boot/stage.sh` and waits until the AP has brought all three radios up by itself. Build logs go to `log/`.
+Then, for each AP in turn, `deploy.sh` builds its image, boots it with `boot/stage.sh` and waits until the AP has brought all three radios up by itself. Build logs go to `log/`.
 
 ## Booting
 

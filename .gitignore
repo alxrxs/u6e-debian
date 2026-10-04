@@ -27,3 +27,4 @@ __pycache__/
 pkg/iproute2-nss/out/
 pkg/hostapd/out/
 /log/
+/stamps/

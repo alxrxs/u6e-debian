@@ -1,29 +1,56 @@
 #!/bin/bash
-# Build the current tree and boot it on the APs. Run as root, after the kernel
-# and nss/build.sh:
+# Build whatever the checked-out commits need and boot it on the APs. Run as
+# root:
 #   ./deploy.sh [<ap>...]      (default: every AP in U6E_APS)
-# The hostapd package is built when its version has no .deb yet, and the rootfs
-# rebuilt when it does not carry that version (remove rootfs/ to force one).
-# Then each AP in turn gets its image (prep-rootfs.sh nss, kept under images/),
-# boots it (boot/stage.sh) and must bring its radios up by itself. Build logs
-# go to log/.
+# Each step runs only when its inputs changed since it last ran (stamps/ records
+# the commits each was built from): the board files ($BLOBS), the kernel
+# (linux-7.2.8 and config-u6e.sh), the NSS drivers and wireless stack
+# (backports-7.2, nss/ and the kernel), the hostapd and iproute2 packages
+# (their versions) and the rootfs (the packages it installs). Then each AP in
+# turn gets its image (prep-rootfs.sh nss, kept under images/), boots it
+# (boot/stage.sh) and must bring its radios up by itself. The trees are built
+# as their owner, the packages and images as root. Logs go to log/.
 set -uo pipefail
 cd "$(dirname "$0")" || exit 1
 . ./site.conf
 L=$PWD/log
 mkdir -p "$L"
 fail() { echo "$*" >&2; exit 1; }
-ver=$(sed -n 's/.* VER=2:\([^ ]*\).*/\1/p' pkg/hostapd/build.sh)
-[ -n "$ver" ] || fail "no VER= in pkg/hostapd/build.sh"
-if [ ! -f "pkg/hostapd/out/hostapd_${ver}_arm64.deb" ]; then
-	(cd pkg/hostapd && ./build.sh) > "$L/hostapd.log" 2>&1 || fail "hostapd $ver: build failed, see $L/hostapd.log"
-	echo "hostapd $ver built"
-fi
-if [ "$(dpkg-query --admindir=rootfs/var/lib/dpkg -W -f '${Version}' hostapd 2>/dev/null)" != "2:$ver" ]; then
+as_owner() { sudo -u "$(stat -c %U linux-7.2.8)" "$@"; }
+head_of() { git -c safe.directory='*' -C "$1" rev-parse "${2:-HEAD}"; }
+# step <name> <inputs> <command>...: run the command unless stamps/<name>
+# already records these inputs.
+mkdir -p stamps
+step() {
+	local name=$1 stamp=stamps/$1 inputs=$2
+	shift 2
+	[ "$(cat "$stamp" 2>/dev/null)" = "$inputs" ] && return
+	"$@" > "$L/$name.log" 2>&1 || fail "$name: failed, see $L/$name.log"
+	echo "$inputs" > "$stamp"
+	echo "$name: built"
+}
+pkg_version() { sed -n "s/.*\b$2=\([^ ]*\).*/\1/p" "pkg/$1/build.sh" | head -1; }
+
+step board-files "$(head_of "$BLOBS")" as_owner fw/mk-board2.sh
+kernel=$(head_of linux-7.2.8)/$(head_of . HEAD:config-u6e.sh)
+step kernel "$kernel" as_owner sh -c './config-u6e.sh nss &&
+	make -C linux-7.2.8 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" Image modules qcom/ipq5018-ubnt-u6-enterprise.dtb'
+step nss "$kernel/$(head_of backports-7.2)/$(head_of . HEAD:nss)" as_owner nss/build.sh
+
+hostapd=$(sed -n 's/.* VER=2:\([^ ]*\).*/\1/p' pkg/hostapd/build.sh)
+iproute2=$(pkg_version iproute2-nss VER)-$(pkg_version iproute2-nss DEB)+nss1
+[ -n "$hostapd" ] && [ "$iproute2" != -+nss1 ] || fail "no package versions in pkg/*/build.sh"
+[ -f "pkg/hostapd/out/hostapd_${hostapd}_arm64.deb" ] ||
+	step hostapd "$hostapd" pkg/hostapd/build.sh
+[ -f "pkg/iproute2-nss/out/iproute2_${iproute2}_arm64.deb" ] ||
+	step iproute2 "$iproute2" sh -c 'rm -rf pkg/iproute2-nss/work && pkg/iproute2-nss/build.sh'
+installed() { dpkg-query --admindir=rootfs/var/lib/dpkg -W -f '${Version}' "$1" 2>/dev/null; }
+if [ "$(installed hostapd)" != "2:$hostapd" ] || [ "$(installed iproute2)" != "$iproute2" ]; then
 	rm -rf "$PWD/rootfs"
-	./mkrootfs.sh arm64 > "$L/mkrootfs.log" 2>&1 || fail "rootfs: build failed, see $L/mkrootfs.log"
-	echo "rootfs built with hostapd $ver"
+	./mkrootfs.sh arm64 > "$L/rootfs.log" 2>&1 || fail "rootfs: failed, see $L/rootfs.log"
+	echo "rootfs: built with hostapd $hostapd, iproute2 $iproute2"
 fi
+
 if [ $# = 0 ]; then
 	read -ra aps <<<"$U6E_APS"
 	set -- "${aps[@]}"
