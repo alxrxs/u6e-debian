@@ -417,8 +417,9 @@ install -m0644 "$WCSS"/q6_fw.* "$WCSS"/m3_fw.* $RF/usr/lib/firmware/ath11k/IPQ50
 # remoteproc support, so that radio stays on 2.7.)
 install -m0644 "$BLOBS"/wifi/firmware/qcn9074-WLAN.HK.2.13-01309/{amss,m3}.bin $RF/usr/lib/firmware/ath11k/QCN9074/hw1.0/
 
-# The controller comes up with the NVM's placeholder address; give it the one
-# the stock firmware uses, the board's base MAC + 4, before bluetoothd powers it.
+# The controller stays unconfigured until it has an address (its NVM carries
+# only a placeholder); give it the one the stock firmware uses, the board's
+# base MAC + 4, before bluetoothd starts.
 cat > $RF/usr/local/sbin/u6e-btaddr <<'BTADDR'
 #!/bin/sh
 base=$(cat /sys/class/net/lan/address) || exit 1

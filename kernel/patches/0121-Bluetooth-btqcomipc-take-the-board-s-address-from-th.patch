@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Mon, 5 Oct 2026 00:33:22 +0300
+Subject: [PATCH] Bluetooth: btqcomipc: take the board's address from the host
+
+The IPQ5018 NVM carries one placeholder address (50:18:00:00:5a:ad) for
+every board, and btqca skips the NVM tag parsing on IPQ5018, so the
+placeholder check that sets HCI_QUIRK_USE_BDADDR_PROPERTY for other QCA
+parts never matches: the controller came up configured with the
+placeholder and, being set up again on every power on, went back to it
+even after an address was set through mgmt.
+
+Set the quirk in setup, so the controller stays unconfigured until the
+board's address comes from the local-bd-address property or from
+userspace, and the core programs it after each setup.
+
+Assisted-by: LLM
+Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
+---
+ drivers/bluetooth/btqcomipc.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/bluetooth/btqcomipc.c b/drivers/bluetooth/btqcomipc.c
+index 8513c1780..92a0d671e 100644
+--- a/drivers/bluetooth/btqcomipc.c
++++ b/drivers/bluetooth/btqcomipc.c
+@@ -997,9 +997,13 @@ static int btqcomipc_setup(struct hci_dev *hdev)
+ 	}
+ 
+ 	/*
+-	 * 7.2 has no NVMEM-backed BD address in the HCI core; the board's
+-	 * address is set from userspace through set_bdaddr instead.
++	 * The NVM carries the same placeholder address for every board, so
++	 * the controller stays unconfigured until the board's address comes
++	 * from the local-bd-address property or from userspace, and the core
++	 * programs it again after each setup.
+ 	 */
++	hci_set_quirk(hdev, HCI_QUIRK_USE_BDADDR_PROPERTY);
++
+ 	return 0;
+ }
+ 

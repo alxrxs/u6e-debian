@@ -93,7 +93,7 @@ Wi-Fi starts by itself on every boot (`u6e-wifi.service`), with nothing else on 
 - The whole system log goes to your syslog collector (the access point keeps logs only in RAM), the kernel log goes out over the network, and `u6e-stats` adds load, memory, clients per network, temperatures and Wi-Fi firmware crashes every 5 minutes.
 - A hang triggers a reset by the watchdog (a hardware timer), and crash information survives the reset so it can be read back from stock.
 - Each radio's own calibration is loaded at boot, and the status LED can be set to off, blue or white.
-- The Bluetooth controller boots its firmware, but BlueZ cannot use it yet: the kernel never registers it with the Bluetooth management interface, so it keeps its placeholder address and `u6e-btaddr` fails. Never unload `btqcomipc` on a running access point: the SoC hangs until the watchdog resets it.
+- Bluetooth (LE and Classic) works with BlueZ under the stock firmware's address, the board's base MAC + 4: the controller stays unconfigured until `u6e-btaddr` gives it that address at boot. Never unload `btqcomipc` on a running access point: the SoC hangs until the watchdog resets it.
 - `tc` can shape traffic on the NSS processor.
 
 ## Repository layout
