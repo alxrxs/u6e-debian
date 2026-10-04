@@ -26,3 +26,4 @@
 __pycache__/
 pkg/iproute2-nss/out/
 pkg/hostapd/out/
+/fw/dl/

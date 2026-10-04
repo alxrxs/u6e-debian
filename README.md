@@ -19,7 +19,7 @@ Every imported patch keeps its author; a hand-ported one carries a note on what 
 Inputs:
 - `linux-7.2.8/` and `backports-7.2/`: checkouts of `u6e-linux` (branch `u6e`) and `u6e-backports` (branch `u6e-nss`).
 - `site.conf`: copy `site.conf.example` and fill it in (addresses, VLANs, the stock login, the SSIDs).
-- `$BLOBS` (from `site.conf`): the proprietary inputs, laid out as below. The NSS firmware itself is downloaded by `nss/build.sh` (sha256-pinned).
+- `$BLOBS` (from `site.conf`): the proprietary inputs, laid out as below. The NSS firmware itself is downloaded by `nss/build.sh` and the QCN9074 Wi-Fi firmware (WLAN.HK.2.13, newer than linux-firmware's 2.9: its beacon protection works and it keeps probe-response retries within OCE's limit) by `prep-rootfs.sh` into `fw/dl/`, both sha256-pinned.
 
 | `$BLOBS/` path | Source |
 |---|---|
