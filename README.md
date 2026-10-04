@@ -19,11 +19,12 @@ Every imported patch keeps its author; a hand-ported one carries a note on what 
 Inputs:
 - `linux-7.2.8/` and `backports-7.2/`: checkouts of `u6e-linux` (branch `u6e`) and `u6e-backports` (branch `u6e-nss`).
 - `site.conf`: copy `site.conf.example` and fill it in (addresses, VLANs, the stock login, the SSIDs).
-- `$BLOBS` (from `site.conf`): the proprietary inputs, laid out as below. The NSS firmware itself is downloaded by `nss/build.sh` and the QCN9074 Wi-Fi firmware (WLAN.HK.2.13, newer than linux-firmware's 2.9: its beacon protection works and it keeps probe-response retries within OCE's limit) by `prep-rootfs.sh` into `fw/dl/`, both sha256-pinned.
+- `$BLOBS` (from `site.conf`): the proprietary inputs, laid out as below. The NSS firmware itself is downloaded by `nss/build.sh` (sha256-pinned).
 
 | `$BLOBS/` path | Source |
 |---|---|
 | `wifi/firmware/ipq5018-WLAN.HK.2.7.0.1-01744/` (`q6_fw.*`, `m3_fw.*`) | Qualcomm `quic/upstream-wifi-fw` |
+| `wifi/firmware/qcn9074-WLAN.HK.2.13-01309/` (`amss.bin`, `m3.bin`) | `qosmio/upstream-wifi-fw` `testing/2.13`; newer than linux-firmware's 2.9.0.1: its beacon protection works and its probe-response retries stay within OCE's limit |
 | `wifi/board/linux-firmware/{IPQ5018,QCN9074}/` | linux-firmware's `ath11k/<chip>/hw1.0/board-2.bin`, unpacked with `fw/ath11k-bdencoder -e` |
 | `wifi/board/stock-a654/bdwlan.{b23,ba3,ba4}` | the stock firmware's `/lib/firmware/platforms/a654/` |
 | `bt/firmware/` (`bt_fw_patch.mdt` + `.b00`-`.b02`, `mpnv10.bin`) | the stock firmware's `/lib/firmware/IPQ5018/` |

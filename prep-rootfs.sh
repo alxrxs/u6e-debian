@@ -415,19 +415,11 @@ done
 rm -f $RF/usr/lib/firmware/ath11k/IPQ5018/hw1.0/q6_fw.* $RF/usr/lib/firmware/ath11k/IPQ5018/hw1.0/m3_fw.*
 WCSS=$BLOBS/wifi/firmware/ipq5018-WLAN.HK.2.7.0.1-01744
 install -m0644 "$WCSS"/q6_fw.* "$WCSS"/m3_fw.* $RF/usr/lib/firmware/ath11k/IPQ5018/hw1.0/
-# QCN9074: WLAN.HK.2.13 (qosmio/upstream-wifi-fw, pinned), newer than
-# linux-firmware's 2.9.0.1: its beacon protection MICs verify and it retries a
-# probe response 3 times, as OCE allows, not 8. (IPQ5018's 2.12 build needs
-# out-of-tree remoteproc support, so that radio stays on 2.7.)
-Q9=WLAN.HK.2.13-01309-QCAHKSWPL_SILICONZ-1
-Q9_URL=https://raw.githubusercontent.com/qosmio/upstream-wifi-fw/c6f24714c81f874c585ecab0dcfa6c14c4a7a389/ath11k-firmware/QCN9074/hw1.0/testing/2.13/$Q9
-install -d fw/dl/$Q9
-for f in amss.bin:72a79724484648437a91ad95e8493abea9cdd7df6271918a4060fbad68eecad6 \
-	m3.bin:1e238cc0c338b472cb6845269c1292be696bdb593fe13f091bb4907c1b338829; do
-	[ -f fw/dl/$Q9/${f%%:*} ] || curl -fsSL -o fw/dl/$Q9/${f%%:*} $Q9_URL/${f%%:*}
-	echo "${f#*:}  fw/dl/$Q9/${f%%:*}" | sha256sum -c --quiet
-	install -m0644 fw/dl/$Q9/${f%%:*} $RF/usr/lib/firmware/ath11k/QCN9074/hw1.0/
-done
+# QCN9074: WLAN.HK.2.13 (qosmio/upstream-wifi-fw), newer than linux-firmware's
+# 2.9.0.1: its beacon protection MICs verify and it retries a probe response
+# 3 times, as OCE allows, not 8. (IPQ5018's 2.12 build needs out-of-tree
+# remoteproc support, so that radio stays on 2.7.)
+install -m0644 "$BLOBS"/wifi/firmware/qcn9074-WLAN.HK.2.13-01309/{amss,m3}.bin $RF/usr/lib/firmware/ath11k/QCN9074/hw1.0/
 
 # The controller comes up with the NVM's placeholder address; give it the one
 # the stock firmware uses, the board's base MAC + 4, before bluetoothd powers it.
