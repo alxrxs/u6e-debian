@@ -250,12 +250,14 @@ while :; do
 		want=$(echo "$theirs" | awk -v s="$ssid" '$2 == s')
 		for b in $(echo "$nr" | cut -d' ' -f1); do
 			case "$mine" in *" $b "*) continue ;; esac
-			echo "$want" | grep -q "^$b " || hcli "$i" remove_neighbor "$b" >/dev/null
+			# Here-strings, not echo | grep -q: grep exits at the first
+			# match, and echo then dies writing to a closed pipe.
+			grep -q "^$b " <<<"$want" || hcli "$i" remove_neighbor "$b" >/dev/null
 		done
-		echo "$want" | while read -r b s r; do
-			[ -n "$b" ] && ! echo "$nr" | grep -qx "$b ssid=$s nr=$r" &&
+		while read -r b s r; do
+			[ -n "$b" ] && ! grep -qx "$b ssid=$s nr=$r" <<<"$nr" &&
 				hcli "$i" set_neighbor "$b" ssid="$s" nr="$r" >/dev/null
-		done
+		done <<<"$want"
 	done
 	sleep 10
 done
