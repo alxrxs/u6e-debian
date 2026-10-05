@@ -9,9 +9,9 @@ MGMT_GW=192.0.2.1
 MGMT_DNS=192.0.2.53
 MGMT_DOMAIN=example.net
 # NTP server(s); the AP has no real-time clock.
+MGMT_NTP=192.0.2.123
 # Syslog collector (address:port) the AP sends its journal to.
 LOG_SERVER=192.0.2.10:514
-MGMT_NTP=192.0.2.123
 # Wi-Fi clients: a VLAN bridged, unaddressed, into br<vid>; hostapd adds the
 # radios to it.
 CLIENT_VLAN=42
@@ -26,6 +26,9 @@ BLOBS=../u6e-blobs
 # survives reboots and power cuts (README.md, Persistent mode). 0: every boot
 # armed by boot/go8.sh is one-shot.
 U6E_PERSIST=0
+# 1: bluetoothd powers the Bluetooth controller at boot. 0: it stays off until
+# powered by hand (bluetoothctl power on).
+BT_POWERED=1
 
 # Stock firmware SSH: the controller's "Device Authentication" user, and a
 # command printing its password.

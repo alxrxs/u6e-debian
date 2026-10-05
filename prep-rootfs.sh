@@ -450,6 +450,10 @@ RemainAfterExit=yes
 WantedBy=bluetooth.target
 UNIT
 install -d $RF/etc/systemd/system/bluetooth.target.wants
+# BT_POWERED=0 leaves the controller off until someone powers it.
+bt_auto=true
+[ "${BT_POWERED:-1}" = 1 ] || bt_auto=false
+sed -i "s/^#\?AutoEnable=.*/AutoEnable=$bt_auto/" $RF/etc/bluetooth/main.conf
 ln -sf /etc/systemd/system/u6e-btaddr.service $RF/etc/systemd/system/bluetooth.target.wants/u6e-btaddr.service
 
 # Bring-up diagnostics: ath11k AHB/BOOT/QMI debug and the WCSS IPC path's pr_debug.
