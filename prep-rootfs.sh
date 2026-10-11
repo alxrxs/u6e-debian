@@ -55,6 +55,9 @@ printf '[Match]\nPath=platform-39d00000.ethernet\n\n[Link]\nName=lan\n' > $N/30-
 printf '[NetDev]\nName=%s\nKind=vlan\n\n[VLAN]\nId=%s\n' $MGMT_IF $MGMT_VLAN > $N/20-$MGMT_IF.netdev
 printf '[Match]\nName=%s\n\n[Network]\nAddress=%s\nGateway=%s\nDNS=%s\nDomains=%s\nNTP=%s\n' \
 	$MGMT_IF "$MGMT_ADDR" "$MGMT_GW" "$MGMT_DNS" "$MGMT_DOMAIN" "$MGMT_NTP" > $N/20-$MGMT_IF.network
+# resolved only resolves for the AP itself: no LLMNR or mDNS responder.
+mkdir -p $RF/etc/systemd/resolved.conf.d
+printf '[Resolve]\nLLMNR=no\nMulticastDNS=no\n' > $RF/etc/systemd/resolved.conf.d/u6e.conf
 W=$RF/etc/systemd/system/multi-user.target.wants
 for u in systemd-networkd systemd-resolved; do ln -sf /usr/lib/systemd/system/$u.service $W/$u.service; done
 
