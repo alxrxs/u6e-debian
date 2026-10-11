@@ -8,6 +8,9 @@ The segment files of a split image are named <stem>.bNN, as
 qcom_mdt_loader expects, but the stem excludes the dot, so the driver
 asked for qca/bt_fw_patchb02 instead of qca/bt_fw_patch.b02 and failed
 to load any firmware split across segment files.
+
+Assisted-by: LLM
+Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
 ---
  drivers/bluetooth/btqcomipc.c | 2 +-
  1 file changed, 1 insertion(+), 1 deletion(-)

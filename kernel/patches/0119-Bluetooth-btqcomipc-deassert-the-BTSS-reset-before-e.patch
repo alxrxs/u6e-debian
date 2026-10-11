@@ -9,6 +9,9 @@ enabled the LPO branch clock with the subsystem still in reset:
 "gcc_btss_lpo_clk status stuck at 'off'" and the probe failed with
 -EBUSY. Deassert the reset first; devres then also undoes them in the
 right order (clock off, then reset).
+
+Assisted-by: LLM
+Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
 ---
  drivers/bluetooth/btqcomipc.c | 14 +++++++++-----
  1 file changed, 9 insertions(+), 5 deletions(-)

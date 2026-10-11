@@ -8,6 +8,9 @@ HCI_QUIRK_USE_BDADDR_NVMEM and HCI_QUIRK_BDADDR_NVMEM_BE come from a
 separate, unmerged series that reads the BD address from an NVMEM cell;
 7.2 has neither. Leave the address to userspace, which sets it through
 set_bdaddr (qca_set_bdaddr) as the board firmware does: base MAC + 4.
+
+Assisted-by: LLM
+Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
 ---
  drivers/bluetooth/btqcomipc.c | 8 ++++----
  1 file changed, 4 insertions(+), 4 deletions(-)
