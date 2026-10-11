@@ -42,7 +42,9 @@ rm -f $N/*.network $N/*.netdev $N/*.link
 for v in $WIFI_VLANS; do
 	printf '[NetDev]\nName=vlan%s\nKind=vlan\n\n[VLAN]\nId=%s\n' $v $v > $N/20-vlan$v.netdev
 	printf '[Match]\nName=vlan%s\n\n[Network]\nBridge=br%s\nLinkLocalAddressing=no\n' $v $v > $N/20-vlan$v.network
-	printf '[NetDev]\nName=br%s\nKind=bridge\n' $v > $N/25-br$v.netdev
+	# No multicast snooping: with no querier on the VLAN, memberships expire and
+	# the bridge stops forwarding groups such as mDNS to the radios.
+	printf '[NetDev]\nName=br%s\nKind=bridge\n\n[Bridge]\nMulticastSnooping=false\n' $v > $N/25-br$v.netdev
 	printf '[Match]\nName=br%s\n\n[Network]\nLinkLocalAddressing=no\nConfigureWithoutCarrier=yes\n' $v > $N/25-br$v.network
 done
 # The uplink GMAC is lan, which the NSS glue arms by name. The radios need no

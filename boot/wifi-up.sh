@@ -50,10 +50,6 @@ rrm_neighbor_report=1
 rrm_link_measurement_report=1
 bss_transition=1
 wnm_sleep_mode=1
-proxy_arp=1
-na_mcast_to_ucast=1
-ap_isolate=1
-multicast_to_unicast=1
 wpa_deny_ptk0_rekey=2
 bss_load_update_period=50
 esp=1
@@ -66,12 +62,9 @@ qos_map_set=8,1,18,3,20,3,22,3,24,4,26,4,28,4,30,4,32,4,34,4,36,4,38,4,40,5,44,6
 # Parameters, so clients can estimate their throughput. qos_map_set: RFC
 # 8325's DSCP to user priority mapping (CS6/CS7 stay best effort), so clients
 # mark their uplink the way the network does.
-# proxy_arp (802.11v): the bridge answers ARP and IPv6 neighbor solicitations
-# for the clients, so broadcast ARP stays off the air; it hairpins client to
-# client traffic, so ap_isolate leaves that forwarding to the bridge alone
-# (otherwise multicast goes out twice). multicast_to_unicast: group frames
-# (mDNS, SSDP, IPv6) reach each client as unicast at its own rate, not the
-# basic rate. No wpa_strict_rekey: a group rekey on every departure (dozens an
+# No proxy_arp, multicast_to_unicast or ap_isolate: group traffic (mDNS,
+# SSDP, ARP, IPv6 neighbor discovery) goes out as sent, which AirPlay and
+# HomeKit devices need to find each other. No wpa_strict_rekey: a group rekey on every departure (dozens an
 # hour) has to wake every client, and sleeping phones that miss hostapd's ~3.5 s
 # of retries are disconnected.
 # wpa_deny_ptk0_rekey=2: never rekey a client's pairwise key in place (the
