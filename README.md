@@ -86,7 +86,7 @@ Wi-Fi starts by itself on every boot (`u6e-wifi.service`), with nothing else on 
 
 **Speed**
 - Packet forwarding, Wi-Fi offload and encryption run on the NSS processor.
-- Multicast and broadcast (mDNS, SSDP, ARP, IPv6 neighbor discovery) go out to every client as sent, with no conversion, proxying or snooping, so AirPlay and HomeKit devices find each other.
+- Multicast and broadcast (mDNS, SSDP, ARP, IPv6 neighbor discovery) reach every client, each as unicast at its own rate, and a client's broadcasts reach the other clients on its network; nothing is isolated, proxied or snooped, so AirPlay and HomeKit devices find each other.
 - The usual Wi-Fi 4/5/6 speed features are enabled: beamforming, TWT and spatial reuse among them.
 
 **Running it day to day**

@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Sun, 11 Oct 2026 16:03:29 +0300
+Subject: [PATCH] VLAN: Apply bridge port parameters to dynamic VLAN interfaces
+
+bridge_hairpin and bridge_multicast_to_unicast are set on the BSS's own
+interface when it joins its bridge, but a dynamic VLAN interface that
+vlan_newlink() adds to a VLAN bridge keeps the kernel defaults. Clients
+assigned a VLAN then never get their group frames hairpinned back to the
+other clients on that interface, so ARP and IPv6 neighbor discovery
+between two clients in the same VLAN on the same BSS fail whenever the
+driver does not relay them itself.
+
+Set the same bridge port attributes on the VLAN interface once it is in
+its bridge, including when it already was.
+
+Assisted-by: LLM
+Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
+---
+ src/ap/vlan_full.c | 48 +++++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 43 insertions(+), 5 deletions(-)
+
+diff --git a/src/ap/vlan_full.c b/src/ap/vlan_full.c
+index 687fa9c23..82b9fb4cd 100644
+--- a/src/ap/vlan_full.c
++++ b/src/ap/vlan_full.c
+@@ -384,6 +384,37 @@ static int br_getnumports(const char *br_name)
+ }
+ 
+ 
++/* Apply the BSS's bridge port parameters (bridge_hairpin,
++ * bridge_multicast_to_unicast) to a VLAN interface in a bridge, as
++ * hostapd_setup_bss() does for the BSS's own interface. */
++static void vlan_br_port_attrs(struct hostapd_data *hapd, const char *ifname)
++{
++	const char *attrs[2];
++	char path[128];
++	unsigned int i, n = 0;
++	FILE *f;
++
++	if (hapd->conf->bridge_hairpin)
++		attrs[n++] = "hairpin_mode";
++	if (hapd->conf->bridge_multicast_to_unicast)
++		attrs[n++] = "multicast_to_unicast";
++
++	for (i = 0; i < n; i++) {
++		os_snprintf(path, sizeof(path), "/sys/class/net/%s/brport/%s",
++			    ifname, attrs[i]);
++		f = fopen(path, "w");
++		if (!f) {
++			wpa_printf(MSG_ERROR, "VLAN: Failed to open %s: %s",
++				   path, strerror(errno));
++			continue;
++		}
++		if (fputs("1", f) < 0 || fclose(f) != 0)
++			wpa_printf(MSG_ERROR, "VLAN: Failed to set %s on %s",
++				   attrs[i], ifname);
++	}
++}
++
++
+ static void vlan_newlink_tagged(int vlan_naming, const char *tagged_interface,
+ 				const char *br_name, int vid,
+ 				struct hostapd_data *hapd)
+@@ -463,7 +494,7 @@ void vlan_newlink(const char *ifname, struct hostapd_data *hapd)
+ 	char br_name[IFNAMSIZ];
+ 	struct hostapd_vlan *vlan;
+ 	struct hostapd_data *vlan_bss = hapd;
+-	int untagged, *tagged, i, notempty;
++	int untagged, *tagged, i, notempty, ret;
+ 
+ 	wpa_printf(MSG_DEBUG, "VLAN: vlan_newlink(%s)", ifname);
+ 
+@@ -491,16 +522,23 @@ void vlan_newlink(const char *ifname, struct hostapd_data *hapd)
+ 
+ 	if (!notempty) {
+ 		/* Non-VLAN STA */
+-		if (hapd->conf->bridge[0] &&
+-		    !br_addif(hapd->conf->bridge, ifname))
+-			vlan->clean |= DVLAN_CLEAN_WLAN_PORT;
++		if (hapd->conf->bridge[0]) {
++			ret = br_addif(hapd->conf->bridge, ifname);
++			if (ret == 0)
++				vlan->clean |= DVLAN_CLEAN_WLAN_PORT;
++			if (ret >= 0)
++				vlan_br_port_attrs(hapd, ifname);
++		}
+ 	} else if (untagged > 0 && untagged <= MAX_VLAN_ID) {
+ 		vlan_bridge_name(br_name, hapd, vlan, untagged);
+ 
+ 		vlan_get_bridge(br_name, hapd, untagged);
+ 
+-		if (!br_addif(br_name, ifname))
++		ret = br_addif(br_name, ifname);
++		if (ret == 0)
+ 			vlan->clean |= DVLAN_CLEAN_WLAN_PORT;
++		if (ret >= 0)
++			vlan_br_port_attrs(hapd, ifname);
+ 	}
+ 
+ 	for (i = 0; i < MAX_NUM_TAGGED_VLAN && tagged[i]; i++) {

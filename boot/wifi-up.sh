@@ -50,6 +50,8 @@ rrm_neighbor_report=1
 rrm_link_measurement_report=1
 bss_transition=1
 wnm_sleep_mode=1
+multicast_to_unicast=1
+bridge_hairpin=1
 wpa_deny_ptk0_rekey=2
 bss_load_update_period=50
 esp=1
@@ -62,11 +64,15 @@ qos_map_set=8,1,18,3,20,3,22,3,24,4,26,4,28,4,30,4,32,4,34,4,36,4,38,4,40,5,44,6
 # Parameters, so clients can estimate their throughput. qos_map_set: RFC
 # 8325's DSCP to user priority mapping (CS6/CS7 stay best effort), so clients
 # mark their uplink the way the network does.
-# No proxy_arp, multicast_to_unicast or ap_isolate: group traffic (mDNS,
-# SSDP, ARP, IPv6 neighbor discovery) goes out as sent, which AirPlay and
-# HomeKit devices need to find each other. No wpa_strict_rekey: a group rekey on every departure (dozens an
-# hour) has to wake every client, and sleeping phones that miss hostapd's ~3.5 s
-# of retries are disconnected.
+# multicast_to_unicast: group frames (ARP, IPv6 neighbor discovery, mDNS)
+# reach each client as unicast; with NSS offload, group frames sent on a
+# RADIUS-assigned VLAN's interface never reach its clients. bridge_hairpin:
+# the bridge sends a client's group frames back out its own interface to the
+# other clients there (the offload does not relay them), so clients on one
+# BSS find each other; unicast between them stays in NSS (no ap_isolate). No
+# proxy_arp: it needs ap_isolate. No wpa_strict_rekey: a group rekey on every
+# departure (dozens an hour) has to wake every client, and sleeping phones
+# that miss hostapd's ~3.5 s of retries are disconnected.
 # wpa_deny_ptk0_rekey=2: never rekey a client's pairwise key in place (the
 # driver can't replace it safely: traffic stops until the client is dropped);
 # a client asking for one is disconnected and reconnects instead.
