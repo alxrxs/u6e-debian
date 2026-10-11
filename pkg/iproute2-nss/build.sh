@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build Debian's iproute2 with the Qualcomm NSS qdiscs in tc (OpenWrt's
 # 400-add-nss-qdisc.patch): out/iproute2_<ver>+nss1_arm64.deb, which
-# mkrootfs.sh installs and holds. Run as root; needs qemu-user binfmt.
+# mkrootfs.sh installs and holds. Run as root, on arm64 or with qemu-user binfmt.
 set -euo pipefail
 cd "$(dirname "$0")"
 VER=6.15.0 DEB=1

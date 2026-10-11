@@ -9,6 +9,7 @@ The only thing ever written to the SPI flash (the small chip holding the boot lo
 ## What you need
 
 - An x86 Linux build machine with the aarch64 cross compiler (and the armhf one, for the 32-bit boot shim), `mmdebstrap`, `qemu-user-static` and `u-boot-tools`.
+- Optionally, an Apple silicon Mac with OrbStack, reachable over SSH (`NATIVE_BUILD` in `site.conf`): the arm64 package and root filesystem builds then run there natively, many times faster than under `qemu-user-static`.
 - SSH access to the stock firmware of each access point (the stock login set in `site.conf`).
 - `site.conf`: your site's settings. Copy `site.conf.example` and fill it in; it is never committed. It holds:
   - the management network (VLAN, gateway, DNS, NTP, syslog collector) and the VLANs Wi-Fi clients land in;

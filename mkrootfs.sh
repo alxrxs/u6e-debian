@@ -1,6 +1,6 @@
 #!/bin/bash
 # Bootstrap the Debian trixie (arm64) root filesystem the images are built
-# from: mkrootfs.sh -> rootfs/. Run as root; needs qemu-user binfmt.
+# from: mkrootfs.sh -> rootfs/. Run as root, on arm64 or with qemu-user binfmt.
 # prep-rootfs.sh then adds the kernel, the firmware and the AP's configuration.
 # iproute2 comes from pkg/iproute2-nss (tc with the NSS qdiscs) and hostapd from
 # pkg/hostapd (pinned upstream main, every feature), both held so apt cannot

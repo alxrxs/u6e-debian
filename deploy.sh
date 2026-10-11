@@ -8,8 +8,9 @@
 # last ran (stamps/ records them): the board files ($BLOBS), the kernel
 # (kernel/ and config-u6e.sh), the NSS drivers and wireless stack (backports/,
 # nss/ and the kernel), the hostapd and iproute2 packages (their versions) and
-# the rootfs (those packages and mkrootfs.sh). Then each AP whose running image
-# was built from other inputs (stamps/ap-<ap>) gets a new one (prep-rootfs.sh,
+# the rootfs (those packages and mkrootfs.sh); the packages and the rootfs on
+# the native builder if it answers (arm64 below). Then each AP whose running
+# image was built from other inputs (stamps/ap-<ap>) gets a new one (prep-rootfs.sh,
 # kept under images/), boots it (boot/stage.sh) and must bring its radios up by
 # itself. Sources and trees are built as the checkout's
 # owner, the packages and images as root. Logs go to log/.
@@ -33,6 +34,37 @@ step() {
 	echo "$name: built"
 }
 pkg_version() { sed -n "s/.*\b$2=\([^ ]*\).*/\1/p" "pkg/$1/build.sh" | head -1; }
+# arm64 <result> <command> <input>...: run a build that needs arm64 userland
+# and leaves <result>. When NATIVE_BUILD ("<ssh login> <OrbStack machine>", an
+# Apple silicon Mac) answers, it runs in that machine (OrbStack started and the
+# machine created first if need be) with the inputs sent and the result
+# fetched; else here, under qemu-user, several times slower.
+arm64() {
+	local result=$1 cmd=$2 mac vm job
+	shift 2
+	read -r mac vm <<<"${NATIVE_BUILD:-}"
+	if [ -z "$mac" ] || ! ssh -o BatchMode=yes -o ConnectTimeout=5 "$mac" true 2>/dev/null; then
+		echo "arm64: no native builder, building under emulation"
+		sh -c "$cmd"
+		return
+	fi
+	echo "arm64: building on $mac in $vm"
+	local orb='PATH=$PATH:$HOME/.orbstack/bin:/usr/local/bin:/opt/homebrew/bin orb'
+	local deps='command -v mmdebstrap > /dev/null || { apt-get update -qq &&
+		DEBIAN_FRONTEND=noninteractive apt-get install -qq -y git curl xz-utils ca-certificates dpkg-dev mmdebstrap > /dev/null; }'
+	ssh -o BatchMode=yes "$mac" "$orb status | grep -qx Running || open -ga OrbStack
+		for _ in \$(seq 60); do $orb status | grep -qx Running && break; sleep 2; done
+		$orb list -q | grep -qx $vm || $orb create -a arm64 debian:trixie $vm
+		$orb start $vm && $orb -m $vm -u root sh -c $(printf %q "$deps")" || return
+	job="rm -rf /root/u6e && mkdir /root/u6e && cd /root/u6e && tar -xf - &&
+		{ $cmd; } >&2 && tar --xattrs --numeric-owner -cf - $result"
+	rm -rf -- "./$result"
+	tar -cf - --exclude='*/work' "$@" |
+		ssh -o BatchMode=yes "$mac" "$orb -m $vm -u root sh -c $(printf %q "$job")" |
+		tar --xattrs --xattrs-include='*' --numeric-owner -xpf -
+	local rc="${PIPESTATUS[*]}"
+	[ "$rc" = "0 0 0" ] && [ -e "$result" ]
+}
 
 as_owner ./trees.sh > "$L/trees.log" 2>&1 || fail "trees: failed, see $L/trees.log"
 step board-files "$(head_of "$BLOBS")" as_owner fw/mk-board2.sh
@@ -44,11 +76,12 @@ step nss "$kernel/$(head_of backports-7.2)/$(head_of . HEAD:nss)" as_owner nss/b
 hostapd=$(sed -n 's/.* VER=2:\([^ ]*\).*/\1/p' pkg/hostapd/build.sh)
 iproute2=$(pkg_version iproute2-nss VER)-$(pkg_version iproute2-nss DEB)+nss1
 [ -n "$hostapd" ] && [ "$iproute2" != -+nss1 ] || fail "no package versions in pkg/*/build.sh"
-[ -f "pkg/hostapd/out/hostapd_${hostapd}_arm64.deb" ] ||
-	step hostapd "$hostapd" pkg/hostapd/build.sh
-[ -f "pkg/iproute2-nss/out/iproute2_${iproute2}_arm64.deb" ] ||
-	step iproute2 "$iproute2" sh -c 'rm -rf pkg/iproute2-nss/work && pkg/iproute2-nss/build.sh'
-step rootfs "$hostapd/$iproute2/$(head_of . HEAD:mkrootfs.sh)" sh -c 'rm -rf "$PWD/rootfs" && ./mkrootfs.sh'
+deb=pkg/hostapd/out/hostapd_${hostapd}_arm64.deb
+[ -f "$deb" ] || step hostapd "$hostapd" arm64 "$deb" 'rm -rf pkg/hostapd/work && pkg/hostapd/build.sh' pkg/hostapd
+deb=pkg/iproute2-nss/out/iproute2_${iproute2}_arm64.deb
+[ -f "$deb" ] || step iproute2 "$iproute2" arm64 "$deb" 'rm -rf pkg/iproute2-nss/work && pkg/iproute2-nss/build.sh' pkg/iproute2-nss
+step rootfs "$hostapd/$iproute2/$(head_of . HEAD:mkrootfs.sh)" arm64 rootfs 'rm -rf rootfs && ./mkrootfs.sh' \
+	mkrootfs.sh pkg/hostapd/out pkg/iproute2-nss/out
 
 if [ $# = 0 ]; then
 	read -ra aps <<<"$U6E_APS"

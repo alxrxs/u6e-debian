@@ -3,7 +3,7 @@
 # release: AP-side Wi-Fi QoS Management, the 2026-5 RADIUS fix) as a Debian
 # package, from Debian's newest packaging (wpa 2.11-2, experimental) with
 # every hostapd feature built in: out/hostapd_<ver>_arm64.deb, which
-# mkrootfs.sh installs and holds. Run as root; needs qemu-user binfmt.
+# mkrootfs.sh installs and holds. Run as root, on arm64 or with qemu-user binfmt.
 set -euo pipefail
 cd "$(dirname "$0")"
 REV=5b156e272a0266ca6be0f394192bad42b0ff176c  # hostap main, 2026-10-01
