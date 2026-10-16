@@ -6,6 +6,7 @@
 # Downloads, build outputs and state.
 /dl/
 /rootfs/
+/rootfs.ap/
 /out/
 /images/
 /modules.keep

@@ -14,7 +14,11 @@ case " $WIFI_VLANS " in *" $CLIENT_VLAN "*) ;; *) echo "WIFI_VLANS must include 
 MGMT_IP=${MGMT_ADDR%/*}
 MGMT_BCAST=$(python3 -c 'import ipaddress, sys; print(ipaddress.ip_interface(sys.argv[1]).network.broadcast_address)' "$MGMT_ADDR")
 INITRD_ADDR=0x52200000   # must match go8.sh
-RF=rootfs K=linux-7.2.8 X=aarch64-linux-gnu- OUT=out
+RF=rootfs.ap K=linux-7.2.8 X=aarch64-linux-gnu- OUT=out
+# Each image starts from mkrootfs.sh's rootfs/, so nothing this script wrote
+# for an earlier image, or for the other AP, carries over.
+rm -rf $RF
+cp -a rootfs $RF
 DTB=$K/arch/arm64/boot/dts/qcom/ipq5018-ubnt-u6-enterprise.dtb
 R=$(cat $K/include/config/kernel.release)
 
@@ -552,4 +556,5 @@ install -d -m 0700 "$A"; cp -a $OUT/. "$A"/
   echo "debian-ap: $(g .)"
   echo "hostapd:   $(dpkg-query --admindir=$RF/var/lib/dpkg -W -f '${Version}' hostapd)"
   sha256sum $OUT/*; } > "$A"/MANIFEST
+rm -rf $RF
 echo "kept as $A"
