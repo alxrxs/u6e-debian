@@ -5,7 +5,8 @@
 # iproute2 comes from pkg/iproute2-nss (tc with the NSS qdiscs) and hostapd from
 # pkg/hostapd (pinned upstream main, every feature), both held so apt cannot
 # swap them for Debian's; hostapd's own unit stays off, since u6e-wifi.service
-# (prep-rootfs.sh) runs hostapd.
+# (prep-rootfs.sh) runs hostapd. The image lives in RAM: dpkg leaves out the
+# documentation (but the copyright files), manual pages and translations.
 # shellcheck disable=SC2016 # each mmdebstrap hook gets the chroot as its own $1
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -15,12 +16,15 @@ tc=$(printf '%s\n' pkg/iproute2-nss/out/iproute2_*+nss*_arm64.deb | sort -V | ta
 ap=$(printf '%s\n' pkg/hostapd/out/hostapd_*+u6e*_arm64.deb | sort -V | tail -1)
 # apt inside the chroot cannot see host paths: copy the packages in.
 mmdebstrap --variant=minbase --architectures=arm64 --components=main,non-free-firmware \
+	--dpkgopt='path-exclude=/usr/share/doc/*' --dpkgopt='path-include=/usr/share/doc/*/copyright' \
+	--dpkgopt='path-exclude=/usr/share/man/*' --dpkgopt='path-exclude=/usr/share/info/*' \
+	--dpkgopt='path-exclude=/usr/share/locale/*' --dpkgopt='path-include=/usr/share/locale/locale.alias' \
 	--customize-hook="mkdir -p \"\$1/tmp/u6e-debs\"" \
 	--customize-hook="copy-in $PWD/$tc $PWD/$ap /tmp/u6e-debs" \
 	--customize-hook='chroot "$1" sh -c "apt-get install -y /tmp/u6e-debs/*.deb && rm -r /tmp/u6e-debs"' \
 	--customize-hook='chroot "$1" apt-mark hold iproute2 hostapd' \
 	--include=systemd-sysv,udev,kmod,procps,iproute2,iputils-ping,less,vim-tiny,tzdata,ca-certificates \
-	--include=openssh-server,systemd-resolved,systemd-timesyncd,ethtool,pciutils,mmc-utils,mtd-utils,nftables,tcpdump,iperf3 \
+	--include=openssh-server,systemd-timesyncd,ethtool,pciutils,mmc-utils,mtd-utils,nftables,tcpdump,iperf3 \
 	--include=iw,hostapd,wireless-regdb,firmware-atheros,qrtr-tools,libubootenv-tool,fastfetch,bluez \
 	--include=systemd-netlogd \
 	--customize-hook='chroot "$1" systemctl disable hostapd' \

@@ -57,13 +57,14 @@ done
 # interfaces.
 printf '[Match]\nPath=platform-39d00000.ethernet\n\n[Link]\nName=lan\n' > $N/30-lan.link
 printf '[NetDev]\nName=%s\nKind=vlan\n\n[VLAN]\nId=%s\n' $MGMT_IF $MGMT_VLAN > $N/20-$MGMT_IF.netdev
-printf '[Match]\nName=%s\n\n[Network]\nAddress=%s\nGateway=%s\nDNS=%s\nDomains=%s\nNTP=%s\n' \
-	$MGMT_IF "$MGMT_ADDR" "$MGMT_GW" "$MGMT_DNS" "$MGMT_DOMAIN" "$MGMT_NTP" > $N/20-$MGMT_IF.network
-# resolved only resolves for the AP itself: no LLMNR or mDNS responder.
-mkdir -p $RF/etc/systemd/resolved.conf.d
-printf '[Resolve]\nLLMNR=no\nMulticastDNS=no\n' > $RF/etc/systemd/resolved.conf.d/u6e.conf
+printf '[Match]\nName=%s\n\n[Network]\nAddress=%s\nGateway=%s\nNTP=%s\n' \
+	$MGMT_IF "$MGMT_ADDR" "$MGMT_GW" "$MGMT_NTP" > $N/20-$MGMT_IF.network
+# The AP resolves a name only now and then (the NTP server): the static
+# resolver, no resident daemon.
+rm -f $RF/etc/resolv.conf
+printf 'nameserver %s\nsearch %s\n' "$MGMT_DNS" "$MGMT_DOMAIN" > $RF/etc/resolv.conf
 W=$RF/etc/systemd/system/multi-user.target.wants
-for u in systemd-networkd systemd-resolved; do ln -sf /usr/lib/systemd/system/$u.service $W/$u.service; done
+ln -sf /usr/lib/systemd/system/systemd-networkd.service $W/systemd-networkd.service
 
 # Boot traces on raw eMMC sectors past the last partition (survive the
 # fallback to stock): early marker at 5000000, full log at 5001000.
@@ -179,9 +180,15 @@ install -d $RF/etc/systemd/system/sysinit.target.wants
 sed -i "s/@LED@/$AP_LED/g" $RF/etc/systemd/system/u6e-leds.service
 ln -sf /etc/systemd/system/u6e-leds.service $RF/etc/systemd/system/sysinit.target.wants/u6e-leds.service
 
-# The AP keeps no logs (the journal is in RAM): systemd-netlogd sends the whole
-# journal to the site's syslog collector (LOG_SERVER, address:port), and
-# u6e-agent logs the AP's state every 5 minutes, so a long run can be read back.
+# The AP keeps no logs (the journal is in RAM, 8 MB at most): systemd-netlogd
+# sends the whole journal to the site's syslog collector (LOG_SERVER,
+# address:port), and u6e-agent logs the AP's state every 5 minutes, so a long
+# run can be read back.
+install -d $RF/etc/systemd/journald.conf.d
+printf '[Journal]\nStorage=volatile\nRuntimeMaxUse=8M\n' > $RF/etc/systemd/journald.conf.d/u6e.conf
+# Nothing for Debian's maintenance timers to do on an image built from held
+# packages, in RAM.
+for t in apt-daily apt-daily-upgrade dpkg-db-backup fstrim; do ln -sf /dev/null $RF/etc/systemd/system/$t.timer; done
 install -d $RF/etc/systemd/netlogd.conf.d
 printf '[Network]\nAddress=%s\nProtocol=udp\nLogFormat=rfc5424\n' "$LOG_SERVER" \
 	> $RF/etc/systemd/netlogd.conf.d/u6e.conf
