@@ -7,7 +7,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 REV=5b156e272a0266ca6be0f394192bad42b0ff176c  # hostap main, 2026-10-01
-UP=2.13~git20261001 DEBVER=2.11-2 VER=2:2.13~git20261001-0+u6e11
+UP=2.13~git20261001 DEBVER=2.11-2 VER=2:2.13~git20261001-0+u6e12
 [ ! -e work ] || { echo "work exists; remove it first" >&2; exit 1; }
 mkdir work; mkdir -p out
 git clone -q https://w1.fi/hostap.git work/src
@@ -35,7 +35,9 @@ sed -i '/^Bump-DEFAULT_BSS_MAX_COUNT-to-1000.patch$/d; /^CVE-2024-5290-lib_engin
 # carrying their own Mobility Domain element, which FT needs; the bridge
 # port parameters (bridge_hairpin) on dynamic VLAN interfaces too; and a
 # STA returning after the SA Query timed out (it left by FT, say) starting a
-# new association instead of being refused or disconnected as a rekey.
+# new association instead of being refused or disconnected as a rekey; and
+# station reads using only the requested STA of a station dump, which a
+# kernel without NL80211_ATTR_STA_DUMP_LINK_STATS returns whole.
 for p in no-pri-sec-switch-option rnr-6ghz-psd \
 	btm-query-candidates rrm-link-measurement-responder dscp-policy-fixes \
 	nr-mobility-domain esp-element anqp-neighbor-report fils-req-params-length \
@@ -44,7 +46,7 @@ for p in no-pri-sec-switch-option rnr-6ghz-psd \
 	mbo-cell-pref-optional wmm-downlink-medium-time \
 	openssl-keep-pending-tls-data radius-tls-stream-framing \
 	rnr-member-colocated-6ghz-ess mbssid-nontx-mde vlan-br-port-attrs \
-	sa-query-replace-assoc; do
+	sa-query-replace-assoc nl80211-sta-dump-mac; do
 	cp $p.patch $D/patches/
 	echo $p.patch >> $D/patches/series
 done

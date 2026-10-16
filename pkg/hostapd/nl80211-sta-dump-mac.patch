@@ -1,0 +1,101 @@
+From a021b282bfabcb46ac8aef5d95a162961dadbd3a Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Fri, 16 Oct 2026 18:35:28 +0300
+Subject: [PATCH] nl80211: Use only the requested STA from a station dump
+
+Commit 97494e94ee2f ("nl80211: Consider all links for station inactive
+time in an AP MLD") made i802_read_sta_data() and
+nl80211_get_link_signal() request NL80211_CMD_GET_STATION as a dump with
+NL80211_ATTR_MAC and NL80211_ATTR_STA_DUMP_LINK_STATS. A kernel that does
+not support NL80211_ATTR_STA_DUMP_LINK_STATS ignores NL80211_ATTR_MAC on
+a dump and returns every station of the interface, and get_sta_handler()
+stored each of them in turn, so with more than one associated STA every
+read returned the statistics of the last station in the dump: the
+inactivity check, hostapd_cli STA and RADIUS accounting all saw another
+STA's counters, and an idle STA was kept or an active one disconnected
+depending on its neighbor.
+
+Skip stations other than the requested one.
+
+Assisted-by: LLM
+Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
+---
+ src/drivers/driver_nl80211.c | 22 ++++++++++++++++------
+ 1 file changed, 16 insertions(+), 6 deletions(-)
+
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index c6578cb86..f88594e27 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -8776,11 +8776,17 @@ static int get_link_sta_stats(struct hostap_sta_driver_data *data,
+ }
+ 
+ 
++struct get_sta_arg {
++	const u8 *addr;
++	struct hostap_sta_driver_data *data;
++};
++
+ static int get_sta_handler(struct nl_msg *msg, void *arg)
+ {
+ 	struct nlattr *tb[NL80211_ATTR_MAX + 1];
+ 	struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
+-	struct hostap_sta_driver_data *data = arg;
++	struct get_sta_arg *ctx = arg;
++	struct hostap_sta_driver_data *data = ctx->data;
+ 	struct nlattr *stats[NL80211_STA_INFO_MAX + 1];
+ 	static struct nla_policy stats_policy[NL80211_STA_INFO_MAX + 1] = {
+ 		[NL80211_STA_INFO_INACTIVE_TIME] = { .type = NLA_U32 },
+@@ -8825,10 +8831,12 @@ static int get_sta_handler(struct nl_msg *msg, void *arg)
+ 		  genlmsg_attrlen(gnlh, 0), NULL);
+ 
+ 	/*
+-	 * TODO: validate the interface and mac address!
+-	 * Otherwise, there's a race condition as soon as
+-	 * the kernel starts sending station notifications.
++	 * A kernel that does not filter a station dump by NL80211_ATTR_MAC
++	 * returns every station of the interface: use only the requested one.
+ 	 */
++	if (!tb[NL80211_ATTR_MAC] ||
++	    !ether_addr_equal(nla_data(tb[NL80211_ATTR_MAC]), ctx->addr))
++		return NL_SKIP;
+ 
+ 	if (!tb[NL80211_ATTR_STA_INFO] && !tb[NL80211_ATTR_MLO_LINKS]) {
+ 		wpa_printf(MSG_DEBUG, "sta stats missing!");
+@@ -9074,6 +9082,7 @@ static int get_sta_handler(struct nl_msg *msg, void *arg)
+ int nl80211_get_link_signal(struct i802_bss *bss, const u8 *bssid,
+ 			    struct hostap_sta_driver_data *data)
+ {
++	struct get_sta_arg arg = { .addr = bssid, .data = data };
+ 	struct nl_msg *msg;
+ 
+ 	data->signal = -WPA_INVALID_NOISE;
+@@ -9087,7 +9096,7 @@ int nl80211_get_link_signal(struct i802_bss *bss, const u8 *bssid,
+ 		return -ENOBUFS;
+ 	}
+ 
+-	return send_and_recv_resp(bss->drv, msg, get_sta_handler, data);
++	return send_and_recv_resp(bss->drv, msg, get_sta_handler, &arg);
+ }
+ 
+ 
+@@ -9095,6 +9104,7 @@ static int i802_read_sta_data(struct i802_bss *bss,
+ 			      struct hostap_sta_driver_data *data,
+ 			      const u8 *addr)
+ {
++	struct get_sta_arg arg = { .addr = addr, .data = data };
+ 	struct nl_msg *msg;
+ 
+ 	if (!(msg = nl80211_bss_msg(bss, NLM_F_DUMP,
+@@ -9105,7 +9115,7 @@ static int i802_read_sta_data(struct i802_bss *bss,
+ 		return -ENOBUFS;
+ 	}
+ 
+-	return send_and_recv_resp(bss->drv, msg, get_sta_handler, data);
++	return send_and_recv_resp(bss->drv, msg, get_sta_handler, &arg);
+ }
+ 
+ 
+-- 
+2.47.3
+
