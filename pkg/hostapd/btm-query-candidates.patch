@@ -1,4 +1,4 @@
-From dca12d363f101d6a601b257f46958a2f035313f6 Mon Sep 17 00:00:00 2001
+From 2cc2e466fea078dfa62a2923f2f9b184d3c00004 Mon Sep 17 00:00:00 2001
 From: Andrei-Alexandru Bleortu <me@andrei-z.com>
 Date: Sat, 3 Oct 2026 22:00:13 +0300
 Subject: [PATCH] WNM: Include a candidate list when answering a BSS TM Query
@@ -24,12 +24,12 @@ instead of one, so that the STA has time to scan the candidates.
 Assisted-by: LLM
 Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
 ---
- src/ap/wnm_ap.c         | 152 +++++++++++++++++++++++++++++++++++++++-
+ src/ap/wnm_ap.c         | 153 +++++++++++++++++++++++++++++++++++++++-
  tests/hwsim/test_wnm.py |  33 +++++++++
- 2 files changed, 183 insertions(+), 2 deletions(-)
+ 2 files changed, 184 insertions(+), 2 deletions(-)
 
 diff --git a/src/ap/wnm_ap.c b/src/ap/wnm_ap.c
-index 37c85f851..09fcc6584 100644
+index 37c85f851..caf75ea2e 100644
 --- a/src/ap/wnm_ap.c
 +++ b/src/ap/wnm_ap.c
 @@ -11,6 +11,7 @@
@@ -40,7 +40,7 @@ index 37c85f851..09fcc6584 100644
  #include "common/wpa_ctrl.h"
  #include "common/ocv.h"
  #include "ap/hostapd.h"
-@@ -379,6 +380,142 @@ static void ieee802_11_rx_wnmsleep_req(struct hostapd_data *hapd,
+@@ -379,6 +380,143 @@ static void ieee802_11_rx_wnmsleep_req(struct hostapd_data *hapd,
  }
  
  
@@ -52,8 +52,9 @@ index 37c85f851..09fcc6584 100644
 +static int wnm_bss_tm_cand_pref(struct hostapd_data *hapd, struct sta_info *sta,
 +				const u8 *nr)
 +{
-+	u8 op_class = nr[10], chan = nr[11];
++	u8 op_class = nr[10];
 +#ifdef CONFIG_MBO
++	u8 chan = nr[11];
 +	struct mbo_non_pref_chan_info *info;
 +#endif /* CONFIG_MBO */
 +
@@ -183,7 +184,7 @@ index 37c85f851..09fcc6584 100644
  static int ieee802_11_send_bss_trans_mgmt_request(struct hostapd_data *hapd,
  						  const u8 *addr,
  						  u8 dialog_token)
-@@ -386,11 +523,11 @@ static int ieee802_11_send_bss_trans_mgmt_request(struct hostapd_data *hapd,
+@@ -386,11 +524,11 @@ static int ieee802_11_send_bss_trans_mgmt_request(struct hostapd_data *hapd,
  	struct ieee80211_mgmt *mgmt;
  	const u8 *own_addr;
  	struct sta_info *sta;
@@ -197,7 +198,7 @@ index 37c85f851..09fcc6584 100644
  	if (mgmt == NULL)
  		return -1;
  
-@@ -410,6 +547,17 @@ static int ieee802_11_send_bss_trans_mgmt_request(struct hostapd_data *hapd,
+@@ -410,6 +548,17 @@ static int ieee802_11_send_bss_trans_mgmt_request(struct hostapd_data *hapd,
  	mgmt->u.action.u.bss_tm_req.validity_interval = 1;
  	pos = mgmt->u.action.u.bss_tm_req.variable;
  

@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Fri, 16 Oct 2026 20:53:42 +0300
+Subject: [PATCH] BSS Load: Update the Beacon frame only when the element
+ changes
+
+Every bss_load_update_period the Beacon frame was rebuilt and handed to
+the driver, whether or not the values the BSS Load and ESP elements are
+built from had changed. With mac80211 each update also reapplies the BSS
+parameters (CTS protection, preamble, AP isolation, ...), which a driver
+with an offloading firmware turns into a burst of firmware commands and
+a new Beacon template for every BSS every few seconds. On a quiet
+channel two updates in three carried the same elements.
+
+Remember what the current Beacon frame advertises (station count,
+channel utilization and the radio's own share of it, which the ESP
+element uses) and skip the update when none of them changed.
+
+Assisted-by: LLM
+Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
+---
+ src/ap/beacon.c   | 5 +++++
+ src/ap/bss_load.c | 8 +++++++-
+ src/ap/hostapd.h  | 5 +++++
+ 3 files changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/src/ap/beacon.c b/src/ap/beacon.c
+index 2b6eabc..7152db6 100644
+--- a/src/ap/beacon.c
++++ b/src/ap/beacon.c
+@@ -2523,6 +2523,11 @@ int ieee802_11_build_ap_params(struct hostapd_data *hapd,
+ 
+ 	tailpos = hostapd_get_rsne(hapd, tailpos, tailend - tailpos);
+ 	tailpos = hostapd_eid_bss_load(hapd, tailpos, tailend - tailpos);
++	hapd->beacon_bss_load_set = true;
++	hapd->beacon_bss_load_num_sta = hapd->num_sta;
++	hapd->beacon_bss_load_chan_util = hapd->iface->channel_utilization;
++	hapd->beacon_bss_load_chan_util_tx =
++		hapd->iface->channel_utilization_tx;
+ 	tailpos = hostapd_eid_ap_channel_report(hapd, tailpos);
+ 	tailpos = hostapd_eid_rm_enabled_capab(hapd, tailpos,
+ 					       tailend - tailpos);
+diff --git a/src/ap/bss_load.c b/src/ap/bss_load.c
+index e9baafc..99eb864 100644
+--- a/src/ap/bss_load.c
++++ b/src/ap/bss_load.c
+@@ -55,7 +55,13 @@ static void update_channel_utilization(void *eloop_data, void *user_data)
+ 		return;
+ 	}
+ 
+-	ieee802_11_set_beacon_per_bss_only(hapd);
++	/* A Beacon frame update reprograms the whole BSS in the driver; skip
++	 * it when the BSS Load and ESP elements would not change. */
++	if (!hapd->beacon_bss_load_set ||
++	    hapd->beacon_bss_load_num_sta != hapd->num_sta ||
++	    hapd->beacon_bss_load_chan_util != iface->channel_utilization ||
++	    hapd->beacon_bss_load_chan_util_tx != iface->channel_utilization_tx)
++		ieee802_11_set_beacon_per_bss_only(hapd);
+ 
+ 	if (get_bss_load_update_timeout(hapd, &sec, &usec) < 0)
+ 		return;
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index b5d6532..7e67ac7 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -195,6 +195,11 @@ struct hostapd_data {
+ 	u8 own_addr[ETH_ALEN];
+ 
+ 	int num_sta; /* number of entries in sta_list */
++	/* The load the current Beacon frame advertises (BSS Load, ESP) */
++	bool beacon_bss_load_set;
++	int beacon_bss_load_num_sta;
++	u8 beacon_bss_load_chan_util;
++	u8 beacon_bss_load_chan_util_tx;
+ 	struct sta_info *sta_list; /* STA info list head */
+ #define STA_HASH_SIZE 256
+ #define STA_HASH(sta) (sta[5])
+-- 
+2.47.3
+
