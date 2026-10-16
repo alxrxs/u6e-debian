@@ -1,0 +1,58 @@
+From c1ffc97a4b4d92e3e6d3f95c9cad3c32e3408017 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Fri, 16 Oct 2026 17:07:42 +0300
+Subject: [PATCH] AP: End the old association when allowing one after SA Query
+ timeout
+
+A STA associated with PMF that loses its association without telling
+the AP (it roamed away with FT, went out of range, or dropped its keys)
+stays associated and authorized in hostapd until the inactivity timer
+removes it. When it returns with Open System or SAE authentication,
+hostapd keeps the old entry so that an unprotected frame cannot tear
+down a live association, starts the SA Query procedure, and once that
+times out allows the new (re)association. The new association was then
+processed as a reassociation within the old one:
+
+- add_associated_sta() kept the authorized driver entry and tried to
+  update it in place when the old association had been FT, since
+  wpa_auth_sta_ft_tk_already_set() still reported the old TK. cfg80211
+  accepts supported rates and capabilities only for a station that is
+  not yet associated, so NL80211_CMD_SET_STATION failed ("Could not set
+  STA to kernel driver") and every attempt was rejected with status 17
+  until the inactivity timer expired.
+- hostapd_new_assoc_sta() saw a reassociation and sent WPA_REAUTH, which
+  with wpa_deny_ptk0_rekey disconnects the STA as a PTK0 rekey.
+
+Once the SA Query has timed out, the STA no longer has the previous
+association, so end it there: clear the authorized and associated flags
+and stop its accounting session. The association then gets a new driver
+STA entry and a new 4-way handshake.
+
+Assisted-by: LLM
+Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
+---
+ src/ap/ieee802_11.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index 219a94b0f..0b840d44c 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -8263,6 +8263,14 @@ static void handle_assoc(struct hostapd_data *hapd,
+ 		 * unprotected frame would be received by the STA that is now
+ 		 * trying to associate.
+ 		 */
++
++		/* The STA no longer has the previous association, so end it
++		 * here: this association then gets a new driver STA entry and
++		 * a new 4-way handshake instead of being processed as a
++		 * reassociation within the old one. */
++		ap_sta_set_authorized(hapd, sta, 0);
++		sta->flags &= ~WLAN_STA_ASSOC;
++		accounting_sta_stop(hapd, sta);
+ 	}
+ 
+ 	/* Make sure that the previously registered inactivity timer will not
+-- 
+2.47.3
+
