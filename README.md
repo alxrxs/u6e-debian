@@ -8,7 +8,7 @@ The only thing ever written to the SPI flash (the small chip holding the boot lo
 
 ## What you need
 
-- An x86 Linux build machine with the aarch64 cross compiler (and the armhf one, for the 32-bit boot shim), `mmdebstrap`, `qemu-user-static` and `u-boot-tools`.
+- An x86 Linux build machine with the aarch64 cross compiler (and the armhf one, for the 32-bit boot shim), `mmdebstrap`, `qemu-user-static`, `u-boot-tools`, and Rust from rustup with the `aarch64-unknown-linux-musl` target.
 - Optionally, an Apple silicon Mac with OrbStack, reachable over SSH (`NATIVE_BUILD` in `site.conf`): the arm64 package and root filesystem builds then run there natively, many times faster than under `qemu-user-static`.
 - SSH access to the stock firmware of each access point (the stock login set in `site.conf`).
 - `site.conf`: your site's settings. Copy `site.conf.example` and fill it in; it is never committed. It holds:
@@ -47,7 +47,8 @@ sudo BOOT=0 ./deploy.sh           # build everything, each image included, but b
 5. `pkg/hostapd/build.sh`: builds hostapd (the program that runs the Wi-Fi networks) as a Debian package.
 6. `pkg/iproute2-nss/build.sh`: builds Debian's `iproute2` with the NSS traffic-shaping options added to `tc`.
 7. `mkrootfs.sh`: creates the Debian root filesystem.
-8. For each access point whose running image was built from other inputs (this repository, `$BLOBS`, `site.conf` or the source trees): `prep-rootfs.sh` builds its image, `boot/stage.sh` boots it, and `deploy.sh` waits until all three radios are up. An access point already running the current build is left alone; `FORCE=1` boots a new image anyway. With `BOOT=0` each image is built and kept but not booted, so the access points keep running until a later run boots it.
+8. `pkg/u6e-neighbors`: builds the neighbor report exchange between access points (Rust, one static binary).
+9. For each access point whose running image was built from other inputs (this repository, `$BLOBS`, `site.conf` or the source trees): `prep-rootfs.sh` builds its image, `boot/stage.sh` boots it, and `deploy.sh` waits until all three radios are up. An access point already running the current build is left alone; `FORCE=1` boots a new image anyway. With `BOOT=0` each image is built and kept but not booted, so the access points keep running until a later run boots it.
 
 Every image is kept in `images/` with a `MANIFEST` (versions and checksums), so an earlier build can be booted again without rebuilding.
 
@@ -81,7 +82,7 @@ Wi-Fi starts by itself on every boot (`u6e-wifi.service`), with nothing else on 
 
 **Roaming and client help**
 - Fast roaming between radios and access points (802.11r).
-- Roaming advice for clients (802.11k and 802.11v). The access points send each other lists of their networks every 10 seconds (`u6e-neighbors`), so clients are told about the others.
+- Roaming advice for clients (802.11k and 802.11v). The access points send each other lists of their networks every 10 seconds (`u6e-neighbors`, a single small process that changes hostapd's lists only when they differ), so clients are told about the others.
 - Optimized Connectivity (OCE), Agile Multiband (MBO) and Wi-Fi QoS Management, which help clients pick the best band and mark their traffic correctly.
 - Beacon protection on 5 GHz and 6 GHz, which stops forged beacons.
 - Time-of-flight ranging for indoor location, 6 GHz discovery frames, and 6 GHz announcements on the 2.4 and 5 GHz beacons so clients find 6 GHz quickly.
@@ -110,6 +111,7 @@ Wi-Fi starts by itself on every boot (`u6e-wifi.service`), with nothing else on 
 | `fw/` | Builds the board data files; includes `ath11k-bdencoder` |
 | `pkg/hostapd/` | hostapd build with our 22 patches |
 | `pkg/iproute2-nss/` | `iproute2` with NSS support in `tc` |
+| `pkg/u6e-neighbors/` | The neighbor report exchange between access points (Rust) |
 | `mkrootfs.sh` | Creates the Debian root filesystem |
 | `prep-rootfs.sh` | Adds the kernel, firmware and configuration, and produces one image per access point |
 | `u6e-caldata` | Script that writes each radio's calibration at boot |

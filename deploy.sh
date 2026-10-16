@@ -11,7 +11,8 @@
 # (kernel/ and config-u6e.sh), the NSS drivers and wireless stack (backports/,
 # nss/ and the kernel), the hostapd and iproute2 packages (their versions) and
 # the rootfs (those packages and mkrootfs.sh); the packages and the rootfs on
-# the native builder if it answers (arm64 below). Then each AP whose running
+# the native builder if it answers (arm64 below), and u6e-neighbors
+# (pkg/u6e-neighbors). Then each AP whose running
 # image was built from other inputs (stamps/ap-<ap>) gets a new one (prep-rootfs.sh,
 # kept under images/), boots it (boot/stage.sh) and must bring its radios up by
 # itself. Sources and trees are built as the checkout's
@@ -84,6 +85,11 @@ deb=pkg/iproute2-nss/out/iproute2_${iproute2}_arm64.deb
 [ -f "$deb" ] || step iproute2 "$iproute2" arm64 "$deb" 'rm -rf pkg/iproute2-nss/work && pkg/iproute2-nss/build.sh' pkg/iproute2-nss
 step rootfs "$hostapd/$iproute2/$(head_of . HEAD:mkrootfs.sh)" arm64 rootfs 'rm -rf rootfs && ./mkrootfs.sh' \
 	mkrootfs.sh pkg/hostapd/out pkg/iproute2-nss/out
+# u6e-neighbors: a static arm64 binary, cross-built here (rustup's
+# aarch64-unknown-linux-musl target).
+[ -x pkg/u6e-neighbors/target/aarch64-unknown-linux-musl/release/u6e-neighbors ] || rm -f stamps/neighbors
+step neighbors "$(head_of . HEAD:pkg/u6e-neighbors)" sh -c \
+	'cd pkg/u6e-neighbors && PATH=$PATH:$HOME/.cargo/bin cargo build --release --locked'
 
 if [ $# = 0 ]; then
 	read -ra aps <<<"$U6E_APS"

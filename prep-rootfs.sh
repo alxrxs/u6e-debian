@@ -222,60 +222,23 @@ WantedBy=multi-user.target
 UNIT
 ln -sf /etc/systemd/system/u6e-wifi.service $W/u6e-wifi.service
 
-# 802.11k across APs: every 10 s u6e-neighbors publishes this AP's own neighbor
-# report entries (of the radios that are up), which u6e-nr.socket serves to the
-# other APs (U6E_APS) on NR_PORT, reads theirs and makes each BSS's neighbor
-# list carry the other APs' BSSs of its SSID; an AP that stops answering drops
-# out within a round. These entries are also OCE's AP Channel Report.
+# 802.11k across APs: u6e-neighbors (pkg/u6e-neighbors), one resident process
+# that every 10 s reads this AP's own neighbor report entries (of the radios
+# that are up) from hostapd, serves them to the other APs (U6E_APS) on
+# NR_PORT, reads theirs and makes each BSS's neighbor list carry the other
+# APs' BSSs of its SSID, changing hostapd only where something differs; an AP
+# that stops answering drops out within a round. These entries are also OCE's
+# AP Channel Report.
 NR_PORT=8211
 peers=$(for a in $U6E_APS; do (U6E_AP=$a; . ./site.conf; echo "${MGMT_ADDR%/*}"); done | grep -vx "$MGMT_IP" | tr '\n' ' ')
-cat > $RF/usr/local/sbin/u6e-neighbors <<'NEIGHBORS'
-#!/bin/bash
-PEERS="@PEERS@" PORT=@PORT@ D=/run/u6e-neighbors
-# The client socket in our runtime directory: hostapd_cli's default,
-# /run/hostapd, is read-only in this sandbox.
-hcli() { hostapd_cli -p /run/hostapd -s $D -i "$@" 2>/dev/null; }
-entries() { sed -nE 's/^([0-9a-f:]{17}) ssid=([0-9a-f]+) nr=([0-9a-f]+) .*stat$/\1 \2 \3/p'; }
-while :; do
-	mine=" " up=
-	for c in /run/hostapd/*; do
-		[ -S "$c" ] || continue
-		i=${c##*/} own=$(hcli "$i" show_neighbor | entries)
-		mine="$mine${own%% *} "
-		hcli "$i" status | grep -qx state=ENABLED && up="$up$own"$'\n'
-	done
-	printf '%s' "$up" > $D/own.new && mv $D/own.new $D/own
-	theirs=$(for p in $PEERS; do
-		timeout 3 bash -c "exec 3<>/dev/tcp/$p/$PORT && cat <&3" 2>/dev/null
-	done | grep -E '^[0-9a-f:]{17} [0-9a-f]+ [0-9a-f]+$')
-	for c in /run/hostapd/*; do
-		[ -S "$c" ] || continue
-		i=${c##*/} nr=$(hcli "$i" show_neighbor)
-		ssid=$(echo "$nr" | entries | cut -d' ' -f2)
-		want=$(echo "$theirs" | awk -v s="$ssid" '$2 == s')
-		for b in $(echo "$nr" | cut -d' ' -f1); do
-			case "$mine" in *" $b "*) continue ;; esac
-			# Here-strings, not echo | grep -q: grep exits at the first
-			# match, and echo then dies writing to a closed pipe.
-			grep -q "^$b " <<<"$want" || hcli "$i" remove_neighbor "$b" >/dev/null
-		done
-		while read -r b s r; do
-			[ -n "$b" ] && ! grep -qx "$b ssid=$s nr=$r" <<<"$nr" &&
-				hcli "$i" set_neighbor "$b" ssid="$s" nr="$r" >/dev/null
-		done <<<"$want"
-	done
-	sleep 10
-done
-NEIGHBORS
-sed -i "s/@PEERS@/$peers/; s/@PORT@/$NR_PORT/" $RF/usr/local/sbin/u6e-neighbors
-chmod 0755 $RF/usr/local/sbin/u6e-neighbors
-cat > $RF/etc/systemd/system/u6e-neighbors.service <<'UNIT'
+install -m0755 pkg/u6e-neighbors/target/aarch64-unknown-linux-musl/release/u6e-neighbors $RF/usr/local/sbin/
+cat > $RF/etc/systemd/system/u6e-neighbors.service <<UNIT
 [Unit]
 Description=U6E neighbor reports across APs
 After=u6e-wifi.service
 
 [Service]
-ExecStart=/usr/local/sbin/u6e-neighbors
+ExecStart=/usr/local/sbin/u6e-neighbors $MGMT_IP $NR_PORT $peers
 RuntimeDirectory=u6e-neighbors
 RuntimeDirectoryMode=0755
 Restart=always
@@ -289,45 +252,6 @@ PrivateTmp=yes
 WantedBy=multi-user.target
 UNIT
 ln -sf /etc/systemd/system/u6e-neighbors.service $W/u6e-neighbors.service
-printf '[Unit]\nDescription=U6E neighbor report entries for the other APs\n\n[Socket]\nListenStream=%s:%s\nFreeBind=yes\nAccept=yes\n\n[Install]\nWantedBy=sockets.target\n' \
-	"$MGMT_IP" $NR_PORT > $RF/etc/systemd/system/u6e-nr.socket
-cat > $RF/etc/systemd/system/u6e-nr@.service <<'UNIT'
-[Unit]
-Description=U6E neighbor report entries for another AP
-# Until u6e-neighbors has published this AP's entries, the peer gets none.
-ConditionPathExists=/run/u6e-neighbors/own
-
-[Service]
-ExecStart=/bin/cat /run/u6e-neighbors/own
-StandardInput=socket
-StandardOutput=socket
-StandardError=journal
-DynamicUser=yes
-PrivateNetwork=yes
-CapabilityBoundingSet=
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=yes
-PrivateTmp=yes
-PrivateDevices=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectKernelLogs=yes
-ProtectControlGroups=yes
-ProtectClock=yes
-ProtectHostname=yes
-ProtectProc=invisible
-RestrictAddressFamilies=AF_UNIX
-RestrictNamespaces=yes
-RestrictRealtime=yes
-LockPersonality=yes
-MemoryDenyWriteExecute=yes
-SystemCallArchitectures=native
-SystemCallFilter=@system-service
-RuntimeMaxSec=5
-UNIT
-install -d $RF/etc/systemd/system/sockets.target.wants
-ln -sf /etc/systemd/system/u6e-nr.socket $RF/etc/systemd/system/sockets.target.wants/u6e-nr.socket
 
 # The boot that brought this image up was one-shot: U-Boot disarmed it before
 # starting us. u6e-arm re-arms it from the steps go8.sh staged, or with "disarm"
