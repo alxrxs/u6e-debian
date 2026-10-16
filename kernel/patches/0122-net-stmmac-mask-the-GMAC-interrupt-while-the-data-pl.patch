@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Fri, 16 Oct 2026 20:38:11 +0300
+Subject: [PATCH] net: stmmac: mask the GMAC interrupt while the data plane is
+ claimed
+
+The claim parks the host DMA and NAPI, but the NSS firmware drives the
+same DMA and the GMAC line stays requested by stmmac: every frame the
+firmware moves raised a host interrupt that stmmac_interrupt() counted as
+a normal DMA interrupt and could not act on, since with NAPI disabled it
+never masks the channel. Measured on IPQ5018 under Wi-Fi load: 7495
+interrupts in 10 s, 7283 of them normal_irq_n. Mask the line at the host
+from claim to release; the owner releases before any close or reopen.
+
+Assisted-by: LLM
+Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
+---
+ .../net/ethernet/stmicro/stmmac/stmmac_main.c   | 17 ++++++++++++-----
+ 1 file changed, 12 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index f3c385df6..eca07a47d 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -2573,9 +2573,10 @@ static void stmmac_stop_all_dma(struct stmmac_priv *priv)
+  * @owner: callbacks taking over TX and receiving link transitions
+  * @ctx: cookie passed back through every callback
+  *
+- * Parks the host data path (TX drained, NAPI off, DMA channels stopped)
+- * and redirects ndo_start_xmit to @owner->xmit. The MAC stays enabled and
+- * phylink keeps managing the link; transitions are relayed through
++ * Parks the host data path (TX drained, NAPI off, DMA channels stopped,
++ * the GMAC interrupt masked) and redirects ndo_start_xmit to @owner->xmit.
++ * The MAC stays enabled and phylink keeps managing the link; transitions
++ * are relayed through
+  * @owner->link_up/link_down. Caller holds rtnl. See qca_dwmac.h for the
+  * release contract.
+  */
+@@ -2607,6 +2608,11 @@ int qca_dwmac_dp_claim(struct net_device *dev,
+ 	netif_tx_disable(dev);
+ 	stmmac_disable_all_queues(priv);
+ 	stmmac_stop_all_dma(priv);
++	/*
++	 * The firmware's DMA keeps raising the GMAC interrupt, once per frame
++	 * with NAPI parked: mask it at the host until release.
++	 */
++	disable_irq(dev->irq);
+ 
+ 	priv->dp_ctx = ctx;
+ 	/* xmit hook reads dp_owner without a lock: publish ctx first */
+@@ -2647,6 +2653,7 @@ int qca_dwmac_dp_release(struct net_device *dev)
+ 	netif_tx_disable(dev);
+ 	WRITE_ONCE(priv->dp_owner, NULL);
+ 	priv->dp_ctx = NULL;
++	enable_irq(dev->irq);
+ 
+ 	/*
+ 	 * Claim parked NAPI with stmmac_disable_all_queues(); give it back
+@@ -2654,8 +2661,8 @@ int qca_dwmac_dp_release(struct net_device *dev)
+ 	 * interface going down, or the caller's restorative dev_close() -
+ 	 * will disable it again, and a second napi_disable() without an
+ 	 * enable in between blocks forever (measured: reboot hangs right
+-	 * after "Link is Down"). The DMA channels stay stopped and no IRQs
+-	 * are live, so the re-enabled NAPI sits idle until then.
++	 * after "Link is Down"). The DMA channels stay stopped, so the
++	 * re-enabled NAPI sits idle until then.
+ 	 */
+ 	stmmac_enable_all_queues(priv);
+ 
