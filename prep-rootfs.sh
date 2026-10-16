@@ -138,7 +138,10 @@ echo LANG=C.UTF-8 > $RF/etc/default/locale
 # Kernel log live on the wire: netconsole to the management VLAN's broadcast
 # address, so a hang that ends in the vendor's crash-dump mode (no reset, no
 # pstore) still leaves its last messages; capture them on any host on that
-# segment with tcpdump -A 'vlan <MGMT_VLAN> and udp port 6666'.
+# segment with tcpdump -A 'vlan <MGMT_VLAN> and udp port 6666'. Debug messages
+# stay off the consoles (level 7): they are written synchronously, and a flood
+# of them (ath11k's per-frame debug) stalled an AP until its watchdog reset it;
+# the journal still has them.
 cat > $RF/etc/systemd/system/u6e-netconsole.service <<UNIT
 [Unit]
 Description=U6E kernel log to the management VLAN's broadcast (netconsole)
@@ -151,7 +154,7 @@ RemainAfterExit=yes
 ExecStartPre=/bin/sh -c 'until ip -4 addr show $MGMT_IF 2>/dev/null | grep -q $MGMT_IP; do sleep 1; done'
 ExecStart=/usr/sbin/modprobe netconsole
 ExecStart=/bin/sh -c 'T=/sys/kernel/config/netconsole/u6e; mkdir -p \$T && echo $MGMT_IF > \$T/dev_name && echo $MGMT_IP > \$T/local_ip && echo $MGMT_BCAST > \$T/remote_ip && echo 6666 > \$T/remote_port && echo 1 > \$T/enabled'
-ExecStart=/usr/bin/dmesg -n 8
+ExecStart=/usr/bin/dmesg -n 7
 
 [Install]
 WantedBy=multi-user.target

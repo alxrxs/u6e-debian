@@ -1,0 +1,149 @@
+From 6fe7839c5c16e7f501eaabd6bee8cc737d1a79fb Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Sat, 17 Oct 2026 01:03:39 +0300
+Subject: [PATCH] AP: Complete an association whose response ACK was lost
+
+A STA whose (Re)Association Response frame is reported as not
+acknowledged is removed from the driver. The STA may well have received
+the frame and only its ACK got lost: it then considers itself associated
+and sends Class 3 frames, which the AP answers with a Deauthentication
+frame (reason 7). A PMF STA drops that unprotected frame and starts an
+SA Query the AP cannot answer, so it only recovers seconds later by
+connecting again. On an ath11k AP 0.5% of the Reassociation Response
+frames of FT roams were reported as not acknowledged, and each one cost
+the STA about 4.5 seconds.
+
+Keep the (Re)Association Response frame with status success whose ACK
+is missing, and when a Class 3 frame arrives from that STA, add it back
+to the driver and complete the association as if the TX status had been
+an ACK. The ACK frame is no more protected than the Class 3 frame, so
+this trusts the STA no more than the ACK would have. A new
+Authentication frame, disassociation or deauthentication drops the
+kept frame.
+
+Assisted-by: LLM
+Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
+---
+ src/ap/ieee802_11.c | 41 +++++++++++++++++++++++++++++++++++++++++
+ src/ap/sta_info.c   |  5 +++++
+ src/ap/sta_info.h   |  3 +++
+ 3 files changed, 49 insertions(+)
+
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index 219a94b0f..fdb458505 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -5040,6 +5040,8 @@ static void handle_auth(struct hostapd_data *hapd,
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ 	sta->last_seq_ctrl = seq_ctrl;
++	wpabuf_free(sta->unacked_assoc_resp);
++	sta->unacked_assoc_resp = NULL;
+ 	sta->last_subtype = WLAN_FC_STYPE_AUTH;
+ #ifdef CONFIG_MBO
+ 	sta->auth_rssi = rssi;
+@@ -9287,11 +9289,22 @@ static void handle_assoc_cb(struct hostapd_data *hapd,
+ 	else
+ 		status = le_to_host16(mgmt->u.assoc_resp.status_code);
+ 
++	wpabuf_free(sta->unacked_assoc_resp);
++	sta->unacked_assoc_resp = NULL;
++
+ 	if (!ok) {
+ 		hostapd_logger(hapd, mgmt->da, HOSTAPD_MODULE_IEEE80211,
+ 			       HOSTAPD_LEVEL_DEBUG,
+ 			       "did not acknowledge association response");
+ 		sta->flags &= ~WLAN_STA_ASSOC_REQ_OK;
++		/*
++		 * The STA may well have received the frame and only its ACK
++		 * got lost: keep the frame, so that a Class 3 frame from the
++		 * STA can complete the association.
++		 */
++		if (status == WLAN_STATUS_SUCCESS && !epp_sta &&
++		    !ap_sta_is_mld(hapd, sta))
++			sta->unacked_assoc_resp = wpabuf_alloc_copy(mgmt, len);
+ 		/*
+ 		 * A non-EPP STA is added to the driver only for a successful
+ 		 * association. For EPP stations, the driver may retain the STA
+@@ -9886,6 +9899,34 @@ void ieee802_11_rx_from_unknown(struct hostapd_data *hapd, const u8 *src,
+ 		return;
+ 	}
+ 
++	if (sta && sta->unacked_assoc_resp && (sta->flags & WLAN_STA_AUTH)) {
++		struct wpabuf *resp = sta->unacked_assoc_resp;
++		const struct ieee80211_mgmt *mgmt = wpabuf_head(resp);
++		bool reassoc = WLAN_FC_GET_STYPE(le_to_host16(
++					mgmt->frame_control)) ==
++			WLAN_FC_STYPE_REASSOC_RESP;
++
++		/*
++		 * A Class 3 frame from the STA acknowledges the (Re)Association
++		 * Response frame as well as an ACK frame would: neither is
++		 * protected. Complete the association.
++		 */
++		wpa_printf(MSG_DEBUG,
++			   "Class 3 frame from " MACSTR
++			   " after an unacknowledged (Re)Association Response frame - complete the association",
++			   MAC2STR(src));
++		sta->unacked_assoc_resp = NULL;
++		/* The missing ACK removed the STA from the driver. */
++		if (add_associated_sta(hapd, sta, reassoc) == 0) {
++			sta->flags |= WLAN_STA_ASSOC_REQ_OK;
++			handle_assoc_cb(hapd, mgmt, wpabuf_len(resp), reassoc,
++					1);
++			wpabuf_free(resp);
++			return;
++		}
++		wpabuf_free(resp);
++	}
++
+ 	wpa_printf(MSG_DEBUG, "Data/PS-poll frame from not associated STA "
+ 		   MACSTR, MAC2STR(src));
+ 	if (is_multicast_ether_addr(src) || is_zero_ether_addr(src) ||
+diff --git a/src/ap/sta_info.c b/src/ap/sta_info.c
+index 4326f1344..dd8181e08 100644
+--- a/src/ap/sta_info.c
++++ b/src/ap/sta_info.c
+@@ -396,6 +396,7 @@ void ap_free_sta(struct hostapd_data *hapd, struct sta_info *sta)
+ 
+ #ifdef CONFIG_TAXONOMY
+ 	wpabuf_free(sta->probe_ie_taxonomy);
++	wpabuf_free(sta->unacked_assoc_resp);
+ 	sta->probe_ie_taxonomy = NULL;
+ 	wpabuf_free(sta->assoc_ie_taxonomy);
+ 	sta->assoc_ie_taxonomy = NULL;
+@@ -1123,6 +1124,8 @@ static void ap_sta_handle_disassociate(struct hostapd_data *hapd,
+ 		sta->flags &= ~(WLAN_STA_ASSOC | WLAN_STA_ASSOC_REQ_OK);
+ 		sta->timeout_next = STA_DEAUTH;
+ 	}
++	wpabuf_free(sta->unacked_assoc_resp);
++	sta->unacked_assoc_resp = NULL;
+ 
+ 	ap_sta_disconnect_common(hapd, sta, AP_MAX_INACTIVITY_AFTER_DISASSOC,
+ 				 true);
+@@ -1161,6 +1164,8 @@ static void ap_sta_handle_deauthenticate(struct hostapd_data *hapd,
+ 		   hapd->conf->iface, MAC2STR(sta->addr));
+ 
+ 	sta->flags &= ~(WLAN_STA_AUTH | WLAN_STA_ASSOC | WLAN_STA_ASSOC_REQ_OK);
++	wpabuf_free(sta->unacked_assoc_resp);
++	sta->unacked_assoc_resp = NULL;
+ 
+ 	sta->timeout_next = STA_REMOVE;
+ 	ap_sta_disconnect_common(hapd, sta, AP_MAX_INACTIVITY_AFTER_DEAUTH,
+diff --git a/src/ap/sta_info.h b/src/ap/sta_info.h
+index 6dd3ce4ae..1204eed7d 100644
+--- a/src/ap/sta_info.h
++++ b/src/ap/sta_info.h
+@@ -167,6 +167,9 @@ struct sta_info {
+ 	unsigned int radius_das_match:1;
+ 	unsigned int ecsa_supported:1;
+ 	unsigned int added_unassoc:1;
++	/* (Re)Association Response frame with status success whose TX status
++	 * reported no ACK; see ieee802_11_rx_from_unknown() */
++	struct wpabuf *unacked_assoc_resp;
+ 	unsigned int pending_wds_enable:1;
+ 	unsigned int power_capab:1;
+ 	unsigned int agreed_to_steer:1;
+-- 
+2.47.3
+
