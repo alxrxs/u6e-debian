@@ -11,10 +11,10 @@ Imported from https://github.com/kuncy7/openwrt-nss-edma package/kernel/mac80211
  1 file changed, 2 insertions(+), 5 deletions(-)
 
 diff --git a/net/wireless/nl80211.c b/net/wireless/nl80211.c
-index a067b25..c0213d8 100644
+index 9aa8337..a7a36bd 100644
 --- a/net/wireless/nl80211.c
 +++ b/net/wireless/nl80211.c
-@@ -5626,13 +5626,10 @@ static int nl80211_new_key(struct sk_buff *skb, struct genl_info *info)
+@@ -5625,13 +5625,10 @@ static int nl80211_new_key(struct sk_buff *skb, struct genl_info *info)
  		err = nl80211_validate_key_link_id(info, wdev, link_id,
  				key.type == NL80211_KEYTYPE_PAIRWISE);
  

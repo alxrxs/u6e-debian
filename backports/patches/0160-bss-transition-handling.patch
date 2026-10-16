@@ -2470,10 +2470,10 @@ index 7b2795d..2779260 100644
  								    u8* addr)
  {
 diff --git a/drivers/net/wireless/ath/ath11k/wmi.c b/drivers/net/wireless/ath/ath11k/wmi.c
-index e46e6a1..07007c4 100644
+index 7fb20bb..572952e 100644
 --- a/drivers/net/wireless/ath/ath11k/wmi.c
 +++ b/drivers/net/wireless/ath/ath11k/wmi.c
-@@ -7687,10 +7687,12 @@ static void ath11k_wmi_event_peer_sta_ps_state_chg(struct ath11k_base *ab,
+@@ -7685,10 +7685,12 @@ static void ath11k_wmi_event_peer_sta_ps_state_chg(struct ath11k_base *ab,
  	struct ieee80211_sta *sta;
  	struct ath11k_peer *peer;
  	struct ath11k *ar;
@@ -2486,7 +2486,7 @@ index e46e6a1..07007c4 100644
  
  	tb = ath11k_wmi_tlv_parse_alloc(ab, skb, GFP_ATOMIC);
  	if (IS_ERR(tb)) {
-@@ -7714,69 +7716,65 @@ static void ath11k_wmi_event_peer_sta_ps_state_chg(struct ath11k_base *ab,
+@@ -7712,69 +7714,65 @@ static void ath11k_wmi_event_peer_sta_ps_state_chg(struct ath11k_base *ab,
  
  	rcu_read_lock();
  
@@ -2598,7 +2598,7 @@ index e46e6a1..07007c4 100644
  	rcu_read_unlock();
  	kfree(tb);
  }
-@@ -7891,9 +7889,9 @@ static void ath11k_mgmt_rx_event(struct ath11k_base *ab, struct sk_buff *skb)
+@@ -7889,9 +7887,9 @@ static void ath11k_mgmt_rx_event(struct ath11k_base *ab, struct sk_buff *skb)
  
  	spin_lock_bh(&ab->base_lock);
  
@@ -2610,7 +2610,7 @@ index e46e6a1..07007c4 100644
  	if (!peer) {
  		spin_unlock_bh(&ab->base_lock);
  		goto skip_mgmt_stats;
-@@ -8122,8 +8120,10 @@ static void ath11k_peer_sta_kickout_event(struct ath11k_base *ab, struct sk_buff
+@@ -8120,8 +8118,10 @@ static void ath11k_peer_sta_kickout_event(struct ath11k_base *ab, struct sk_buff
  	struct wmi_peer_sta_kickout_arg arg = {};
  	struct ieee80211_sta *sta;
  	struct ath11k_peer *peer;
@@ -2622,7 +2622,7 @@ index e46e6a1..07007c4 100644
  
  	if (ath11k_pull_peer_sta_kickout_ev(ab, skb, &arg) != 0) {
  		ath11k_warn(ab, "failed to extract peer sta kickout event");
-@@ -8134,40 +8134,30 @@ static void ath11k_peer_sta_kickout_event(struct ath11k_base *ab, struct sk_buff
+@@ -8132,40 +8132,30 @@ static void ath11k_peer_sta_kickout_event(struct ath11k_base *ab, struct sk_buff
  
  	spin_lock_bh(&ab->base_lock);
  

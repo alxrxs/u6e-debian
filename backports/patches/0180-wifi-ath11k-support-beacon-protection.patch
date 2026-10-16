@@ -131,10 +131,10 @@ index 615aee1..7d06d6a 100644
  	ar->hw->wiphy->ema_max_profile_periodicity = TARGET_EMA_MAX_PROFILE_PERIOD;
  
 diff --git a/drivers/net/wireless/ath/ath11k/wmi.c b/drivers/net/wireless/ath/ath11k/wmi.c
-index 07007c4..2b261f9 100644
+index 572952e..91534ac 100644
 --- a/drivers/net/wireless/ath/ath11k/wmi.c
 +++ b/drivers/net/wireless/ath/ath11k/wmi.c
-@@ -1938,6 +1938,8 @@ int ath11k_wmi_bcn_tmpl(struct ath11k *ar, u32 vdev_id,
+@@ -1936,6 +1936,8 @@ int ath11k_wmi_bcn_tmpl(struct ath11k *ar, u32 vdev_id,
  	cmd->buf_len = bcn->len;
  	cmd->mbssid_ie_offset = offs->mbssid_off;
  	cmd->ema_params = ema_params;
@@ -144,10 +144,10 @@ index 07007c4..2b261f9 100644
  	ptr = skb->data + sizeof(*cmd);
  
 diff --git a/drivers/net/wireless/ath/ath11k/wmi.h b/drivers/net/wireless/ath/ath11k/wmi.h
-index 96059fd..2c4a872 100644
+index c7e721e..f809b58 100644
 --- a/drivers/net/wireless/ath/ath11k/wmi.h
 +++ b/drivers/net/wireless/ath/ath11k/wmi.h
-@@ -2136,6 +2136,7 @@ enum wmi_tlv_service {
+@@ -2134,6 +2134,7 @@ enum wmi_tlv_service {
  	WMI_TLV_SERVICE_PER_PEER_HTT_STATS_RESET = 213,
  	WMI_TLV_SERVICE_FREQINFO_IN_METADATA = 219,
  	WMI_TLV_SERVICE_EXT2_MSG = 220,
@@ -155,7 +155,7 @@ index 96059fd..2c4a872 100644
  	WMI_TLV_SERVICE_PEER_POWER_SAVE_DURATION_SUPPORT = 246,
  	WMI_TLV_SERVICE_SRG_SRP_SPATIAL_REUSE_SUPPORT = 249,
  	WMI_TLV_SERVICE_MBSS_PARAM_IN_VDEV_START_SUPPORT = 253,
-@@ -3692,6 +3693,8 @@ struct ath11k_wmi_p2p_noa_info {
+@@ -3690,6 +3691,8 @@ struct ath11k_wmi_p2p_noa_info {
  #define WMI_EMA_FIRST_TMPL_SHIFT          16
  #define WMI_EMA_LAST_TMPL_SHIFT           24
  
@@ -164,7 +164,7 @@ index 96059fd..2c4a872 100644
  struct wmi_bcn_tmpl_cmd {
  	u32 tlv_header;
  	u32 vdev_id;
-@@ -5374,7 +5377,7 @@ enum wmi_ap_ps_peer_param {
+@@ -5362,7 +5365,7 @@ enum wmi_ap_ps_peer_param {
  
  #define DISABLE_SIFS_RESPONSE_TRIGGER 0
  

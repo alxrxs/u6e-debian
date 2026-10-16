@@ -26,7 +26,7 @@ Signed-off-by: Balamurugan Ramar <quic_bramar@quicinc.com>
  1 file changed, 1 insertion(+), 1 deletion(-)
 
 diff --git a/net/mac80211/mlme.c b/net/mac80211/mlme.c
-index dde6ca1..b441aa6 100644
+index 05ea80d..eed8581 100644
 --- a/net/mac80211/mlme.c
 +++ b/net/mac80211/mlme.c
 @@ -9088,7 +9088,7 @@ void ieee80211_sta_work(struct ieee80211_sub_if_data *sdata)

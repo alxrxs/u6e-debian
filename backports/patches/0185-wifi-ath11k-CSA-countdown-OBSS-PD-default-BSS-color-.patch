@@ -65,10 +65,10 @@ index 9d98b0f..51dd780 100644
  			ret = ath11k_wmi_vdev_set_param_cmd(ar, arvif->vdev_id,
  							    param_id,
 diff --git a/drivers/net/wireless/ath/ath11k/wmi.c b/drivers/net/wireless/ath/ath11k/wmi.c
-index a5a14b9..c49383f 100644
+index 9a4d09d..9625161 100644
 --- a/drivers/net/wireless/ath/ath11k/wmi.c
 +++ b/drivers/net/wireless/ath/ath11k/wmi.c
-@@ -1933,6 +1933,9 @@ int ath11k_wmi_bcn_tmpl(struct ath11k *ar, u32 vdev_id,
+@@ -1931,6 +1931,9 @@ int ath11k_wmi_bcn_tmpl(struct ath11k *ar, u32 vdev_id,
  	if (vif->bss_conf.csa_active) {
  		cmd->csa_switch_count_offset = offs->cntdwn_counter_offs[0];
  		cmd->ext_csa_switch_count_offset = offs->cntdwn_counter_offs[1];
@@ -78,7 +78,7 @@ index a5a14b9..c49383f 100644
  	}
  
  	cmd->buf_len = bcn->len;
-@@ -8717,10 +8720,6 @@ ath11k_wmi_process_csa_switch_count_event(struct ath11k_base *ab,
+@@ -8715,10 +8718,6 @@ ath11k_wmi_process_csa_switch_count_event(struct ath11k_base *ab,
  	int i;
  	struct ath11k_vif *arvif;
  
@@ -89,7 +89,7 @@ index a5a14b9..c49383f 100644
  	rcu_read_lock();
  	for (i = 0; i < ev->num_vdevs; i++) {
  		arvif = ath11k_mac_get_arvif_by_vdev_id(ab, vdev_ids[i]);
-@@ -8731,8 +8730,22 @@ ath11k_wmi_process_csa_switch_count_event(struct ath11k_base *ab,
+@@ -8729,8 +8728,22 @@ ath11k_wmi_process_csa_switch_count_event(struct ath11k_base *ab,
  			continue;
  		}
  

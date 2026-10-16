@@ -168,10 +168,10 @@ index 3c0d62d..0e7ad0d 100644
  #define ATH11K_THERMAL_DEFAULT_DUTY_CYCLE 100
  #define ATH11K_HWMON_NAME_LEN           15
 diff --git a/drivers/net/wireless/ath/ath11k/wmi.c b/drivers/net/wireless/ath/ath11k/wmi.c
-index 623bd31..e46e6a1 100644
+index 064d0a5..7fb20bb 100644
 --- a/drivers/net/wireless/ath/ath11k/wmi.c
 +++ b/drivers/net/wireless/ath/ath11k/wmi.c
-@@ -3255,6 +3255,7 @@ ath11k_wmi_send_thermal_mitigation_param_cmd(struct ath11k *ar,
+@@ -3253,6 +3253,7 @@ ath11k_wmi_send_thermal_mitigation_param_cmd(struct ath11k *ar,
  		lvl_conf->temp_hwm = param->levelconf[i].tmphwm;
  		lvl_conf->dc_off_percent = param->levelconf[i].dcoffpercent;
  		lvl_conf->prio = param->levelconf[i].priority;
@@ -180,10 +180,10 @@ index 623bd31..e46e6a1 100644
  	}
  
 diff --git a/drivers/net/wireless/ath/ath11k/wmi.h b/drivers/net/wireless/ath/ath11k/wmi.h
-index 6a1e9a3..96059fd 100644
+index 3b46a4d..c7e721e 100644
 --- a/drivers/net/wireless/ath/ath11k/wmi.h
 +++ b/drivers/net/wireless/ath/ath11k/wmi.h
-@@ -4053,12 +4053,14 @@ struct wmi_11d_new_cc_ev {
+@@ -4051,12 +4051,14 @@ struct wmi_11d_new_cc_ev {
  	u32 new_alpha2;
  } __packed;
  
@@ -199,7 +199,7 @@ index 6a1e9a3..96059fd 100644
  };
  
  struct thermal_mitigation_params {
-@@ -4069,6 +4071,14 @@ struct thermal_mitigation_params {
+@@ -4067,6 +4069,14 @@ struct thermal_mitigation_params {
  	struct tt_level_config levelconf[THERMAL_LEVELS];
  };
  
@@ -214,7 +214,7 @@ index 6a1e9a3..96059fd 100644
  struct wmi_therm_throt_config_request_cmd {
  	u32 tlv_header;
  	u32 pdev_id;
-@@ -4076,14 +4086,48 @@ struct wmi_therm_throt_config_request_cmd {
+@@ -4074,14 +4084,48 @@ struct wmi_therm_throt_config_request_cmd {
  	u32 dc;
  	u32 dc_per_event;
  	u32 therm_throt_levels;

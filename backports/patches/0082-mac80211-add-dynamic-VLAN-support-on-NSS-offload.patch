@@ -25,7 +25,7 @@ Signed-off-by: Sathishkumar Muruganandam <murugana@codeaurora.org>
  7 files changed, 41 insertions(+), 5 deletions(-)
 
 diff --git a/include/net/mac80211.h b/include/net/mac80211.h
-index d63ff0f..c899053 100644
+index aa172d0..a37fd78 100644
 --- a/include/net/mac80211.h
 +++ b/include/net/mac80211.h
 @@ -2439,6 +2439,8 @@ enum ieee80211_key_flags {

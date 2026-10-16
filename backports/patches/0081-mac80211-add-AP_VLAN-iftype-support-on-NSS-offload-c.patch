@@ -23,7 +23,7 @@ Signed-off-by: Sathishkumar Muruganandam <murugana@codeaurora.org>
  9 files changed, 57 insertions(+), 12 deletions(-)
 
 diff --git a/include/net/mac80211.h b/include/net/mac80211.h
-index 3cc5d2d..d63ff0f 100644
+index 3f9f422..aa172d0 100644
 --- a/include/net/mac80211.h
 +++ b/include/net/mac80211.h
 @@ -5589,6 +5589,17 @@ void ieee80211_sta_pspoll(struct ieee80211_sta *sta);
@@ -142,7 +142,7 @@ index 0903fd9..ec4c651 100644
  		} else {
  			netif_carrier_off(dev);
 diff --git a/net/mac80211/mlme.c b/net/mac80211/mlme.c
-index 233af0b..dde6ca1 100644
+index fa773f3..05ea80d 100644
 --- a/net/mac80211/mlme.c
 +++ b/net/mac80211/mlme.c
 @@ -7116,7 +7116,8 @@ static bool ieee80211_assoc_success(struct ieee80211_sub_if_data *sdata,

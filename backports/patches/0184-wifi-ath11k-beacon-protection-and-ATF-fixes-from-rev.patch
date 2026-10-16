@@ -81,7 +81,7 @@ index 51631b2..9d98b0f 100644
  				      NL80211_EXT_FEATURE_BEACON_PROTECTION);
  
 diff --git a/drivers/net/wireless/ath/ath11k/wmi.h b/drivers/net/wireless/ath/ath11k/wmi.h
-index 6de8b9c..6b582e7 100644
+index c5e4ad6..8868e9d 100644
 --- a/drivers/net/wireless/ath/ath11k/wmi.h
 +++ b/drivers/net/wireless/ath/ath11k/wmi.h
 @@ -627,6 +627,7 @@ enum wmi_tlv_cmd_id {
@@ -92,8 +92,8 @@ index 6de8b9c..6b582e7 100644
  };
  
  enum wmi_tlv_event_id {
-@@ -1898,6 +1899,8 @@ enum wmi_tlv_tag {
- 	WMI_TAG_MUEDCA_PARAMS_CONFIG_EVENT = 0x32a,
+@@ -1896,6 +1897,8 @@ enum wmi_tlv_tag {
+ 	WMI_TAG_PEER_CFR_CAPTURE_EVENT = 0x317,
  	WMI_TAG_CFR_CAPTURE_PHASE_PARAM = 0x33b,
  	WMI_TAG_FILS_DISCOVERY_TMPL_CMD = 0x344,
 +	WMI_TAG_ATF_SSID_GRP_REQUEST = 0x346,
@@ -101,7 +101,7 @@ index 6de8b9c..6b582e7 100644
  	WMI_TAG_PDEV_SRG_BSS_COLOR_BITMAP_CMD = 0x37b,
  	WMI_TAG_PDEV_SRG_PARTIAL_BSSID_BITMAP_CMD,
  	WMI_TAG_PDEV_SRG_OBSS_COLOR_ENABLE_BITMAP_CMD = 0x381,
-@@ -3704,11 +3707,6 @@ struct ath11k_wmi_p2p_noa_info {
+@@ -3702,11 +3705,6 @@ struct ath11k_wmi_p2p_noa_info {
  #define WMI_PEER_ATF_REQ_FLAG_PDEV_ID_VALID	BIT(2)
  #define WMI_ATF_GROUP_POLICY_FAIR		0
  

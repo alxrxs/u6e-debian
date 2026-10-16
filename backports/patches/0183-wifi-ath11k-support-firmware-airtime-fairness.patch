@@ -200,10 +200,10 @@ index 196b59d..51631b2 100644
  	ar->hw->wiphy->ema_max_profile_periodicity = TARGET_EMA_MAX_PROFILE_PERIOD;
  
 diff --git a/drivers/net/wireless/ath/ath11k/wmi.c b/drivers/net/wireless/ath/ath11k/wmi.c
-index 2b261f9..a5a14b9 100644
+index 91534ac..9a4d09d 100644
 --- a/drivers/net/wireless/ath/ath11k/wmi.c
 +++ b/drivers/net/wireless/ath/ath11k/wmi.c
-@@ -4599,6 +4599,100 @@ int ath11k_wmi_set_hw_mode(struct ath11k_base *ab,
+@@ -4597,6 +4597,100 @@ int ath11k_wmi_set_hw_mode(struct ath11k_base *ab,
  	return 0;
  }
  
@@ -304,7 +304,7 @@ index 2b261f9..a5a14b9 100644
  int ath11k_wmi_cmd_init(struct ath11k_base *ab)
  {
  	struct ath11k_wmi_base *wmi_ab = &ab->wmi_ab;
-@@ -4617,6 +4711,9 @@ int ath11k_wmi_cmd_init(struct ath11k_base *ab)
+@@ -4615,6 +4709,9 @@ int ath11k_wmi_cmd_init(struct ath11k_base *ab)
  		     ab->wmi_ab.svc_map))
  		config.is_reg_cc_ext_event_supported = 1;
  
@@ -315,7 +315,7 @@ index 2b261f9..a5a14b9 100644
  
  	init_param.res_cfg = &wmi_ab->wlan_resource_config;
 diff --git a/drivers/net/wireless/ath/ath11k/wmi.h b/drivers/net/wireless/ath/ath11k/wmi.h
-index 2c4a872..6de8b9c 100644
+index f809b58..c5e4ad6 100644
 --- a/drivers/net/wireless/ath/ath11k/wmi.h
 +++ b/drivers/net/wireless/ath/ath11k/wmi.h
 @@ -212,6 +212,7 @@ enum wmi_cmd_group {
@@ -326,7 +326,7 @@ index 2c4a872..6de8b9c 100644
  };
  
  #define WMI_CMD_GRP(grp_id) (((grp_id) << 12) | 0x1)
-@@ -2372,6 +2373,7 @@ struct wmi_init_cmd {
+@@ -2370,6 +2371,7 @@ struct wmi_init_cmd {
  } __packed;
  
  #define WMI_RSRC_CFG_FLAG1_BSS_CHANNEL_INFO_64 BIT(5)
@@ -334,7 +334,7 @@ index 2c4a872..6de8b9c 100644
  #define WMI_RSRC_CFG_FLAG2_CALC_NEXT_DTIM_COUNT_SET BIT(9)
  #define WMI_RSRC_CFG_FLAG1_ACK_RSSI BIT(18)
  
-@@ -3695,6 +3697,53 @@ struct ath11k_wmi_p2p_noa_info {
+@@ -3693,6 +3695,53 @@ struct ath11k_wmi_p2p_noa_info {
  
  #define WMI_BCN_TMPL_BEACON_PROTECTION_EN BIT(0)
  
@@ -388,7 +388,7 @@ index 2c4a872..6de8b9c 100644
  struct wmi_bcn_tmpl_cmd {
  	u32 tlv_header;
  	u32 vdev_id;
-@@ -6604,6 +6653,10 @@ int ath11k_wmi_vdev_start(struct ath11k *ar, struct wmi_vdev_start_req_arg *arg,
+@@ -6592,6 +6641,10 @@ int ath11k_wmi_vdev_start(struct ath11k *ar, struct wmi_vdev_start_req_arg *arg,
  			  bool restart);
  int ath11k_wmi_set_peer_param(struct ath11k *ar, const u8 *peer_addr,
  			      u32 vdev_id, u32 param_id, u32 param_val);

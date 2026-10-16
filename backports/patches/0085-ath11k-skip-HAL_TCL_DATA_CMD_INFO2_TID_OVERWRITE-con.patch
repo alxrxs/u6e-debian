@@ -15,7 +15,7 @@ Signed-off-by: Gautham Kumar Senthilkumaran <quic_gauthamk@quicinc.com>
  2 files changed, 4 insertions(+)
 
 diff --git a/include/net/mac80211.h b/include/net/mac80211.h
-index 06309bd..e071c02 100644
+index f2848e1..3ce1193 100644
 --- a/include/net/mac80211.h
 +++ b/include/net/mac80211.h
 @@ -3125,6 +3125,8 @@ struct ieee80211_txq {

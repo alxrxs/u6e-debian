@@ -37,7 +37,7 @@ Signed-off-by: Gautham Kumar Senthilkumaran <quic_gauthamk@quicinc.com>
  10 files changed, 679 insertions(+), 53 deletions(-)
 
 diff --git a/include/net/mac80211.h b/include/net/mac80211.h
-index c899053..06309bd 100644
+index a37fd78..f2848e1 100644
 --- a/include/net/mac80211.h
 +++ b/include/net/mac80211.h
 @@ -145,6 +145,9 @@
@@ -144,7 +144,7 @@ index c899053..06309bd 100644
  	void (*sta_set_airtime_weight)(struct ieee80211_hw *hw,
  				       struct ieee80211_vif *vif,
  				       struct ieee80211_sta *sta, u16 weight);
-@@ -8277,6 +8306,103 @@ int ieee80211_emulate_switch_vif_chanctx(struct ieee80211_hw *hw,
+@@ -8263,6 +8292,103 @@ int ieee80211_emulate_switch_vif_chanctx(struct ieee80211_hw *hw,
   */
  bool ieee80211_vif_nan_started(struct ieee80211_vif *vif);
  

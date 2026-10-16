@@ -29,7 +29,7 @@ Signed-off-by: Yuvasree Sivasankaran <quic_ysivasan@quicinc.com>
  10 files changed, 80 insertions(+), 35 deletions(-)
 
 diff --git a/include/net/mac80211.h b/include/net/mac80211.h
-index e071c02..07305cb 100644
+index 3ce1193..4e0928d 100644
 --- a/include/net/mac80211.h
 +++ b/include/net/mac80211.h
 @@ -3127,6 +3127,9 @@ struct ieee80211_txq {
