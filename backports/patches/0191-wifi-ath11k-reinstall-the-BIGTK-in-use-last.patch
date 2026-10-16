@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Fri, 16 Oct 2026 21:24:38 +0300
+Subject: [PATCH] wifi: ath11k: reinstall the BIGTK in use last
+
+The firmware signs beacons with the BIGTK installed last. When a group
+key changes while no station is associated, the first station to
+associate makes ath11k_set_group_keys() reinstall all group keys in
+index order, so with both BIGTKs installed index 7 always went last:
+after a rekey to index 6 the beacons were signed with the previous key
+again until the next rekey. Associated stations, which still had it,
+saw nothing; a station joining in that window got the new BIGTK only,
+verified no beacon and disconnected. With a daily rekey on a BSS that
+was empty at that moment, that lasted a day.
+
+Track the BIGTK installed last and reinstall it after the other keys.
+
+Assisted-by: LLM
+Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
+---
+ drivers/net/wireless/ath/ath11k/core.h |  2 ++
+ drivers/net/wireless/ath/ath11k/mac.c  | 41 ++++++++++++++++++--------
+ 2 files changed, 31 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath11k/core.h b/drivers/net/wireless/ath/ath11k/core.h
+index da985b2..55fc98c 100644
+--- a/drivers/net/wireless/ath/ath11k/core.h
++++ b/drivers/net/wireless/ath/ath11k/core.h
+@@ -458,6 +458,8 @@ struct ath11k_vif {
+ 	struct ath11k_rekey_data rekey_data;
+ 	u32 num_stations;
+ 	bool reinstall_group_keys;
++	/* BIGTK index the firmware signs beacons with (the last installed) */
++	u8 bigtk_keyidx;
+ 
+ 	struct ath11k_reg_tpc_power_info reg_tpc_info;
+ 	struct ath11k_mgmt_frame_stats mgmt_stats;
+diff --git a/drivers/net/wireless/ath/ath11k/mac.c b/drivers/net/wireless/ath/ath11k/mac.c
+index 63f8b2d..28f1812 100644
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -4602,35 +4602,50 @@ static int ath11k_clear_peer_keys(struct ath11k_vif *arvif,
+ 	return first_errno;
+ }
+ 
++static int ath11k_set_group_key(struct ath11k_vif *arvif,
++				struct ieee80211_key_conf *key)
++{
++	int ret;
++
++	if (!key || (key->flags & IEEE80211_KEY_FLAG_PAIRWISE))
++		return 0;
++
++	ret = ath11k_install_key(arvif, key, SET_KEY, arvif->bssid,
++				 WMI_KEY_GROUP);
++	if (ret < 0)
++		ath11k_warn(arvif->ar->ab, "failed to set group key of idx %d for vdev %d: %d\n",
++			    key->keyidx, arvif->vdev_id, ret);
++	return ret;
++}
++
+ static int ath11k_set_group_keys(struct ath11k_vif *arvif)
+ {
+ 	struct ath11k *ar = arvif->ar;
+ 	struct ath11k_base *ab = ar->ab;
+-	const u8 *addr = arvif->bssid;
+ 	int i, ret, first_errno = 0;
+ 	struct ath11k_peer *peer;
+ 
+ 	spin_lock_bh(&ab->base_lock);
+-	peer = ath11k_peer_find(ar, arvif->vdev_id, addr);
++	peer = ath11k_peer_find(ar, arvif->vdev_id, arvif->bssid);
+ 	spin_unlock_bh(&ab->base_lock);
+ 
+ 	if (!peer)
+ 		return -ENOENT;
+ 
++	/* The firmware signs beacons with the BIGTK installed last, so the
++	 * one in use goes after the other, whatever their indexes.
++	 */
+ 	for (i = 0; i < ARRAY_SIZE(peer->keys); i++) {
+-		struct ieee80211_key_conf *key = peer->keys[i];
+-
+-		if (!key || (key->flags & IEEE80211_KEY_FLAG_PAIRWISE))
++		if (arvif->bigtk_keyidx && i == arvif->bigtk_keyidx)
+ 			continue;
+-
+-		ret = ath11k_install_key(arvif, key, SET_KEY, addr,
+-					 WMI_KEY_GROUP);
++		ret = ath11k_set_group_key(arvif, peer->keys[i]);
++		if (ret < 0 && first_errno == 0)
++			first_errno = ret;
++	}
++	if (arvif->bigtk_keyidx) {
++		ret = ath11k_set_group_key(arvif, peer->keys[arvif->bigtk_keyidx]);
+ 		if (ret < 0 && first_errno == 0)
+ 			first_errno = ret;
+-
+-		if (ret < 0)
+-			ath11k_warn(ab, "failed to set group key of idx %d for vdev %d: %d\n",
+-				    i, arvif->vdev_id, ret);
+ 	}
+ 
+ 	return first_errno;
+@@ -4803,6 +4818,8 @@ static int ath11k_mac_op_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
+ 
+ 		if (flags == WMI_KEY_GROUP && cmd == SET_KEY && is_ap_with_no_sta)
+ 			arvif->reinstall_group_keys = true;
++		if (flags == WMI_KEY_GROUP && cmd == SET_KEY && key->keyidx >= 6)
++			arvif->bigtk_keyidx = key->keyidx;
+ 	}
+ 
+ 	/* VLAN ID is updated non-zero only for AP_VLAN vif */
