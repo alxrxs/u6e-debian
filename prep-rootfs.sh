@@ -180,27 +180,12 @@ sed -i "s/@LED@/$AP_LED/g" $RF/etc/systemd/system/u6e-leds.service
 ln -sf /etc/systemd/system/u6e-leds.service $RF/etc/systemd/system/sysinit.target.wants/u6e-leds.service
 
 # The AP keeps no logs (the journal is in RAM): systemd-netlogd sends the whole
-# journal to the site's syslog collector (LOG_SERVER, address:port), and a
-# timer logs the AP's state every 5 minutes, so a long run can be read back.
+# journal to the site's syslog collector (LOG_SERVER, address:port), and
+# u6e-agent logs the AP's state every 5 minutes, so a long run can be read back.
 install -d $RF/etc/systemd/netlogd.conf.d
 printf '[Network]\nAddress=%s\nProtocol=udp\nLogFormat=rfc5424\n' "$LOG_SERVER" \
 	> $RF/etc/systemd/netlogd.conf.d/u6e.conf
 ln -sf /usr/lib/systemd/system/systemd-netlogd.service $W/systemd-netlogd.service
-cat > $RF/usr/local/sbin/u6e-stats <<'STATS'
-#!/bin/sh
-# One line of the AP's state for the syslog collector: load, free memory, the
-# clients of each BSS, the thermal zones and the Wi-Fi firmware crashes so far.
-sta=$(for c in /run/hostapd/*; do i=${c##*/}; printf '%s=%s ' $i "$(hostapd_cli -p /run/hostapd -i $i list_sta 2>/dev/null | wc -l)"; done)
-temp=$(for z in /sys/class/thermal/thermal_zone*; do printf '%s=%s ' "$(cat $z/type)" $(($(cat $z/temp) / 1000)); done)
-logger -t u6e-stats "load=$(cut -d' ' -f1 /proc/loadavg) memavail_kb=$(awk '/MemAvailable/ {print $2}' /proc/meminfo) fw_crashes=$(dmesg | grep -c 'firmware crashed') clients: ${sta}temps: $temp"
-STATS
-chmod 0755 $RF/usr/local/sbin/u6e-stats
-printf '[Unit]\nDescription=U6E state to the log\n\n[Service]\nType=oneshot\nExecStart=/usr/local/sbin/u6e-stats\n' \
-	> $RF/etc/systemd/system/u6e-stats.service
-printf '[Unit]\nDescription=U6E state to the log every 5 minutes\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=5min\n\n[Install]\nWantedBy=timers.target\n' \
-	> $RF/etc/systemd/system/u6e-stats.timer
-install -d $RF/etc/systemd/system/timers.target.wants
-ln -sf /etc/systemd/system/u6e-stats.timer $RF/etc/systemd/system/timers.target.wants/u6e-stats.timer
 
 # Wi-Fi comes up on its own on every boot: u6e-wifi is boot/wifi-up.sh's AP
 # side (with the site's Wi-Fi secrets, so root-only, as is the image), and the
@@ -226,24 +211,26 @@ WantedBy=multi-user.target
 UNIT
 ln -sf /etc/systemd/system/u6e-wifi.service $W/u6e-wifi.service
 
-# 802.11k across APs: u6e-neighbors (pkg/u6e-neighbors), one resident process
-# that every 10 s reads this AP's own neighbor report entries (of the radios
-# that are up) from hostapd, serves them to the other APs (U6E_APS) on
-# NR_PORT, reads theirs and makes each BSS's neighbor list carry the other
-# APs' BSSs of its SSID, changing hostapd only where something differs; an AP
-# that stops answering drops out within a round. These entries are also OCE's
-# AP Channel Report.
+# u6e-agent (pkg/u6e-agent): one resident process for the AP's periodic work.
+# 802.11k across APs: every 10 s it reads this AP's own neighbor report entries
+# (of the radios that are up) from hostapd, serves them to the other APs
+# (U6E_APS) on NR_PORT, reads theirs and makes each BSS's neighbor list carry
+# the other APs' BSSs of its SSID, changing hostapd only where something
+# differs; an AP that stops answering drops out within a round. These entries
+# are also OCE's AP Channel Report. It also checks the management network
+# (below) and logs the AP's state.
 NR_PORT=8211
-peers=$(for a in $U6E_APS; do (U6E_AP=$a; . ./site.conf; echo "${MGMT_ADDR%/*}"); done | grep -vx "$MGMT_IP" | tr '\n' ' ')
-install -m0755 pkg/u6e-neighbors/target/aarch64-unknown-linux-musl/release/u6e-neighbors $RF/usr/local/sbin/
-cat > $RF/etc/systemd/system/u6e-neighbors.service <<UNIT
+peers=$(for a in $U6E_APS; do (U6E_AP=$a; . ./site.conf; echo "${MGMT_ADDR%/*}"); done | grep -vx "$MGMT_IP" | sed 's/^/--peer /' | tr '\n' ' ')
+arm=; [ "${U6E_PERSIST:-0}" = 1 ] && arm=--arm
+install -m0755 pkg/u6e-agent/target/aarch64-unknown-linux-musl/release/u6e-agent $RF/usr/local/sbin/
+cat > $RF/etc/systemd/system/u6e-agent.service <<UNIT
 [Unit]
-Description=U6E neighbor reports across APs
+Description=U6E agent: neighbor reports across APs, management network check, state
 After=u6e-wifi.service
 
 [Service]
-ExecStart=/usr/local/sbin/u6e-neighbors $MGMT_IP $NR_PORT $peers
-RuntimeDirectory=u6e-neighbors
+ExecStart=/usr/local/sbin/u6e-agent --listen $MGMT_IP --port $NR_PORT --gateway $MGMT_GW $arm $peers
+RuntimeDirectory=u6e-agent
 RuntimeDirectoryMode=0755
 Restart=always
 RestartSec=10
@@ -255,7 +242,7 @@ PrivateTmp=yes
 [Install]
 WantedBy=multi-user.target
 UNIT
-ln -sf /etc/systemd/system/u6e-neighbors.service $W/u6e-neighbors.service
+ln -sf /etc/systemd/system/u6e-agent.service $W/u6e-agent.service
 
 # The boot that brought this image up was one-shot: U-Boot disarmed it before
 # starting us. u6e-arm re-arms it from the steps go8.sh staged, or with "disarm"
@@ -282,19 +269,18 @@ want="setenv bootcmd_real bootubnt; saveenv; ${steps}run u8b"
 ARM
 chmod 0755 $RF/usr/local/sbin/u6e-arm
 
-# Management network up 3 minutes after boot: with U6E_PERSIST the image re-arms
-# itself once, so a reboot or power cut comes back here. None: disarm, put the
-# journal into pstore and warm-reboot, so the fallback to stock keeps the
-# evidence (boot/ramoops.sh). ARP, not ICMP: a gateway may well drop pings.
-cat > $RF/usr/local/sbin/u6e-netcheck <<'CHECK'
+# Management network: u6e-agent checks from 3 minutes after boot, once a minute,
+# that the gateway resolves over ARP. With U6E_PERSIST the first success starts
+# u6e-arm.service, so a reboot or power cut comes back here; a failure starts
+# u6e-fallback.service: disarm, put the journal into pstore and warm-reboot, so
+# the fallback to stock keeps the evidence (boot/ramoops.sh). Both run outside
+# the agent's sandbox.
+printf '[Unit]\nDescription=U6E boot re-armed into this image\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/usr/local/sbin/u6e-arm\n' \
+	> $RF/etc/systemd/system/u6e-arm.service
+cat > $RF/usr/local/sbin/u6e-fallback <<'FALLBACK'
 #!/bin/sh
-ping -c1 -W2 @MGMT_GW@ >/dev/null 2>&1
-if ip neigh show @MGMT_GW@ | grep -qE 'REACHABLE|STALE|DELAY|PROBE'; then
-	[ @PERSIST@ = 1 ] && [ ! -e /run/u6e-armed ] && /usr/local/sbin/u6e-arm && touch /run/u6e-armed
-	exit 0
-fi
 /usr/local/sbin/u6e-arm disarm
-{ echo "u6e-netcheck: no gateway at $(cut -d' ' -f1 /proc/uptime)s; links:"; ip -br link; ip -br addr; ip neigh
+{ echo "u6e-fallback: no gateway at $(cut -d' ' -f1 /proc/uptime)s; links:"; ip -br link; ip -br addr; ip neigh
   mount -t debugfs none /sys/kernel/debug 2>/dev/null; D=/sys/kernel/debug/qca-nss-drv/stats
   grep -iE 'uniphy|gmac1|cmn_pll|ubi32' /sys/kernel/debug/clk/clk_summary; head -20 /sys/kernel/debug/clk/clk_orphan_summary
   ip -s -d link show lan; tc -s qdisc show dev lan; ethtool -S lan | grep -vE ': 0$'
@@ -310,15 +296,11 @@ fi
   journalctl -b --no-pager -o short-monotonic | grep -vE 'mem_seg|board name|: 000000[0-9a-f]0: ' | tail -n 700
 } | head -c 120000 > /dev/pmsg0
 systemctl reboot
-CHECK
-sed -i "s/@MGMT_GW@/$MGMT_GW/g; s/@MGMT_IF@/$MGMT_IF/g; s/@PERSIST@/${U6E_PERSIST:-0}/g" $RF/usr/local/sbin/u6e-netcheck
-chmod 0755 $RF/usr/local/sbin/u6e-netcheck
-printf '[Unit]\nDescription=U6E reboot to stock when the management network is lost\n\n[Service]\nType=oneshot\nExecStart=/usr/local/sbin/u6e-netcheck\n' \
-	> $RF/etc/systemd/system/u6e-netcheck.service
-printf '[Unit]\nDescription=U6E management network check\n\n[Timer]\nOnBootSec=180\nOnUnitActiveSec=60\n\n[Install]\nWantedBy=timers.target\n' \
-	> $RF/etc/systemd/system/u6e-netcheck.timer
-install -d $RF/etc/systemd/system/timers.target.wants
-ln -sf /etc/systemd/system/u6e-netcheck.timer $RF/etc/systemd/system/timers.target.wants/u6e-netcheck.timer
+FALLBACK
+sed -i "s/@MGMT_IF@/$MGMT_IF/g" $RF/usr/local/sbin/u6e-fallback
+chmod 0755 $RF/usr/local/sbin/u6e-fallback
+printf '[Unit]\nDescription=U6E reboot to stock when the management network is lost\n\n[Service]\nType=oneshot\nExecStart=/usr/local/sbin/u6e-fallback\n' \
+	> $RF/etc/systemd/system/u6e-fallback.service
 
 # Wi-Fi: per-unit calibration is written from ART at every boot, before anything
 # loads ath11k; board-2.bin adds the U6-Enterprise BDF variants (fw/mk-board2.sh).

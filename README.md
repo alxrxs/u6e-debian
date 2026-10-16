@@ -47,7 +47,7 @@ sudo BOOT=0 ./deploy.sh           # build everything, each image included, but b
 5. `pkg/hostapd/build.sh`: builds hostapd (the program that runs the Wi-Fi networks) as a Debian package.
 6. `pkg/iproute2-nss/build.sh`: builds Debian's `iproute2` with the NSS traffic-shaping options added to `tc`.
 7. `mkrootfs.sh`: creates the Debian root filesystem.
-8. `pkg/u6e-neighbors`: builds the neighbor report exchange between access points (Rust, one static binary).
+8. `pkg/u6e-agent`: builds the access point's resident agent (Rust, one static binary): the neighbor report exchange between access points, the management network check and the state line in the log.
 9. For each access point whose running image was built from other inputs (this repository, `$BLOBS`, `site.conf` or the source trees): `prep-rootfs.sh` builds its image, `boot/stage.sh` boots it, and `deploy.sh` waits until all three radios are up. An access point already running the current build is left alone; `FORCE=1` boots a new image anyway. With `BOOT=0` each image is built and kept but not booted, so the access points keep running until a later run boots it.
 
 Every image is kept in `images/` with a `MANIFEST` (versions and checksums), so an earlier build can be booted again without rebuilding.
@@ -69,7 +69,7 @@ Ubiquiti's boot loader (U-Boot) is 32-bit and only starts its own signed images,
 
 `boot/go8.sh` does the staging while the stock firmware is running. It copies the shim, the kernel, the device tree and the initial filesystem into stock's data partition on the eMMC (changing only the parts that differ), and writes a one-shot U-Boot boot command that loads them. The next reboot starts Debian. The reboot after that returns to stock, because the command removes itself as it runs. `boot/stage.sh` does the whole cycle for one access point, from either system, and `boot/apstate.sh` tells you which system is running.
 
-Persistent mode: with `U6E_PERSIST=1` in `site.conf`, the image re-arms the boot command once the management network is reachable (`u6e-netcheck` and `u6e-arm`), so reboots and power cuts come back into Debian. If the network never comes up, or is lost later, the boot command is removed and the access point returns to stock instead of looping. `u6e-arm disarm` does the same by hand. Each Debian boot in persistent mode writes the 64 KiB U-Boot settings area twice.
+Persistent mode: with `U6E_PERSIST=1` in `site.conf`, the image re-arms the boot command once the management network is reachable (`u6e-agent` checks it every minute and starts `u6e-arm`), so reboots and power cuts come back into Debian. If the network never comes up, or is lost later, `u6e-fallback` removes the boot command and the access point returns to stock instead of looping. `u6e-arm disarm` does the same by hand. Each Debian boot in persistent mode writes the 64 KiB U-Boot settings area twice.
 
 ## What the access point does
 
@@ -82,7 +82,7 @@ Wi-Fi starts by itself on every boot (`u6e-wifi.service`), with nothing else on 
 
 **Roaming and client help**
 - Fast roaming between radios and access points (802.11r).
-- Roaming advice for clients (802.11k and 802.11v). The access points send each other lists of their networks every 10 seconds (`u6e-neighbors`, a single small process that changes hostapd's lists only when they differ), so clients are told about the others.
+- Roaming advice for clients (802.11k and 802.11v). The access points send each other lists of their networks every 10 seconds (`u6e-agent`, a single small process that changes hostapd's lists only when they differ), so clients are told about the others.
 - Optimized Connectivity (OCE), Agile Multiband (MBO) and Wi-Fi QoS Management, which help clients pick the best band and mark their traffic correctly.
 - Beacon protection on 5 GHz and 6 GHz, which stops forged beacons.
 - Time-of-flight ranging for indoor location, 6 GHz discovery frames, and 6 GHz announcements on the 2.4 and 5 GHz beacons so clients find 6 GHz quickly.
@@ -93,7 +93,7 @@ Wi-Fi starts by itself on every boot (`u6e-wifi.service`), with nothing else on 
 - The usual Wi-Fi 4/5/6 speed features are enabled: beamforming, TWT and spatial reuse among them.
 
 **Running it day to day**
-- The whole system log goes to your syslog collector (the access point keeps logs only in RAM), the kernel log goes out over the network, and `u6e-stats` adds load, memory, clients per network, temperatures and Wi-Fi firmware crashes every 5 minutes.
+- The whole system log goes to your syslog collector (the access point keeps logs only in RAM), the kernel log goes out over the network, and `u6e-agent` adds load, memory, clients per network, temperatures and Wi-Fi firmware crashes every 5 minutes.
 - A hang triggers a reset by the watchdog (a hardware timer), and crash information survives the reset so it can be read back from stock.
 - Each radio's own calibration is loaded at boot, and the status LED can be set to off, blue or white.
 - Bluetooth (LE and Classic) works with BlueZ under the stock firmware's address, the board's base MAC + 4: the controller stays unconfigured until `u6e-btaddr` gives it that address at boot. With `BT_POWERED=0` in `site.conf` it stays off until powered by hand (`bluetoothctl power on`). Never unload `btqcomipc` on a running access point: the SoC hangs until the watchdog resets it.
@@ -111,7 +111,7 @@ Wi-Fi starts by itself on every boot (`u6e-wifi.service`), with nothing else on 
 | `fw/` | Builds the board data files; includes `ath11k-bdencoder` |
 | `pkg/hostapd/` | hostapd build with our 23 patches |
 | `pkg/iproute2-nss/` | `iproute2` with NSS support in `tc` |
-| `pkg/u6e-neighbors/` | The neighbor report exchange between access points (Rust) |
+| `pkg/u6e-agent/` | The access point's resident agent: neighbor reports across access points, management network check, state line (Rust) |
 | `mkrootfs.sh` | Creates the Debian root filesystem |
 | `prep-rootfs.sh` | Adds the kernel, firmware and configuration, and produces one image per access point |
 | `u6e-caldata` | Script that writes each radio's calibration at boot |

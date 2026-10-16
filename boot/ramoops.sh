@@ -1,7 +1,7 @@
 #!/bin/bash
 # Read our kernel's pstore (ramoops @ 0x4e000000, see the board DTS) from the
 # stock firmware after a failed boot fell back to it: prints the console log,
-# any oops/panic records and the pmsg journal u6e-netcheck leaves. memdump is
+# any oops/panic records and the pmsg journal u6e-fallback leaves. memdump is
 # built from memdump.c (static armhf; /dev/mem read() refuses the no-map range,
 # mmap works) and lives in stock's /tmp.
 #   ramoops.sh [lines]   (console tail length, default 60)
@@ -37,7 +37,7 @@ for off, cap, kind in ((0x0, 0x20000, 'crash record'), (0x20000, 0x20000, 'crash
     if kind == 'console':
         log = data[start:] + data[:start] if start < size else data
         print('\n'.join(log.decode('utf-8', 'replace').splitlines()[-int(sys.argv[2]):]))
-    elif kind == 'pmsg':  # u6e-netcheck's snapshot leads, the journal tail follows
+    elif kind == 'pmsg':  # u6e-fallback's snapshot leads, the journal tail follows
         print(data.decode('utf-8', 'replace'))
     else:  # pstore deflates oops dumps (CONFIG_PSTORE_COMPRESS); ramoops prefixes a ====sec.nsec-C line
         if data.startswith(b'===='):

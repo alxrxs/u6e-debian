@@ -1,23 +1,23 @@
-//! 802.11k across APs. Every 10 s: read this AP's own neighbor report entries
-//! (of the radios that are up) from hostapd, serve them to the other APs, read
-//! theirs, and make each BSS's neighbor list carry the other APs' BSSs of its
-//! SSID, changing hostapd only where something differs. An AP that stops
-//! answering drops out within a round. One process; it forks nothing.
-//!
-//!   u6e-neighbors <listen address> <port> [<peer address>...]
+//! 802.11k across APs. Every round (10 s): read this AP's own neighbor report
+//! entries (of the radios that are up) from hostapd, serve them to the other
+//! APs, read theirs, and make each BSS's neighbor list carry the other APs'
+//! BSSs of its SSID, changing hostapd only where something differs. An AP that
+//! stops answering drops out within a round.
+
+pub const ROUND_SECS: u64 = 10;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixDatagram;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use std::{env, fs, process, thread};
+use std::{fs, thread};
 
 const HOSTAPD: &str = "/run/hostapd";
-const CTRL: &str = "/run/u6e-neighbors/ctrl";
-const ROUND: Duration = Duration::from_secs(10);
+const CTRL: &str = "/run/u6e-agent/ctrl";
+const ROUND: Duration = Duration::from_secs(ROUND_SECS);
 const TIMEOUT: Duration = Duration::from_secs(3);
 
 /// A neighbor report entry: BSSID, and SSID and element in hex.
@@ -62,12 +62,22 @@ fn peer_entry(line: &str) -> Option<Entry> {
     })
 }
 
-struct Hostapd {
+pub struct Hostapd {
     sock: UnixDatagram,
     buf: Vec<u8>,
 }
 
 impl Hostapd {
+    pub fn open() -> std::io::Result<Self> {
+        let _ = fs::remove_file(CTRL);
+        let sock = UnixDatagram::bind(CTRL)?;
+        sock.set_read_timeout(Some(Duration::from_secs(1)))?;
+        Ok(Hostapd {
+            sock,
+            buf: vec![0; 65536],
+        })
+    }
+
     /// One control interface request; "" when hostapd does not answer. A
     /// reply left over from a request that timed out is discarded first.
     fn request(&mut self, iface: &str, cmd: &str) -> String {
@@ -98,7 +108,8 @@ fn fetch(peer: &SocketAddr) -> Vec<Entry> {
     data.lines().filter_map(peer_entry).collect()
 }
 
-fn round(h: &mut Hostapd, own: &Mutex<String>, peers: &[SocketAddr]) {
+/// One round; returns each BSS's number of stations.
+pub fn round(h: &mut Hostapd, own: &Mutex<String>, peers: &[SocketAddr]) -> Vec<(String, u32)> {
     let ifaces: Vec<String> = fs::read_dir(HOSTAPD)
         .into_iter()
         .flatten()
@@ -107,12 +118,12 @@ fn round(h: &mut Hostapd, own: &Mutex<String>, peers: &[SocketAddr]) {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
     let (mut lists, mut mine, mut up) = (Vec::new(), HashSet::new(), String::new());
+    let mut stations = Vec::new();
     for iface in ifaces {
         let list = h.request(&iface, "SHOW_NEIGHBOR");
-        let enabled = h
-            .request(&iface, "STATUS")
-            .lines()
-            .any(|l| l == "state=ENABLED");
+        let status = h.request(&iface, "STATUS");
+        let enabled = status.lines().any(|l| l == "state=ENABLED");
+        stations.push((iface.clone(), num_sta(&status, &iface)));
         let mut ssid = None;
         for e in list.lines().filter_map(own_entry) {
             if enabled {
@@ -133,6 +144,7 @@ fn round(h: &mut Hostapd, own: &Mutex<String>, peers: &[SocketAddr]) {
             }
         }
     }
+    stations
 }
 
 /// The hostapd commands that make a BSS's neighbor list (its SHOW_NEIGHBOR
@@ -160,9 +172,21 @@ fn changes(list: &str, ssid: &str, mine: &HashSet<String>, theirs: &[Entry]) -> 
     cmds
 }
 
+/// A BSS's station count in its radio's STATUS: "bss[i]=<name>" and
+/// "num_sta[i]=<n>".
+fn num_sta(status: &str, iface: &str) -> u32 {
+    let field = |key: &str| status.lines().find_map(|l| l.strip_prefix(key));
+    let i = status
+        .lines()
+        .find_map(|l| l.strip_prefix("bss[")?.strip_suffix(&format!("]={iface}")));
+    i.and_then(|i| field(&format!("num_sta[{i}]=")))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
 /// Serve this AP's entries to whoever connects. The management address may
 /// come up after us, so binding is retried every round.
-fn serve(addr: SocketAddr, own: Arc<Mutex<String>>) {
+pub fn serve(addr: SocketAddr, own: Arc<Mutex<String>>) {
     let listener = loop {
         match TcpListener::bind(addr) {
             Ok(l) => break l,
@@ -173,45 +197,6 @@ fn serve(addr: SocketAddr, own: Arc<Mutex<String>>) {
         let data = own.lock().unwrap().clone();
         let _ = conn.set_write_timeout(Some(TIMEOUT));
         let _ = (&conn).write_all(data.as_bytes());
-    }
-}
-
-fn main() {
-    let args: Vec<String> = env::args().skip(1).collect();
-    let parse = |a: &String| a.parse::<IpAddr>().ok();
-    let (Some(listen), Some(port)) = (
-        args.first().and_then(parse),
-        args.get(1).and_then(|p| p.parse::<u16>().ok()),
-    ) else {
-        eprintln!("usage: u6e-neighbors <listen address> <port> [<peer address>...]");
-        process::exit(2);
-    };
-    let Some(peers) = args[2..]
-        .iter()
-        .map(|a| parse(a).map(|ip| SocketAddr::new(ip, port)))
-        .collect::<Option<Vec<_>>>()
-    else {
-        eprintln!("u6e-neighbors: a peer is not an IP address");
-        process::exit(2);
-    };
-
-    let _ = fs::remove_file(CTRL);
-    let sock = UnixDatagram::bind(CTRL).unwrap_or_else(|e| {
-        eprintln!("u6e-neighbors: {CTRL}: {e}");
-        process::exit(1);
-    });
-    let _ = sock.set_read_timeout(Some(Duration::from_secs(1)));
-    let mut h = Hostapd {
-        sock,
-        buf: vec![0; 65536],
-    };
-
-    let own = Arc::new(Mutex::new(String::new()));
-    let served = Arc::clone(&own);
-    thread::spawn(move || serve(SocketAddr::new(listen, port), served));
-    loop {
-        round(&mut h, &own, &peers);
-        thread::sleep(ROUND);
     }
 }
 
@@ -280,6 +265,14 @@ mod tests {
         let list = format!("{OWN}\nbb:bb:bb:bb:bb:01 ssid=4775657374 nr=bb01");
         let theirs = [peer("bb:bb:bb:bb:bb:01", "4775657374", "bb01")];
         assert!(changes(&list, "4775657374", &mine, &theirs).is_empty());
+    }
+
+    #[test]
+    fn counts_the_stations_of_its_own_bss() {
+        let status = "state=ENABLED\nbss[0]=wlan5\nnum_sta[0]=8\nbss[1]=wlan5-1\nnum_sta[1]=3\nbss[2]=wlan5-2\nnum_sta[2]=1";
+        assert_eq!(num_sta(status, "wlan5-1"), 3);
+        assert_eq!(num_sta(status, "wlan5"), 8);
+        assert_eq!(num_sta(status, "wlan6"), 0);
     }
 
     #[test]

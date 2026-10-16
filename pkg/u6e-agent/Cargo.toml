@@ -1,5 +1,5 @@
 [package]
-name = "u6e-neighbors"
+name = "u6e-agent"
 version = "1.0.0"
 edition = "2024"
 license = "GPL-2.0-only"

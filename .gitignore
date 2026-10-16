@@ -20,7 +20,7 @@
 /nss/dl/
 /pkg/iproute2-nss/out/
 /pkg/hostapd/out/
-/pkg/u6e-neighbors/target/
+/pkg/u6e-agent/target/
 /log/
 /stamps/
 __pycache__/

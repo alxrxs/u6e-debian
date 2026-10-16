@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "u6e-neighbors"
+name = "u6e-agent"
 version = "1.0.0"
