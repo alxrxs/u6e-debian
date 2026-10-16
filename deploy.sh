@@ -3,6 +3,8 @@
 # root:
 #   ./deploy.sh [<ap>...]      (default: every AP in U6E_APS)
 #   FORCE=1 ./deploy.sh ...    (boot a new image even where nothing changed)
+#   BOOT=0 ./deploy.sh ...     (build everything, each AP's image included,
+#                               but boot nothing: a later run boots it)
 # First the source trees (trees.sh: the kernel and backports releases with our
 # patch series). Then each step runs only when its inputs changed since it
 # last ran (stamps/ records them): the board files ($BLOBS), the kernel
@@ -98,6 +100,10 @@ for ap in "$@"; do
 	fi
 	./prep-rootfs.sh > "$L/prep-$ap.log" 2>&1 || fail "$ap: image build failed, see $L/prep-$ap.log"
 	grep "^kept as" "$L/prep-$ap.log"
+	if [ "${BOOT:-1}" = 0 ]; then
+		echo "$ap: image built, not booted (BOOT=0)"
+		continue
+	fi
 	boot/stage.sh || fail "$ap: did not boot the image"
 	up=
 	for _ in $(seq 30); do

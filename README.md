@@ -35,6 +35,7 @@ The NSS firmware is downloaded by the build and checked against a pinned checksu
 cp site.conf.example site.conf    # then edit it
 sudo ./deploy.sh                  # build everything and boot every access point in U6E_APS
 sudo ./deploy.sh ap1 ap2          # or only the named ones
+sudo BOOT=0 ./deploy.sh           # build everything, each image included, but boot nothing yet
 ```
 
 `deploy.sh` runs these steps in order and skips any whose inputs have not changed since the last run (it records them in `stamps/`; logs go to `log/`):
@@ -46,7 +47,7 @@ sudo ./deploy.sh ap1 ap2          # or only the named ones
 5. `pkg/hostapd/build.sh`: builds hostapd (the program that runs the Wi-Fi networks) as a Debian package.
 6. `pkg/iproute2-nss/build.sh`: builds Debian's `iproute2` with the NSS traffic-shaping options added to `tc`.
 7. `mkrootfs.sh`: creates the Debian root filesystem.
-8. For each access point whose running image was built from other inputs (this repository, `$BLOBS`, `site.conf` or the source trees): `prep-rootfs.sh` builds its image, `boot/stage.sh` boots it, and `deploy.sh` waits until all three radios are up. An access point already running the current build is left alone; `FORCE=1` boots a new image anyway.
+8. For each access point whose running image was built from other inputs (this repository, `$BLOBS`, `site.conf` or the source trees): `prep-rootfs.sh` builds its image, `boot/stage.sh` boots it, and `deploy.sh` waits until all three radios are up. An access point already running the current build is left alone; `FORCE=1` boots a new image anyway. With `BOOT=0` each image is built and kept but not booted, so the access points keep running until a later run boots it.
 
 Every image is kept in `images/` with a `MANIFEST` (versions and checksums), so an earlier build can be booted again without rebuilding.
 
