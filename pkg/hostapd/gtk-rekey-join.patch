@@ -1,0 +1,496 @@
+From fe43429a8535b6afe4e185699e07db42523eb46f Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Fri, 16 Oct 2026 20:07:18 +0300
+Subject: [PATCH] AP: Give a STA joining during a group rekey the group keys in
+ use
+
+During a group rekey the new GTK, IGTK and BIGTK are not installed until
+every STA has completed the Group Key Handshake (SETKEYS), but a STA that
+joined in that window got the new keys in EAPOL-Key msg 3/4, the FT
+Reassociation Response or the FILS/EPPKE Key Delivery. Group frames, and
+with beacon protection every Beacon frame, were protected with keys it
+did not have until the AP switched: a STA verifying Beacon frames saw
+none valid and disconnected, which is how a STA joining a BSS whose rekey
+waited on an unresponsive STA lost its connection seconds later.
+
+Give a joining STA the keys in use (GM) during the rekey, and once it is
+in PTKINITDONE start the Group Key Handshake for it, like for the other
+STAs, whenever the keys it got are not the current ones. That also covers
+a STA whose keys a rekey replaced while it was still joining, which the
+rekey skips because it is not yet in PTKINITDONE.
+
+Assisted-by: LLM
+Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
+---
+ src/ap/wpa_auth.c    | 136 ++++++++++++++++++++++++++++++++++---------
+ src/ap/wpa_auth_ft.c |  26 +++++----
+ src/ap/wpa_auth_i.h  |   9 +++
+ 3 files changed, 135 insertions(+), 36 deletions(-)
+
+diff --git a/src/ap/wpa_auth.c b/src/ap/wpa_auth.c
+index 0a618041c..e2dd40d96 100644
+--- a/src/ap/wpa_auth.c
++++ b/src/ap/wpa_auth.c
+@@ -70,7 +70,8 @@ static void wpa_group_put_vlan(struct wpa_authenticator *wpa_auth,
+ 			       int vlan_id);
+ #endif /* CONFIG_IEEE80211BE */
+ static int ieee80211w_kde_len(struct wpa_state_machine *sm);
+-static u8 * ieee80211w_kde_add(struct wpa_state_machine *sm, u8 *pos);
++static u8 * ieee80211w_kde_add(struct wpa_state_machine *sm, u8 *pos,
++			       bool join);
+ static int wpa_group_update_gtk(struct wpa_authenticator *wpa_auth,
+ 				struct wpa_group *group);
+ 
+@@ -128,6 +129,66 @@ static void wpa_gkeydone_sta(struct wpa_state_machine *sm)
+ }
+ 
+ 
++/*
++ * The group keys a STA gets when it joins (EAPOL-Key msg 3/4, FT, FILS) are
++ * the ones in use. During a group rekey (SETKEYS) the new ones (GN) are not in
++ * use until every STA has them, so a STA joining then gets the previous ones
++ * (GM) and the new ones with the Group Key Handshake once it is in
++ * PTKINITDONE, as does a STA whose keys a rekey replaced before then.
++ */
++static bool wpa_group_rekeying(struct wpa_group *gsm)
++{
++	return gsm->wpa_group_state == WPA_GROUP_SETKEYS;
++}
++
++
++int wpa_auth_join_gtk_idx(struct wpa_state_machine *sm, struct wpa_group *gsm)
++{
++	int idx = wpa_group_rekeying(gsm) ? gsm->GM : gsm->GN;
++
++	sm->gtk_given |= BIT(idx - 1);
++	return idx;
++}
++
++
++int wpa_auth_join_igtk_idx(struct wpa_group *gsm)
++{
++	return wpa_group_rekeying(gsm) ? gsm->GM_igtk : gsm->GN_igtk;
++}
++
++
++int wpa_auth_join_bigtk_idx(struct wpa_state_machine *sm,
++			    struct wpa_group *gsm)
++{
++	int idx = wpa_group_rekeying(gsm) ? gsm->GM_bigtk : gsm->GN_bigtk;
++
++	sm->bigtk_given |= BIT(idx - 6);
++	return idx;
++}
++
++
++/* Start the Group Key Handshake for a STA in PTKINITDONE whose group keys
++ * are older than the current ones; returns whether it was started. */
++static bool wpa_group_update_joined_sta(struct wpa_state_machine *sm)
++{
++	struct wpa_authenticator *bigtk_auth = sm->wpa_auth->conf.tx_bss_auth ?
++		sm->wpa_auth->conf.tx_bss_auth : sm->wpa_auth;
++	bool old = (sm->gtk_given & ~BIT(sm->group->GN - 1)) ||
++		(sm->bigtk_given & ~BIT(bigtk_auth->group->GN_bigtk - 6));
++
++	sm->gtk_given = 0;
++	sm->bigtk_given = 0;
++	if (!old || sm->GUpdateStationKeys || sm->is_wnmsleep)
++		return false;
++
++	wpa_auth_logger(sm->wpa_auth, wpa_auth_get_spa(sm), LOGGER_DEBUG,
++			"joined with group keys a rekey replaces; start Group Key Handshake");
++	sm->group->GKeyDoneStations++;
++	sm->GUpdateStationKeys = true;
++	return true;
++}
++
++
+ #ifdef CONFIG_IEEE80211BE
+ 
+ void wpa_release_link_auth_ref(struct wpa_state_machine *sm, u8 link_id,
+@@ -1103,6 +1164,8 @@ int wpa_auth_sta_associated(struct wpa_authenticator *wpa_auth,
+ 		/* Go to PTKINITDONE state to allow GTK rekeying */
+ 		sm->wpa_ptk_state = WPA_PTK_PTKINITDONE;
+ 		sm->Pair = true;
++		if (wpa_group_update_joined_sta(sm))
++			wpa_sm_step(sm);
+ 		return 0;
+ 	}
+ #endif /* CONFIG_ENC_ASSOC */
+@@ -1116,6 +1179,8 @@ int wpa_auth_sta_associated(struct wpa_authenticator *wpa_auth,
+ 		/* Go to PTKINITDONE state to allow GTK rekeying */
+ 		sm->wpa_ptk_state = WPA_PTK_PTKINITDONE;
+ 		sm->Pair = true;
++		if (wpa_group_update_joined_sta(sm))
++			wpa_sm_step(sm);
+ 		return 0;
+ 	}
+ #endif /* CONFIG_IEEE8021X_AUTH */
+@@ -1127,6 +1192,8 @@ int wpa_auth_sta_associated(struct wpa_authenticator *wpa_auth,
+ 		/* Go to PTKINITDONE state to allow GTK rekeying */
+ 		sm->wpa_ptk_state = WPA_PTK_PTKINITDONE;
+ 		sm->Pair = true;
++		if (wpa_group_update_joined_sta(sm))
++			wpa_sm_step(sm);
+ 		return 0;
+ 	}
+ #endif /* CONFIG_IEEE80211R_AP */
+@@ -1138,6 +1205,8 @@ int wpa_auth_sta_associated(struct wpa_authenticator *wpa_auth,
+ 		/* Go to PTKINITDONE state to allow GTK rekeying */
+ 		sm->wpa_ptk_state = WPA_PTK_PTKINITDONE;
+ 		sm->Pair = true;
++		if (wpa_group_update_joined_sta(sm))
++			wpa_sm_step(sm);
+ 		return 0;
+ 	}
+ #endif /* CONFIG_FILS */
+@@ -2655,6 +2724,8 @@ SM_STATE(WPA_PTK, INITIALIZE)
+ 	}
+ 
+ 	sm->keycount = 0;
++	sm->gtk_given = 0;
++	sm->bigtk_given = 0;
+ 	if (sm->GUpdateStationKeys)
+ 		wpa_gkeydone_sta(sm);
+ 	if (sm->wpa == WPA_VERSION_WPA)
+@@ -3604,6 +3675,7 @@ static struct wpabuf * fils_prepare_plainbuf(struct wpa_state_machine *sm,
+ 	u8 *gtk, stub_gtk[32];
+ 	size_t gtk_len;
+ 	struct wpa_group *gsm;
++	int gtkidx;
+ 	size_t plain_len;
+ 	struct wpa_auth_config *conf = &sm->wpa_auth->conf;
+ 
+@@ -3631,13 +3703,14 @@ static struct wpabuf * fils_prepare_plainbuf(struct wpa_state_machine *sm,
+ 
+ 	/* Key Delivery */
+ 	gsm = sm->group;
++	gtkidx = wpa_auth_join_gtk_idx(sm, gsm);
+ 	wpabuf_put_u8(plain, WLAN_EID_EXTENSION); /* Element ID */
+ 	len = wpabuf_put(plain, 1);
+ 	wpabuf_put_u8(plain, WLAN_EID_EXT_KEY_DELIVERY);
+-	wpa_auth_get_seqnum(sm->wpa_auth, NULL, gsm->GN,
++	wpa_auth_get_seqnum(sm->wpa_auth, NULL, gtkidx,
+ 			    wpabuf_put(plain, WPA_KEY_RSC_LEN));
+ 	/* GTK KDE */
+-	gtk = gsm->GTK[gsm->GN - 1];
++	gtk = gsm->GTK[gtkidx - 1];
+ 	gtk_len = gsm->GTK_len;
+ 	if (conf->disable_gtk) {
+ 		/*
+@@ -3650,7 +3723,7 @@ static struct wpabuf * fils_prepare_plainbuf(struct wpa_state_machine *sm,
+ 		}
+ 		gtk = stub_gtk;
+ 	}
+-	hdr[0] = gsm->GN & 0x03;
++	hdr[0] = gtkidx & 0x03;
+ 	hdr[1] = 0;
+ 	tmp = wpabuf_put(plain, 0);
+ 	tmp2 = wpa_add_kde(tmp, RSN_KEY_DATA_GROUPKEY, hdr, 2,
+@@ -3659,7 +3732,7 @@ static struct wpabuf * fils_prepare_plainbuf(struct wpa_state_machine *sm,
+ 
+ 	/* IGTK KDE and BIGTK KDE */
+ 	tmp = wpabuf_put(plain, 0);
+-	tmp2 = ieee80211w_kde_add(sm, tmp);
++	tmp2 = ieee80211w_kde_add(sm, tmp, true);
+ 	wpabuf_put(plain, tmp2 - tmp);
+ 
+ 	if (conf->transition_disable) {
+@@ -4296,12 +4369,14 @@ static int ieee80211w_kde_len(struct wpa_state_machine *sm)
+ }
+ 
+ 
+-static u8 * ieee80211w_kde_add(struct wpa_state_machine *sm, u8 *pos)
++static u8 * ieee80211w_kde_add(struct wpa_state_machine *sm, u8 *pos,
++			       bool join)
+ {
+ 	struct wpa_igtk_kde igtk;
+ 	struct wpa_bigtk_kde bigtk;
+ 	struct wpa_group *gsm = sm->group;
+ 	u8 rsc[WPA_KEY_RSC_LEN];
++	int idx;
+ 	struct wpa_authenticator *wpa_auth = sm->wpa_auth;
+ 	struct wpa_auth_config *conf = &wpa_auth->conf;
+ 	size_t len = wpa_cipher_key_len(conf->group_mgmt_cipher);
+@@ -4314,14 +4389,16 @@ static u8 * ieee80211w_kde_add(struct wpa_state_machine *sm, u8 *pos)
+ 		return pos; /* Use per-link MLO KDEs instead */
+ #endif /* CONFIG_IEEE80211BE */
+ 
+-	igtk.keyid[0] = gsm->GN_igtk;
++	idx = join ? wpa_auth_join_igtk_idx(gsm) : gsm->GN_igtk;
++	igtk.keyid[0] = idx;
+ 	igtk.keyid[1] = 0;
+-	if (gsm->wpa_group_state != WPA_GROUP_SETKEYSDONE ||
+-	    wpa_auth_get_seqnum(sm->wpa_auth, NULL, gsm->GN_igtk, rsc) < 0)
++	if ((idx == gsm->GN_igtk &&
++	     gsm->wpa_group_state != WPA_GROUP_SETKEYSDONE) ||
++	    wpa_auth_get_seqnum(sm->wpa_auth, NULL, idx, rsc) < 0)
+ 		os_memset(igtk.pn, 0, sizeof(igtk.pn));
+ 	else
+ 		os_memcpy(igtk.pn, rsc, sizeof(igtk.pn));
+-	os_memcpy(igtk.igtk, gsm->IGTK[gsm->GN_igtk - 4], len);
++	os_memcpy(igtk.igtk, gsm->IGTK[idx - 4], len);
+ 	if (conf->disable_gtk) {
+ 		/*
+ 		 * Provide unique random IGTK to each STA to prevent use of
+@@ -4350,14 +4427,16 @@ static u8 * ieee80211w_kde_add(struct wpa_state_machine *sm, u8 *pos)
+ 	if (!sm->wpa_auth->conf.beacon_prot)
+ 		return pos;
+ 
+-	bigtk.keyid[0] = gsm->GN_bigtk;
++	idx = join ? wpa_auth_join_bigtk_idx(sm, gsm) : gsm->GN_bigtk;
++	bigtk.keyid[0] = idx;
+ 	bigtk.keyid[1] = 0;
+-	if (gsm->wpa_group_state != WPA_GROUP_SETKEYSDONE ||
+-	    wpa_auth_get_seqnum(wpa_auth, NULL, gsm->GN_bigtk, rsc) < 0)
++	if ((idx == gsm->GN_bigtk &&
++	     gsm->wpa_group_state != WPA_GROUP_SETKEYSDONE) ||
++	    wpa_auth_get_seqnum(wpa_auth, NULL, idx, rsc) < 0)
+ 		os_memset(bigtk.pn, 0, sizeof(bigtk.pn));
+ 	else
+ 		os_memcpy(bigtk.pn, rsc, sizeof(bigtk.pn));
+-	os_memcpy(bigtk.bigtk, gsm->BIGTK[gsm->GN_bigtk - 6], len);
++	os_memcpy(bigtk.bigtk, gsm->BIGTK[idx - 6], len);
+ 	pos = wpa_add_kde(pos, RSN_KEY_DATA_BIGTK,
+ 			  (const u8 *) &bigtk, WPA_BIGTK_KDE_PREFIX_LEN + len,
+ 			  NULL, 0);
+@@ -5044,7 +5123,9 @@ SM_STATE(WPA_PTK, PTKINITNEGOTIATING)
+ 	   GTK[GN], IGTK, [BIGTK], [FTIE], [TIE * 2])
+ 	 */
+ 	os_memset(rsc, 0, WPA_KEY_RSC_LEN);
+-	wpa_auth_get_seqnum(sm->wpa_auth, NULL, gsm->GN, rsc);
++	gtkidx = is_mld || sm->wpa != WPA_VERSION_WPA2 ? gsm->GN :
++		wpa_auth_join_gtk_idx(sm, gsm);
++	wpa_auth_get_seqnum(sm->wpa_auth, NULL, gtkidx, rsc);
+ 	/* If FT is used, wpa_auth->wpa_ie includes both RSNIE and MDIE */
+ 	wpa_ie = sm->wpa_auth->wpa_ie;
+ 	wpa_ie_len = sm->wpa_auth->wpa_ie_len;
+@@ -5157,7 +5238,7 @@ SM_STATE(WPA_PTK, PTKINITNEGOTIATING)
+ 
+ 		/* WPA2 send GTK in the 4-way handshake */
+ 		secure = 1;
+-		gtk = gsm->GTK[gsm->GN - 1];
++		gtk = gsm->GTK[gtkidx - 1];
+ 		gtk_len = gsm->GTK_len;
+ 		if (conf->disable_gtk) {
+ 			/*
+@@ -5168,7 +5249,6 @@ SM_STATE(WPA_PTK, PTKINITNEGOTIATING)
+ 				goto done;
+ 			gtk = stub_gtk;
+ 		}
+-		gtkidx = gsm->GN;
+ 		_rsc = rsc;
+ 		encr = 1;
+ 	} else {
+@@ -5281,7 +5361,7 @@ SM_STATE(WPA_PTK, PTKINITNEGOTIATING)
+ 		pos = wpa_add_kde(pos, RSN_KEY_DATA_GROUPKEY, hdr, 2,
+ 				  gtk, gtk_len);
+ 	}
+-	pos = ieee80211w_kde_add(sm, pos);
++	pos = ieee80211w_kde_add(sm, pos, true);
+ 	if (ocv_oci_add(sm, &pos, conf->oci_freq_override_eapol_m3) < 0)
+ 		goto done;
+ 
+@@ -5563,6 +5643,7 @@ SM_STATE(WPA_PTK, PTKINITDONE)
+ #endif /* CONFIG_IEEE80211R_AP */
+ 
+ 	sm->ptkstart_without_success = 0;
++	wpa_group_update_joined_sta(sm);
+ }
+ 
+ 
+@@ -5780,7 +5861,7 @@ SM_STATE(WPA_PTK_GROUP, REKEYNEGOTIATING)
+ 		hdr[1] = 0;
+ 		pos = wpa_add_kde(pos, RSN_KEY_DATA_GROUPKEY, hdr, 2,
+ 				  gtk, gsm->GTK_len);
+-		pos = ieee80211w_kde_add(sm, pos);
++		pos = ieee80211w_kde_add(sm, pos, false);
+ 		if (ocv_oci_add(sm, &pos,
+ 				conf->oci_freq_override_eapol_g1) < 0) {
+ 			os_free(kde_buf);
+@@ -7768,7 +7849,7 @@ int wpa_auth_resend_m3(struct wpa_state_machine *sm,
+ 				  gtk, gtk_len);
+ 	}
+ 	opos = pos;
+-	pos = ieee80211w_kde_add(sm, pos);
++	pos = ieee80211w_kde_add(sm, pos, false);
+ 	if (pos - opos >= 2 + RSN_SELECTOR_LEN + WPA_IGTK_KDE_PREFIX_LEN) {
+ 		/* skip KDE header and keyid */
+ 		opos += 2 + RSN_SELECTOR_LEN + 2;
+@@ -7867,7 +7948,7 @@ int wpa_auth_resend_group_m1(struct wpa_state_machine *sm,
+ 		pos = wpa_add_kde(pos, RSN_KEY_DATA_GROUPKEY, hdr, 2,
+ 				  gtk, gsm->GTK_len);
+ 		opos = pos;
+-		pos = ieee80211w_kde_add(sm, pos);
++		pos = ieee80211w_kde_add(sm, pos, false);
+ 		if (pos - opos >=
+ 		    2 + RSN_SELECTOR_LEN + WPA_IGTK_KDE_PREFIX_LEN) {
+ 			/* skip KDE header and keyid */
+@@ -8100,6 +8181,7 @@ u8 * wpa_auth_eid_key_delivery(u8 *eid, size_t max_len,
+ 	size_t gtk_len, kde_len = 0;
+ 	u8 rsc[WPA_KEY_RSC_LEN] = {0}, *gtk;
+ 	struct wpa_group *gsm = sm->group;
++	int gtkidx = 0;
+ 	u8 hdr[2];
+ 	u8 *kde, *buf, *start = eid, *end = eid + max_len;
+ 	const u8 *ptr;
+@@ -8121,13 +8203,14 @@ u8 * wpa_auth_eid_key_delivery(u8 *eid, size_t max_len,
+ 		kde_len = wpa_auth_ml_group_kdes_len(sm, KDE_ALL_LINKS);
+ #endif /* CONFIG_IEEE80211BE */
+ 	} else {
+-		gtk = gsm->GTK[gsm->GN - 1];
++		gtkidx = wpa_auth_join_gtk_idx(sm, gsm);
++		gtk = gsm->GTK[gtkidx - 1];
+ 		gtk_len = gsm->GTK_len;
+-		hdr[0] = gsm->GN & 0x03; /* KeyID bits */
++		hdr[0] = gtkidx & 0x03; /* KeyID bits */
+ 		hdr[1] = 0;
+ 		kde = wpa_add_kde(kde, RSN_KEY_DATA_GROUPKEY, hdr, sizeof(hdr),
+ 				  gtk, gtk_len);
+-		kde = ieee80211w_kde_add(sm, kde);
++		kde = ieee80211w_kde_add(sm, kde, true);
+ 		/* GTK KDE: 0xdd|len(1B)|RSN Selector(4B)|KeyID(2B)|GTK| */
+ 		kde_len = 2 + RSN_SELECTOR_LEN + 2 + gsm->GTK_len +
+ 			ieee80211w_kde_len(sm);
+@@ -8152,8 +8235,9 @@ u8 * wpa_auth_eid_key_delivery(u8 *eid, size_t max_len,
+ 	}
+ #endif /* CONFIG_SAE */
+ 
+-	if (!is_ml && sm->group->wpa_group_state == WPA_GROUP_SETKEYSDONE)
+-		wpa_auth_get_seqnum(sm->wpa_auth, NULL, gsm->GN, rsc);
++	if (!is_ml && (gtkidx != gsm->GN ||
++		       gsm->wpa_group_state == WPA_GROUP_SETKEYSDONE))
++		wpa_auth_get_seqnum(sm->wpa_auth, NULL, gtkidx, rsc);
+ 
+ 	/*
+ 	 * As the Key Delivery element can exceed the size of 255 bytes need to
+diff --git a/src/ap/wpa_auth_ft.c b/src/ap/wpa_auth_ft.c
+index 172f3db40..90b6678db 100644
+--- a/src/ap/wpa_auth_ft.c
++++ b/src/ap/wpa_auth_ft.c
+@@ -2205,6 +2205,7 @@ static u8 * wpa_ft_gtk_subelem(struct wpa_state_machine *sm, size_t *len,
+ 	u8 *subelem;
+ 	struct wpa_auth_config *conf = &sm->wpa_auth->conf;
+ 	struct wpa_group *gsm = sm->group;
++	int idx;
+ 	size_t subelem_len, pad_len;
+ 	const u8 *key;
+ 	size_t key_len;
+@@ -2216,6 +2217,7 @@ static u8 * wpa_ft_gtk_subelem(struct wpa_state_machine *sm, size_t *len,
+ 	if (reassoc && vlan_id)
+ 		gsm = wpa_select_vlan_wpa_group(gsm, vlan_id);
+ #endif /* CONFIG_IEEE80211BE */
++	idx = wpa_auth_join_gtk_idx(sm, gsm);
+ 
+ 	if (wpa_key_mgmt_fils(sm->wpa_key_mgmt)) {
+ 		kek = sm->PTK.kek2;
+@@ -2239,7 +2241,7 @@ static u8 * wpa_ft_gtk_subelem(struct wpa_state_machine *sm, size_t *len,
+ 	if (key_len + pad_len < 16)
+ 		pad_len += 8;
+ 	if (pad_len && key_len < sizeof(keybuf)) {
+-		os_memcpy(keybuf, gsm->GTK[gsm->GN - 1], key_len);
++		os_memcpy(keybuf, gsm->GTK[idx - 1], key_len);
+ 		if (conf->disable_gtk) {
+ 			/*
+ 			 * Provide unique random GTK to each STA to prevent use
+@@ -2261,7 +2263,7 @@ static u8 * wpa_ft_gtk_subelem(struct wpa_state_machine *sm, size_t *len,
+ 			return NULL;
+ 		key = keybuf;
+ 	} else {
+-		key = gsm->GTK[gsm->GN - 1];
++		key = gsm->GTK[idx - 1];
+ 	}
+ 
+ 	/*
+@@ -2276,9 +2278,9 @@ static u8 * wpa_ft_gtk_subelem(struct wpa_state_machine *sm, size_t *len,
+ 	subelem[0] = FTIE_SUBELEM_GTK;
+ 	subelem[1] = 11 + key_len + 8;
+ 	/* Key ID in B0-B1 of Key Info */
+-	WPA_PUT_LE16(&subelem[2], gsm->GN & 0x03);
++	WPA_PUT_LE16(&subelem[2], idx & 0x03);
+ 	subelem[4] = gsm->GTK_len;
+-	wpa_auth_get_seqnum(sm->wpa_auth, NULL, gsm->GN, subelem + 5);
++	wpa_auth_get_seqnum(sm->wpa_auth, NULL, idx, subelem + 5);
+ 	if (aes_wrap(kek, kek_len, key_len / 8, key, subelem + 13)) {
+ 		wpa_printf(MSG_DEBUG,
+ 			   "FT: GTK subelem encryption failed: kek_len=%d",
+@@ -2299,6 +2301,7 @@ static u8 * wpa_ft_igtk_subelem(struct wpa_state_machine *sm, size_t *len)
+ 	u8 *subelem, *pos;
+ 	struct wpa_auth_config *conf = &sm->wpa_auth->conf;
+ 	struct wpa_group *gsm = sm->group;
++	int idx;
+ 	size_t subelem_len;
+ 	const u8 *kek, *igtk;
+ 	size_t kek_len;
+@@ -2325,12 +2328,13 @@ static u8 * wpa_ft_igtk_subelem(struct wpa_state_machine *sm, size_t *len)
+ 	pos = subelem;
+ 	*pos++ = FTIE_SUBELEM_IGTK;
+ 	*pos++ = subelem_len - 2;
+-	WPA_PUT_LE16(pos, gsm->GN_igtk);
++	idx = wpa_auth_join_igtk_idx(gsm);
++	WPA_PUT_LE16(pos, idx);
+ 	pos += 2;
+-	wpa_auth_get_seqnum(sm->wpa_auth, NULL, gsm->GN_igtk, pos);
++	wpa_auth_get_seqnum(sm->wpa_auth, NULL, idx, pos);
+ 	pos += 6;
+ 	*pos++ = igtk_len;
+-	igtk = gsm->IGTK[gsm->GN_igtk - 4];
++	igtk = gsm->IGTK[idx - 4];
+ 	if (conf->disable_gtk) {
+ 		/*
+ 		 * Provide unique random IGTK to each STA to prevent use of
+@@ -2360,6 +2364,7 @@ static u8 * wpa_ft_bigtk_subelem(struct wpa_state_machine *sm, size_t *len)
+ 	u8 *subelem, *pos;
+ 	struct wpa_authenticator *wpa_auth = sm->wpa_auth;
+ 	struct wpa_group *gsm = wpa_auth->group;
++	int idx;
+ 	size_t subelem_len;
+ 	const u8 *kek, *bigtk;
+ 	size_t kek_len;
+@@ -2385,12 +2390,13 @@ static u8 * wpa_ft_bigtk_subelem(struct wpa_state_machine *sm, size_t *len)
+ 	pos = subelem;
+ 	*pos++ = FTIE_SUBELEM_BIGTK;
+ 	*pos++ = subelem_len - 2;
+-	WPA_PUT_LE16(pos, gsm->GN_bigtk);
++	idx = wpa_auth_join_bigtk_idx(sm, gsm);
++	WPA_PUT_LE16(pos, idx);
+ 	pos += 2;
+-	wpa_auth_get_seqnum(wpa_auth, NULL, gsm->GN_bigtk, pos);
++	wpa_auth_get_seqnum(wpa_auth, NULL, idx, pos);
+ 	pos += 6;
+ 	*pos++ = bigtk_len;
+-	bigtk = gsm->BIGTK[gsm->GN_bigtk - 6];
++	bigtk = gsm->BIGTK[idx - 6];
+ 	if (aes_wrap(kek, kek_len, bigtk_len / 8, bigtk, pos)) {
+ 		wpa_printf(MSG_DEBUG,
+ 			   "FT: BIGTK subelem encryption failed: kek_len=%d",
+diff --git a/src/ap/wpa_auth_i.h b/src/ap/wpa_auth_i.h
+index a1b34ee0a..acfbe455d 100644
+--- a/src/ap/wpa_auth_i.h
++++ b/src/ap/wpa_auth_i.h
+@@ -53,6 +53,10 @@ struct wpa_state_machine {
+ 	bool EAPOLKeyRequest;
+ 	bool MICVerified;
+ 	bool GUpdateStationKeys;
++	/* Group keys given to the STA since it last reached PTKINITDONE:
++	 * bit (GTK Key ID - 1) and bit (BIGTK Key ID - 6) */
++	u8 gtk_given;
++	u8 bigtk_given;
+ 	u8 ANonce[WPA_NONCE_LEN];
+ 	u8 SNonce[WPA_NONCE_LEN];
+ 	u8 alt_SNonce[WPA_NONCE_LEN];
+@@ -339,6 +343,11 @@ void wpa_auth_store_ptksa(struct wpa_authenticator *wpa_auth,
+ 			  const u8 *addr, int cipher,
+ 			  u32 life_time, const struct wpa_ptk *ptk);
+ 
++int wpa_auth_join_gtk_idx(struct wpa_state_machine *sm, struct wpa_group *gsm);
++int wpa_auth_join_igtk_idx(struct wpa_group *gsm);
++int wpa_auth_join_bigtk_idx(struct wpa_state_machine *sm,
++			    struct wpa_group *gsm);
++
+ #ifdef CONFIG_IEEE80211R_AP
+ int wpa_write_mdie(struct wpa_auth_config *conf, u8 *buf, size_t len);
+ int wpa_write_ftie(struct wpa_auth_config *conf, int key_mgmt, size_t key_len,
+-- 
+2.47.3
+
