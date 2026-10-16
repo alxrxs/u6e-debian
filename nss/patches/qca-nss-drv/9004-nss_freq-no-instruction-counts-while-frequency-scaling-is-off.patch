@@ -1,0 +1,53 @@
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Subject: [PATCH] nss_freq: no instruction counts while frequency scaling is off
+
+With frequency scaling off (dev.nss.clock.auto_scale=0, or a pinned
+dev.nss.clock.current_freq) the firmware still reported its instruction
+count every millisecond: 1000 of the 1700 status messages a second an
+idle IPQ5018 AP received, and more than half of its NSS interrupts, only
+to keep cpu_load_ubi current. Stop the counts at the current frequency
+in both paths; cpu_load_ubi then holds its last value. initialized still
+keeps samples that arrive late from turning scaling back on.
+
+Measured on IPQ5018 (switching the counts at runtime): status messages
+1702/s -> 702/s, nss_queue0 interrupts 1064/s -> 468/s.
+
+Assisted-by: LLM
+Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
+---
+--- a/nss_init.c
++++ b/nss_init.c
+@@ -240,7 +240,7 @@
+ 	}
+ 	INIT_WORK((struct work_struct *)nss_work, nss_hal_wq_function);
+ 	nss_work->frequency = nss_cmd_buf.current_freq;
+-	nss_work->stats_enable = 1;
++	nss_work->stats_enable = 0;
+ 
+ 	/*
+ 	 * Ensure we start with a fresh set of samples later
+@@ -268,10 +268,22 @@
+ 
+ 	if (nss_cmd_buf.auto_scale != 1) {
+ 		/*
+-		 * The instruction counts stay on, since the CPU load is computed
+-		 * from them; initialized stops them from turning scaling back on.
++		 * With scaling off the firmware's instruction counts, a status
++		 * message every millisecond, only feed cpu_load_ubi: stop them at
++		 * the current frequency. initialized keeps late samples from
++		 * turning scaling back on.
+ 		 */
+ 		nss_runtime_samples.initialized = 1;
++		nss_runtime_samples.freq_scale_ready = 0;
++		nss_work = (nss_work_t *)kmalloc(sizeof(nss_work_t), GFP_ATOMIC);
++		if (!nss_work) {
++			nss_info("NSS Freq WQ kmalloc fail");
++			return ret;
++		}
++		INIT_WORK((struct work_struct *)nss_work, nss_hal_wq_function);
++		nss_work->frequency = nss_runtime_samples.freq_scale[nss_runtime_samples.freq_scale_index].frequency;
++		nss_work->stats_enable = 0;
++		queue_work(nss_wq, (struct work_struct *)nss_work);
+ 		return ret;
+ 	}
+ 

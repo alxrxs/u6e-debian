@@ -292,7 +292,7 @@ cat > $RF/usr/local/sbin/u6e-fallback <<'FALLBACK'
   grep -iE 'uniphy|gmac1|cmn_pll|ubi32' /sys/kernel/debug/clk/clk_summary; head -20 /sys/kernel/debug/clk/clk_orphan_summary
   ip -s -d link show lan; tc -s qdisc show dev lan; ethtool -S lan | grep -vE ': 0$'
   echo "== dwmac-nss"; cat /sys/kernel/debug/qca-dwmac-nss/status 2>&1 | head -n 40
-  for f in n2h drv eth_rx gmac dma unaligned cpu_load_ubi; do echo "== nss $f"; grep -vE ' = 0 ' "$D/$f" 2>/dev/null | head -40; done
+  for f in n2h drv eth_rx gmac dma unaligned; do echo "== nss $f"; grep -vE ' = 0 ' "$D/$f" 2>/dev/null | head -40; done
   echo "== nss irqs"; grep -E 'nss' /proc/interrupts
   echo "== nss n2hcfg"; sysctl -a 2>/dev/null | grep -E '^dev\.nss\.(n2hcfg|clock)'
   echo "== nss meminfo"; grep -vE '^\s*$' /sys/kernel/debug/qca-nss-drv/meminfo/core0 2>&1 | head -n 40
