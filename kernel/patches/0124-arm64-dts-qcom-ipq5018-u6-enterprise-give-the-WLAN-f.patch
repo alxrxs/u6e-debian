@@ -1,32 +1,57 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Andrei-Alexandru Bleortu <me@andrei-z.com>
-Date: Fri, 23 Oct 2026 22:52:01 +0300
+Date: Fri, 23 Oct 2026 23:16:55 +0300
 Subject: [PATCH] arm64: dts: qcom: ipq5018-u6-enterprise: give the WLAN
  firmware its M3 dump area
 
 The IPQ5018 WLAN firmware requests a 1 MB M3 dump segment, and ath11k
 gave none without qcom,m3-dump-addr ("ignore m3 dump mem req"), so the
-firmware had nowhere to write its M3 state on a crash. Use the stock
-firmware's 0x4c800000: inside the reserved WCSS region, and past every
-segment this firmware loads (the q6 image ends at 0x4c247000, the BDF and
-M3 firmware at 0x4c480000). Local: the property is the NSS ath11k
-patches', not a mainline binding.
+firmware had nowhere to write its M3 state on a crash. The stock
+firmware's address, 0x4c800000, lies inside the 48 MB this firmware uses
+at run time, and it asserts on it (platform.c:717, err_smem_ver):
+reserve 1 MB past that span, after ramoops, instead, and list it as the
+WCSS remoteproc's second memory region so a crash dump includes it.
+Local: the property is the NSS ath11k patches', not a mainline binding.
 
 Assisted-by: LLM
 ---
- arch/arm64/boot/dts/qcom/ipq5018-ubnt-u6-enterprise.dts | 2 ++
- 1 file changed, 2 insertions(+)
+ .../boot/dts/qcom/ipq5018-ubnt-u6-enterprise.dts     | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
 
 diff --git a/arch/arm64/boot/dts/qcom/ipq5018-ubnt-u6-enterprise.dts b/arch/arm64/boot/dts/qcom/ipq5018-ubnt-u6-enterprise.dts
-index ff89a33ae..a35fdd972 100644
+index ff89a33ae..bb1d5af50 100644
 --- a/arch/arm64/boot/dts/qcom/ipq5018-ubnt-u6-enterprise.dts
 +++ b/arch/arm64/boot/dts/qcom/ipq5018-ubnt-u6-enterprise.dts
-@@ -352,6 +352,8 @@ &wifi {
+@@ -28,6 +28,15 @@ ramoops@4e000000 {
+ 			console-size = <0x80000>;
+ 			pmsg-size = <0x20000>;
+ 		};
++
++		/*
++		 * The internal radio's M3 dump area, past the span its firmware
++		 * uses at run time (the firmware asserts on one inside it).
++		 */
++		m3_dump: m3-dump@4e100000 {
++			reg = <0x0 0x4e100000 0x0 0x100000>;
++			no-map;
++		};
+ 	};
+ 
+ 	aliases {
+@@ -322,6 +331,8 @@ &q6_region {
+ 
+ &q6v5_wcss {
+ 	compatible = "qcom,ipq5018-q6-mpd";
++	/* the second region is dumped with the first when the firmware crashes */
++	memory-region = <&q6_region>, <&m3_dump>;
+ 	firmware-name = "ath11k/IPQ5018/hw1.0/q6_fw.mdt",
+ 			"ath11k/IPQ5018/hw1.0/m3_fw.mdt";
+ 
+@@ -352,6 +363,7 @@ &wifi {
  	qcom,userpd-subsys-name = "q6v5_wcss_userpd1";
  	/* past the multi-PD image, whose segments cover the default 0x4ba00000 */
  	qcom,bdf-addr = <0x4c400000>;
-+	/* the stock firmware's M3 dump area, free in the WCSS region here too */
-+	qcom,m3-dump-addr = <0x4c800000>;
++	qcom,m3-dump-addr = <0x4e100000>;
  	qcom,calibration-variant = "Ubiquiti-U6-Enterprise";
  	qcom,ath11k-fw-memory-mode = <1>;
  };

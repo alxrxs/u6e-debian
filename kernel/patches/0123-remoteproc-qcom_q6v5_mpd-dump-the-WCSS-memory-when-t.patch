@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Fri, 23 Oct 2026 23:16:55 +0300
+Subject: [PATCH] remoteproc: qcom_q6v5_mpd: dump the WCSS memory when the
+ firmware crashes
+
+The multi-PD WCSS driver registered no coredump segments and left
+coredumps disabled, so a crash of the IPQ5018's WLAN firmware left no
+dump at all, unlike the PCI radios'. Add each memory region of the node
+as a segment on every boot: the first is the firmware's own memory
+(copied through the driver's existing mapping), further ones are areas
+the firmware fills when it crashes, such as its M3 dump area.
+
+The dump is built in memory before the recovery goes on, not read
+inline: an inline dump holds the recovery until userspace has read it,
+and ath11k gives up on the restarted firmware after waiting 10 s for its
+memory request, which left the radio down.
+
+Assisted-by: LLM
+---
+ drivers/remoteproc/qcom_q6v5_mpd.c | 56 ++++++++++++++++++++++++++++++
+ 1 file changed, 56 insertions(+)
+
+diff --git a/drivers/remoteproc/qcom_q6v5_mpd.c b/drivers/remoteproc/qcom_q6v5_mpd.c
+index 1e49a7da3..f4cf5b66b 100644
+--- a/drivers/remoteproc/qcom_q6v5_mpd.c
++++ b/drivers/remoteproc/qcom_q6v5_mpd.c
+@@ -529,10 +529,64 @@ static const struct rproc_ops wcss_ops = {
+ 	.get_boot_addr = rproc_elf_get_boot_addr,
+ };
+ 
++static void q6_wcss_copy_segment(struct rproc *rproc,
++				 struct rproc_dump_segment *segment,
++				 void *dest, size_t offset, size_t size)
++{
++	struct q6_wcss *wcss = rproc->priv;
++	void __iomem *base;
++
++	if (segment->da == wcss->mem_phys) {
++		memcpy_fromio(dest, (void __iomem *)wcss->mem_region + offset, size);
++		return;
++	}
++
++	base = ioremap_wc(segment->da + offset, size);
++	if (!base) {
++		dev_err(wcss->dev, "unable to map dump segment %pad\n",
++			&segment->da);
++		return;
++	}
++	memcpy_fromio(dest, base, size);
++	iounmap(base);
++}
++
++static int q6_wcss_parse_fw(struct rproc *rproc, const struct firmware *fw)
++{
++	struct q6_wcss *wcss = rproc->priv;
++	struct device *dev = wcss->dev;
++	struct reserved_mem *rmem;
++	struct device_node *node;
++	int i, n, ret;
++
++	/* A crash dump holds every memory region of the WCSS: the first is
++	 * the firmware's own, the others (the M3 dump area) are filled by
++	 * the WLAN firmware when it crashes.
++	 */
++	n = of_count_phandle_with_args(dev->of_node, "memory-region", NULL);
++	for (i = 0; i < n; i++) {
++		node = of_parse_phandle(dev->of_node, "memory-region", i);
++		rmem = node ? of_reserved_mem_lookup(node) : NULL;
++		of_node_put(node);
++		if (!rmem)
++			return -EINVAL;
++
++		ret = rproc_coredump_add_custom_segment(rproc, rmem->base,
++							rmem->size,
++							q6_wcss_copy_segment,
++							NULL);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
+ static const struct rproc_ops q6_wcss_ops = {
+ 	.start = q6_wcss_start,
+ 	.stop = q6_wcss_stop,
+ 	.da_to_va = q6_wcss_da_to_va,
++	.parse_fw = q6_wcss_parse_fw,
+ 	.load = q6_wcss_load,
+ 	.get_boot_addr = rproc_elf_get_boot_addr,
+ 	.panic = q6_wcss_panic,
+@@ -806,6 +860,8 @@ static int q6_wcss_probe(struct platform_device *pdev)
+ 	qcom_add_ssr_subdev(rproc, &wcss->ssr_subdev, "q6wcss");
+ 
+ 	rproc->auto_boot = false;
++	rproc->dump_conf = RPROC_COREDUMP_ENABLED;
++	rproc_coredump_set_elf_info(rproc, ELFCLASS32, EM_NONE);
+ 	ret = rproc_add(rproc);
+ 	if (ret)
+ 		goto free_rproc;
