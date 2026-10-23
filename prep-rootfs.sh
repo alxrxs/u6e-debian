@@ -436,6 +436,9 @@ for r in c000000.wifi:wlan24 0000:01:00.0:wlan5 0001:01:00.0:wlan6; do
 	printf 'ACTION=="add", SUBSYSTEM=="ieee80211", KERNELS=="%s", RUN+="/usr/sbin/iw phy %%k interface add %s type __ap"\n' \
 		"${r%:*}" "${r##*:}"
 done > $RF/etc/udev/rules.d/80-u6e-wlan.rules
+# The qrtr module runs the QRTR name service in the kernel: qrtr-tools' own
+# daemon would only find it taken and log an error at every boot.
+rm -f $RF/etc/systemd/system/multi-user.target.wants/qrtr-ns.service
 # A radio's firmware crash dump stays in sysfs for five minutes only: keep the
 # latest one (about 4 MB compressed) for scp, and log where it is. Firmware
 # memory holds the session keys, so it is root's only.
