@@ -202,10 +202,17 @@ ln -sf /usr/lib/systemd/system/systemd-netlogd.service $W/systemd-netlogd.servic
 # unit runs hostapd under it, restarted if it exits.
 (umask 077; boot/wifi-up.sh --print > $RF/usr/local/sbin/u6e-wifi)
 chmod 0700 $RF/usr/local/sbin/u6e-wifi
+# hostapd checks the RADIUS server's certificate, and the AP has no RTC: it
+# boots with the clock at systemd's build date, so Wi-Fi waits for NTP. The
+# wait is bounded, so an AP that cannot reach NTP still starts its Wi-Fi.
+ln -sf /usr/lib/systemd/system/systemd-time-wait-sync.service \
+	$RF/etc/systemd/system/sysinit.target.wants/systemd-time-wait-sync.service
+install -d $RF/etc/systemd/system/systemd-time-wait-sync.service.d
+printf '[Service]\nTimeoutStartSec=60\n' > $RF/etc/systemd/system/systemd-time-wait-sync.service.d/u6e.conf
 cat > $RF/etc/systemd/system/u6e-wifi.service <<'UNIT'
 [Unit]
 Description=U6E Wi-Fi (hostapd)
-After=u6e-nss.service systemd-networkd.service
+After=u6e-nss.service systemd-networkd.service time-sync.target
 
 [Service]
 ExecStartPre=/usr/local/sbin/u6e-wifi prepare

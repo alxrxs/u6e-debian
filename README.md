@@ -73,7 +73,7 @@ Persistent mode: with `U6E_PERSIST=1` in `site.conf`, the image re-arms the boot
 
 ## What the access point does
 
-Wi-Fi starts by itself on every boot (`u6e-wifi.service`), with nothing else on the network needed. `boot/wifi-up.sh` generates the configuration from `site.conf`, and can install a changed one on a running access point.
+Wi-Fi starts by itself on every boot (`u6e-wifi.service`), with nothing else on the network needed. The access point has no battery-backed clock, so Wi-Fi first waits up to 60 seconds for NTP: hostapd checks the RADIUS server's certificate against the time. `boot/wifi-up.sh` generates the configuration from `site.conf`, and can install a changed one on a running access point.
 
 **Networks**
 - Three kinds of SSID, each on the bands you choose: WPA3-Personal, WPA3-Enterprise, and WPA2-Personal with MAC-address authentication for old devices that can do nothing newer.
