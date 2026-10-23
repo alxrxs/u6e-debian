@@ -431,6 +431,24 @@ for r in c000000.wifi:wlan24 0000:01:00.0:wlan5 0001:01:00.0:wlan6; do
 	printf 'ACTION=="add", SUBSYSTEM=="ieee80211", KERNELS=="%s", RUN+="/usr/sbin/iw phy %%k interface add %s type __ap"\n' \
 		"${r%:*}" "${r##*:}"
 done > $RF/etc/udev/rules.d/80-u6e-wlan.rules
+# A radio's firmware crash dump stays in sysfs for five minutes only: keep the
+# latest one (about 4 MB compressed) for scp, and log where it is. Firmware
+# memory holds the session keys, so it is root's only.
+cat > $RF/usr/local/sbin/u6e-coredump <<'DUMP'
+#!/bin/sh
+set -eu
+umask 077
+dir=/var/lib/u6e-coredump dev=$(basename "$(readlink -f "$1/failing_device")")
+mkdir -p $dir
+rm -f $dir/*.gz
+f=$dir/$(date -u +%Y%m%dT%H%M%SZ)-$dev.gz
+gzip -1 < "$1/data" > "$f"
+echo 1 > "$1/data"
+logger -t u6e-coredump -p daemon.warning "firmware crash dump of $dev saved: $f ($(stat -c %s "$f") bytes)"
+DUMP
+chmod 0755 $RF/usr/local/sbin/u6e-coredump
+printf '%s\n' 'ACTION=="add", SUBSYSTEM=="devcoredump", RUN+="/usr/local/sbin/u6e-coredump /sys%p"' \
+	> $RF/etc/udev/rules.d/80-u6e-coredump.rules
 depmod -b $RF "$R"
 
 # Firmware: ath11k for this board's radios, its Bluetooth, and regdb only.
