@@ -1,0 +1,50 @@
+From 9f8035d2f9f5c49df0c0339326d308cd7ee12db5 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Fri, 23 Oct 2026 18:18:22 +0300
+Subject: [PATCH] FT: Keep the XXKey of a PMKSA cache entry used by the 4-way
+ handshake
+
+With FT-EAP, a STA that reassociates using a PMKSA cache entry gets the
+PMK from that entry in WPA_PTK INITPMK, but the XXKey was left unset and
+wpa_auth_derive_ptk_ft() later fell back to sm->pmksa. The entry does not
+necessarily outlive the handshake: if the EAPOL state machine of the STA
+still has the key data of the earlier authentication (the STA entry of an
+association that was never removed, e.g., after an SA Query timeout),
+reaching the Authenticated state adds a new PMKSA cache entry for the
+STA. That replaces the old entry and clears sm->pmksa while EAPOL-Key
+msg 1/4 is already sent, so the PTK derivation for msg 2/4 failed with
+"FT: XXKey not available for key derivation" and "FT: PTK derivation
+failed" and the STA was disconnected when the handshake timed out.
+
+Copy the PMK from the PMKSA cache entry to the XXKey in INITPMK for FT
+AKMs, like INITPSK does for FT-SAE, so that the 4-way handshake does not
+depend on the cache entry remaining.
+
+Assisted-by: LLM
+---
+ src/ap/wpa_auth.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/src/ap/wpa_auth.c b/src/ap/wpa_auth.c
+index e2dd40d96..eadcbfa7d 100644
+--- a/src/ap/wpa_auth.c
++++ b/src/ap/wpa_auth.c
+@@ -2908,6 +2908,15 @@ SM_STATE(WPA_PTK, INITPMK)
+ 		wpa_printf(MSG_DEBUG, "WPA: PMK from PMKSA cache");
+ 		os_memcpy(sm->PMK, sm->pmksa->pmk, sm->pmksa->pmk_len);
+ 		sm->pmk_len = sm->pmksa->pmk_len;
++#ifdef CONFIG_IEEE80211R_AP
++		if (wpa_key_mgmt_ft(sm->wpa_key_mgmt)) {
++			/* The PMKSA cache entry is not guaranteed to outlive
++			 * the 4-way handshake, so keep the XXKey here. */
++			os_memcpy(sm->xxkey, sm->pmksa->pmk,
++				  sm->pmksa->pmk_len);
++			sm->xxkey_len = sm->pmksa->pmk_len;
++		}
++#endif /* CONFIG_IEEE80211R_AP */
+ #ifdef CONFIG_DPP
+ 	} else if (sm->wpa_key_mgmt == WPA_KEY_MGMT_DPP) {
+ 		wpa_printf(MSG_DEBUG,
+-- 
+2.47.3
+
