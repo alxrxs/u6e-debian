@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Fri, 23 Oct 2026 22:11:33 +0300
+Subject: [PATCH] remoteproc: qcom_q6v5_mpd: dump the WCSS region when the
+ firmware crashes
+
+The multi-PD WCSS driver registered no coredump segments and left
+coredumps disabled, so a crash of the IPQ5018's WLAN firmware left no
+dump at all, unlike the PCI radios'. Add the whole WCSS memory region as
+a segment on each boot (it holds the firmware's memory and the M3 dump
+area the WLAN firmware fills when it crashes), copied from the driver's
+existing mapping by physical offset, and dump inline like
+qcom_q6v5_wcss_sec, so no copy of the 27 MB region is held in memory.
+
+Assisted-by: LLM
+---
+ drivers/remoteproc/qcom_q6v5_mpd.c | 25 +++++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/drivers/remoteproc/qcom_q6v5_mpd.c b/drivers/remoteproc/qcom_q6v5_mpd.c
+index 1e49a7da3..639fd4ce2 100644
+--- a/drivers/remoteproc/qcom_q6v5_mpd.c
++++ b/drivers/remoteproc/qcom_q6v5_mpd.c
+@@ -529,10 +529,33 @@ static const struct rproc_ops wcss_ops = {
+ 	.get_boot_addr = rproc_elf_get_boot_addr,
+ };
+ 
++static void q6_wcss_copy_segment(struct rproc *rproc,
++				 struct rproc_dump_segment *segment,
++				 void *dest, size_t offset, size_t size)
++{
++	struct q6_wcss *wcss = rproc->priv;
++
++	memcpy_fromio(dest, (void __iomem *)wcss->mem_region +
++		      (segment->da - wcss->mem_phys) + offset, size);
++}
++
++static int q6_wcss_parse_fw(struct rproc *rproc, const struct firmware *fw)
++{
++	struct q6_wcss *wcss = rproc->priv;
++
++	/* A crash dump holds the whole WCSS region: the firmware's memory
++	 * and the M3 dump area the WLAN firmware fills when it crashes.
++	 */
++	return rproc_coredump_add_custom_segment(rproc, wcss->mem_phys,
++						 wcss->mem_size,
++						 q6_wcss_copy_segment, NULL);
++}
++
+ static const struct rproc_ops q6_wcss_ops = {
+ 	.start = q6_wcss_start,
+ 	.stop = q6_wcss_stop,
+ 	.da_to_va = q6_wcss_da_to_va,
++	.parse_fw = q6_wcss_parse_fw,
+ 	.load = q6_wcss_load,
+ 	.get_boot_addr = rproc_elf_get_boot_addr,
+ 	.panic = q6_wcss_panic,
+@@ -806,6 +829,8 @@ static int q6_wcss_probe(struct platform_device *pdev)
+ 	qcom_add_ssr_subdev(rproc, &wcss->ssr_subdev, "q6wcss");
+ 
+ 	rproc->auto_boot = false;
++	rproc->dump_conf = RPROC_COREDUMP_INLINE;
++	rproc_coredump_set_elf_info(rproc, ELFCLASS32, EM_NONE);
+ 	ret = rproc_add(rproc);
+ 	if (ret)
+ 		goto free_rproc;
