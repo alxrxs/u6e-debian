@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Fri, 23 Oct 2026 19:23:01 +0300
+Subject: [PATCH] wifi: ath11k: no regulatory failure for the rules a recovery
+ repeats
+
+After a firmware restart the firmware sends its default regulatory rules
+again. ath11k_reg_handle_chan_list() deliberately keeps the pdev's
+existing default regd then, but returned -EINVAL for that, so every
+recovery logged "failed to process regulatory info -22". For the
+event's own rules (power type unset), free them and return 0, like the
+rules that would overwrite an identical default regd; a power type
+update passes the stored rules, which are not ours to free, and keeps
+its result.
+
+Assisted-by: LLM
+---
+ drivers/net/wireless/ath/ath11k/reg.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/drivers/net/wireless/ath/ath11k/reg.c b/drivers/net/wireless/ath/ath11k/reg.c
+index 2ac9156..c9a48af 100644
+--- a/drivers/net/wireless/ath/ath11k/reg.c
++++ b/drivers/net/wireless/ath/ath11k/reg.c
+@@ -755,6 +755,16 @@ int ath11k_reg_handle_chan_list(struct ath11k_base *ab,
+ 	if (test_bit(ATH11K_FLAG_RECOVERY, &ab->dev_flags) &&
+ 	    ab->default_regd[pdev_idx]) {
+ 		spin_unlock_bh(&ab->base_lock);
++		/* The firmware's event repeats the rules the pdev has, and
++		 * the event's reg_info is ours to free; the stored one of a
++		 * power type update is not.
++		 */
++		if (power_type == IEEE80211_REG_UNSET_AP) {
++			ath11k_dbg(ab, ATH11K_DBG_WMI,
++				   "recovery: default regulatory rules unchanged\n");
++			ath11k_reg_reset_info(reg_info);
++			return 0;
++		}
+ 		goto retfail;
+ 	}
+ 	spin_unlock_bh(&ab->base_lock);
