@@ -195,6 +195,11 @@ for t in apt-daily apt-daily-upgrade dpkg-db-backup fstrim; do ln -sf /dev/null 
 install -d $RF/etc/systemd/netlogd.conf.d
 printf '[Network]\nAddress=%s\nProtocol=udp\nLogFormat=rfc5424\n' "$LOG_SERVER" \
 	> $RF/etc/systemd/netlogd.conf.d/u6e.conf
+# It starts once the management network is routable, rather than failing to
+# send until then (it forwards what was logged before from the journal).
+install -d $RF/etc/systemd/system/systemd-netlogd.service.d
+printf '[Unit]\nWants=systemd-networkd-wait-online@%s:routable.service\nAfter=systemd-networkd-wait-online@%s:routable.service\n' \
+	$MGMT_IF $MGMT_IF > $RF/etc/systemd/system/systemd-netlogd.service.d/u6e.conf
 ln -sf /usr/lib/systemd/system/systemd-netlogd.service $W/systemd-netlogd.service
 
 # Wi-Fi comes up on its own on every boot: u6e-wifi is boot/wifi-up.sh's AP
