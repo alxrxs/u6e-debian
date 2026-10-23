@@ -7,7 +7,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 REV=5b156e272a0266ca6be0f394192bad42b0ff176c  # hostap main, 2026-10-01
-UP=2.13~git20261001 DEBVER=2.11-2 VER=2:2.13~git20261001-0+u6e18
+UP=2.13~git20261001 DEBVER=2.11-2 VER=2:2.13~git20261001-0+u6e19
 [ ! -e work ] || { echo "work exists; remove it first" >&2; exit 1; }
 mkdir work; mkdir -p out
 git clone -q https://w1.fi/hostap.git work/src
@@ -45,8 +45,8 @@ sed -i '/^Bump-DEFAULT_BSS_MAX_COUNT-to-1000.patch$/d; /^CVE-2024-5290-lib_engin
 # dropped as coming from an unknown link; a Class 3 frame completing an
 # association whose (Re)Association Response frame lost its ACK; and an FT
 # 4-way handshake keeping the key it took from a PMKSA cache entry, which a
-# STA returning to its stale association replaced mid-handshake; and no
-# OpenSSL errors left queued by the optional PKCS#11 provider's absence.
+# STA returning to its stale association replaced mid-handshake; and the
+# optional PKCS#11 provider loaded only for a connection that uses it.
 for p in no-pri-sec-switch-option rnr-6ghz-psd \
 	btm-query-candidates rrm-link-measurement-responder dscp-policy-fixes \
 	nr-mobility-domain esp-element anqp-neighbor-report fils-req-params-length \
@@ -56,7 +56,7 @@ for p in no-pri-sec-switch-option rnr-6ghz-psd \
 	openssl-keep-pending-tls-data radius-tls-stream-framing \
 	rnr-member-colocated-6ghz-ess mbssid-nontx-mde vlan-br-port-attrs \
 	sa-query-replace-assoc nl80211-sta-dump-mac gtk-rekey-join bss-load-unchanged nl80211-sta-vlan-get \
-	nl80211-spurious-link-id assoc-resp-implicit-ack ft-pmksa-xxkey openssl-pkcs11-optional; do
+	nl80211-spurious-link-id assoc-resp-implicit-ack ft-pmksa-xxkey openssl-pkcs11-on-demand; do
 	cp $p.patch $D/patches/
 	echo $p.patch >> $D/patches/series
 done

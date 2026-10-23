@@ -1,0 +1,51 @@
+From 9b42c6e97986f27ef96a8b1a672dfccd259ef622 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Fri, 23 Oct 2026 22:06:40 +0300
+Subject: [PATCH] OpenSSL: Load the PKCS#11 provider only for a connection that
+ uses it
+
+With OPENSSL_NO_ENGINE, tls_init() tried to load the PKCS#11 provider
+unconditionally. The provider is optional and usually not installed, so
+every start logged "PKCS11 provider not present", and the errors of the
+failed load stayed in the OpenSSL error queue until the first TLS
+connection reported them as "Clearing pending SSL error: ... DSO support
+routines::could not load the shared library".
+
+Load the provider when tls_connection_set_params() selects the pkcs11
+engine ID, explicitly or for a pkcs11: URI, before anything uses it. A
+setup without PKCS#11 never tries to load it; one with PKCS#11 gets it
+before tls_engine_init() as before, and a missing provider is reported
+where it is needed.
+
+Assisted-by: LLM
+---
+ src/crypto/tls_openssl.c | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/src/crypto/tls_openssl.c b/src/crypto/tls_openssl.c
+index 275ddd1d2..99473642c 100644
+--- a/src/crypto/tls_openssl.c
++++ b/src/crypto/tls_openssl.c
+@@ -1284,9 +1284,6 @@ void * tls_init(const struct tls_config *conf)
+ 		void openssl_load_legacy_provider(void);
+ 
+ 		openssl_load_legacy_provider();
+-#if !defined(ANDROID) && defined(OPENSSL_NO_ENGINE)
+-		openssl_load_pkcs11_provider();
+-#endif /* !ANDROID && OPENSSL_NO_ENGINE */
+ 
+ 		tls_global = context = tls_context_new(conf);
+ 		if (context == NULL)
+@@ -5813,6 +5810,12 @@ int tls_connection_set_params(void *tls_ctx, struct tls_connection *conn,
+ 		return -1;
+ 
+ 	if (engine_id) {
++#if !defined(ANDROID) && defined(OPENSSL_NO_ENGINE)
++		/* The PKCS#11 provider is optional: load it only for a
++		 * connection that uses it. */
++		if (!os_strcmp(engine_id, "pkcs11"))
++			openssl_load_pkcs11_provider();
++#endif /* !ANDROID && OPENSSL_NO_ENGINE */
+ 		wpa_printf(MSG_DEBUG, "SSL: Initializing TLS engine %s",
+ 			   engine_id);
+ 		ret = tls_engine_init(conn, engine_id, params->pin,
