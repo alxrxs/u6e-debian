@@ -12,7 +12,7 @@ make -s defconfig
 	-e ARCH_QCOM -e PINCTRL_IPQ5018 -e IPQ_GCC_5018 -e IPQ_CMN_PLL \
 	-e QCOM_APCS_IPC -e IPQ_APSS_PLL -e IPQ_APSS_6018 \
 	-e STMMAC_ETH -e STMMAC_PLATFORM -e DWMAC_IPQ5018 -e PCS_QCA_UNIPHY -e FWNODE_PCS \
-	-e MDIO_IPQ4019 -e AT803X_PHY -e QCA808X_PHY -e PHY_QCOM_UNIPHY_PCIE_USB3_28LP \
+	-e MDIO_IPQ4019 -e AT803X_PHY -e QCA808X_PHY -e PHY_QCOM_UNIPHY_PCIE_USB3_28LP -e PHY_QCOM_M31_USB \
 	-e PCI -e PCI_MSI -e PCIE_QCOM \
 	-e EXPERT -e CFG80211_CERTIFICATION_ONUS -e ATH_REG_DYNAMIC_USER_REG_HINTS \
 	-m ATH11K -e ATH11K_DEBUG -e DYNAMIC_DEBUG -m ATH11K_PCI -e REMOTEPROC -m ATH11K_AHB -m QCOM_Q6V5_MPD -m QCOM_Q6V5_WCSS_SEC -m QRTR -m QRTR_MHI \
@@ -39,6 +39,10 @@ done
 ./scripts/config -d SOUND -d DRM -d FB -d MEDIA_SUPPORT -d BT -d CAN -d NFC \
 	-d INPUT_TOUCHSCREEN -d USB_GADGET -d STAGING -d SLIMBUS -d QCOM_APR -d QCOM_IPA -d CMA
 ./scripts/config -e IIO -m IIO_ST_ACCEL_3AXIS -m IIO_ST_ACCEL_I2C_3AXIS
+# The USB controller is built in, so its M31 PHY is too (above): as a module
+# it came after the controller's probe, which waited for it. networkd's
+# sysctl monitor is a CO-RE BPF program, which needs the kernel's BTF.
+./scripts/config -d DEBUG_INFO_REDUCED -e DEBUG_INFO_BTF
 # What the NSS host drivers hook into (the NSS firmware DMAs to physical
 # addresses, and the IPQ5018 has no IOMMU); mac80211/ath11k are built from
 # backports, which also provides qmi_helpers - so nothing in the kernel may

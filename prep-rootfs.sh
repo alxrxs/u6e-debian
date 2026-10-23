@@ -411,7 +411,7 @@ ln -sf /lib/firmware/regulatory.db.p7s-upstream $RF/etc/alternatives/regulatory.
 rm -rf modstage $RF/usr/lib/modules/*
 make -s -C $K ARCH=arm64 CROSS_COMPILE=$X INSTALL_MOD_PATH=$PWD/modstage INSTALL_MOD_STRIP=1 modules_install
 M=$PWD/modstage/lib/modules/$R
-WANT="netconsole qcom_q6v5_mpd qcom_q6v5_wcss_sec qrtr-smd qcrypto st_accel_i2c phy-qcom-m31 qrtr qrtr-mhi vxlan macsec bridge 8021q nf_tables nft_ct nft_chain_nat nft_nat nft_masq nft_reject_inet nft_fib_inet nft_log nft_limit nf_conntrack tun wireguard sch_htb sch_tbf sch_fq_codel sch_prio sch_ingress cls_u32 cls_fw cls_matchall cls_flower act_police act_skbedit act_connmark act_mirred ifb btqcomipc"
+WANT="netconsole qcom_q6v5_mpd qcom_q6v5_wcss_sec qrtr-smd qcrypto st_accel_i2c qrtr qrtr-mhi vxlan macsec bridge 8021q nf_tables nft_ct nft_chain_nat nft_nat nft_masq nft_reject_inet nft_fib_inet nft_log nft_limit nf_conntrack tun wireguard sch_htb sch_tbf sch_fq_codel sch_prio sch_ingress cls_u32 cls_fw cls_matchall cls_flower act_police act_skbedit act_connmark act_mirred ifb btqcomipc"
 install -d "$M/updates"
 cp nss/out/$R/*.ko "$M/updates/"
 find nss/src/backports -name '*.ko' -print0 | while IFS= read -r -d '' f; do
