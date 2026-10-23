@@ -57,7 +57,7 @@ Every image is kept in `images/` with a `MANIFEST` (versions and checksums), so 
 
 The kernel and the Wi-Fi drivers are stored here as a download address plus a series of patches, not as copies of the upstream code:
 
-- `kernel/`: Linux 7.2.8 (`kernel/source`) and 122 patches (`kernel/patches`) for this board and for NSS.
+- `kernel/`: Linux 7.2.8 (`kernel/source`) and 123 patches (`kernel/patches`) for this board and for NSS.
 - `backports/`: OpenWrt's backports of the Linux 7.2 wireless stack (`backports/source`) and 195 patches (`backports/patches`) adding NSS Wi-Fi offload and fixes.
 
 `./trees.sh` downloads each release (checked against its checksum), applies the patches as git commits and produces the working trees `linux-7.2.8/` and `backports-7.2/`. The commit IDs come out the same every time. To change something, commit in a tree and run `./export.sh kernel` (or `backports`) to turn your new commits back into patch files. `trees.sh` refuses to overwrite a tree whose work has not been exported.
