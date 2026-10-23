@@ -111,7 +111,7 @@ Wi-Fi starts by itself on every boot (`u6e-wifi.service`), with nothing else on 
 | `config-u6e.sh` | Kernel configuration |
 | `nss/` | Builds the NSS drivers, the Wi-Fi stack and the NSS firmware download, with the patches for each |
 | `fw/` | Builds the board data files; includes `ath11k-bdencoder` |
-| `pkg/hostapd/` | hostapd build with our 28 patches |
+| `pkg/hostapd/` | hostapd build with our 29 patches |
 | `pkg/iproute2-nss/` | `iproute2` with NSS support in `tc` |
 | `pkg/netlogd/` | `systemd-netlogd` (the log forwarder) without a spurious error at each journal file rotation |
 | `pkg/u6e-agent/` | The access point's resident agent: neighbor reports across access points, management network check, state line (Rust) |
