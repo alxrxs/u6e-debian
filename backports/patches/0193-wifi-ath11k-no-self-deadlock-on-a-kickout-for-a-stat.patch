@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Fri, 23 Oct 2026 17:56:25 +0300
+Subject: [PATCH] wifi: ath11k: no self-deadlock on a kickout for a station
+ being removed
+
+A peer sta kickout event for a peer whose station mac80211 had already
+unlinked called ath11k_dp_peer_cleanup() with ab->base_lock held, and
+that takes the lock again: the CE tasklet spun on it forever, the NAPI
+thread spun behind it, and the watchdog reset the AP. It hit when a
+client moved between the 5 GHz and 6 GHz BSSs of one AP and the old
+radio's firmware kicked out the peer it was still deleting (two resets
+in two weeks). The same path also read sta and the saved peer
+uninitialized when no radio had the peer.
+
+Such a peer is being removed: ath11k_mac_station_remove() cleans up its
+receive state and deletes it. Skip it, at debug level.
+
+Assisted-by: LLM
+---
+ drivers/net/wireless/ath/ath11k/wmi.c | 26 +++++++++++---------------
+ 1 file changed, 11 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath11k/wmi.c b/drivers/net/wireless/ath/ath11k/wmi.c
+index ef97013..c493c2e 100644
+--- a/drivers/net/wireless/ath/ath11k/wmi.c
++++ b/drivers/net/wireless/ath/ath11k/wmi.c
+@@ -8222,10 +8222,7 @@ static void ath11k_peer_sta_kickout_event(struct ath11k_base *ab, struct sk_buff
+ {
+ 	struct wmi_peer_sta_kickout_arg arg = {};
+ 	struct ieee80211_sta *sta;
+-	struct ath11k_peer *peer;
+-	struct ath11k_peer *save_peer;
+ 	struct ath11k *ar;
+-	struct ath11k *save_ar;
+ 	int i;
+ 
+ 	if (ath11k_pull_peer_sta_kickout_ev(ab, skb, &arg) != 0) {
+@@ -8238,27 +8235,26 @@ static void ath11k_peer_sta_kickout_event(struct ath11k_base *ab, struct sk_buff
+ 	spin_lock_bh(&ab->base_lock);
+ 
+ 	for (i = 0; i < ab->num_radios; i++) {
+-		struct ath11k_pdev *pdev = &ab->pdevs[i];
+-		ar = pdev->ar;
+-		peer = ath11k_peer_find_by_addr(ar, arg.mac_addr);
+-		if (!peer) {
++		ar = ab->pdevs[i].ar;
++		if (!ath11k_peer_find_by_addr(ar, arg.mac_addr))
+ 			continue;
+-		}
+-		save_peer = peer;
+-		save_ar = ar;
++
++		/* A peer whose station mac80211 has already unlinked is being
++		 * removed: ath11k_mac_station_remove() cleans it up and deletes
++		 * it, so a kickout the firmware raced in has nothing to do.
++		 */
+ 		sta = ieee80211_find_sta_by_ifaddr(ar->hw, arg.mac_addr, NULL);
+ 		if (!sta) {
+-			    continue;
++			ath11k_dbg(ab, ATH11K_DBG_WMI,
++				   "peer sta kickout %pM: station being removed\n",
++				   arg.mac_addr);
++			continue;
+ 		}
+ 
+ 		ath11k_dbg(ab, ATH11K_DBG_WMI, "event peer sta kickout %pM", arg.mac_addr);
+ 
+ 		ieee80211_report_low_ack(sta, 10);
+ 	}
+-	if (!sta && save_peer) {
+-		ath11k_warn(ab, "Spurious quick kickout for STA %pM but found in peer table\n", arg.mac_addr);
+-		ath11k_dp_peer_cleanup(save_ar, save_peer->vdev_id, arg.mac_addr);
+-	}
+ 
+ 	spin_unlock_bh(&ab->base_lock);
+ 	rcu_read_unlock();
