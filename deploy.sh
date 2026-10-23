@@ -78,13 +78,16 @@ step nss "$kernel/$(head_of backports-7.2)/$(head_of . HEAD:nss)" as_owner nss/b
 
 hostapd=$(sed -n 's/.* VER=2:\([^ ]*\).*/\1/p' pkg/hostapd/build.sh)
 iproute2=$(pkg_version iproute2-nss VER)-$(pkg_version iproute2-nss DEB)+nss1
-[ -n "$hostapd" ] && [ "$iproute2" != -+nss1 ] || fail "no package versions in pkg/*/build.sh"
+netlogd=$(pkg_version netlogd VER)-$(pkg_version netlogd DEB)+u6e1
+[ -n "$hostapd" ] && [ "$iproute2" != -+nss1 ] && [ "$netlogd" != -+u6e1 ] || fail "no package versions in pkg/*/build.sh"
 deb=pkg/hostapd/out/hostapd_${hostapd}_arm64.deb
 [ -f "$deb" ] || step hostapd "$hostapd" arm64 "$deb" 'rm -rf pkg/hostapd/work && pkg/hostapd/build.sh' pkg/hostapd
 deb=pkg/iproute2-nss/out/iproute2_${iproute2}_arm64.deb
 [ -f "$deb" ] || step iproute2 "$iproute2" arm64 "$deb" 'rm -rf pkg/iproute2-nss/work && pkg/iproute2-nss/build.sh' pkg/iproute2-nss
-step rootfs "$hostapd/$iproute2/$(head_of . HEAD:mkrootfs.sh)" arm64 rootfs 'rm -rf rootfs && ./mkrootfs.sh' \
-	mkrootfs.sh pkg/hostapd/out pkg/iproute2-nss/out
+deb=pkg/netlogd/out/systemd-netlogd_${netlogd}_arm64.deb
+[ -f "$deb" ] || step netlogd "$netlogd" arm64 "$deb" 'rm -rf pkg/netlogd/work && pkg/netlogd/build.sh' pkg/netlogd
+step rootfs "$hostapd/$iproute2/$netlogd/$(head_of . HEAD:mkrootfs.sh)" arm64 rootfs 'rm -rf rootfs && ./mkrootfs.sh' \
+	mkrootfs.sh pkg/hostapd/out pkg/iproute2-nss/out pkg/netlogd/out
 # u6e-agent: a static arm64 binary, cross-built here (rustup's
 # aarch64-unknown-linux-musl target).
 [ -x pkg/u6e-agent/target/aarch64-unknown-linux-musl/release/u6e-agent ] || rm -f stamps/agent

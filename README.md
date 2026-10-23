@@ -46,9 +46,10 @@ sudo BOOT=0 ./deploy.sh           # build everything, each image included, but b
 4. `nss/build.sh`: builds the NSS drivers and the Wi-Fi stack, and fetches the NSS firmware.
 5. `pkg/hostapd/build.sh`: builds hostapd (the program that runs the Wi-Fi networks) as a Debian package.
 6. `pkg/iproute2-nss/build.sh`: builds Debian's `iproute2` with the NSS traffic-shaping options added to `tc`.
-7. `mkrootfs.sh`: creates the Debian root filesystem.
-8. `pkg/u6e-agent`: builds the access point's resident agent (Rust, one static binary): the neighbor report exchange between access points, the management network check and the state line in the log.
-9. For each access point whose running image was built from other inputs (this repository, `$BLOBS`, `site.conf` or the source trees): `prep-rootfs.sh` builds its image, `boot/stage.sh` boots it, and `deploy.sh` waits until all three radios are up. An access point already running the current build is left alone; `FORCE=1` boots a new image anyway. With `BOOT=0` each image is built and kept but not booted, so the access points keep running until a later run boots it.
+7. `pkg/netlogd/build.sh`: builds Debian's `systemd-netlogd`, which forwards the log, with a fix for its journal file rotation.
+8. `mkrootfs.sh`: creates the Debian root filesystem.
+9. `pkg/u6e-agent`: builds the access point's resident agent (Rust, one static binary): the neighbor report exchange between access points, the management network check and the state line in the log.
+10. For each access point whose running image was built from other inputs (this repository, `$BLOBS`, `site.conf` or the source trees): `prep-rootfs.sh` builds its image, `boot/stage.sh` boots it, and `deploy.sh` waits until all three radios are up. An access point already running the current build is left alone; `FORCE=1` boots a new image anyway. With `BOOT=0` each image is built and kept but not booted, so the access points keep running until a later run boots it.
 
 Every image is kept in `images/` with a `MANIFEST` (versions and checksums), so an earlier build can be booted again without rebuilding.
 
@@ -112,6 +113,7 @@ Wi-Fi starts by itself on every boot (`u6e-wifi.service`), with nothing else on 
 | `fw/` | Builds the board data files; includes `ath11k-bdencoder` |
 | `pkg/hostapd/` | hostapd build with our 27 patches |
 | `pkg/iproute2-nss/` | `iproute2` with NSS support in `tc` |
+| `pkg/netlogd/` | `systemd-netlogd` (the log forwarder) without a spurious error at each journal file rotation |
 | `pkg/u6e-agent/` | The access point's resident agent: neighbor reports across access points, management network check, state line (Rust) |
 | `mkrootfs.sh` | Creates the Debian root filesystem |
 | `prep-rootfs.sh` | Adds the kernel, firmware and configuration, and produces one image per access point |

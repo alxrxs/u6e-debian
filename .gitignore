@@ -20,6 +20,7 @@
 /nss/dl/
 /pkg/iproute2-nss/out/
 /pkg/hostapd/out/
+/pkg/netlogd/out/
 /pkg/u6e-agent/target/
 /log/
 /stamps/
