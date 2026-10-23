@@ -395,11 +395,6 @@ bt_auto=true
 sed -i "s/^#\?AutoEnable=.*/AutoEnable=$bt_auto/" $RF/etc/bluetooth/main.conf
 ln -sf /etc/systemd/system/u6e-btaddr.service $RF/etc/systemd/system/bluetooth.target.wants/u6e-btaddr.service
 
-# Bring-up diagnostics: ath11k AHB/BOOT/QMI debug and the WCSS IPC path's pr_debug.
-install -d $RF/etc/modprobe.d
-printf '%s\n' 'options ath11k debug_mask=0x61' 'options qrtr dyndbg=+p' 'options qrtr_smd dyndbg=+p' \
-	'options qcom_glink_smem dyndbg=+p' 'options qcom_q6v5_wcss_sec dyndbg=+p' > $RF/etc/modprobe.d/u6e-debug.conf
-
 # wireless-regdb defaults to a database re-signed with Debian's key, which only
 # Debian kernels trust; ours trusts the upstream signers, so use their copy.
 ln -sf /lib/firmware/regulatory.db-upstream $RF/etc/alternatives/regulatory.db
