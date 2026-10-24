@@ -190,11 +190,16 @@ fn parse(msg: &str, bss: u16, phy: impl FnOnce() -> String) -> Option<EventKind>
             mac: station(&mut f)?,
             bss,
         },
-        "CTRL-EVENT-EAP-SUCCESS" => EventKind::EapOk {
+        // The 2 forms are hostapd relaying to a RADIUS server, the plain
+        // ones its own EAP server.
+        "CTRL-EVENT-EAP-SUCCESS" | "CTRL-EVENT-EAP-SUCCESS2" => EventKind::EapOk {
             mac: station(&mut f)?,
             bss,
         },
-        "CTRL-EVENT-EAP-FAILURE" => EventKind::EapFail {
+        "CTRL-EVENT-EAP-FAILURE"
+        | "CTRL-EVENT-EAP-FAILURE2"
+        | "CTRL-EVENT-EAP-TIMEOUT-FAILURE"
+        | "CTRL-EVENT-EAP-TIMEOUT-FAILURE2" => EventKind::EapFail {
             mac: station(&mut f)?,
             bss,
         },
@@ -247,10 +252,77 @@ mod tests {
         );
     }
 
+    /// With an external RADIUS server hostapd only relays EAP, and reports
+    /// its results with a 2 suffix.
+    #[test]
+    fn reports_the_eap_results_of_a_radius_server() {
+        let a = "02:00:00:00:00:08";
+        for (name, ok) in [
+            ("CTRL-EVENT-EAP-SUCCESS2", true),
+            ("CTRL-EVENT-EAP-FAILURE2", false),
+            ("CTRL-EVENT-EAP-TIMEOUT-FAILURE", false),
+            ("CTRL-EVENT-EAP-TIMEOUT-FAILURE2", false),
+        ] {
+            let want = if ok {
+                EventKind::EapOk { mac: STA, bss: 1 }
+            } else {
+                EventKind::EapFail { mac: STA, bss: 1 }
+            };
+            assert_eq!(parse(&format!("<3>{name} {a}"), 1, phy1), Some(want));
+        }
+    }
+
+    /// The events of one boot of a real AP, as hostapd logged them.
+    #[test]
+    fn parses_a_recorded_event_stream() {
+        let order = ["wlan24", "wlan5", "wlan6"];
+        let mut got = Vec::new();
+        for l in include_str!("../tests/fixtures/hostapd-events.txt").lines() {
+            let Some((ifname, msg)) = l.split_once(' ').filter(|_| !l.starts_with('#')) else {
+                continue;
+            };
+            let bss = order.iter().position(|n| *n == ifname).unwrap() as u16;
+            got.extend(parse(msg, bss, || format!("phy-{ifname}")));
+        }
+        let count = |f: fn(&EventKind) -> bool| got.iter().filter(|k| f(k)).count();
+        assert_eq!(count(|k| matches!(k, EventKind::Assoc { .. })), 15);
+        assert_eq!(count(|k| matches!(k, EventKind::Disassoc { .. })), 10);
+        assert_eq!(count(|k| matches!(k, EventKind::RadioUp { .. })), 3);
+        let sta = |n| [2, 0, 0, 0, 0, n];
+        let eap: Vec<_> = got
+            .iter()
+            .filter(|k| matches!(k, EventKind::EapOk { .. } | EventKind::EapFail { .. }))
+            .cloned()
+            .collect();
+        assert_eq!(
+            eap,
+            [
+                EventKind::EapOk {
+                    mac: sta(6),
+                    bss: 1
+                },
+                EventKind::EapFail {
+                    mac: sta(2),
+                    bss: 1
+                },
+                EventKind::EapFail {
+                    mac: sta(2),
+                    bss: 1
+                },
+                EventKind::EapOk {
+                    mac: sta(2),
+                    bss: 1
+                },
+            ]
+        );
+        assert_eq!(got.len(), 15 + 10 + 3 + 4);
+    }
+
     #[test]
     fn ignores_everything_else() {
         for m in [
-            "<3>CTRL-EVENT-EAP-SUCCESS2 02:00:00:00:00:08",
+            "<3>CTRL-EVENT-EAP-SUCCESSX 02:00:00:00:00:08",
+            "<3>CTRL-EVENT-EAP-RETRANSMIT2 02:00:00:00:00:08",
             "<3>AP-STA-CONNECTED",
             "<3>AP-STA-CONNECTED 02:00:00:00:00",
             "<3>AP-STA-CONNECTED 02:00:00:00:00:08:09",
