@@ -445,23 +445,29 @@ fn channel(freq_mhz: u32) -> u16 {
         Band::B24 if freq_mhz == 2484 => return 14,
         Band::B24 => (freq_mhz, 2407),
         Band::B5 => (freq_mhz, 5000),
+        Band::B6 if freq_mhz == 5935 => return 2,
         Band::B6 => (freq_mhz, 5950),
     };
     (f.saturating_sub(base) / 5) as u16
 }
 
 /// One radio per phy that has a BSS, by phy name. Its channel, width and power
-/// are its first BSS's; the survey of the channel in use gives the noise and
-/// the times, and the first BSS's hostapd says whether it is up.
+/// are its first BSS's that is on a channel (hostapd brings them up one by
+/// one); the survey of the channel in use gives the noise and the times, and
+/// that BSS's hostapd says whether it is up.
 fn radios(
     bsss: &[Bss],
     ifaces: &[Iface],
     mut survey: impl FnMut(&Iface) -> Vec<Survey>,
     mut enabled: impl FnMut(&str) -> bool,
 ) -> Vec<Radio> {
+    let on_channel = |b: &Bss| ifaces.iter().any(|i| i.name == b.ifname && i.freq_mhz != 0);
     let mut firsts: BTreeMap<&str, &Bss> = BTreeMap::new();
     for b in bsss.iter().filter(|b| !b.phy.is_empty()) {
-        firsts.entry(&b.phy).or_insert(b);
+        let first = firsts.entry(&b.phy).or_insert(b);
+        if !on_channel(first) && on_channel(b) {
+            *first = b;
+        }
     }
     firsts
         .into_iter()
@@ -674,6 +680,24 @@ mod tests {
         assert!(!radio_up(refused, Some(true)));
     }
 
+    /// hostapd brings a radio's BSSs up one by one: until the first is on its
+    /// channel, the radio's channel comes from one that is.
+    #[test]
+    fn a_radio_takes_its_channel_from_a_bss_that_has_one() {
+        let t = TestDir::new();
+        let mut ifaces = nl80211::parse_interfaces(INTERFACES);
+        ifaces
+            .iter_mut()
+            .filter(|i| i.name == "wlan5")
+            .for_each(|i| i.freq_mhz = 0);
+        let all_bsss = bsss(&sys(&t), &order(), &ifaces);
+        let all = radios(&all_bsss, &ifaces, |_| Vec::new(), |_| true);
+        assert_eq!(
+            (all[1].phy.as_str(), all[1].band, all[1].channel),
+            ("phy1", Band::B5, 149)
+        );
+    }
+
     #[test]
     fn a_radio_without_a_survey_reads_as_zeros() {
         let t = TestDir::new();
@@ -731,6 +755,8 @@ mod tests {
         assert_eq!((channel(2412), channel(2472), channel(2484)), (1, 13, 14));
         assert_eq!((channel(5180), channel(5745)), (36, 149));
         assert_eq!((channel(5955), channel(6375)), (1, 85));
+        // 6 GHz channel 2 sits below channel 1.
+        assert_eq!((band(5935), channel(5935)), (Band::B6, 2));
         assert_eq!(
             (band(2484), band(5180), band(5925), band(7115)),
             (Band::B24, Band::B5, Band::B6, Band::B6)
