@@ -392,6 +392,10 @@ dependencies = [
 [[package]]
 name = "u6e-agent"
 version = "1.0.0"
+dependencies = [
+ "libc",
+ "u6e-proto",
+]
 
 [[package]]
 name = "u6e-controller"

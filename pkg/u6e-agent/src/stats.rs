@@ -2,87 +2,57 @@
 //! Wi-Fi firmware crashes so far, the stations of each BSS and the thermal
 //! zones.
 
-use std::fs;
-use std::io::{ErrorKind, Read};
-use std::os::unix::fs::OpenOptionsExt;
+use u6e_proto::msg::Snapshot;
 
-const O_NONBLOCK: i32 = 0o4000;
-
-fn first_field(path: &str) -> String {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|s| Some(s.split_whitespace().next()?.to_owned()))
-        .unwrap_or_default()
-}
-
-fn mem_available_kb() -> String {
-    fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|m| {
-            let l = m.lines().find(|l| l.starts_with("MemAvailable:"))?;
-            Some(l.split_whitespace().nth(1)?.to_owned())
-        })
-        .unwrap_or_default()
-}
-
-/// The kernel log records (one per read of /dev/kmsg) that report a crash.
-fn fw_crashes() -> usize {
-    let Ok(mut kmsg) = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(O_NONBLOCK)
-        .open("/dev/kmsg")
-    else {
-        return 0;
-    };
-    let (mut buf, mut n) = (vec![0; 8192], 0);
-    loop {
-        match kmsg.read(&mut buf) {
-            Ok(0) => break,
-            Ok(len) => n += usize::from(buf[..len].windows(17).any(|w| w == b"firmware crashed")),
-            // A record overwritten while we read it.
-            Err(e) if e.kind() == ErrorKind::BrokenPipe => continue,
-            Err(_) => break,
-        }
-    }
-    n
-}
-
-fn temps() -> String {
-    let mut zones: Vec<_> = fs::read_dir("/sys/class/thermal")
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with("thermal_zone"))
-        })
-        .collect();
-    zones.sort();
-    zones
-        .iter()
-        .map(|z| {
-            let millic: i64 = first_field(&z.join("temp").to_string_lossy())
-                .parse()
-                .unwrap_or(0);
-            format!(
-                "{}={} ",
-                first_field(&z.join("type").to_string_lossy()),
-                millic / 1000
-            )
-        })
-        .collect()
-}
-
-pub fn line(stations: &[(String, u32)]) -> String {
+pub fn line(snap: &Snapshot, fw_crashes: u64, stations: &[(String, u32)]) -> String {
     let mut stations = stations.to_vec();
     stations.sort();
     let clients: String = stations.iter().map(|(i, n)| format!("{i}={n} ")).collect();
+    let temps: Vec<String> = snap
+        .temps
+        .iter()
+        .map(|t| format!("{}={}", t.zone, t.milli_c / 1000))
+        .collect();
     format!(
-        "load={} memavail_kb={} fw_crashes={} clients: {clients}temps: {}",
-        first_field("/proc/loadavg"),
-        mem_available_kb(),
-        fw_crashes(),
-        temps().trim_end()
+        "load={}.{:02} memavail_kb={} fw_crashes={fw_crashes} clients: {clients}temps: {}",
+        snap.load_milli / 1000,
+        snap.load_milli % 1000 / 10,
+        snap.mem_avail_kb,
+        temps.join(" ")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use u6e_proto::msg::Temp;
+
+    #[test]
+    fn keeps_the_line_format() {
+        let snap = Snapshot {
+            seq: 0,
+            uptime_s: 0,
+            load_milli: 1230,
+            mem_avail_kb: 812345,
+            nss_load_pct: 0,
+            temps: vec![
+                Temp {
+                    zone: "cpu-thermal".into(),
+                    milli_c: 61000,
+                },
+                Temp {
+                    zone: "phy1".into(),
+                    milli_c: 55500,
+                },
+            ],
+            radios: vec![],
+            bsss: vec![],
+            stations: vec![],
+        };
+        let stations = [("wlan5".to_string(), 3), ("wlan24".to_string(), 0)];
+        assert_eq!(
+            line(&snap, 2, &stations),
+            "load=1.23 memavail_kb=812345 fw_crashes=2 clients: wlan24=0 wlan5=3 temps: cpu-thermal=61 phy1=55"
+        );
+    }
 }

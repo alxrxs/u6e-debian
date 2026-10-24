@@ -4,10 +4,19 @@
 //!
 //!   u6e-agent --listen <address> --port <port> --gateway <address> [--arm]
 //!             [--peer <address>]...
+//!   u6e-agent --print-snapshot
 
+mod collect;
+#[allow(dead_code, reason = "the link starts the events thread")]
+mod events;
+#[allow(dead_code, reason = "used by the events thread")]
+mod kmsg;
 mod neighbors;
 mod netcheck;
+mod nl80211;
 mod stats;
+#[cfg(test)]
+mod testdir;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -50,6 +59,14 @@ fn args() -> Option<Args> {
 }
 
 fn main() {
+    if env::args().nth(1).as_deref() == Some("--print-snapshot") {
+        let mut c = collect::Collector::new().unwrap_or_else(|e| {
+            eprintln!("u6e-agent: collectors: {e}");
+            process::exit(1);
+        });
+        println!("{:#?}", c.snapshot(0));
+        return;
+    }
     let Some(a) = args() else {
         eprintln!(
             "usage: u6e-agent --listen <address> --port <port> --gateway <address> [--arm] [--peer <address>]..."
@@ -58,6 +75,10 @@ fn main() {
     };
     let mut h = neighbors::Hostapd::open().unwrap_or_else(|e| {
         eprintln!("u6e-agent: hostapd control socket: {e}");
+        process::exit(1);
+    });
+    let mut collector = collect::Collector::new().unwrap_or_else(|e| {
+        eprintln!("u6e-agent: collectors: {e}");
         process::exit(1);
     });
     let peers: Vec<SocketAddr> = a
@@ -76,7 +97,8 @@ fn main() {
     for n in 0.. {
         let stations = neighbors::round(&mut h, &own, &peers);
         if n >= STATS_FIRST && (n - STATS_FIRST).is_multiple_of(STATS_EVERY) {
-            println!("{}", stats::line(&stations));
+            let snap = collector.snapshot(0);
+            println!("{}", stats::line(&snap, collector.fw_crashes(), &stations));
         }
         thread::sleep(Duration::from_secs(neighbors::ROUND_SECS));
     }

@@ -11,11 +11,12 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixDatagram;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{fs, thread};
 
-const HOSTAPD: &str = "/run/hostapd";
+pub const HOSTAPD: &str = "/run/hostapd";
 const CTRL: &str = "/run/u6e-agent/ctrl";
 const ROUND: Duration = Duration::from_secs(ROUND_SECS);
 const TIMEOUT: Duration = Duration::from_secs(3);
@@ -62,31 +63,39 @@ fn peer_entry(line: &str) -> Option<Entry> {
     })
 }
 
+/// A client of hostapd's control interfaces, bound at its own socket path.
 pub struct Hostapd {
     sock: UnixDatagram,
+    dir: PathBuf,
     buf: Vec<u8>,
 }
 
 impl Hostapd {
     pub fn open() -> std::io::Result<Self> {
-        let _ = fs::remove_file(CTRL);
-        let sock = UnixDatagram::bind(CTRL)?;
+        Self::bind(Path::new(CTRL), Path::new(HOSTAPD))
+    }
+
+    /// A client at `client` talking to the sockets in `dir`.
+    pub fn bind(client: &Path, dir: &Path) -> std::io::Result<Self> {
+        let _ = fs::remove_file(client);
+        let sock = UnixDatagram::bind(client)?;
         sock.set_read_timeout(Some(Duration::from_secs(1)))?;
         Ok(Hostapd {
             sock,
+            dir: dir.to_owned(),
             buf: vec![0; 65536],
         })
     }
 
     /// One control interface request; "" when hostapd does not answer. A
     /// reply left over from a request that timed out is discarded first.
-    fn request(&mut self, iface: &str, cmd: &str) -> String {
+    pub fn request(&mut self, iface: &str, cmd: &str) -> String {
         let _ = self.sock.set_nonblocking(true);
         while self.sock.recv(&mut self.buf).is_ok() {}
         let _ = self.sock.set_nonblocking(false);
         if self
             .sock
-            .send_to(cmd.as_bytes(), format!("{HOSTAPD}/{iface}"))
+            .send_to(cmd.as_bytes(), self.dir.join(iface))
             .is_err()
         {
             return String::new();

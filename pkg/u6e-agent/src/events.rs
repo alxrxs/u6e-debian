@@ -1,0 +1,383 @@
+//! What happens between two snapshots: stations associating and leaving, EAP
+//! results, a radio going up or down (hostapd's event stream, one attached
+//! control socket per BSS) and a Wi-Fi firmware crash (the kernel log). One
+//! thread owns all the sockets; it re-attaches to a hostapd that restarted
+//! and picks up BSSs that appear, so nothing has to restart it.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::io;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::net::UnixDatagram;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{SyncSender, TrySendError};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use u6e_proto::msg::{Event, EventKind};
+
+use crate::collect::{self, Paths};
+use crate::kmsg::{self, Kmsg};
+
+/// How often the set of hostapd sockets and the kernel log are looked at when
+/// nothing arrives.
+const RESCAN_MS: i32 = 1000;
+const ATTACH_TIMEOUT: Duration = Duration::from_secs(1);
+
+pub struct Events;
+
+impl Events {
+    /// Starts the thread; events go to `tx`, which drops them when it is full
+    /// (the next snapshot carries the state anyway) and ends the thread when
+    /// its receiver is gone.
+    pub fn spawn(tx: SyncSender<Event>) -> io::Result<()> {
+        Self::spawn_with(tx, Paths::default())
+    }
+
+    pub fn spawn_with(tx: SyncSender<Event>, paths: Paths) -> io::Result<()> {
+        fs::create_dir_all(&paths.run)?;
+        thread::Builder::new()
+            .name("events".into())
+            .spawn(move || run(&tx, &paths))?;
+        Ok(())
+    }
+}
+
+/// A control socket attached to one hostapd BSS socket.
+struct Attached {
+    sock: UnixDatagram,
+    path: PathBuf,
+    /// Identity of the hostapd socket file at attach time: a restarted
+    /// hostapd binds a new one.
+    stamp: (u64, i64, i64),
+}
+
+impl Drop for Attached {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn stamp(path: &Path) -> Option<(u64, i64, i64)> {
+    let m = fs::metadata(path).ok()?;
+    Some((m.ino(), m.ctime(), m.ctime_nsec()))
+}
+
+fn attach(paths: &Paths, name: &str) -> Option<Attached> {
+    let target = paths.hostapd.join(name);
+    let stamp = stamp(&target)?;
+    let path = paths.run.join(format!("ev-{name}"));
+    let _ = fs::remove_file(&path);
+    let sock = UnixDatagram::bind(&path).ok()?;
+    let attached = Attached { sock, path, stamp };
+    attached.sock.set_read_timeout(Some(ATTACH_TIMEOUT)).ok()?;
+    attached.sock.send_to(b"ATTACH", &target).ok()?;
+    let mut reply = [0; 16];
+    let n = attached.sock.recv(&mut reply).ok()?;
+    (reply[..n].starts_with(b"OK")).then_some(())?;
+    attached.sock.set_nonblocking(true).ok()?;
+    Some(attached)
+}
+
+fn run(tx: &SyncSender<Event>, paths: &Paths) {
+    let mut kmsg = Kmsg::open(&paths.kmsg, true);
+    let mut attached: BTreeMap<String, Attached> = BTreeMap::new();
+    let mut buf = vec![0; 4096];
+    loop {
+        let order = collect::bss_order(&paths.hostapd);
+        attached.retain(|name, a| {
+            order.contains(name) && stamp(&paths.hostapd.join(name)) == Some(a.stamp)
+        });
+        for name in &order {
+            if !attached.contains_key(name)
+                && let Some(a) = attach(paths, name)
+            {
+                attached.insert(name.clone(), a);
+            }
+        }
+
+        let mut fds: Vec<libc::pollfd> = attached
+            .values()
+            .map(|a| libc::pollfd {
+                fd: a.sock.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, RESCAN_MS) };
+
+        let mut events = Vec::new();
+        for ((name, a), fd) in attached.iter().zip(&fds) {
+            if fd.revents == 0 {
+                continue;
+            }
+            let bss = order.iter().position(|n| n == name).unwrap_or(0) as u16;
+            while let Ok(n) = a.sock.recv(&mut buf) {
+                let msg = String::from_utf8_lossy(&buf[..n]);
+                events.extend(parse(&msg, bss, || phy_of(&paths.sys(), name)));
+            }
+        }
+        for msg in kmsg.drain() {
+            if kmsg::is_fw_crash(&msg) {
+                events.extend(
+                    kmsg::crashed_phy(&paths.sys(), &msg).map(|phy| EventKind::FwCrash { phy }),
+                );
+            }
+        }
+        for kind in events {
+            match tx.try_send(Event {
+                at_ms: now_ms(),
+                kind,
+            }) {
+                Err(TrySendError::Disconnected(_)) => return,
+                Ok(()) | Err(TrySendError::Full(_)) => {}
+            }
+        }
+    }
+}
+
+/// Milliseconds since the epoch, as the AP's clock has it.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// The phy an interface belongs to, from sysfs.
+fn phy_of(sys: &Path, ifname: &str) -> String {
+    fs::read_link(sys.join("class/net").join(ifname).join("phy80211"))
+        .ok()
+        .and_then(|l| Some(l.file_name()?.to_string_lossy().into_owned()))
+        .unwrap_or_default()
+}
+
+fn mac(s: &str) -> Option<[u8; 6]> {
+    let mut out = [0; 6];
+    let mut parts = s.split(':');
+    for b in &mut out {
+        *b = u8::from_str_radix(parts.next().filter(|p| p.len() == 2)?, 16).ok()?;
+    }
+    parts.next().is_none().then_some(out)
+}
+
+/// The event a hostapd message reports, "<3>NAME [MAC ...]" (the priority
+/// prefix stripped); none for what is not one of ours. `phy` names the phy of
+/// the BSS, for the events about the radio.
+fn parse(msg: &str, bss: u16, phy: impl FnOnce() -> String) -> Option<EventKind> {
+    let msg = msg
+        .strip_prefix('<')
+        .and_then(|m| m.split_once('>'))
+        .map_or(msg, |(_, m)| m);
+    let mut f = msg.split_whitespace();
+    let name = f.next()?;
+    let station = |f: &mut std::str::SplitWhitespace| mac(f.next()?);
+    Some(match name {
+        "AP-STA-CONNECTED" => EventKind::Assoc {
+            mac: station(&mut f)?,
+            bss,
+        },
+        "AP-STA-DISCONNECTED" => EventKind::Disassoc {
+            mac: station(&mut f)?,
+            bss,
+        },
+        "CTRL-EVENT-EAP-SUCCESS" => EventKind::EapOk {
+            mac: station(&mut f)?,
+            bss,
+        },
+        "CTRL-EVENT-EAP-FAILURE" => EventKind::EapFail {
+            mac: station(&mut f)?,
+            bss,
+        },
+        "AP-ENABLED" => EventKind::RadioUp { phy: phy() },
+        "AP-DISABLED" => EventKind::RadioDown { phy: phy() },
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testdir::TestDir;
+    use std::os::unix::fs::symlink;
+    use std::sync::mpsc::sync_channel;
+
+    const STA: [u8; 6] = [2, 0, 0, 0, 0, 8];
+    const WAIT: Duration = Duration::from_secs(5);
+
+    fn phy1() -> String {
+        "phy1".into()
+    }
+
+    #[test]
+    fn parses_what_hostapd_reports() {
+        let a = "02:00:00:00:00:08";
+        assert_eq!(
+            parse(&format!("<3>AP-STA-CONNECTED {a} auth_alg=open"), 2, phy1),
+            Some(EventKind::Assoc { mac: STA, bss: 2 })
+        );
+        assert_eq!(
+            parse(&format!("AP-STA-DISCONNECTED {a}"), 0, phy1),
+            Some(EventKind::Disassoc { mac: STA, bss: 0 })
+        );
+        assert_eq!(
+            parse(&format!("<3>CTRL-EVENT-EAP-SUCCESS {a}"), 1, phy1),
+            Some(EventKind::EapOk { mac: STA, bss: 1 })
+        );
+        assert_eq!(
+            parse(&format!("<3>CTRL-EVENT-EAP-FAILURE {a}"), 1, phy1),
+            Some(EventKind::EapFail { mac: STA, bss: 1 })
+        );
+        assert_eq!(
+            parse("<3>AP-ENABLED", 0, phy1),
+            Some(EventKind::RadioUp { phy: "phy1".into() })
+        );
+        assert_eq!(
+            parse("<3>AP-DISABLED", 0, phy1),
+            Some(EventKind::RadioDown { phy: "phy1".into() })
+        );
+    }
+
+    #[test]
+    fn ignores_everything_else() {
+        for m in [
+            "<3>CTRL-EVENT-EAP-SUCCESS2 02:00:00:00:00:08",
+            "<3>AP-STA-CONNECTED",
+            "<3>AP-STA-CONNECTED 02:00:00:00:00",
+            "<3>AP-STA-CONNECTED 02:00:00:00:00:08:09",
+            "<3>WPS-PIN-NEEDED",
+            "",
+        ] {
+            assert_eq!(parse(m, 0, phy1), None, "{m}");
+        }
+    }
+
+    /// A stand-in for hostapd's control socket: answers ATTACH and remembers
+    /// who attached, so the test can push events to it.
+    struct FakeHostapd {
+        sock: UnixDatagram,
+        client: Option<PathBuf>,
+    }
+
+    impl FakeHostapd {
+        fn bind(path: &Path) -> Self {
+            let sock = UnixDatagram::bind(path).unwrap();
+            sock.set_read_timeout(Some(WAIT)).unwrap();
+            FakeHostapd { sock, client: None }
+        }
+
+        fn wait_attach(&mut self) {
+            let mut buf = [0; 64];
+            let (n, from) = self.sock.recv_from(&mut buf).unwrap();
+            assert_eq!(&buf[..n], b"ATTACH");
+            let client = from.as_pathname().unwrap().to_owned();
+            self.sock.send_to(b"OK\n", &client).unwrap();
+            self.client = Some(client);
+        }
+
+        fn event(&self, msg: &str) {
+            self.sock
+                .send_to(msg.as_bytes(), self.client.as_ref().unwrap())
+                .unwrap();
+        }
+    }
+
+    fn paths(t: &TestDir) -> Paths {
+        let p = Paths {
+            root: t.path().join("root"),
+            hostapd: t.path().join("hostapd"),
+            kmsg: t.path().join("kmsg"),
+            run: t.path().join("run"),
+        };
+        fs::create_dir_all(&p.hostapd).unwrap();
+        fs::create_dir_all(p.sys().join("class/net/wlan6")).unwrap();
+        symlink(
+            "../../ieee80211/phy2",
+            p.sys().join("class/net/wlan6/phy80211"),
+        )
+        .unwrap();
+        p
+    }
+
+    #[test]
+    fn hostapd_restart_reattaches() {
+        let t = TestDir::new();
+        let paths = paths(&t);
+        let (sock5, sock6) = (paths.hostapd.join("wlan5"), paths.hostapd.join("wlan6"));
+        let mut first = FakeHostapd::bind(&sock5);
+        let mut other = FakeHostapd::bind(&sock6);
+        let (tx, rx) = sync_channel(16);
+        Events::spawn_with(tx, paths.clone()).unwrap();
+
+        first.wait_attach();
+        other.wait_attach();
+        first.event("<3>AP-STA-CONNECTED 02:00:00:00:00:08");
+        assert_eq!(
+            rx.recv_timeout(WAIT).unwrap().kind,
+            EventKind::Assoc { mac: STA, bss: 0 }
+        );
+        other.event("<3>AP-DISABLED");
+        assert_eq!(
+            rx.recv_timeout(WAIT).unwrap().kind,
+            EventKind::RadioDown { phy: "phy2".into() }
+        );
+
+        // hostapd restarts: the socket disappears and a new one takes its place.
+        drop(first);
+        fs::remove_file(&sock5).unwrap();
+        let mut second = FakeHostapd::bind(&sock5);
+        second.wait_attach();
+        second.event("<3>AP-STA-DISCONNECTED 02:00:00:00:00:08");
+        assert_eq!(
+            rx.recv_timeout(WAIT).unwrap().kind,
+            EventKind::Disassoc { mac: STA, bss: 0 }
+        );
+
+        // A BSS that appears later is attached too, and sorts into the indices.
+        let mut early = FakeHostapd::bind(&paths.hostapd.join("wlan24"));
+        early.wait_attach();
+        early.event("<3>CTRL-EVENT-EAP-FAILURE 02:00:00:00:00:08");
+        assert_eq!(
+            rx.recv_timeout(WAIT).unwrap().kind,
+            EventKind::EapFail { mac: STA, bss: 0 }
+        );
+        second.event("<3>CTRL-EVENT-EAP-SUCCESS 02:00:00:00:00:08");
+        assert_eq!(
+            rx.recv_timeout(WAIT).unwrap().kind,
+            EventKind::EapOk { mac: STA, bss: 1 }
+        );
+    }
+
+    #[test]
+    fn a_firmware_crash_becomes_an_event() {
+        let t = TestDir::new();
+        let paths = paths(&t);
+        let phy = paths.sys().join("class/ieee80211/phy1");
+        fs::create_dir_all(&phy).unwrap();
+        symlink("../../../0000:01:00.0", phy.join("device")).unwrap();
+        fs::write(
+            &paths.kmsg,
+            "6,1,1,-;old line\n4,2,2,-;ath11k_pci 0000:01:00.0: firmware crashed: x\n",
+        )
+        .unwrap();
+        let log = paths.kmsg.clone();
+        let (tx, rx) = sync_channel(16);
+        Events::spawn_with(tx, paths).unwrap();
+
+        thread::sleep(Duration::from_millis(1500));
+        let mut f = fs::OpenOptions::new().append(true).open(log).unwrap();
+        io::Write::write_all(
+            &mut f,
+            b"4,3,3,-;ath11k_pci 0000:01:00.0: firmware crashed: y\n",
+        )
+        .unwrap();
+        assert_eq!(
+            rx.recv_timeout(WAIT).unwrap().kind,
+            EventKind::FwCrash { phy: "phy1".into() }
+        );
+        assert!(
+            rx.recv_timeout(Duration::from_millis(1500)).is_err(),
+            "the backlog is not replayed"
+        );
+    }
+}
