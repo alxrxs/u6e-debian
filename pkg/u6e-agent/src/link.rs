@@ -49,26 +49,65 @@ pub struct Config {
     pub identity: Identity,
     pub controller_key: [u8; 32],
     pub hello: Hello,
+    /// How long the controller may say nothing before the session is taken
+    /// for dead and dialed again.
+    pub silence: Duration,
+}
+
+impl Config {
+    pub fn new(
+        controller: String,
+        identity: Identity,
+        controller_key: [u8; 32],
+        hello: Hello,
+    ) -> Self {
+        Config {
+            controller,
+            identity,
+            controller_key,
+            hello,
+            silence: SILENCE,
+        }
+    }
 }
 
 /// Runs the link for the life of the process. `snapshot` is called with the
 /// sequence number of each snapshot, only while connected.
 pub fn run(cfg: Config, snapshot: impl FnMut(u64) -> Snapshot, events: Receiver<Event>) -> ! {
-    run_with(cfg, snapshot, &Ring::relay(events))
+    let events = Arc::new(Mutex::new(Some(events)));
+    run_with(cfg, snapshot, || Ring::relay(&events))
 }
 
-fn run_with(cfg: Config, mut snapshot: impl FnMut(u64) -> Snapshot, ring: &Ring) -> ! {
+/// The link. `relay` starts the ring the events go through; it is tried again
+/// before each connection until it works, and meanwhile the link carries the
+/// snapshots alone. Nothing here may stop the agent: it has other duties.
+fn run_with(
+    cfg: Config,
+    mut snapshot: impl FnMut(u64) -> Snapshot,
+    mut relay: impl FnMut() -> io::Result<Arc<Ring>>,
+) -> ! {
     let client = tls::client_config(&cfg.identity, cfg.controller_key);
+    let mut ring = None;
     let mut backoff = BACKOFF_MIN;
-    // An unreachable controller is logged once, not at every attempt.
-    let mut failed = String::new();
+    // A failure that repeats is logged once, not at every attempt.
+    let (mut failed, mut relay_failed) = (String::new(), String::new());
     loop {
+        if ring.is_none() {
+            match relay() {
+                Ok(r) => ring = Some(r),
+                Err(e) if e.to_string() != relay_failed => {
+                    relay_failed = e.to_string();
+                    eprintln!("u6e-agent: link events: {e}; snapshots only until they start");
+                }
+                Err(_) => {}
+            }
+        }
         match connect(&cfg.controller, &client) {
             Ok(mut s) => {
                 backoff = BACKOFF_MIN;
                 failed.clear();
                 eprintln!("u6e-agent: link to {} up", cfg.controller);
-                let Err(e) = s.serve(&cfg.hello, ring, &mut snapshot);
+                let Err(e) = s.serve(&cfg, ring.as_deref(), &mut snapshot);
                 eprintln!("u6e-agent: link to {} down: {e}", cfg.controller);
             }
             Err(e) => {
@@ -93,24 +132,28 @@ struct Ring {
 }
 
 impl Ring {
-    /// Starts the thread that moves events from `rx` into the ring. It drains
-    /// the channel during an outage too, so what an outage loses is the
-    /// oldest events (the ring's choice), not the newest (a full channel's).
-    fn relay(rx: Receiver<Event>) -> Arc<Ring> {
-        let (wake_rx, wake_tx) = UnixStream::pair().expect("socketpair");
-        wake_rx.set_nonblocking(true).expect("nonblocking");
-        wake_tx.set_nonblocking(true).expect("nonblocking");
+    /// Starts the thread that moves events from the receiver in `events`
+    /// into the ring. It drains the channel during an outage too, so what an
+    /// outage loses is the oldest events (the ring's choice), not the newest
+    /// (a full channel's). The receiver stays in `events` until the thread
+    /// runs, so a start that fails can be tried again.
+    fn relay(events: &Arc<Mutex<Option<Receiver<Event>>>>) -> io::Result<Arc<Ring>> {
+        let (wake_rx, wake_tx) = UnixStream::pair()?;
+        wake_rx.set_nonblocking(true)?;
+        wake_tx.set_nonblocking(true)?;
         let ring = Arc::new(Ring {
             events: Mutex::new(VecDeque::new()),
             wake_rx,
             wake_tx,
         });
-        let r = Arc::clone(&ring);
+        let (r, events) = (Arc::clone(&ring), Arc::clone(events));
         thread::Builder::new()
             .name("link-events".into())
-            .spawn(move || rx.into_iter().for_each(|ev| r.push(ev)))
-            .expect("spawn link-events");
-        ring
+            .spawn(move || {
+                let rx = events.lock().unwrap_or_else(PoisonError::into_inner).take();
+                rx.into_iter().flatten().for_each(|ev| r.push(ev));
+            })?;
+        Ok(ring)
     }
 
     fn lock(&self) -> MutexGuard<'_, VecDeque<Event>> {
@@ -213,24 +256,27 @@ impl Session {
         }
     }
 
-    /// Serves the connection until it fails.
+    /// Serves the connection until it fails; without a ring, the snapshots
+    /// alone.
     fn serve(
         &mut self,
-        hello: &Hello,
-        ring: &Ring,
+        cfg: &Config,
+        ring: Option<&Ring>,
         snapshot: &mut impl FnMut(u64) -> Snapshot,
     ) -> io::Result<Infallible> {
         let mut out = Vec::new();
-        write_frame(&mut out, &AgentMsg::Hello(hello.clone()))?;
+        write_frame(&mut out, &AgentMsg::Hello(cfg.hello.clone()))?;
         loop {
-            ring.clear_wake();
+            if let Some(r) = ring {
+                r.clear_wake();
+            }
             let now = Instant::now();
             let ticked = now >= self.due;
             if ticked {
                 self.snapshot_into(&mut out, now, snapshot)?;
             }
             if ticked || self.due - now > COALESCE {
-                for ev in ring.take() {
+                for ev in ring.map(Ring::take).unwrap_or_default() {
                     write_frame(&mut out, &AgentMsg::Event(ev))?;
                 }
             }
@@ -238,10 +284,10 @@ impl Session {
                 self.send(&out)?;
                 out.clear();
             }
-            if self.wait(ring) {
+            if self.wait(ring, cfg.silence) {
                 self.receive()?;
             }
-            if self.last_rx.elapsed() >= SILENCE {
+            if self.last_rx.elapsed() >= cfg.silence {
                 return Err(io::Error::new(ErrorKind::TimedOut, "controller silent"));
             }
         }
@@ -276,11 +322,13 @@ impl Session {
     }
 
     /// Waits for the socket (true), an event or the next deadline (false).
-    fn wait(&self, ring: &Ring) -> bool {
-        let deadline = self.due.min(self.last_rx + SILENCE);
+    fn wait(&self, ring: Option<&Ring>, silence: Duration) -> bool {
+        let deadline = self.due.min(self.last_rx + silence);
         let left = deadline.saturating_duration_since(Instant::now());
         let ms = i32::try_from(left.as_micros().div_ceil(1000)).unwrap_or(i32::MAX);
-        let mut fds = [self.sock.as_raw_fd(), ring.wake_rx.as_raw_fd()].map(|fd| libc::pollfd {
+        // poll skips a negative fd: without a ring, the socket alone.
+        let wake = ring.map_or(-1, |r| r.wake_rx.as_raw_fd());
+        let mut fds = [self.sock.as_raw_fd(), wake].map(|fd| libc::pollfd {
             fd,
             events: libc::POLLIN,
             revents: 0,
@@ -613,29 +661,49 @@ mod tests {
 
     impl Agent {
         fn spawn(fake: &Fake, snapshot: impl FnMut(u64) -> Snapshot + Send + 'static) -> Self {
+            Self::spawn_with(fake, SILENCE, 0, snapshot)
+        }
+
+        /// An agent whose controller may be silent for `silence`, and whose
+        /// event relay fails to start the first `relay_failures` times.
+        fn spawn_with(
+            fake: &Fake,
+            silence: Duration,
+            relay_failures: u32,
+            snapshot: impl FnMut(u64) -> Snapshot + Send + 'static,
+        ) -> Self {
             let (events, rx) = sync_channel(256);
             let (tick_tx, ticks) = mpsc::channel();
-            let ring = Ring::relay(rx);
-            let cfg = Config {
-                controller: fake.addr().to_string(),
-                identity: Identity::from_pem(KEY_AGENT).unwrap(),
-                controller_key: fake.key,
-                hello: Hello {
+            let ring = Ring::relay(&Arc::new(Mutex::new(Some(rx)))).unwrap();
+            let mut cfg = Config::new(
+                fake.addr().to_string(),
+                Identity::from_pem(KEY_AGENT).unwrap(),
+                fake.key,
+                Hello {
                     ap: "ap1".into(),
                     manifest: "image: test".into(),
                     kernel: "6.12".into(),
                     hostapd: "2.11".into(),
                     agent: "1.0.0".into(),
                 },
-            };
+            );
+            cfg.silence = silence;
             let r = Arc::clone(&ring);
+            let mut failures = relay_failures;
+            let relay = move || match failures.checked_sub(1) {
+                Some(left) => {
+                    failures = left;
+                    Err(io::Error::other("no threads left"))
+                }
+                None => Ok(Arc::clone(&r)),
+            };
             let mut snapshot = snapshot;
             thread::spawn(move || {
                 let snap = move |seq| {
                     let _ = tick_tx.send((seq, Instant::now()));
                     snapshot(seq)
                 };
-                run_with(cfg, snap, &r)
+                run_with(cfg, snap, relay)
             });
             Agent {
                 events,
@@ -863,6 +931,54 @@ mod tests {
         }
         p.send(CtlMsg::Ping(1));
         assert_eq!(p.recv(), AgentMsg::Pong(1));
+    }
+
+    #[test]
+    fn a_silent_controller_is_dropped_and_dialed_again() {
+        let fake = Fake::new();
+        let _agent = Agent::spawn_with(&fake, Duration::from_secs(1), 0, blank);
+        let mut p = fake.accept();
+        p.start();
+        let started = Instant::now();
+        let mut again = fake.accept();
+        // 1 s of silence, then the 1 s backoff after a completed handshake.
+        let gone = secs(started, Instant::now());
+        assert!((0.9..4.0).contains(&gone), "{gone}");
+        again.start();
+    }
+
+    #[test]
+    fn a_controller_that_pings_keeps_the_session() {
+        let fake = Fake::new();
+        let _agent = Agent::spawn_with(&fake, Duration::from_secs(1), 0, blank);
+        let mut p = fake.accept();
+        p.start();
+        for n in 0..10 {
+            thread::sleep(Duration::from_millis(250));
+            p.send(CtlMsg::Ping(n));
+            assert_eq!(p.recv(), AgentMsg::Pong(n));
+        }
+        // Only another test's agent may have dialed in meanwhile.
+        while let Ok((sock, _)) = fake.listener.accept() {
+            assert!(fake.handshake(sock).is_none(), "the agent dialed again");
+        }
+    }
+
+    /// The events need a thread and a socket pair; without them (resource
+    /// exhaustion) the link carries the snapshots and tries again later.
+    #[test]
+    fn a_relay_that_fails_to_start_is_tried_again() {
+        let fake = Fake::new();
+        let agent = Agent::spawn_with(&fake, SILENCE, 1, blank);
+        let mut p = fake.accept();
+        p.start();
+        agent.events.send(event(1)).unwrap();
+        p.send(CtlMsg::Ping(7));
+        assert_eq!(p.recv(), AgentMsg::Pong(7), "no ring, no events");
+        drop(p);
+        let mut p = fake.accept();
+        p.start();
+        assert_eq!(p.recv(), AgentMsg::Event(event(1)));
     }
 
     #[test]

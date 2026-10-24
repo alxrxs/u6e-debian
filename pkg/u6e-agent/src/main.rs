@@ -119,14 +119,14 @@ fn start_link(l: LinkArgs, collector: &Arc<Mutex<collect::Collector>>) {
     if let Err(e) = events::Events::spawn(tx) {
         eprintln!("u6e-agent: events: {e}; the link carries snapshots only");
     }
-    let cfg = link::Config {
-        controller: l.controller,
+    let cfg = link::Config::new(
+        l.controller,
         identity,
-        controller_key: l.controller_key,
-        hello: link::local_hello(),
-    };
+        l.controller_key,
+        link::local_hello(),
+    );
     let collector = Arc::clone(collector);
-    thread::spawn(move || {
+    spawn_or_log("link", move || {
         link::run(
             cfg,
             move |seq| {
@@ -136,6 +136,15 @@ fn start_link(l: LinkArgs, collector: &Arc<Mutex<collect::Collector>>) {
             rx,
         )
     });
+}
+
+/// Starts a thread for a duty the 802.11k exchange and the network check do
+/// not depend on; if it cannot start (no threads left), that is logged and
+/// they carry on.
+fn spawn_or_log(name: &str, f: impl FnOnce() + Send + 'static) {
+    if let Err(e) = thread::Builder::new().name(name.into()).spawn(f) {
+        eprintln!("u6e-agent: {name}: {e}; carrying on without it");
+    }
 }
 
 fn main() {
@@ -179,7 +188,7 @@ fn main() {
 
     let stations = Arc::new(Mutex::new(Vec::new()));
     let counted = Arc::clone(&stations);
-    thread::spawn(move || {
+    spawn_or_log("state line", move || {
         state_lines(&collector, &counted, STATS_FIRST, STATS_EVERY, |l| {
             println!("{l}");
         })
