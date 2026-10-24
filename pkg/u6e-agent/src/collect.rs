@@ -339,7 +339,8 @@ fn nss_load_pct(path: &Path) -> u8 {
 }
 
 /// Every thermal zone by its type, and a radio's own sensor as the zone named
-/// after its phy, where the driver exposes one.
+/// after its phy, where the driver exposes one: ath11k registers its hwmon on
+/// the wiphy, a class device, so sysfs puts it in the phy's own directory.
 fn temps(sys: &Path, radios: &[Radio]) -> Vec<Temp> {
     let milli_c = |p: PathBuf| fs::read_to_string(p).ok()?.trim().parse().ok();
     let mut zones: Vec<_> = fs::read_dir(sys.join("class/thermal"))
@@ -364,8 +365,7 @@ fn temps(sys: &Path, radios: &[Radio]) -> Vec<Temp> {
         })
         .collect();
     for r in radios {
-        let dev = sys.join("class/ieee80211").join(&r.phy).join("device");
-        let mut hwmons: Vec<_> = fs::read_dir(dev)
+        let mut hwmons: Vec<_> = fs::read_dir(sys.join("class/ieee80211").join(&r.phy))
             .into_iter()
             .flatten()
             .flatten()
@@ -809,7 +809,7 @@ mod tests {
             fs::write(dir.join("type"), format!("{name}\n")).unwrap();
             fs::write(dir.join("temp"), format!("{milli}\n")).unwrap();
         }
-        fs::create_dir_all(t.path().join("class/ieee80211/phy1/device")).unwrap();
+        fs::create_dir_all(t.path().join("class/ieee80211/phy1/device/hwmon")).unwrap();
         let zones = |all: Vec<Temp>| {
             all.into_iter()
                 .map(|t| (t.zone, t.milli_c))
@@ -824,7 +824,7 @@ mod tests {
             ]
         );
 
-        let hwmon = t.path().join("class/ieee80211/phy1/device/hwmon3");
+        let hwmon = t.path().join("class/ieee80211/phy1/hwmon3");
         fs::create_dir_all(&hwmon).unwrap();
         fs::write(hwmon.join("temp1_input"), "47500\n").unwrap();
         assert_eq!(
