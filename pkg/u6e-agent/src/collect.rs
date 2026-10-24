@@ -60,12 +60,16 @@ pub fn bss_order(hostapd: &Path) -> Vec<String> {
     names
 }
 
-/// A source that may not be there yet: opened again at every snapshot until
-/// it opens, and a failure is logged once, not every tick.
+/// A source that may not be there yet, or may break: opened again at every
+/// snapshot until it opens, dropped when it fails so the next snapshot opens
+/// it afresh. A failure is logged once, and its end once a use succeeds.
 struct Source<T> {
     name: &'static str,
     inner: Option<T>,
     reported: bool,
+    /// It failed in use, so opening it again proves nothing until a use
+    /// succeeds.
+    failed_in_use: bool,
 }
 
 impl<T> Source<T> {
@@ -74,6 +78,7 @@ impl<T> Source<T> {
             name,
             inner: None,
             reported: false,
+            failed_in_use: false,
         }
     }
 
@@ -81,20 +86,38 @@ impl<T> Source<T> {
         if self.inner.is_none() {
             match open() {
                 Ok(v) => {
-                    if self.reported {
-                        eprintln!("u6e-agent: {} is available again", self.name);
-                    }
-                    self.reported = false;
                     self.inner = Some(v);
+                    if !self.failed_in_use {
+                        self.ok();
+                    }
                 }
-                Err(e) if !self.reported => {
-                    eprintln!("u6e-agent: {}: {e}", self.name);
-                    self.reported = true;
-                }
-                Err(_) => {}
+                Err(e) => self.report(&e),
             }
         }
         self.inner.as_mut()
+    }
+
+    /// The source failed in use: it is opened again next time.
+    fn fail(&mut self, e: &io::Error) {
+        self.inner = None;
+        self.failed_in_use = true;
+        self.report(e);
+    }
+
+    /// A use of the source succeeded.
+    fn ok(&mut self) {
+        self.failed_in_use = false;
+        if self.reported {
+            eprintln!("u6e-agent: {} is available again", self.name);
+            self.reported = false;
+        }
+    }
+
+    fn report(&mut self, e: &io::Error) {
+        if !self.reported {
+            eprintln!("u6e-agent: {}: {e}", self.name);
+            self.reported = true;
+        }
     }
 }
 
@@ -173,6 +196,35 @@ impl Collector {
         self.nl.inner.is_some()
     }
 
+    /// Opens nl80211 if need be and reads the interfaces again if they are
+    /// stale.
+    fn refresh_ifaces(&mut self, order: &[String]) {
+        let Some(nl) = self.nl.get(Nl80211::open) else {
+            return;
+        };
+        // Notifications are read before the dump, so one that follows it
+        // brings the next.
+        let watch = self.watch.get(|| nl.watch());
+        let reconfigured = watch.is_some_and(|w| w.reconfigured());
+        let now = Instant::now();
+        if !self.ifaces.stale(order, reconfigured, now) {
+            return;
+        }
+        match nl.interfaces() {
+            Ok(list) => {
+                self.ifaces.store(list, order.to_vec(), now);
+                self.nl.ok();
+            }
+            // A socket that fails a dump (the family registered again under
+            // a new id, say) is opened afresh, its watch too.
+            Err(e) => {
+                self.ifaces = Ifaces::default();
+                self.nl.fail(&e);
+                self.watch.inner = None;
+            }
+        }
+    }
+
     pub fn snapshot(&mut self, seq: u64) -> Snapshot {
         let sys = self.paths.sys();
         self.crashes += self
@@ -182,20 +234,8 @@ impl Collector {
             .filter(|m| kmsg::is_fw_crash(m))
             .count() as u64;
         let order = bss_order(&self.paths.hostapd);
-        let mut nl = self.nl.get(Nl80211::open);
-        if let Some(nl) = nl.as_mut() {
-            // Notifications are read before the dump, so one that follows it
-            // brings the next.
-            let watch = self.watch.get(|| nl.watch());
-            let reconfigured = watch.is_some_and(|w| w.reconfigured());
-            let now = Instant::now();
-            if self.ifaces.stale(&order, reconfigured, now) {
-                match nl.interfaces() {
-                    Ok(list) => self.ifaces.store(list, order.clone(), now),
-                    Err(_) => self.ifaces = Ifaces::default(),
-                }
-            }
-        }
+        self.refresh_ifaces(&order);
+        let mut nl = self.nl.inner.as_mut();
         let ifaces = &self.ifaces.list;
         let bsss = bsss(&sys, &order, ifaces);
         let per_iface: Vec<_> = ifaces
@@ -618,6 +658,31 @@ mod tests {
                 .all(|r| r.noise_dbm == 0 && r.active_ms == 0 && !r.up)
         );
         assert!(radios(&[], &ifaces, |_| Vec::new(), |_| true).is_empty());
+    }
+
+    #[test]
+    fn a_source_that_fails_is_opened_again_and_reported_once() {
+        let mut s = Source::new("test");
+        assert!(s.get(|| Err(io::Error::other("absent"))).is_none());
+        assert!(s.reported);
+        let mut opens = 0;
+        let mut open = || {
+            opens += 1;
+            Ok(opens)
+        };
+        assert_eq!(s.get(&mut open).copied(), Some(1));
+        assert!(!s.reported, "it opened: it is back");
+        assert_eq!(s.get(&mut open).copied(), Some(1));
+        s.fail(&io::Error::other("broken"));
+        assert!(s.reported);
+        assert_eq!(s.get(&mut open).copied(), Some(2));
+        // Opening is not working: still reported until a use succeeds, so
+        // a source that keeps failing is not logged at every tick.
+        s.fail(&io::Error::other("broken"));
+        assert_eq!(s.get(&mut open).copied(), Some(3));
+        assert!(s.reported);
+        s.ok();
+        assert!(!s.reported);
     }
 
     #[test]

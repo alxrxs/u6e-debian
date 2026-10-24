@@ -77,18 +77,27 @@ impl Hostapd {
 
     /// A client named after `what` in `run`, talking to the sockets in `dir`.
     pub fn bind(run: &Path, what: &str, dir: &Path) -> std::io::Result<Self> {
-        let sock = ClientSocket::bind(run, what)?;
-        sock.set_read_timeout(Some(Duration::from_secs(1)))?;
         Ok(Hostapd {
-            sock,
+            sock: Self::ready(ClientSocket::bind(run, what)?)?,
             dir: dir.to_owned(),
             buf: vec![0; 65536],
         })
     }
 
+    fn ready(sock: ClientSocket) -> std::io::Result<ClientSocket> {
+        sock.set_read_timeout(Some(Duration::from_secs(1)))?;
+        Ok(sock)
+    }
+
     /// One control interface request; "" when hostapd does not answer. A
     /// reply left over from a request that timed out is discarded first.
     pub fn request(&mut self, iface: &str, cmd: &str) -> String {
+        if !self.sock.reachable() {
+            match self.sock.rebind().and_then(Self::ready) {
+                Ok(s) => self.sock = s,
+                Err(_) => return String::new(),
+            }
+        }
         let _ = self.sock.set_nonblocking(true);
         while self.sock.recv(&mut self.buf).is_ok() {}
         let _ = self.sock.set_nonblocking(false);
@@ -284,12 +293,9 @@ mod tests {
         assert_eq!(num_sta(status, "wlan6"), 0);
     }
 
-    /// `u6e-agent --print-snapshot` beside the resident agent.
-    #[test]
-    fn a_second_client_does_not_deafen_the_first() {
-        let t = crate::testdir::TestDir::new();
-        let dir = t.path().join("hostapd");
-        fs::create_dir_all(&dir).unwrap();
+    /// A hostapd at `<dir>/wlan5` that answers every request.
+    fn answering_hostapd(dir: &Path) {
+        fs::create_dir_all(dir).unwrap();
         let server = UnixDatagram::bind(dir.join("wlan5")).unwrap();
         thread::spawn(move || {
             let mut buf = [0; 64];
@@ -299,10 +305,30 @@ mod tests {
                 }
             }
         });
+    }
+
+    /// `u6e-agent --print-snapshot` beside the resident agent.
+    #[test]
+    fn a_second_client_does_not_deafen_the_first() {
+        let t = crate::testdir::TestDir::new();
+        let dir = t.path().join("hostapd");
+        answering_hostapd(&dir);
         let mut resident = Hostapd::bind(t.path(), "collect", &dir).unwrap();
         assert_eq!(resident.request("wlan5", "STATUS"), "state=ENABLED");
         drop(Hostapd::bind(t.path(), "collect", &dir).unwrap());
         assert_eq!(resident.request("wlan5", "STATUS"), "state=ENABLED");
+    }
+
+    /// hostapd answers to the client's path; with the path gone (the run
+    /// directory emptied by hand, say) the client binds a new one.
+    #[test]
+    fn a_client_whose_path_was_removed_binds_again() {
+        let t = crate::testdir::TestDir::new();
+        let (run, dir) = (t.path().join("run"), t.path().join("hostapd"));
+        answering_hostapd(&dir);
+        let mut h = Hostapd::bind(&run, "ctrl", &dir).unwrap();
+        fs::remove_dir_all(&run).unwrap();
+        assert_eq!(h.request("wlan5", "STATUS"), "state=ENABLED");
     }
 
     #[test]

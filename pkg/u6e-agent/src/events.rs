@@ -52,9 +52,13 @@ struct Attached {
 }
 
 impl Attached {
-    /// Whether the hostapd behind the socket is still there: a datagram to a
-    /// closed peer is refused. hostapd answers the PING; the answer is ignored.
+    /// Whether events still flow: the hostapd behind the socket is still
+    /// there (a datagram to a closed peer is refused; hostapd answers the PING,
+    /// and the answer is ignored), and so is the path it sends them to.
     fn alive(&self) -> bool {
+        if !self.sock.reachable() {
+            return false;
+        }
         match self.sock.send(b"PING") {
             Ok(_) => true,
             Err(e) => e.kind() == io::ErrorKind::WouldBlock,
@@ -341,7 +345,11 @@ mod tests {
 
         fn wait_attach(&mut self) {
             let mut buf = [0; 64];
-            let (n, from) = self.sock.recv_from(&mut buf).unwrap();
+            let (mut n, mut from) = self.sock.recv_from(&mut buf).unwrap();
+            // The liveness probes of an earlier attachment.
+            while &buf[..n] == b"PING" {
+                (n, from) = self.sock.recv_from(&mut buf).unwrap();
+            }
             assert_eq!(&buf[..n], b"ATTACH");
             let client = from.as_pathname().unwrap().to_owned();
             self.sock.send_to(b"OK\n", &client).unwrap();
@@ -370,6 +378,27 @@ mod tests {
         )
         .unwrap();
         p
+    }
+
+    /// hostapd sends events to the client's path: with it removed they are
+    /// lost, so the thread attaches again from a new one.
+    #[test]
+    fn a_removed_client_path_attaches_again() {
+        let t = TestDir::new();
+        let paths = paths(&t);
+        let mut h = FakeHostapd::bind(&paths.hostapd.join("wlan5"));
+        let (tx, rx) = sync_channel(16);
+        Events::spawn_with(tx, paths.clone()).unwrap();
+        h.wait_attach();
+        let first = h.client.clone().unwrap();
+        fs::remove_file(&first).unwrap();
+        h.wait_attach();
+        assert_ne!(h.client.as_ref(), Some(&first));
+        h.event("<3>AP-STA-CONNECTED 02:00:00:00:00:08");
+        assert_eq!(
+            rx.recv_timeout(WAIT).unwrap().kind,
+            EventKind::Assoc { mac: STA, bss: 0 }
+        );
     }
 
     #[test]

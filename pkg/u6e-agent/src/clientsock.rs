@@ -20,6 +20,8 @@ static NEXT: AtomicU32 = AtomicU32::new(0);
 
 pub struct ClientSocket {
     sock: UnixDatagram,
+    dir: PathBuf,
+    what: String,
     path: PathBuf,
 }
 
@@ -31,7 +33,23 @@ impl ClientSocket {
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let path = dir.join(format!("{what}-{}-{n}", process::id()));
         let sock = UnixDatagram::bind(&path)?;
-        Ok(ClientSocket { sock, path })
+        Ok(ClientSocket {
+            sock,
+            dir: dir.to_owned(),
+            what: what.to_owned(),
+            path,
+        })
+    }
+
+    /// Whether answers can still reach the socket: they are sent to its
+    /// path, and one removed from the directory leads nowhere.
+    pub fn reachable(&self) -> bool {
+        self.path.exists()
+    }
+
+    /// A new socket for the same purpose, in place of an unreachable one.
+    pub fn rebind(&self) -> io::Result<Self> {
+        Self::bind(&self.dir, &self.what)
     }
 }
 
