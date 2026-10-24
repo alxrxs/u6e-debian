@@ -1,7 +1,12 @@
 //! Delta coding of snapshots: only the fields that changed since the previous
 //! tick, as zigzag-varint differences under a change mask.
+//!
+//! A delta addresses stations by their index in the base, so both ends must
+//! hold the same list in the same order. [`valid`] states what that takes;
+//! [`diff`] declines and [`apply`] refuses whatever is not valid, so a broken
+//! snapshot costs a key frame instead of misattributed counters.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::msg::{Band, FieldDelta, Radio, RecDelta, Snapshot, SnapshotDelta, Station};
 
@@ -11,14 +16,30 @@ use crate::msg::{Band, FieldDelta, Radio, RecDelta, Snapshot, SnapshotDelta, Sta
 pub struct Gap;
 
 const SCALARS: usize = 4;
+/// Scalars and temperatures share one 32-bit mask.
 const MAX_TEMPS: usize = 32 - SCALARS;
+/// Far above what an AP has (3 radios, 7 BSSs, tens of stations), and low
+/// enough that a hostile peer cannot make each delta cost a megabyte's worth.
+const MAX_RADIOS: usize = 8;
+const MAX_BSSS: usize = 64;
+const MAX_STATIONS: usize = 1024;
 
-/// Whether [`diff`] can express the change from `prev` to `next`: the same
-/// temperature zones (at most 28) and the same radios, which do not change
-/// while a connection lives. Otherwise the sender sends a key frame.
-pub fn same_shape(prev: &Snapshot, next: &Snapshot) -> bool {
-    next.temps.len() <= MAX_TEMPS
-        && prev.temps.len() == next.temps.len()
+/// Whether the delta coding can work on `s`: stations sorted by MAC with each
+/// MAC once, each on a BSS of the list, and every list within its cap.
+pub fn valid(s: &Snapshot) -> bool {
+    s.temps.len() <= MAX_TEMPS
+        && s.radios.len() <= MAX_RADIOS
+        && s.bsss.len() <= MAX_BSSS
+        && s.stations.len() <= MAX_STATIONS
+        && s.stations.windows(2).all(|w| w[0].mac < w[1].mac)
+        && s.stations.iter().all(|t| usize::from(t.bss) < s.bsss.len())
+}
+
+/// Whether a delta can express the change from `prev` to `next`: the same
+/// temperature zones and the same radios, which do not change while a
+/// connection lives.
+fn same_shape(prev: &Snapshot, next: &Snapshot) -> bool {
+    prev.temps.len() == next.temps.len()
         && prev
             .temps
             .iter()
@@ -32,10 +53,13 @@ pub fn same_shape(prev: &Snapshot, next: &Snapshot) -> bool {
             .all(|(a, b)| a.phy == b.phy)
 }
 
-/// The difference from `prev` to `next` (which must have the same shape),
-/// stations matched by MAC. `next.stations` must be sorted by MAC.
-pub fn diff(prev: &Snapshot, next: &Snapshot) -> SnapshotDelta {
-    debug_assert!(same_shape(prev, next));
+/// The difference from `prev` to `next`, stations matched by MAC; `None` when
+/// a delta cannot carry it (either is not [`valid`], or the shape changed) and
+/// the sender sends `next` as a key frame.
+pub fn diff(prev: &Snapshot, next: &Snapshot) -> Option<SnapshotDelta> {
+    if !(valid(prev) && valid(next) && same_shape(prev, next)) {
+        return None;
+    }
     let (mask, vals) = diff_fields(&scalar_fields(prev), &scalar_fields(next));
     let radios = prev
         .radios
@@ -72,7 +96,7 @@ pub fn diff(prev: &Snapshot, next: &Snapshot) -> SnapshotDelta {
         .cloned()
         .collect();
 
-    SnapshotDelta {
+    Some(SnapshotDelta {
         seq: next.seq,
         base: prev.seq,
         scalars: FieldDelta { mask, vals },
@@ -81,12 +105,13 @@ pub fn diff(prev: &Snapshot, next: &Snapshot) -> SnapshotDelta {
         removed,
         added,
         bsss: (prev.bsss != next.bsss).then(|| next.bsss.clone()),
-    }
+    })
 }
 
-/// Rebuilds the snapshot `d` was made from, given the one it was made against.
+/// Rebuilds the snapshot `d` was made from, given the one it was made against;
+/// both must be [`valid`].
 pub fn apply(base: &Snapshot, d: &SnapshotDelta) -> Result<Snapshot, Gap> {
-    if d.base != base.seq {
+    if d.base != base.seq || !valid(base) {
         return Err(Gap);
     }
     let mut next = base.clone();
@@ -118,17 +143,15 @@ pub fn apply(base: &Snapshot, d: &SnapshotDelta) -> Result<Snapshot, Gap> {
         apply_fields(&mut f, r.mask, &r.vals)?;
         *sta = station_from(sta.mac, &f);
     }
-    for mac in &d.removed {
-        let at = next
-            .stations
-            .iter()
-            .position(|s| s.mac == *mac)
-            .ok_or(Gap)?;
-        next.stations.remove(at);
+    let removed: HashSet<_> = d.removed.iter().collect();
+    let before = next.stations.len();
+    next.stations.retain(|s| !removed.contains(&s.mac));
+    if before - next.stations.len() != d.removed.len() {
+        return Err(Gap);
     }
     next.stations.extend(d.added.iter().cloned());
     next.stations.sort_by_key(|s| s.mac);
-    if next.stations.windows(2).any(|w| w[0].mac == w[1].mac) {
+    if !valid(&next) {
         return Err(Gap);
     }
     Ok(next)
@@ -149,6 +172,7 @@ fn diff_fields(a: &[i64], b: &[i64]) -> (u32, Vec<i64>) {
 }
 
 fn apply_fields(fields: &mut [i64], mask: u32, vals: &[i64]) -> Result<(), Gap> {
+    // At most 32 fields: `valid` caps the temperatures.
     let in_range = fields.len() >= 32 || mask >> fields.len() == 0;
     if !in_range || mask.count_ones() as usize != vals.len() {
         return Err(Gap);
@@ -300,7 +324,7 @@ mod tests {
         let bsss = bsss();
         let mut a: Vec<Station> = (0..20)
             .map(|i| {
-                let mac = [0xac, 0xbc, 0xb5, r(256) as u8, r(256) as u8, i as u8];
+                let mac = [0x02, 0, 0, r(256) as u8, r(256) as u8, i as u8];
                 let bss = r(7) as u16;
                 Station {
                     mac,
@@ -403,7 +427,7 @@ mod tests {
     }
 
     fn roundtrips(prev: &Snapshot, next: &Snapshot) {
-        let d = diff(prev, next);
+        let d = diff(prev, next).unwrap();
         assert_eq!(&apply(prev, &d).unwrap(), next);
         let wire = postcard::to_stdvec(&d).unwrap();
         let d2: SnapshotDelta = postcard::from_bytes(&wire).unwrap();
@@ -483,6 +507,7 @@ mod tests {
         let (a, _) = fixture();
         let mut n = successor(&a);
         n.bsss.pop();
+        n.stations.retain(|s| usize::from(s.bss) < n.bsss.len());
         n.bsss[0].ssid = "other".into();
         roundtrips(&a, &n);
     }
@@ -498,24 +523,24 @@ mod tests {
     }
 
     #[test]
-    fn shape_changes_are_detected() {
+    fn a_shape_change_is_a_key_frame() {
         let (a, _) = fixture();
-        assert!(same_shape(&a, &successor(&a)));
+        assert!(diff(&a, &successor(&a)).is_some());
         let mut n = successor(&a);
         n.temps.pop();
-        assert!(!same_shape(&a, &n));
+        assert_eq!(diff(&a, &n), None);
         let mut n = successor(&a);
         n.radios.pop();
-        assert!(!same_shape(&a, &n));
+        assert_eq!(diff(&a, &n), None);
         let mut n = successor(&a);
         n.radios[0].phy = "phy9".into();
-        assert!(!same_shape(&a, &n));
+        assert_eq!(diff(&a, &n), None);
     }
 
     #[test]
     fn gap_requests_key_frame() {
         let (a, b) = fixture();
-        let mut d = diff(&a, &b);
+        let mut d = diff(&a, &b).unwrap();
         d.base += 1;
         assert_eq!(apply(&a, &d), Err(Gap));
     }
@@ -523,18 +548,166 @@ mod tests {
     #[test]
     fn inconsistent_delta_is_a_gap() {
         let (a, b) = fixture();
-        let mut d = diff(&a, &b);
+        let mut d = diff(&a, &b).unwrap();
         d.stations[0].idx = 999;
         assert_eq!(apply(&a, &d), Err(Gap));
-        let mut d = diff(&a, &b);
+        let mut d = diff(&a, &b).unwrap();
         d.stations[0].vals.pop();
         assert_eq!(apply(&a, &d), Err(Gap));
-        let mut d = diff(&a, &b);
+        let mut d = diff(&a, &b).unwrap();
         d.removed.push([9; 6]);
         assert_eq!(apply(&a, &d), Err(Gap));
-        let mut d = diff(&a, &b);
+        let mut d = diff(&a, &b).unwrap();
         d.radios[0].mask = 1 << 31;
         assert_eq!(apply(&a, &d), Err(Gap));
+    }
+
+    fn sta(last: u8, bss: u16, rx_bytes: u64) -> Station {
+        Station {
+            mac: [0x02, 0, 0, 0, 0, last],
+            bss,
+            rx_bytes,
+            ..fixture().0.stations[0].clone()
+        }
+    }
+
+    /// One radio, two BSSs and the given stations.
+    fn snap(seq: u64, stations: Vec<Station>) -> Snapshot {
+        let (mut s, _) = fixture();
+        s.seq = seq;
+        s.radios.truncate(1);
+        s.bsss.truncate(2);
+        s.stations = stations;
+        s
+    }
+
+    /// A client roaming between two radios of the AP is listed by both BSSs
+    /// for a moment. Such a snapshot goes out as a key frame: a delta would
+    /// misalign the two ends' station lists.
+    #[test]
+    fn a_duplicate_station_is_a_key_frame() {
+        let a = snap(1, vec![sta(1, 0, 100), sta(2, 0, 200), sta(3, 0, 300)]);
+        let b = snap(
+            2,
+            vec![sta(1, 0, 100), sta(2, 0, 200), sta(2, 1, 0), sta(3, 0, 300)],
+        );
+        let c = snap(
+            3,
+            vec![
+                sta(1, 0, 100),
+                sta(2, 0, 200),
+                sta(2, 1, 10),
+                sta(3, 0, 300),
+            ],
+        );
+        assert_eq!(diff(&a, &b), None);
+        assert_eq!(diff(&b, &c), None);
+        assert!(!valid(&b));
+        // A controller holding such a base cannot apply to it.
+        let d = SnapshotDelta {
+            seq: 3,
+            base: 2,
+            scalars: FieldDelta::default(),
+            radios: Vec::new(),
+            stations: Vec::new(),
+            removed: Vec::new(),
+            added: Vec::new(),
+            bsss: None,
+        };
+        assert_eq!(apply(&b, &d), Err(Gap));
+    }
+
+    #[test]
+    fn unsorted_stations_are_a_key_frame() {
+        let a = snap(1, vec![sta(2, 0, 200), sta(1, 0, 100)]);
+        let b = snap(2, vec![sta(2, 0, 210), sta(1, 0, 110)]);
+        assert_eq!(diff(&a, &b), None);
+        let sorted = snap(1, vec![sta(1, 0, 100), sta(2, 0, 200)]);
+        assert_eq!(diff(&sorted, &b), None);
+        assert_eq!(diff(&b, &sorted), None);
+    }
+
+    #[test]
+    fn a_station_past_the_bss_list_is_a_gap() {
+        let a = snap(1, vec![sta(1, 0, 0)]);
+        let mut d = diff(&a, &snap(2, vec![sta(1, 0, 0), sta(9, 1, 0)])).unwrap();
+        d.added[0].bss = 7;
+        assert_eq!(apply(&a, &d), Err(Gap));
+        assert_eq!(diff(&a, &snap(2, vec![sta(1, 2, 0)])), None);
+    }
+
+    /// A base of more temperatures than a mask can address (from a hostile or
+    /// broken key frame) is a gap, not a shift overflow.
+    #[test]
+    fn too_many_temperatures_are_a_gap() {
+        let mut a = snap(1, Vec::new());
+        a.temps = (0..40)
+            .map(|i| Temp {
+                zone: format!("z{i}"),
+                milli_c: 0,
+            })
+            .collect();
+        let d = SnapshotDelta {
+            seq: 2,
+            base: 1,
+            scalars: FieldDelta {
+                mask: 1,
+                vals: vec![1],
+            },
+            radios: Vec::new(),
+            stations: Vec::new(),
+            removed: Vec::new(),
+            added: Vec::new(),
+            bsss: None,
+        };
+        assert_eq!(apply(&a, &d), Err(Gap));
+        assert_eq!(diff(&a, &successor(&a)), None);
+    }
+
+    /// Lists past the caps are refused, so a hostile peer cannot make every
+    /// delta cost what a megabyte of records costs.
+    #[test]
+    fn lists_past_their_caps_are_not_valid() {
+        let many: Vec<Station> = (0..=MAX_STATIONS as u16)
+            .map(|i| Station {
+                mac: [0x02, 0, 0, 0, (i >> 8) as u8, i as u8],
+                ..sta(0, 0, 0)
+            })
+            .collect();
+        assert!(valid(&snap(1, many[..MAX_STATIONS].to_vec())));
+        assert!(!valid(&snap(1, many)));
+        let mut s = snap(1, Vec::new());
+        s.bsss = vec![s.bsss[0].clone(); MAX_BSSS + 1];
+        assert!(!valid(&s));
+        let mut s = snap(1, Vec::new());
+        s.radios = vec![s.radios[0].clone(); MAX_RADIOS + 1];
+        assert!(!valid(&s));
+    }
+
+    /// Counters at and past 2^63 survive the i64 differences.
+    #[test]
+    fn counters_above_i63_round_trip() {
+        let mut a = snap(1, vec![sta(1, 0, (1 << 63) - 1)]);
+        a.radios[0].active_ms = u64::MAX - 1;
+        let mut b = snap(2, vec![sta(1, 0, 1 << 63)]);
+        b.radios[0].active_ms = 3;
+        b.stations[0].tx_bytes = u64::MAX;
+        b.stations[0].tx_retries = u32::MAX;
+        roundtrips(&a, &b);
+        let mut c = successor(&b);
+        c.stations[0].tx_retries = 0;
+        c.stations[0].signal = i8::MIN;
+        roundtrips(&b, &c);
+    }
+
+    /// A station leaving and another joining in one tick, one reassociating
+    /// on another BSS, and the BSS list reordered.
+    #[test]
+    fn readd_and_bss_change_round_trip() {
+        let a = snap(1, vec![sta(1, 0, 5), sta(2, 1, 6)]);
+        let mut b = snap(2, vec![sta(1, 1, 0), sta(3, 0, 1)]);
+        b.bsss.reverse();
+        roundtrips(&a, &b);
     }
 
     fn wire_len(v: &impl serde::Serialize) -> usize {
@@ -548,7 +721,7 @@ mod tests {
     #[test]
     fn delta_is_small() {
         let (a, b) = fixture();
-        let d = diff(&a, &b);
+        let d = diff(&a, &b).unwrap();
         println!(
             "full {} B (stations {}, bsss {}, radios {}), delta {} B (stations {}, radios {}, scalars {})",
             wire_len(&a),
@@ -578,7 +751,7 @@ mod tests {
     fn unchanged_is_tiny() {
         let (a, _) = fixture();
         let n = successor(&a);
-        let size = postcard::to_stdvec(&diff(&a, &n)).unwrap().len();
+        let size = postcard::to_stdvec(&diff(&a, &n).unwrap()).unwrap().len();
         assert!(size <= 16, "{size} B");
     }
 }

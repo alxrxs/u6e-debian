@@ -172,9 +172,10 @@ fn clamp_tick(secs: u16) -> Duration {
     Duration::from_secs(u64::from(secs.clamp(1, 60)))
 }
 
-/// Whether this tick sends a key frame rather than a delta from `prev`.
-fn needs_key(prev: &Snapshot, next: &Snapshot, want_key: bool, since_key: Duration) -> bool {
-    want_key || since_key >= KEY_EVERY || !delta::same_shape(prev, next)
+/// Whether this tick sends a key frame whatever the snapshot; otherwise it
+/// does only when no delta can carry the change.
+fn key_due(want_key: bool, since_key: Duration) -> bool {
+    want_key || since_key >= KEY_EVERY
 }
 
 /// One connection: what has been sent and when the next tick is due.
@@ -255,11 +256,14 @@ impl Session {
     ) -> io::Result<()> {
         self.seq += 1;
         let next = snapshot(self.seq);
-        match self.prev.take() {
-            Some(prev) if !needs_key(&prev, &next, self.want_key, now - self.last_key) => {
-                write_frame(out, &AgentMsg::Delta(delta::diff(&prev, &next)))?;
-            }
-            _ => {
+        let delta = self
+            .prev
+            .take()
+            .filter(|_| !key_due(self.want_key, now - self.last_key))
+            .and_then(|prev| delta::diff(&prev, &next));
+        match delta {
+            Some(d) => write_frame(out, &AgentMsg::Delta(d))?,
+            None => {
                 write_frame(out, &AgentMsg::Key(next.clone()))?;
                 self.last_key = now;
                 self.want_key = false;
@@ -381,7 +385,7 @@ mod tests {
     use std::sync::mpsc::{self, SyncSender, sync_channel};
 
     use rustls::{ServerConfig, ServerConnection};
-    use u6e_proto::msg::{EventKind, Temp};
+    use u6e_proto::msg::{Bss, EventKind, Station, Temp};
 
     // A throwaway Ed25519 key made for tests (the same as in u6e-proto's tls
     // tests); it protects nothing.
@@ -426,6 +430,30 @@ mod tests {
             radios: Vec::new(),
             bsss: Vec::new(),
             stations: Vec::new(),
+        }
+    }
+
+    fn station() -> Station {
+        Station {
+            mac: [2, 0, 0, 0, 0, 8],
+            bss: 0,
+            signal: -50,
+            signal_avg: -50,
+            rx_bytes: 0,
+            tx_bytes: 0,
+            rx_packets: 0,
+            tx_packets: 0,
+            tx_retries: 0,
+            tx_failed: 0,
+            tx_rate_kbps: 0,
+            rx_rate_kbps: 0,
+            tx_mcs: 0,
+            rx_mcs: 0,
+            tx_airtime_us: 0,
+            rx_airtime_us: 0,
+            inactive_ms: 0,
+            connected_s: 0,
+            vlan: 0,
         }
     }
 
@@ -677,19 +705,10 @@ mod tests {
 
     #[test]
     fn key_frame_every_minute_and_on_request() {
-        let (a, b) = (blank(1), blank(2));
         let fresh = Duration::from_secs(1);
-        assert!(!needs_key(&a, &b, false, fresh));
-        assert!(needs_key(&a, &b, true, fresh));
-        assert!(needs_key(&a, &b, false, KEY_EVERY));
-        let hot = Snapshot {
-            temps: vec![Temp {
-                zone: "cpu".into(),
-                milli_c: 40_000,
-            }],
-            ..blank(2)
-        };
-        assert!(needs_key(&a, &hot, false, fresh));
+        assert!(!key_due(false, fresh));
+        assert!(key_due(true, fresh));
+        assert!(key_due(false, KEY_EVERY));
     }
 
     #[test]
@@ -723,6 +742,34 @@ mod tests {
         p.send(CtlMsg::SetTick { secs: 1 });
         p.expect_delta(2);
         assert!(matches!(p.recv(), AgentMsg::Key(s) if s.seq == 3 && s.temps.len() == 1));
+    }
+
+    /// A client listed by two BSSs at once: no delta can carry that, so each
+    /// such tick is a key frame.
+    #[test]
+    fn a_snapshot_no_delta_can_carry_is_a_key_frame() {
+        let fake = Fake::new();
+        let _agent = Agent::spawn(&fake, |seq| {
+            let mut s = blank(seq);
+            s.bsss = vec![Bss {
+                ifname: "wl0".into(),
+                bssid: [2, 0, 0, 0, 0, 1],
+                ssid: "net".into(),
+                phy: "phy0".into(),
+                vlan: 0,
+            }];
+            if seq == 2 {
+                s.stations = vec![station(), station()];
+            }
+            s
+        });
+        let mut p = fake.accept();
+        assert!(matches!(p.recv(), AgentMsg::Hello(_)));
+        assert!(matches!(p.recv(), AgentMsg::Key(s) if s.seq == 1));
+        p.send(CtlMsg::SetTick { secs: 1 });
+        assert!(matches!(p.recv(), AgentMsg::Key(s) if s.seq == 2));
+        assert!(matches!(p.recv(), AgentMsg::Key(s) if s.seq == 3));
+        assert!(matches!(p.recv(), AgentMsg::Delta(d) if d.seq == 4));
     }
 
     #[test]

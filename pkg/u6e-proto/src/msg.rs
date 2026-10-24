@@ -42,9 +42,8 @@ pub struct Hello {
 
 /// The state of the AP at one tick.
 ///
-/// `stations` is sorted by MAC: [`crate::delta::apply`] restores that order,
-/// so a collector that sorts gets snapshots equal to the ones the controller
-/// rebuilds.
+/// `stations` is sorted by MAC, each MAC once, as [`crate::delta::valid`]
+/// requires; a snapshot that is not goes out as a key frame.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
     pub seq: u64,
