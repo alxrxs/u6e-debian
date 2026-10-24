@@ -51,6 +51,9 @@ done
 	-e NET_CLS_ACT -e NF_CONNTRACK_EVENTS -e NF_CONNTRACK_MARK \
 	-e IP_MROUTE -e IPV6_MROUTE -m IFB -e CFG80211_HEADERS -d CFG80211 -d MAC80211 -d IOMMU_SUPPORT \
 	-d QCOM_SYSMON -d QCOM_PDR_HELPERS -d QCOM_PD_MAPPER
+# ath11k's spectral scan hands its FFT samples to user space through relay
+# files in debugfs.
+./scripts/config -e RELAY
 # Every link type ECM and the NSS clients can offload needs its kernel side.
 ./scripts/config -m PPP -m PPPOE -m PPTP -m NF_CONNTRACK_PPTP -m L2TP -e L2TP_V3 -m PPPOL2TP -m L2TP_ETH \
 	-m BONDING -m MACVLAN -m NET_IPIP -m NET_IPGRE_DEMUX -m NET_IPGRE -e NET_IPGRE_BROADCAST -m IPV6_GRE \

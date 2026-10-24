@@ -94,7 +94,9 @@ Wi-Fi starts by itself on every boot (`u6e-wifi.service`), with nothing else on 
 - The usual Wi-Fi 4/5/6 speed features are enabled: beamforming, TWT and spatial reuse among them.
 
 **Running it day to day**
-- The whole system log goes to your syslog collector (the access point keeps logs only in RAM), the kernel log goes out over the network, and `u6e-agent` adds load, memory, clients per network, temperatures and Wi-Fi firmware crashes every 5 minutes.
+- The whole system log goes to your syslog collector (the access point keeps logs only in RAM), the kernel log goes out over the network, and `u6e-agent` adds load, memory, clients per network, temperatures (the SoC's sensors and each radio's own) and Wi-Fi firmware crashes every 5 minutes.
+- Each radio reports its temperature (`/sys/class/ieee80211/phy*/hwmon*/temp1_input`), and its firmware throttles transmission when it runs hot, in steps with hysteresis: the 5 and 6 GHz radios stop transmitting half of the time above 100 °C, 90 % above 105 °C and entirely above 110 °C (back down below 95, 100 and 105 °C); the 2.4 GHz radio does the same above 105, 110 and 115 °C.
+- The radios' spectral scan (FFT samples of the channel, read through debugfs) is built in; nothing runs it yet.
 - A hang triggers a reset by the watchdog (a hardware timer), and crash information survives the reset so it can be read back from stock.
 - When a radio's firmware crashes, the driver restarts it, and the access point keeps the latest firmware crash dump in `/var/lib/u6e-coredump/` (compressed: about 4 MB for a 5 or 6 GHz radio, 12 MB for the 2.4 GHz one, whose dump holds the whole WCSS region and the M3 dump area its firmware fills; readable by root only) and logs its name.
 - Each radio's own calibration is loaded at boot, and the status LED can be set to off, blue or white.
