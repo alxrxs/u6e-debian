@@ -149,17 +149,17 @@ impl Nl80211 {
         if bound < 0 || set < 0 {
             return Err(io::Error::last_os_error());
         }
-        let mut nl = Nl80211 {
-            fd,
-            family: GENL_ID_CTRL,
-            seq: 0,
-        };
+        let mut nl = Self::with_fd(fd, GENL_ID_CTRL);
         let mut name = Vec::new();
         put_attr(&mut name, CTRL_ATTR_FAMILY_NAME, b"nl80211\0");
         let reply = nl.transact(GENL_ID_CTRL, 0, CTRL_CMD_GETFAMILY, &name)?;
         nl.family = parse_family_id(&reply)
             .ok_or_else(|| io::Error::other("no nl80211 family in the reply"))?;
         Ok(nl)
+    }
+
+    fn with_fd(fd: OwnedFd, family: u16) -> Self {
+        Nl80211 { fd, family, seq: 0 }
     }
 
     /// The raw replies to `GET_INTERFACE`: every interface of every wiphy.
@@ -215,7 +215,12 @@ impl Nl80211 {
                     continue;
                 }
                 match ty {
-                    NLMSG_DONE => return Ok(out),
+                    // A dump that failed part-way says so here; what came
+                    // before is not the whole list.
+                    NLMSG_DONE => match m.get(16..20).map_or(0, i32_of) {
+                        e if e < 0 => return Err(io::Error::from_raw_os_error(-e)),
+                        _ => return Ok(out),
+                    },
                     NLMSG_ERROR => match m.get(16..20).map(i32_of) {
                         Some(0) => {}
                         Some(e) => return Err(io::Error::from_raw_os_error(-e)),
@@ -383,7 +388,7 @@ fn rate(d: &[u8]) -> (u32, u8) {
     for (ty, d) in attrs(d) {
         match ty {
             RATE_BITRATE if kbps == 0 => kbps = u32::from(u16_of(d)) * 100,
-            RATE_BITRATE32 => kbps = u32_of(d) * 100,
+            RATE_BITRATE32 => kbps = u32_of(d).saturating_mul(100),
             RATE_MCS | RATE_VHT_MCS | RATE_HE_MCS | RATE_EHT_MCS => {
                 mcs = d.first().copied().unwrap_or(0)
             }
@@ -596,6 +601,90 @@ mod tests {
         let reply = request(GENL_ID_CTRL, 0, 1, 1, &attrs);
         assert_eq!(parse_family_id(&reply), Some(27));
         assert_eq!(parse_family_id(&[]), None);
+    }
+
+    /// A client whose kernel is the other end of a socket pair: the test
+    /// queues the kernel's datagrams on the returned end.
+    fn fake_kernel() -> (Nl80211, OwnedFd) {
+        let mut sv = [0; 2];
+        let r = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, sv.as_mut_ptr()) };
+        assert_eq!(r, 0);
+        let (ours, kernel) = unsafe { (OwnedFd::from_raw_fd(sv[0]), OwnedFd::from_raw_fd(sv[1])) };
+        (Nl80211::with_fd(ours, 28), kernel)
+    }
+
+    fn queue(kernel: &OwnedFd, datagram: &[u8]) {
+        let sent = unsafe {
+            libc::send(
+                kernel.as_raw_fd(),
+                datagram.as_ptr().cast(),
+                datagram.len(),
+                0,
+            )
+        };
+        assert_eq!(sent as usize, datagram.len());
+    }
+
+    /// A station record of the dump with sequence number `seq`.
+    fn station_msg(seq: u32, last: u8) -> Vec<u8> {
+        let mut mac = Vec::new();
+        put_attr(&mut mac, ATTR_MAC, &[2, 0, 0, 0, 0, last]);
+        request(28, 2, seq, CMD_GET_STATION, &mac)
+    }
+
+    /// The end of a dump: NLMSG_DONE with the dump's status.
+    fn done(seq: u32, status: i32) -> Vec<u8> {
+        let mut m = Vec::new();
+        m.extend_from_slice(&20u32.to_ne_bytes());
+        m.extend_from_slice(&NLMSG_DONE.to_ne_bytes());
+        m.extend_from_slice(&2u16.to_ne_bytes());
+        m.extend_from_slice(&seq.to_ne_bytes());
+        m.extend_from_slice(&0u32.to_ne_bytes());
+        m.extend_from_slice(&status.to_ne_bytes());
+        m
+    }
+
+    #[test]
+    fn a_dump_is_joined_across_reads_and_skips_other_requests() {
+        let (mut nl, kernel) = fake_kernel();
+        // A late answer to an earlier request, then the dump in two reads.
+        queue(&kernel, &station_msg(0, 9));
+        queue(&kernel, &station_msg(1, 1));
+        queue(&kernel, &[station_msg(1, 2), done(1, 0)].concat());
+        let macs: Vec<u8> = nl.stations(9).unwrap().iter().map(|s| s.mac[5]).collect();
+        assert_eq!(macs, [1, 2]);
+    }
+
+    #[test]
+    fn a_dump_that_ends_in_an_error_is_not_a_complete_answer() {
+        let (mut nl, kernel) = fake_kernel();
+        queue(
+            &kernel,
+            &[station_msg(1, 1), done(1, -libc::ENODEV)].concat(),
+        );
+        let e = nl.stations(9).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::ENODEV));
+    }
+
+    #[test]
+    fn an_error_reply_is_an_error() {
+        let (mut nl, kernel) = fake_kernel();
+        let mut err = request(NLMSG_ERROR, 0, 1, 0, &[]);
+        err.truncate(16);
+        err.extend_from_slice(&(-libc::EPERM).to_ne_bytes());
+        err[..4].copy_from_slice(&20u32.to_ne_bytes());
+        queue(&kernel, &err);
+        assert_eq!(
+            nl.stations(9).unwrap_err().raw_os_error(),
+            Some(libc::EPERM)
+        );
+    }
+
+    #[test]
+    fn a_huge_rate_saturates() {
+        let mut a = Vec::new();
+        put_attr(&mut a, RATE_BITRATE32, &u32::MAX.to_ne_bytes());
+        assert_eq!(rate(&a).0, u32::MAX);
     }
 
     #[test]
