@@ -341,6 +341,8 @@ fn nss_load_pct(path: &Path) -> u8 {
 /// Every thermal zone by its type, and a radio's own sensor as the zone named
 /// after its phy, where the driver exposes one: ath11k registers its hwmon on
 /// the wiphy, a class device, so sysfs puts it in the phy's own directory.
+/// Each name is used once, as the snapshot requires: a zone whose type is
+/// empty or taken goes by its directory's name.
 fn temps(sys: &Path, radios: &[Radio]) -> Vec<Temp> {
     let milli_c = |p: PathBuf| fs::read_to_string(p).ok()?.trim().parse().ok();
     let mut zones: Vec<_> = fs::read_dir(sys.join("class/thermal"))
@@ -354,17 +356,27 @@ fn temps(sys: &Path, radios: &[Radio]) -> Vec<Temp> {
         })
         .collect();
     zones.sort();
-    let mut out: Vec<Temp> = zones
-        .iter()
-        .map(|z| Temp {
-            zone: fs::read_to_string(z.join("type"))
+    let mut out: Vec<Temp> = Vec::new();
+    let taken = |out: &[Temp], name: &str| name.is_empty() || out.iter().any(|t| t.zone == name);
+    for z in &zones {
+        let kind = fs::read_to_string(z.join("type")).unwrap_or_default();
+        let mut zone = kind.trim().to_owned();
+        if taken(&out, &zone) {
+            zone = z
+                .file_name()
                 .unwrap_or_default()
-                .trim()
-                .to_owned(),
+                .to_string_lossy()
+                .into_owned();
+        }
+        out.push(Temp {
+            zone,
             milli_c: milli_c(z.join("temp")).unwrap_or(0),
-        })
-        .collect();
+        });
+    }
     for r in radios {
+        if taken(&out, &r.phy) {
+            continue;
+        }
         let mut hwmons: Vec<_> = fs::read_dir(sys.join("class/ieee80211").join(&r.phy))
             .into_iter()
             .flatten()
@@ -832,6 +844,30 @@ mod tests {
             Some(&("phy1".to_owned(), 47_500))
         );
         assert!(temps(&t.path().join("absent"), &radios).is_empty());
+    }
+
+    /// Two zones of one type would be two series of one name at the
+    /// controller; the second goes by its directory's name.
+    #[test]
+    fn temperature_zones_are_named_once() {
+        let t = TestDir::new();
+        for (z, name) in [(0, "cpu-thermal"), (1, "cpu-thermal"), (2, ""), (3, "phy1")] {
+            let dir = t.path().join(format!("class/thermal/thermal_zone{z}"));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("type"), format!("{name}\n")).unwrap();
+            fs::write(dir.join("temp"), "50000\n").unwrap();
+        }
+        let hwmon = t.path().join("class/ieee80211/phy1/hwmon0");
+        fs::create_dir_all(&hwmon).unwrap();
+        fs::write(hwmon.join("temp1_input"), "47500\n").unwrap();
+        let names: Vec<_> = temps(t.path(), &[radio("phy1")])
+            .into_iter()
+            .map(|t| t.zone)
+            .collect();
+        assert_eq!(
+            names,
+            ["cpu-thermal", "thermal_zone1", "thermal_zone2", "phy1"]
+        );
     }
 
     #[test]
