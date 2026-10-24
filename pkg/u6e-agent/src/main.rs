@@ -25,15 +25,15 @@ mod testdir;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::mpsc::sync_channel;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 use std::{env, process, thread};
 
 use u6e_proto::tls::Identity;
 
-/// The state line: first 2 minutes after start, then every 5 (in rounds).
-const STATS_FIRST: u64 = 120 / neighbors::ROUND_SECS;
-const STATS_EVERY: u64 = 300 / neighbors::ROUND_SECS;
+/// The state line: first 2 minutes after start, then every 5.
+const STATS_FIRST: Duration = Duration::from_secs(120);
+const STATS_EVERY: Duration = Duration::from_secs(300);
 
 /// Where and as whom the telemetry link connects.
 struct LinkArgs {
@@ -130,7 +130,7 @@ fn start_link(l: LinkArgs, collector: &Arc<Mutex<collect::Collector>>) {
         link::run(
             cfg,
             move |seq| {
-                let mut c = collector.lock().unwrap_or_else(PoisonError::into_inner);
+                let mut c = lock(&collector);
                 c.snapshot(seq)
             },
             rx,
@@ -177,20 +177,75 @@ fn main() {
         start_link(l, &collector);
     }
 
-    for n in 0.. {
-        let stations = neighbors::round(&mut h, &own, &peers);
-        if n >= STATS_FIRST && (n - STATS_FIRST).is_multiple_of(STATS_EVERY) {
-            let mut c = collector.lock().unwrap_or_else(PoisonError::into_inner);
-            let snap = c.snapshot(0);
-            println!("{}", stats::line(&snap, c.fw_crashes(), &stations));
-        }
+    let stations = Arc::new(Mutex::new(Vec::new()));
+    let counted = Arc::clone(&stations);
+    thread::spawn(move || {
+        state_lines(&collector, &counted, STATS_FIRST, STATS_EVERY, |l| {
+            println!("{l}");
+        })
+    });
+    loop {
+        let counts = neighbors::round(&mut h, &own, &peers);
+        *lock(&stations) = counts;
         thread::sleep(Duration::from_secs(neighbors::ROUND_SECS));
     }
+}
+
+/// Prints the state line, on a thread of its own: a snapshot can wait on the
+/// collector (the link's, or a slow kernel), and the 802.11k rounds must not.
+/// `stations` holds the latest round's stations per BSS.
+fn state_lines(
+    collector: &Mutex<collect::Collector>,
+    stations: &Mutex<Vec<(String, u32)>>,
+    first: Duration,
+    every: Duration,
+    mut emit: impl FnMut(String),
+) -> ! {
+    thread::sleep(first);
+    loop {
+        let line = {
+            let mut c = lock(collector);
+            let snap = c.snapshot(0);
+            stats::line(&snap, c.fw_crashes(), &lock(stations))
+        };
+        emit(line);
+        thread::sleep(every);
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_state_line_counts_the_latest_round() {
+        let t = testdir::TestDir::new();
+        let paths = collect::Paths {
+            root: t.path().join("root"),
+            hostapd: t.path().join("hostapd"),
+            kmsg: t.path().join("kmsg"),
+            run: t.path().join("run"),
+        };
+        let collector = Arc::new(Mutex::new(collect::Collector::with_paths(paths)));
+        let stations = Arc::new(Mutex::new(vec![("wlan5".to_owned(), 3)]));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (c, s) = (Arc::clone(&collector), Arc::clone(&stations));
+        let every = Duration::from_millis(20);
+        thread::spawn(move || {
+            state_lines(&c, &s, Duration::ZERO, every, |l| {
+                // The thread outlives the test.
+                let _ = tx.send(l);
+            })
+        });
+        let wait = Duration::from_secs(5);
+        assert!(rx.recv_timeout(wait).unwrap().contains("clients: wlan5=3 "));
+        *stations.lock().unwrap() = vec![("wlan5".to_owned(), 4)];
+        while !rx.recv_timeout(wait).unwrap().contains("clients: wlan5=4 ") {}
+    }
 
     #[test]
     fn controller_key_is_64_hex_digits() {
