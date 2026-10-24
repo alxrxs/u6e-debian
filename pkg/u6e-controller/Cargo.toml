@@ -4,3 +4,11 @@ version = "1.0.0"
 edition = "2024"
 license = "GPL-2.0-only"
 publish = false
+
+[dependencies]
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+serde = { version = "1.0.229", features = ["derive"] }
+tokio = { version = "1.54.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-rustls = { version = "0.26.6", default-features = false }
+toml = { version = "1.1.8", default-features = false, features = ["parse", "serde", "std"] }
+u6e-proto = { path = "../u6e-proto" }
