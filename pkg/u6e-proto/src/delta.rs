@@ -25,7 +25,9 @@ const MAX_BSSS: usize = 64;
 const MAX_STATIONS: usize = 1024;
 
 /// Whether the delta coding can work on `s`: stations sorted by MAC with each
-/// MAC once, each on a BSS of the list, and every list within its cap.
+/// MAC once, each on a BSS of the list, every list within its cap, and each
+/// radio, BSS and temperature zone named once (the names key the
+/// controller's metrics, where a duplicate would fail the whole scrape).
 pub fn valid(s: &Snapshot) -> bool {
     s.temps.len() <= MAX_TEMPS
         && s.radios.len() <= MAX_RADIOS
@@ -33,6 +35,14 @@ pub fn valid(s: &Snapshot) -> bool {
         && s.stations.len() <= MAX_STATIONS
         && s.stations.windows(2).all(|w| w[0].mac < w[1].mac)
         && s.stations.iter().all(|t| usize::from(t.bss) < s.bsss.len())
+        && unique(s.radios.iter().map(|r| &r.phy))
+        && unique(s.bsss.iter().map(|b| &b.ifname))
+        && unique(s.temps.iter().map(|t| &t.zone))
+}
+
+fn unique<'a>(mut names: impl Iterator<Item = &'a String>) -> bool {
+    let mut seen = HashSet::new();
+    names.all(|n| seen.insert(n))
 }
 
 /// Whether a delta can express the change from `prev` to `next`: the same
@@ -677,11 +687,48 @@ mod tests {
         assert!(valid(&snap(1, many[..MAX_STATIONS].to_vec())));
         assert!(!valid(&snap(1, many)));
         let mut s = snap(1, Vec::new());
-        s.bsss = vec![s.bsss[0].clone(); MAX_BSSS + 1];
+        s.bsss = (0..=MAX_BSSS)
+            .map(|i| Bss {
+                ifname: format!("wl{i}"),
+                ..s.bsss[0].clone()
+            })
+            .collect();
+        assert!(valid(&Snapshot {
+            bsss: s.bsss[..MAX_BSSS].to_vec(),
+            ..s.clone()
+        }));
         assert!(!valid(&s));
         let mut s = snap(1, Vec::new());
-        s.radios = vec![s.radios[0].clone(); MAX_RADIOS + 1];
+        s.radios = (0..=MAX_RADIOS)
+            .map(|i| Radio {
+                phy: format!("phy{i}"),
+                ..s.radios[0].clone()
+            })
+            .collect();
+        assert!(valid(&Snapshot {
+            radios: s.radios[..MAX_RADIOS].to_vec(),
+            ..s.clone()
+        }));
         assert!(!valid(&s));
+    }
+
+    /// Each name becomes a Prometheus label set, and a series written twice
+    /// fails the whole scrape.
+    #[test]
+    fn duplicate_names_are_not_valid() {
+        let (a, _) = fixture();
+        assert!(valid(&a));
+        let mut s = a.clone();
+        s.radios[1].phy = s.radios[0].phy.clone();
+        assert!(!valid(&s));
+        let mut s = a.clone();
+        s.bsss[3].ifname = s.bsss[0].ifname.clone();
+        assert!(!valid(&s));
+        let mut s = a.clone();
+        s.temps[2].zone = s.temps[1].zone.clone();
+        assert!(!valid(&s));
+        // A duplicate name is a key frame, never a delta.
+        assert_eq!(diff(&s, &successor(&s)), None);
     }
 
     /// Counters at and past 2^63 survive the i64 differences.
