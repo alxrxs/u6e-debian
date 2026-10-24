@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Sat, 24 Oct 2026 03:13:20 +0300
+Subject: [PATCH] soc: qcom: smp2p: ack a remote that restarts without toggling
+ restart_done
+
+qcom_smp2p_check_ssr() reset the last value of every inbound entry on
+each interrupt, not only when a restart was detected as intended, so
+every interrupt replayed every set bit as a new rising edge (the WCSS
+remoteproc's "Handover signaled, but it already happened").
+
+A version 1 remote with the SSR ack feature can also restart without
+toggling restart_done: the IPQ5018 WCSS firmware clears its entries and
+waits for the restart ack, which the host never sent, so its restart
+after a crash timed out. Treat entries that all went from set to clear
+as such a restart too, and ack it. Measured with the root PD crashing:
+the firmware rings with every entry clear 80 ms after its reset, and
+reports ready 3 ms after the ack.
+
+Assisted-by: LLM
+---
+ drivers/soc/qcom/smp2p.c | 26 ++++++++++++++++++++++----
+ 1 file changed, 22 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/soc/qcom/smp2p.c b/drivers/soc/qcom/smp2p.c
+index af0ceeaf6..1242cd142 100644
+--- a/drivers/soc/qcom/smp2p.c
++++ b/drivers/soc/qcom/smp2p.c
+@@ -186,6 +186,8 @@ static bool qcom_smp2p_check_ssr(struct qcom_smp2p *smp2p)
+ {
+ 	struct smp2p_smem_item *in = smp2p->in;
+ 	struct smp2p_entry *entry;
++	bool was_set = false;
++	bool cleared = true;
+ 	bool restart_done;
+ 	bool restart;
+ 
+@@ -194,10 +196,26 @@ static bool qcom_smp2p_check_ssr(struct qcom_smp2p *smp2p)
+ 
+ 	restart_done = in->flags & BIT(SMP2P_FLAGS_RESTART_DONE_BIT);
+ 	restart = restart_done != smp2p->ssr_ack;
+-	list_for_each_entry(entry, &smp2p->inbound, node) {
+-		if (!entry->value)
+-			continue;
+-		entry->last_value = 0;
++
++	/*
++	 * A version 1 remote can also restart without toggling restart_done
++	 * (the IPQ5018 WCSS does): it clears its entries and waits for the ack.
++	 */
++	if (!restart && in->version == 1) {
++		list_for_each_entry(entry, &smp2p->inbound, node) {
++			if (!entry->value)
++				continue;
++			if (entry->last_value)
++				was_set = true;
++			if (readl(entry->value))
++				cleared = false;
++		}
++		restart = was_set && cleared;
++	}
++
++	if (restart) {
++		list_for_each_entry(entry, &smp2p->inbound, node)
++			entry->last_value = 0;
+ 	}
+ 
+ 	return restart;

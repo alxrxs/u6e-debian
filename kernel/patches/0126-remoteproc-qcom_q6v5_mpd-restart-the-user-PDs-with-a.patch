@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Fri, 23 Oct 2026 23:33:03 +0300
+Subject: [PATCH] remoteproc: qcom_q6v5_mpd: restart the user PDs with a
+ crashed root PD
+
+A crash of the root PD takes its user PDs down with it, but the
+remoteproc core recovers only the root: the IPQ5018's internal radio,
+which runs in user PD 1, stayed down until a reboot.
+
+A subdevice of the root PD now releases each running user PD's
+TrustZone state when the root is stopped after a crash, as
+wcss_pd_stop() would, and loads and starts those user PDs again once the
+root has started; ath11k then finds its firmware again and recovers the
+radio. An orderly stop or start is left alone.
+
+Assisted-by: LLM
+---
+ drivers/remoteproc/qcom_q6v5_mpd.c | 72 ++++++++++++++++++++++++++++++
+ 1 file changed, 72 insertions(+)
+
+diff --git a/drivers/remoteproc/qcom_q6v5_mpd.c b/drivers/remoteproc/qcom_q6v5_mpd.c
+index f4cf5b66b..a38f72491 100644
+--- a/drivers/remoteproc/qcom_q6v5_mpd.c
++++ b/drivers/remoteproc/qcom_q6v5_mpd.c
+@@ -87,6 +87,7 @@ struct q6_wcss {
+ 	const struct wcss_data *desc;
+ 	const char **firmware;
+ 	struct userpd *upd[MAX_UPD];
++	struct rproc_subdev upd_subdev;
+ };
+ 
+ struct userpd {
+@@ -94,6 +95,7 @@ struct userpd {
+ 	struct device *dev;
+ 	struct qcom_rproc_ssr ssr_subdev;
+ 	struct qcom_q6v5 q6;
++	bool restart;
+ };
+ 
+ struct wcss_data {
+@@ -582,6 +584,73 @@ static int q6_wcss_parse_fw(struct rproc *rproc, const struct firmware *fw)
+ 	return 0;
+ }
+ 
++/*
++ * A crash of the root PD takes its user PDs down with it, but the remoteproc
++ * core recovers only the root, whose start then times out while the user PDs
++ * still hold their TrustZone state. Release that state as wcss_pd_stop()
++ * would before the root restarts, and load and start the user PDs again once
++ * it has.
++ */
++static void q6_wcss_upd_stop(struct rproc_subdev *subdev, bool crashed)
++{
++	struct q6_wcss *wcss = container_of(subdev, struct q6_wcss, upd_subdev);
++	struct userpd *upd;
++	int i;
++
++	if (!crashed)
++		return;
++
++	for (i = 0; i < ARRAY_SIZE(wcss->upd); i++) {
++		upd = wcss->upd[i];
++		if (!upd || upd->q6.rproc->state != RPROC_RUNNING)
++			continue;
++
++		if (upd->pd_asid == 1 &&
++		    qcom_scm_internal_wifi_shutdown(wcss->desc->pasid))
++			dev_err(upd->dev, "failed to power down internal radio\n");
++		if (qcom_scm_msa_unlock((upd->pd_asid << 8) | UPD_SWID))
++			dev_err(upd->dev, "failed to power down pd\n");
++		upd->restart = true;
++	}
++}
++
++static int q6_wcss_upd_start(struct rproc_subdev *subdev)
++{
++	struct q6_wcss *wcss = container_of(subdev, struct q6_wcss, upd_subdev);
++	const struct firmware *fw;
++	struct userpd *upd;
++	struct rproc *rproc;
++	int i, ret;
++
++	for (i = 0; i < ARRAY_SIZE(wcss->upd); i++) {
++		upd = wcss->upd[i];
++		if (!upd || !upd->restart)
++			continue;
++
++		upd->restart = false;
++		rproc = upd->q6.rproc;
++		ret = request_firmware(&fw, rproc->firmware, upd->dev);
++		if (ret) {
++			dev_err(upd->dev, "can't load %s: %d\n", rproc->firmware, ret);
++			return ret;
++		}
++		ret = qcom_mdt_load_pd_seg(upd->dev, fw, rproc->firmware,
++					   wcss->desc->pasid, upd->pd_asid,
++					   wcss->mem_region, wcss->mem_phys,
++					   wcss->mem_size, NULL);
++		release_firmware(fw);
++		if (!ret)
++			ret = wcss_pd_start(rproc);
++		if (ret) {
++			dev_err(upd->dev, "pd restart failed: %d\n", ret);
++			return ret;
++		}
++		dev_info(upd->dev, "pd restarted after the root pd's recovery\n");
++	}
++
++	return 0;
++}
++
+ static const struct rproc_ops q6_wcss_ops = {
+ 	.start = q6_wcss_start,
+ 	.stop = q6_wcss_stop,
+@@ -858,6 +927,9 @@ static int q6_wcss_probe(struct platform_device *pdev)
+ 
+ 	qcom_add_glink_subdev(rproc, &wcss->glink_subdev, "q6wcss");
+ 	qcom_add_ssr_subdev(rproc, &wcss->ssr_subdev, "q6wcss");
++	wcss->upd_subdev.start = q6_wcss_upd_start;
++	wcss->upd_subdev.stop = q6_wcss_upd_stop;
++	rproc_add_subdev(rproc, &wcss->upd_subdev);
+ 
+ 	rproc->auto_boot = false;
+ 	rproc->dump_conf = RPROC_COREDUMP_ENABLED;
