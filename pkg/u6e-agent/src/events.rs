@@ -22,7 +22,12 @@ use crate::kmsg::{self, Kmsg};
 /// How often the set of hostapd sockets and the kernel log are looked at when
 /// nothing arrives.
 const RESCAN_MS: i32 = 1000;
+/// How long hostapd has to confirm an ATTACH. A BSS that does not is tried
+/// again after a wait that doubles up to `RETRY_MAX`, so a hung hostapd's
+/// queue does not fill with them.
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(1);
+const RETRY_MIN: Duration = Duration::from_secs(1);
+const RETRY_MAX: Duration = Duration::from_secs(30);
 /// How often each attached socket is checked for a hostapd that went away.
 const PROBE_EVERY: Duration = Duration::from_secs(2);
 
@@ -49,6 +54,16 @@ impl Events {
 /// even when its new socket file takes the old one's place.
 struct Attached {
     sock: ClientSocket,
+    /// When ATTACH was sent, until hostapd confirms it. The answer comes
+    /// through the poll loop like any event, so one silent hostapd holds up
+    /// nobody else's.
+    pending: Option<Instant>,
+}
+
+/// When a BSS whose hostapd did not confirm ATTACH is tried again.
+struct Retry {
+    at: Instant,
+    wait: Duration,
 }
 
 impl Attached {
@@ -66,34 +81,55 @@ impl Attached {
     }
 }
 
+/// Sends ATTACH to the BSS socket `name`; hostapd's OK arrives later.
 fn attach(paths: &Paths, name: &str) -> Option<Attached> {
-    let target = paths.hostapd.join(name);
     let sock = ClientSocket::bind(&paths.run, &format!("ev-{name}")).ok()?;
-    let attached = Attached { sock };
-    attached.sock.set_read_timeout(Some(ATTACH_TIMEOUT)).ok()?;
-    attached.sock.connect(&target).ok()?;
-    attached.sock.send(b"ATTACH").ok()?;
-    let mut reply = [0; 16];
-    let n = attached.sock.recv(&mut reply).ok()?;
-    (reply[..n].starts_with(b"OK")).then_some(())?;
-    attached.sock.set_nonblocking(true).ok()?;
-    Some(attached)
+    sock.set_nonblocking(true).ok()?;
+    sock.connect(paths.hostapd.join(name)).ok()?;
+    sock.send(b"ATTACH").ok()?;
+    Some(Attached {
+        sock,
+        pending: Some(Instant::now()),
+    })
 }
 
 fn run(tx: &SyncSender<Event>, paths: &Paths) {
     let mut kmsg = Kmsg::open(&paths.kmsg, true);
     let mut attached: BTreeMap<String, Attached> = BTreeMap::new();
+    let mut retry: BTreeMap<String, Retry> = BTreeMap::new();
     let mut buf = vec![0; 4096];
     let mut last_probe = Instant::now();
     loop {
         let order = collect::bss_order(&paths.hostapd);
-        let probe = last_probe.elapsed() >= PROBE_EVERY;
+        let now = Instant::now();
+        let probe = now.duration_since(last_probe) >= PROBE_EVERY;
         if probe {
-            last_probe = Instant::now();
+            last_probe = now;
         }
-        attached.retain(|name, a| order.contains(name) && (!probe || a.alive()));
+        attached.retain(|name, a| {
+            let unconfirmed = a
+                .pending
+                .is_some_and(|sent| now.duration_since(sent) >= ATTACH_TIMEOUT);
+            if unconfirmed {
+                let wait = retry
+                    .get(name)
+                    .map_or(RETRY_MIN, |r| (r.wait * 2).min(RETRY_MAX));
+                retry.insert(
+                    name.clone(),
+                    Retry {
+                        at: now + wait,
+                        wait,
+                    },
+                );
+            }
+            let dead = probe && a.pending.is_none() && !a.alive();
+            order.contains(name) && !unconfirmed && !dead
+        });
+        retry.retain(|name, _| order.contains(name));
         for name in &order {
-            if !attached.contains_key(name)
+            let due = retry.get(name).is_none_or(|r| now >= r.at);
+            if due
+                && !attached.contains_key(name)
                 && let Some(a) = attach(paths, name)
             {
                 attached.insert(name.clone(), a);
@@ -111,12 +147,19 @@ fn run(tx: &SyncSender<Event>, paths: &Paths) {
         unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, RESCAN_MS) };
 
         let mut events = Vec::new();
-        for ((name, a), fd) in attached.iter().zip(&fds) {
+        for ((name, a), fd) in attached.iter_mut().zip(&fds) {
             if fd.revents == 0 {
                 continue;
             }
             let bss = order.iter().position(|n| n == name).unwrap_or(0) as u16;
             while let Ok(n) = a.sock.recv(&mut buf) {
+                if a.pending.is_some() {
+                    if buf[..n].starts_with(b"OK") {
+                        a.pending = None;
+                        retry.remove(name);
+                    }
+                    continue;
+                }
                 let msg = String::from_utf8_lossy(&buf[..n]);
                 events.extend(parse(&msg, bss, || phy_of(&paths.sys(), name)));
             }
@@ -378,6 +421,53 @@ mod tests {
         )
         .unwrap();
         p
+    }
+
+    /// A hostapd starting up or hung does not answer ATTACH; the BSSs of one
+    /// that does are not held up by it.
+    #[test]
+    fn a_silent_hostapd_does_not_hold_up_the_others() {
+        let t = TestDir::new();
+        let paths = paths(&t);
+        let _silent: Vec<_> = ["wlan24", "wlan24-1"]
+            .map(|n| UnixDatagram::bind(paths.hostapd.join(n)).unwrap())
+            .into();
+        let mut h = FakeHostapd::bind(&paths.hostapd.join("wlan5"));
+        let (tx, rx) = sync_channel(16);
+        Events::spawn_with(tx, paths.clone()).unwrap();
+        h.wait_attach();
+        for _ in 0..6 {
+            let sent = Instant::now();
+            h.event("<3>AP-STA-CONNECTED 02:00:00:00:00:08");
+            assert_eq!(
+                rx.recv_timeout(WAIT).unwrap().kind,
+                EventKind::Assoc { mac: STA, bss: 2 }
+            );
+            assert!(
+                sent.elapsed() < Duration::from_millis(500),
+                "{:?}",
+                sent.elapsed()
+            );
+            thread::sleep(Duration::from_millis(400));
+        }
+    }
+
+    #[test]
+    fn an_unanswered_attach_is_tried_less_and_less_often() {
+        let t = TestDir::new();
+        let paths = paths(&t);
+        let silent = UnixDatagram::bind(paths.hostapd.join("wlan5")).unwrap();
+        silent.set_nonblocking(true).unwrap();
+        let (tx, _rx) = sync_channel(16);
+        Events::spawn_with(tx, paths).unwrap();
+        thread::sleep(Duration::from_secs(6));
+        let mut buf = [0; 16];
+        let mut attaches = 0;
+        while let Ok(n) = silent.recv(&mut buf) {
+            attaches += usize::from(&buf[..n] == b"ATTACH");
+        }
+        // Sent at 0, about 2 and about 5 s; once a second without a backoff.
+        assert!((2..=3).contains(&attaches), "{attaches} in 6 s");
     }
 
     /// hostapd sends events to the client's path: with it removed they are
