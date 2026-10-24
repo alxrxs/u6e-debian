@@ -39,6 +39,29 @@ pub fn read_frame<R: Read, T: DeserializeOwned>(r: &mut R) -> io::Result<T> {
     postcard::from_bytes(&body).map_err(invalid)
 }
 
+/// Decodes the first frame of `buf` and returns it with the bytes it took, or
+/// `None` while `buf` holds only part of one. For a reader that accumulates
+/// bytes from a stream that can time out, where [`read_frame`] would lose its
+/// place mid-frame. A length above [`MAX_FRAME`] is refused without waiting for
+/// the body.
+pub fn decode_frame<T: DeserializeOwned>(buf: &[u8]) -> io::Result<Option<(T, usize)>> {
+    let Some(prefix) = buf.first_chunk::<4>() else {
+        return Ok(None);
+    };
+    let len = u32::from_le_bytes(*prefix);
+    if len > MAX_FRAME {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!("frame of {len} B exceeds {MAX_FRAME}"),
+        ));
+    }
+    let end = 4 + len as usize;
+    let Some(body) = buf.get(4..end) else {
+        return Ok(None);
+    };
+    Ok(Some((postcard::from_bytes(body).map_err(invalid)?, end)))
+}
+
 fn invalid(e: postcard::Error) -> io::Error {
     io::Error::new(ErrorKind::InvalidData, e)
 }
@@ -90,6 +113,36 @@ mod tests {
         let mut buf = 2u32.to_le_bytes().to_vec();
         buf.extend([0xff, 0xff]);
         let e = read_frame::<_, AgentMsg>(&mut buf.as_slice()).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn decode_frame_waits_for_the_whole_frame() {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &AgentMsg::Pong(7)).unwrap();
+        write_frame(&mut buf, &AgentMsg::Pong(8)).unwrap();
+        let first = 4 + u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
+        for cut in 0..first {
+            assert!(decode_frame::<AgentMsg>(&buf[..cut]).unwrap().is_none());
+        }
+        let (msg, n) = decode_frame::<AgentMsg>(&buf).unwrap().unwrap();
+        assert_eq!((msg, n), (AgentMsg::Pong(7), first));
+        let (msg, n2) = decode_frame::<AgentMsg>(&buf[n..]).unwrap().unwrap();
+        assert_eq!((msg, n + n2), (AgentMsg::Pong(8), buf.len()));
+    }
+
+    #[test]
+    fn decode_frame_refuses_oversize_before_the_body() {
+        let buf = (MAX_FRAME + 1).to_le_bytes();
+        let e = decode_frame::<AgentMsg>(&buf).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn decode_frame_garbage_is_invalid_data() {
+        let mut buf = 2u32.to_le_bytes().to_vec();
+        buf.extend([0xff, 0xff]);
+        let e = decode_frame::<AgentMsg>(&buf).unwrap_err();
         assert_eq!(e.kind(), ErrorKind::InvalidData);
     }
 }
