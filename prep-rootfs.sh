@@ -242,7 +242,7 @@ ln -sf /etc/systemd/system/u6e-wifi.service $W/u6e-wifi.service
 # are also OCE's AP Channel Report. It also checks the management network
 # (below) and logs the AP's state.
 NR_PORT=8211
-peers=$(for a in $U6E_APS; do (U6E_AP=$a; . ./site.conf; echo "${MGMT_ADDR%/*}"); done | grep -vx "$MGMT_IP" | sed 's/^/--peer /' | tr '\n' ' ')
+peers=$(for a in $U6E_APS; do (U6E_AP=$a; . ./site.conf; echo "${MGMT_ADDR%/*}"); done | { grep -vx "$MGMT_IP" || true; } | sed 's/^/--peer /' | tr '\n' ' ')
 arm=; [ "${U6E_PERSIST:-0}" = 1 ] && arm=--arm
 install -m0755 target/aarch64-unknown-linux-musl/release/u6e-agent $RF/usr/local/sbin/
 cat > $RF/etc/systemd/system/u6e-agent.service <<UNIT
