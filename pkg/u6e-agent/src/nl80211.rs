@@ -108,6 +108,10 @@ pub struct Nl80211 {
     fd: OwnedFd,
     family: u16,
     seq: u32,
+    /// The receive buffer and the answer, kept across requests: allocating
+    /// and zeroing 64 KiB per request cost more than the dumps themselves.
+    buf: Vec<u8>,
+    out: Vec<u8>,
 }
 
 impl Nl80211 {
@@ -153,58 +157,65 @@ impl Nl80211 {
         let mut name = Vec::new();
         put_attr(&mut name, CTRL_ATTR_FAMILY_NAME, b"nl80211\0");
         let reply = nl.transact(GENL_ID_CTRL, 0, CTRL_CMD_GETFAMILY, &name)?;
-        nl.family = parse_family_id(&reply)
+        nl.family = parse_family_id(reply)
             .ok_or_else(|| io::Error::other("no nl80211 family in the reply"))?;
         Ok(nl)
     }
 
     fn with_fd(fd: OwnedFd, family: u16) -> Self {
-        Nl80211 { fd, family, seq: 0 }
+        Nl80211 {
+            fd,
+            family,
+            seq: 0,
+            buf: vec![0; 65536],
+            out: Vec::new(),
+        }
     }
 
     /// The raw replies to `GET_INTERFACE`: every interface of every wiphy.
-    pub fn dump_interfaces(&mut self) -> io::Result<Vec<u8>> {
+    pub fn dump_interfaces(&mut self) -> io::Result<&[u8]> {
         self.dump(CMD_GET_INTERFACE, &[])
     }
 
     /// The raw replies to `GET_STATION` of one interface.
-    pub fn dump_stations(&mut self, ifindex: u32) -> io::Result<Vec<u8>> {
+    pub fn dump_stations(&mut self, ifindex: u32) -> io::Result<&[u8]> {
         self.dump(CMD_GET_STATION, &ifindex_attr(ifindex))
     }
 
     /// The raw replies to `GET_SURVEY` of the wiphy of an interface.
-    pub fn dump_survey(&mut self, ifindex: u32) -> io::Result<Vec<u8>> {
+    pub fn dump_survey(&mut self, ifindex: u32) -> io::Result<&[u8]> {
         self.dump(CMD_GET_SURVEY, &ifindex_attr(ifindex))
     }
 
     pub fn interfaces(&mut self) -> io::Result<Vec<Iface>> {
-        Ok(parse_interfaces(&self.dump_interfaces()?))
+        Ok(parse_interfaces(self.dump_interfaces()?))
     }
 
     pub fn stations(&mut self, ifindex: u32) -> io::Result<Vec<Station>> {
-        Ok(parse_stations(&self.dump_stations(ifindex)?))
+        Ok(parse_stations(self.dump_stations(ifindex)?))
     }
 
     pub fn survey(&mut self, ifindex: u32) -> io::Result<Vec<Survey>> {
-        Ok(parse_survey(&self.dump_survey(ifindex)?))
+        Ok(parse_survey(self.dump_survey(ifindex)?))
     }
 
-    fn dump(&mut self, cmd: u8, attrs: &[u8]) -> io::Result<Vec<u8>> {
+    fn dump(&mut self, cmd: u8, attrs: &[u8]) -> io::Result<&[u8]> {
         self.transact(self.family, NLM_F_DUMP, cmd, attrs)
     }
 
     /// Sends one request and returns the data messages of the answer, back
     /// to back: until the end of the dump, or the one reply of a plain
     /// request.
-    fn transact(&mut self, family: u16, flags: u16, cmd: u8, attrs: &[u8]) -> io::Result<Vec<u8>> {
+    fn transact(&mut self, family: u16, flags: u16, cmd: u8, attrs: &[u8]) -> io::Result<&[u8]> {
         self.seq = self.seq.wrapping_add(1);
         let msg = request(family, NLM_F_REQUEST | flags, self.seq, cmd, attrs);
         let sent = unsafe { libc::send(self.fd.as_raw_fd(), msg.as_ptr().cast(), msg.len(), 0) };
         if sent < 0 {
             return Err(io::Error::last_os_error());
         }
-        let (mut out, mut buf) = (Vec::new(), vec![0u8; 65536]);
+        self.out.clear();
         loop {
+            let (buf, out) = (&mut self.buf, &mut self.out);
             let n =
                 unsafe { libc::recv(self.fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
             if n < 0 {
@@ -219,7 +230,7 @@ impl Nl80211 {
                     // before is not the whole list.
                     NLMSG_DONE => match m.get(16..20).map_or(0, i32_of) {
                         e if e < 0 => return Err(io::Error::from_raw_os_error(-e)),
-                        _ => return Ok(out),
+                        _ => return Ok(&self.out),
                     },
                     NLMSG_ERROR => match m.get(16..20).map(i32_of) {
                         Some(0) => {}
@@ -230,7 +241,7 @@ impl Nl80211 {
                 }
             }
             if flags & NLM_F_DUMP != NLM_F_DUMP && !out.is_empty() {
-                return Ok(out);
+                return Ok(&self.out);
             }
         }
     }

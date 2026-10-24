@@ -35,7 +35,7 @@ fn status(iface: &str, client: &Path) -> String {
 fn run(dir: &Path) -> std::io::Result<()> {
     fs::create_dir_all(dir)?;
     let mut nl = nl80211::Nl80211::open()?;
-    let raw = nl.dump_interfaces()?;
+    let raw = nl.dump_interfaces()?.to_vec();
     fs::write(dir.join("interfaces.bin"), &raw)?;
     let mut radios = Vec::new();
     for i in nl80211::parse_interfaces(&raw) {
