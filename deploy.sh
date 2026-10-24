@@ -91,7 +91,7 @@ step rootfs "$hostapd/$iproute2/$netlogd/$(head_of . HEAD:mkrootfs.sh)" arm64 ro
 # u6e-agent: a static arm64 binary from the cargo workspace, cross-built here
 # (cargo-zigbuild: zig is the C toolchain for musl crates such as aws-lc-sys).
 [ -x target/aarch64-unknown-linux-musl/release/u6e-agent ] || rm -f stamps/agent
-step agent "$(head_of . HEAD:Cargo.toml)/$(head_of . HEAD:Cargo.lock)/$(head_of . HEAD:pkg/u6e-agent)/$(head_of . HEAD:pkg/u6e-proto)" sh -c \
+step agent "$(head_of . HEAD:Cargo.toml)/$(head_of . HEAD:Cargo.lock)/$(head_of . HEAD:.cargo)/$(head_of . HEAD:pkg/u6e-agent)/$(head_of . HEAD:pkg/u6e-proto)" sh -c \
 	'PATH=$PATH:$HOME/.cargo/bin cargo zigbuild --release --locked --target aarch64-unknown-linux-musl -p u6e-agent'
 
 if [ $# = 0 ]; then
