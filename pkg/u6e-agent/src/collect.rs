@@ -59,36 +59,79 @@ pub fn bss_order(hostapd: &Path) -> Vec<String> {
     names
 }
 
+/// A source that may not be there yet: opened again at every snapshot until
+/// it opens, and a failure is logged once, not every tick.
+struct Source<T> {
+    name: &'static str,
+    inner: Option<T>,
+    reported: bool,
+}
+
+impl<T> Source<T> {
+    fn new(name: &'static str) -> Self {
+        Source {
+            name,
+            inner: None,
+            reported: false,
+        }
+    }
+
+    fn get(&mut self, open: impl FnOnce() -> io::Result<T>) -> Option<&mut T> {
+        if self.inner.is_none() {
+            match open() {
+                Ok(v) => {
+                    if self.reported {
+                        eprintln!("u6e-agent: {} is available again", self.name);
+                    }
+                    self.reported = false;
+                    self.inner = Some(v);
+                }
+                Err(e) if !self.reported => {
+                    eprintln!("u6e-agent: {}: {e}", self.name);
+                    self.reported = true;
+                }
+                Err(_) => {}
+            }
+        }
+        self.inner.as_mut()
+    }
+}
+
+/// Collects the state; whatever cannot be read yet reads as empty, so the
+/// agent's other duties never depend on the collectors.
 pub struct Collector {
-    nl: Nl80211,
-    hostapd: Hostapd,
+    nl: Source<Nl80211>,
+    hostapd: Source<Hostapd>,
     kmsg: Kmsg,
     paths: Paths,
     crashes: u64,
 }
 
 impl Collector {
-    pub fn new() -> io::Result<Self> {
+    pub fn new() -> Self {
         Self::with_paths(Paths::default())
     }
 
-    pub fn with_paths(paths: Paths) -> io::Result<Self> {
-        let nl = Nl80211::open()?;
-        let hostapd = Hostapd::bind(&paths.run.join("collect"), &paths.hostapd)?;
+    pub fn with_paths(paths: Paths) -> Self {
         let mut kmsg = Kmsg::open(&paths.kmsg, false);
         let crashes = kmsg.drain().iter().filter(|m| kmsg::is_fw_crash(m)).count() as u64;
-        Ok(Collector {
-            nl,
-            hostapd,
+        Collector {
+            nl: Source::new("nl80211"),
+            hostapd: Source::new("hostapd control socket"),
             kmsg,
             paths,
             crashes,
-        })
+        }
     }
 
     /// The Wi-Fi firmware crashes in the kernel log, as of the last snapshot.
     pub fn fw_crashes(&self) -> u64 {
         self.crashes
+    }
+
+    /// Whether nl80211 is open (after a snapshot).
+    pub fn has_nl80211(&self) -> bool {
+        self.nl.inner.is_some()
     }
 
     pub fn snapshot(&mut self, seq: u64) -> Snapshot {
@@ -99,30 +142,37 @@ impl Collector {
             .iter()
             .filter(|m| kmsg::is_fw_crash(m))
             .count() as u64;
-        let ifaces = self.nl.interfaces().unwrap_or_default();
+        let mut nl = self.nl.get(Nl80211::open);
+        let ifaces = nl
+            .as_mut()
+            .and_then(|nl| nl.interfaces().ok())
+            .unwrap_or_default();
         let order = bss_order(&self.paths.hostapd);
         let bsss = bsss(&sys, &order, &ifaces);
         let per_iface: Vec<_> = ifaces
             .iter()
             .filter(|i| i.kind == nl80211::IFTYPE_AP || i.kind == nl80211::IFTYPE_AP_VLAN)
             .map(|i| {
-                (
-                    i.name.as_str(),
-                    self.nl.stations(i.ifindex).unwrap_or_default(),
-                )
+                let stas = nl.as_mut().and_then(|nl| nl.stations(i.ifindex).ok());
+                (i.name.as_str(), stas.unwrap_or_default())
             })
             .collect();
         let stations = stations(&sys, &order, per_iface);
-        let (nl, hostapd) = (&mut self.nl, &mut self.hostapd);
+        let (client, dir) = (self.paths.run.join("collect"), &self.paths.hostapd);
+        let mut hostapd = self.hostapd.get(|| Hostapd::bind(&client, dir));
         let radios = radios(
             &bsss,
             &ifaces,
-            |i| nl.survey(i.ifindex).unwrap_or_default(),
+            |i| {
+                let survey = nl.as_mut().and_then(|nl| nl.survey(i.ifindex).ok());
+                survey.unwrap_or_default()
+            },
             |bss| {
-                hostapd
-                    .request(bss, "STATUS")
-                    .lines()
-                    .any(|l| l == "state=ENABLED")
+                hostapd.as_mut().is_some_and(|h| {
+                    h.request(bss, "STATUS")
+                        .lines()
+                        .any(|l| l == "state=ENABLED")
+                })
             },
         );
         let root = &self.paths.root;
@@ -614,5 +664,39 @@ mod tests {
         assert_eq!(mem_available_kb(&t.path().join("meminfo")), 812_345);
         assert_eq!(first_field(&t.path().join("absent")), None);
         assert_eq!(mem_available_kb(&t.path().join("absent")), 0);
+    }
+
+    #[test]
+    fn a_collector_without_its_sources_still_reports_and_picks_them_up() {
+        let t = TestDir::new();
+        let run = t.path().join("run");
+        fs::create_dir_all(&run).unwrap();
+        let paths = Paths {
+            root: t.path().join("root"),
+            hostapd: t.path().join("hostapd"),
+            kmsg: t.path().join("kmsg"),
+            run,
+        };
+        let mut c = Collector::with_paths(paths.clone());
+        let snap = c.snapshot(7);
+        assert_eq!(snap.seq, 7);
+        assert!(snap.bsss.is_empty() && snap.stations.is_empty() && snap.temps.is_empty());
+        assert_eq!(
+            (snap.uptime_s, snap.load_milli, snap.nss_load_pct),
+            (0, 0, 0)
+        );
+        assert_eq!(c.fw_crashes(), 0);
+
+        fs::create_dir_all(&paths.hostapd).unwrap();
+        let _sock = UnixDatagram::bind(paths.hostapd.join("wlan5")).unwrap();
+        fs::write(
+            &paths.kmsg,
+            "4,1,1,-;ath11k_pci 0000:01:00.0: firmware crashed: x\n",
+        )
+        .unwrap();
+        let snap = c.snapshot(8);
+        assert_eq!(snap.bsss.len(), 1);
+        assert_eq!(snap.bsss[0].ifname, "wlan5");
+        assert_eq!(c.fw_crashes(), 1);
     }
 }

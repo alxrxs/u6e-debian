@@ -4,40 +4,51 @@
 use std::fs::{self, File};
 use std::io::{ErrorKind, Read, Seek, SeekFrom};
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const O_NONBLOCK: i32 = 0o4000;
 const CRASH: &str = "firmware crashed";
 
 pub struct Kmsg {
+    path: PathBuf,
+    new_only: bool,
     file: Option<File>,
     buf: Vec<u8>,
 }
 
 impl Kmsg {
     /// Opens the log at its oldest record, or past the newest with `new_only`.
-    /// An unreadable log reads as empty.
+    /// An unreadable log reads as empty and is opened again at the next
+    /// `drain`.
     pub fn open(path: &Path, new_only: bool) -> Self {
-        let file = fs::OpenOptions::new()
+        let mut k = Kmsg {
+            path: path.to_owned(),
+            new_only,
+            file: None,
+            buf: vec![0; 8192],
+        };
+        k.file = k.try_open();
+        k
+    }
+
+    fn try_open(&self) -> Option<File> {
+        let mut f = fs::OpenOptions::new()
             .read(true)
             .custom_flags(O_NONBLOCK)
-            .open(path)
-            .ok()
-            .and_then(|mut f| {
-                if new_only {
-                    f.seek(SeekFrom::End(0)).ok()?;
-                }
-                Some(f)
-            });
-        Kmsg {
-            file,
-            buf: vec![0; 8192],
+            .open(&self.path)
+            .ok()?;
+        if self.new_only {
+            f.seek(SeekFrom::End(0)).ok()?;
         }
+        Some(f)
     }
 
     /// The messages logged since the last call. A record is "<prefix>;<message>"
     /// and continuation lines (the device properties) start with a space.
     pub fn drain(&mut self) -> Vec<String> {
+        if self.file.is_none() {
+            self.file = self.try_open();
+        }
         let Some(file) = &mut self.file else {
             return Vec::new();
         };

@@ -60,11 +60,11 @@ fn args() -> Option<Args> {
 
 fn main() {
     if env::args().nth(1).as_deref() == Some("--print-snapshot") {
-        let mut c = collect::Collector::new().unwrap_or_else(|e| {
-            eprintln!("u6e-agent: collectors: {e}");
-            process::exit(1);
-        });
+        let mut c = collect::Collector::new();
         println!("{:#?}", c.snapshot(0));
+        if !c.has_nl80211() {
+            process::exit(1);
+        }
         return;
     }
     let Some(a) = args() else {
@@ -77,10 +77,7 @@ fn main() {
         eprintln!("u6e-agent: hostapd control socket: {e}");
         process::exit(1);
     });
-    let mut collector = collect::Collector::new().unwrap_or_else(|e| {
-        eprintln!("u6e-agent: collectors: {e}");
-        process::exit(1);
-    });
+    let mut collector = collect::Collector::new();
     let peers: Vec<SocketAddr> = a
         .peers
         .iter()
