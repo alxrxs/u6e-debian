@@ -4,7 +4,7 @@
 //! thread owns all the sockets; it re-attaches to a hostapd that restarted
 //! and picks up BSSs that appear, so nothing has to restart it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io;
 use std::os::fd::AsRawFd;
@@ -97,6 +97,7 @@ fn run(tx: &SyncSender<Event>, paths: &Paths) {
     let mut kmsg = Kmsg::open(&paths.kmsg, true);
     let mut attached: BTreeMap<String, Attached> = BTreeMap::new();
     let mut retry: BTreeMap<String, Retry> = BTreeMap::new();
+    let mut radios = HashMap::new();
     let mut buf = vec![0; 4096];
     let mut last_probe = Instant::now();
     loop {
@@ -157,6 +158,9 @@ fn run(tx: &SyncSender<Event>, paths: &Paths) {
                     if buf[..n].starts_with(b"OK") {
                         a.pending = None;
                         retry.remove(name);
+                        // It may have come up before the attachment: its
+                        // radio's next event is news either way.
+                        radios.remove(&phy_of(&paths.sys(), name));
                     }
                     continue;
                 }
@@ -164,6 +168,7 @@ fn run(tx: &SyncSender<Event>, paths: &Paths) {
                 events.extend(parse(&msg, bss, || phy_of(&paths.sys(), name)));
             }
         }
+        events.retain(|kind| changes_radio(&mut radios, kind));
         for msg in kmsg.drain() {
             if kmsg::is_fw_crash(&msg) {
                 events.extend(
@@ -181,6 +186,18 @@ fn run(tx: &SyncSender<Event>, paths: &Paths) {
             }
         }
     }
+}
+
+/// Whether `kind` is to be reported: anything but a radio event, and a radio
+/// event that changes what was last reported of that radio. hostapd reports
+/// AP-DISABLED from every BSS of a radio that stops.
+fn changes_radio(last: &mut HashMap<String, bool>, kind: &EventKind) -> bool {
+    let (phy, up) = match kind {
+        EventKind::RadioUp { phy } => (phy, true),
+        EventKind::RadioDown { phy } => (phy, false),
+        _ => return true,
+    };
+    last.insert(phy.clone(), up) != Some(up)
 }
 
 /// Milliseconds since the epoch, as the AP's clock has it.
@@ -309,6 +326,34 @@ mod tests {
             };
             assert_eq!(parse(&format!("<3>{name} {a}"), 1, phy1), Some(want));
         }
+    }
+
+    /// hostapd says AP-DISABLED for every BSS of a radio that stops, and
+    /// AP-ENABLED once; the radio's events are its changes of state.
+    #[test]
+    fn one_radio_stopping_is_one_event() {
+        let up = |p: &str| EventKind::RadioUp { phy: p.into() };
+        let down = |p: &str| EventKind::RadioDown { phy: p.into() };
+        let assoc = EventKind::Assoc { mac: STA, bss: 0 };
+        let mut radios = HashMap::new();
+        let kept: Vec<bool> = [
+            down("phy1"),
+            down("phy1"),
+            assoc.clone(),
+            down("phy1"),
+            down("phy2"),
+            up("phy1"),
+            up("phy1"),
+            assoc,
+            down("phy1"),
+        ]
+        .iter()
+        .map(|k| changes_radio(&mut radios, k))
+        .collect();
+        assert_eq!(
+            kept,
+            [true, false, true, false, true, true, false, true, true]
+        );
     }
 
     /// The events of one boot of a real AP, as hostapd logged them.
@@ -450,6 +495,41 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(400));
         }
+    }
+
+    #[test]
+    fn a_radio_reported_down_twice_is_one_event() {
+        let t = TestDir::new();
+        let paths = paths(&t);
+        let mut h = FakeHostapd::bind(&paths.hostapd.join("wlan6"));
+        let (tx, rx) = sync_channel(16);
+        Events::spawn_with(tx, paths.clone()).unwrap();
+        h.wait_attach();
+        h.event("<3>AP-DISABLED");
+        h.event("<3>AP-DISABLED");
+        h.event("<3>AP-STA-DISCONNECTED 02:00:00:00:00:08");
+        let got: Vec<_> = (0..2)
+            .map(|_| rx.recv_timeout(WAIT).unwrap().kind)
+            .collect();
+        assert_eq!(
+            got,
+            [
+                EventKind::RadioDown { phy: "phy2".into() },
+                EventKind::Disassoc { mac: STA, bss: 0 }
+            ]
+        );
+        // A hostapd that restarted may have come up before it was attached
+        // to: what it says next is news.
+        let sock = paths.hostapd.join("wlan6");
+        drop(h);
+        fs::remove_file(&sock).unwrap();
+        let mut h = FakeHostapd::bind(&sock);
+        h.wait_attach();
+        h.event("<3>AP-DISABLED");
+        assert_eq!(
+            rx.recv_timeout(WAIT).unwrap().kind,
+            EventKind::RadioDown { phy: "phy2".into() }
+        );
     }
 
     #[test]
