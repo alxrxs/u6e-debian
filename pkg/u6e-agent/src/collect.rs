@@ -34,7 +34,7 @@ impl Default for Paths {
             root: "/".into(),
             hostapd: crate::neighbors::HOSTAPD.into(),
             kmsg: "/dev/kmsg".into(),
-            run: "/run/u6e-agent".into(),
+            run: crate::clientsock::RUN.into(),
         }
     }
 }
@@ -207,8 +207,8 @@ impl Collector {
             })
             .collect();
         let stations = stations(&sys, &order, per_iface);
-        let (client, dir) = (self.paths.run.join("collect"), &self.paths.hostapd);
-        let mut hostapd = self.hostapd.get(|| Hostapd::bind(&client, dir));
+        let (run, dir) = (&self.paths.run, &self.paths.hostapd);
+        let mut hostapd = self.hostapd.get(|| Hostapd::bind(run, "collect", dir));
         let radios = radios(
             &bsss,
             ifaces,

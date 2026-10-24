@@ -10,6 +10,7 @@
 //! With the three controller options it also streams telemetry to the
 //! controller (see `link`).
 
+mod clientsock;
 mod collect;
 mod events;
 mod kmsg;
@@ -141,7 +142,10 @@ fn main() {
     if env::args().nth(1).as_deref() == Some("--print-snapshot") {
         let mut c = collect::Collector::new();
         println!("{:#?}", c.snapshot(0));
-        if !c.has_nl80211() {
+        let ok = c.has_nl80211();
+        // Its client sockets go with it; exit would skip that.
+        drop(c);
+        if !ok {
             process::exit(1);
         }
         return;

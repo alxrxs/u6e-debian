@@ -8,14 +8,14 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::os::fd::AsRawFd;
-use std::os::unix::net::UnixDatagram;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use u6e_proto::msg::{Event, EventKind};
 
+use crate::clientsock::ClientSocket;
 use crate::collect::{self, Paths};
 use crate::kmsg::{self, Kmsg};
 
@@ -37,7 +37,6 @@ impl Events {
     }
 
     pub fn spawn_with(tx: SyncSender<Event>, paths: Paths) -> io::Result<()> {
-        fs::create_dir_all(&paths.run)?;
         thread::Builder::new()
             .name("events".into())
             .spawn(move || run(&tx, &paths))?;
@@ -49,14 +48,7 @@ impl Events {
 /// that very socket, not to the path, so a hostapd that restarted is noticed
 /// even when its new socket file takes the old one's place.
 struct Attached {
-    sock: UnixDatagram,
-    path: PathBuf,
-}
-
-impl Drop for Attached {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
+    sock: ClientSocket,
 }
 
 impl Attached {
@@ -72,10 +64,8 @@ impl Attached {
 
 fn attach(paths: &Paths, name: &str) -> Option<Attached> {
     let target = paths.hostapd.join(name);
-    let path = paths.run.join(format!("ev-{name}"));
-    let _ = fs::remove_file(&path);
-    let sock = UnixDatagram::bind(&path).ok()?;
-    let attached = Attached { sock, path };
+    let sock = ClientSocket::bind(&paths.run, &format!("ev-{name}")).ok()?;
+    let attached = Attached { sock };
     attached.sock.set_read_timeout(Some(ATTACH_TIMEOUT)).ok()?;
     attached.sock.connect(&target).ok()?;
     attached.sock.send(b"ATTACH").ok()?;
@@ -214,6 +204,8 @@ mod tests {
     use super::*;
     use crate::testdir::TestDir;
     use std::os::unix::fs::symlink;
+    use std::os::unix::net::UnixDatagram;
+    use std::path::PathBuf;
     use std::sync::mpsc::sync_channel;
 
     const STA: [u8; 6] = [2, 0, 0, 0, 0, 8];

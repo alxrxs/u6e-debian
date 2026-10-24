@@ -10,14 +10,14 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::FileTypeExt;
-use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{fs, thread};
 
+use crate::clientsock::{ClientSocket, RUN};
+
 pub const HOSTAPD: &str = "/run/hostapd";
-const CTRL: &str = "/run/u6e-agent/ctrl";
 const ROUND: Duration = Duration::from_secs(ROUND_SECS);
 const TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -65,20 +65,19 @@ fn peer_entry(line: &str) -> Option<Entry> {
 
 /// A client of hostapd's control interfaces, bound at its own socket path.
 pub struct Hostapd {
-    sock: UnixDatagram,
+    sock: ClientSocket,
     dir: PathBuf,
     buf: Vec<u8>,
 }
 
 impl Hostapd {
     pub fn open() -> std::io::Result<Self> {
-        Self::bind(Path::new(CTRL), Path::new(HOSTAPD))
+        Self::bind(Path::new(RUN), "ctrl", Path::new(HOSTAPD))
     }
 
-    /// A client at `client` talking to the sockets in `dir`.
-    pub fn bind(client: &Path, dir: &Path) -> std::io::Result<Self> {
-        let _ = fs::remove_file(client);
-        let sock = UnixDatagram::bind(client)?;
+    /// A client named after `what` in `run`, talking to the sockets in `dir`.
+    pub fn bind(run: &Path, what: &str, dir: &Path) -> std::io::Result<Self> {
+        let sock = ClientSocket::bind(run, what)?;
         sock.set_read_timeout(Some(Duration::from_secs(1)))?;
         Ok(Hostapd {
             sock,
@@ -212,6 +211,7 @@ pub fn serve(addr: SocketAddr, own: Arc<Mutex<String>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::net::UnixDatagram;
 
     const OWN: &str = "aa:aa:aa:aa:aa:01 ssid=4775657374 nr=aa01 stat";
 
@@ -282,6 +282,27 @@ mod tests {
         assert_eq!(num_sta(status, "wlan5-1"), 3);
         assert_eq!(num_sta(status, "wlan5"), 8);
         assert_eq!(num_sta(status, "wlan6"), 0);
+    }
+
+    /// `u6e-agent --print-snapshot` beside the resident agent.
+    #[test]
+    fn a_second_client_does_not_deafen_the_first() {
+        let t = crate::testdir::TestDir::new();
+        let dir = t.path().join("hostapd");
+        fs::create_dir_all(&dir).unwrap();
+        let server = UnixDatagram::bind(dir.join("wlan5")).unwrap();
+        thread::spawn(move || {
+            let mut buf = [0; 64];
+            while let Ok((_, from)) = server.recv_from(&mut buf) {
+                if let Some(p) = from.as_pathname() {
+                    let _ = server.send_to(b"state=ENABLED", p);
+                }
+            }
+        });
+        let mut resident = Hostapd::bind(t.path(), "collect", &dir).unwrap();
+        assert_eq!(resident.request("wlan5", "STATUS"), "state=ENABLED");
+        drop(Hostapd::bind(t.path(), "collect", &dir).unwrap());
+        assert_eq!(resident.request("wlan5", "STATUS"), "state=ENABLED");
     }
 
     #[test]
