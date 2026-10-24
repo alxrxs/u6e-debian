@@ -15,6 +15,7 @@ The only thing ever written to the SPI flash (the small chip holding the boot lo
   - the management network (VLAN, gateway, DNS, NTP, syslog collector) and the VLANs Wi-Fi clients land in;
   - the Wi-Fi plan: country, one line per SSID (name, kind, bands, default VLAN), channels, transmit power, and the optional 6 GHz Multiple BSSID setting;
   - how secrets are fetched: passphrases, the roaming key, the RADIUS-over-TLS certificate and the stock login are read by small shell functions, so they can come from a file or a password manager;
+  - optionally, the controller `u6e-agent` streams to: its address and its public key (plain values), with each access point's own private key read by a shell function in that access point's block;
   - one block per access point (hostname, address, LED colour, Wi-Fi colours), and the test client for `test/`;
   - `U6E_PERSIST` (see [Booting](#booting)) and `BLOBS`, the location of the proprietary files below.
 - `$BLOBS`: a separate private repository with the proprietary files the build reads from it. They are not redistributable, so they are not included here:
@@ -95,6 +96,7 @@ Wi-Fi starts by itself on every boot (`u6e-wifi.service`), with nothing else on 
 
 **Running it day to day**
 - The whole system log goes to your syslog collector (the access point keeps logs only in RAM), the kernel log goes out over the network, and `u6e-agent` adds load, memory, clients per network, temperatures (the SoC's sensors and each radio's own) and Wi-Fi firmware crashes every 5 minutes.
+- With `CONTROLLER` set in `site.conf`, `u6e-agent` also streams the access point's Wi-Fi state (radios, networks, clients, events) and its identity (`/etc/u6e-image`) to the controller over post-quantum TLS, each side pinning the other's key. The access point works the same without it.
 - Each radio reports its temperature (`/sys/class/ieee80211/phy*/hwmon*/temp1_input`), and its firmware throttles transmission when it runs hot, in steps with hysteresis: the 5 and 6 GHz radios stop transmitting half of the time above 100 °C, 90 % above 105 °C and entirely above 110 °C (back down below 95, 100 and 105 °C); the 2.4 GHz radio does the same above 105, 110 and 115 °C.
 - The radios' spectral scan (FFT samples of the channel, read through debugfs) is built in; nothing runs it yet.
 - A hang triggers a reset by the watchdog (a hardware timer), and crash information survives the reset so it can be read back from stock.

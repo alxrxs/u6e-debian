@@ -244,14 +244,24 @@ ln -sf /etc/systemd/system/u6e-wifi.service $W/u6e-wifi.service
 NR_PORT=8211
 peers=$(for a in $U6E_APS; do (U6E_AP=$a; . ./site.conf; echo "${MGMT_ADDR%/*}"); done | { grep -vx "$MGMT_IP" || true; } | sed 's/^/--peer /' | tr '\n' ' ')
 arm=; [ "${U6E_PERSIST:-0}" = 1 ] && arm=--arm
+# With CONTROLLER set, it also streams the AP's Wi-Fi state to the controller,
+# which it pins by CONTROLLER_KEY; this AP's own key (agent_key) is root's only.
+link=
+if [ -n "${CONTROLLER:-}" ]; then
+	[[ ${CONTROLLER_KEY:-} =~ ^[0-9a-fA-F]{64}$ ]] || { echo "CONTROLLER_KEY must be 64 hex digits" >&2; exit 1; }
+	install -d -m0700 $RF/etc/u6e-agent
+	(umask 077; agent_key > $RF/etc/u6e-agent/key.pem)
+	grep -q -- '-----BEGIN PRIVATE KEY-----' $RF/etc/u6e-agent/key.pem || { echo "agent_key: no PKCS#8 private key" >&2; exit 1; }
+	link="--controller $CONTROLLER --key /etc/u6e-agent/key.pem --controller-key $CONTROLLER_KEY"
+fi
 install -m0755 target/aarch64-unknown-linux-musl/release/u6e-agent $RF/usr/local/sbin/
 cat > $RF/etc/systemd/system/u6e-agent.service <<UNIT
 [Unit]
-Description=U6E agent: neighbor reports across APs, management network check, state
+Description=U6E agent: neighbor reports across APs, management network check, state, controller link
 After=u6e-wifi.service
 
 [Service]
-ExecStart=/usr/local/sbin/u6e-agent --listen $MGMT_IP --port $NR_PORT --gateway $MGMT_GW $arm $peers
+ExecStart=/usr/local/sbin/u6e-agent --listen $MGMT_IP --port $NR_PORT --gateway $MGMT_GW $arm $peers $link
 RuntimeDirectory=u6e-agent
 RuntimeDirectoryMode=0755
 Restart=always

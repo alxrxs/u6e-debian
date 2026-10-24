@@ -33,6 +33,12 @@ U6E_PERSIST=0
 # 1: bluetoothd powers the Bluetooth controller at boot. 0: it stays off until
 # powered by hand (bluetoothctl power on).
 BT_POWERED=1
+# Optional: the Wi-Fi controller u6e-agent streams the AP's Wi-Fi state to
+# (host:port), and the controller's Ed25519 public key (64 hex digits), which
+# the agent pins: a plain value, not a secret. Each AP's own private key is
+# agent_key in its block below. CONTROLLER unset: no controller link.
+CONTROLLER=controller.example.net:8443
+CONTROLLER_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 
 # Stock firmware SSH: the controller's "Device Authentication" user, and a
 # command printing its password.
@@ -89,6 +95,9 @@ ap1)
 	MGMT_ADDR=192.0.2.16/24
 	AP_LED=off
 	WIFI_COLORS="11 22 33"
+	# With CONTROLLER: a command printing this AP's Ed25519 private key
+	# (PKCS#8 PEM) for the controller link.
+	agent_key() { cat ~/.config/u6e/agent-ap1.pem; }
 	# boot/powercycle.sh: cut and restore the AP's power, e.g. its PoE
 	# injector's smart plug.
 	power_off() { echo "power_off: not configured" >&2; return 1; }
