@@ -410,9 +410,9 @@ fn bsss(sys: &Path, order: &[String], ifaces: &[Iface]) -> Vec<Bss> {
         .collect()
 }
 
-/// The stations of all interfaces, sorted by MAC. A dynamic VLAN's stations
-/// sit on an AP_VLAN interface `<bss>.<vlan>`, whose BSS is the part before
-/// the dot; one that belongs to no BSS is dropped.
+/// The stations of all interfaces, sorted by MAC, each once. A dynamic
+/// VLAN's stations sit on an AP_VLAN interface `<bss>.<vlan>`, whose BSS is
+/// the part before the dot; one that belongs to no BSS is dropped.
 fn stations(sys: &Path, order: &[String], per_iface: Vec<(&str, Vec<Station>)>) -> Vec<Station> {
     let mut out = Vec::new();
     for (ifname, stas) in per_iface {
@@ -427,7 +427,9 @@ fn stations(sys: &Path, order: &[String], per_iface: Vec<(&str, Vec<Station>)>) 
             ..s
         }));
     }
-    out.sort_by_key(|s| s.mac);
+    // A client roaming between BSSs is listed by both until the old entry
+    // ages out; the newest association is the one it is on.
+    out.sort_by_key(|s| (s.mac, s.connected_s));
     out.dedup_by_key(|s| s.mac);
     out
 }
@@ -589,6 +591,22 @@ mod tests {
             ("wlan0", "", [0; 6])
         );
         assert_eq!(all[3].ifname, "wlan5");
+    }
+
+    /// A client roaming between two BSSs of the AP is listed by both until
+    /// the old entry ages out: it belongs to the newer association.
+    #[test]
+    fn a_station_listed_twice_belongs_to_its_newest_association() {
+        let t = TestDir::new();
+        let sys = sys(&t);
+        let mut old = nl80211::parse_stations(STATIONS);
+        old.truncate(1);
+        old[0].connected_s = 600;
+        let mut new = old.clone();
+        new[0].connected_s = 2;
+        let all = stations(&sys, &order(), vec![("wlan24", old), ("wlan6", new)]);
+        assert_eq!(all.len(), 1);
+        assert_eq!((all[0].bss, all[0].connected_s), (5, 2));
     }
 
     #[test]
