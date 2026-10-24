@@ -1,0 +1,828 @@
+//! The agent's telemetry link: it dials the controller over the pinned-key TLS
+//! of `u6e_proto::tls`, says who it is, then sends a snapshot every tick (a
+//! delta against the previous one, a full key frame now and then) and the
+//! events as they happen. The controller sets the tick, asks for key frames
+//! and pings; a silent or broken connection is dropped and dialed again.
+//!
+//! One thread owns the connection and waits with `poll` for the socket, an
+//! event or the next tick, so an event leaves at once without a polling loop.
+//! Received bytes are decrypted into a buffer and cut into frames only when
+//! whole, so no read can stop mid-frame. A second thread moves events into a
+//! ring of the newest 256 whether or not the link is up.
+
+use std::collections::VecDeque;
+use std::convert::Infallible;
+use std::io::{self, ErrorKind, Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream;
+use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
+use std::{fs, mem, thread};
+
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, ClientConnection};
+use u6e_proto::delta;
+use u6e_proto::frame::{decode_frame, write_frame};
+use u6e_proto::msg::{AgentMsg, CtlMsg, Event, Hello, Snapshot};
+use u6e_proto::tls::{self, Identity};
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Longest the handshake may wait for the controller, or a write for the socket.
+const IO_TIMEOUT: Duration = Duration::from_secs(10);
+const BACKOFF_MIN: Duration = Duration::from_secs(1);
+const BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// The tick until the controller sets one: the estate's scrape interval.
+const TICK_DEFAULT: Duration = Duration::from_secs(15);
+const KEY_EVERY: Duration = Duration::from_secs(60);
+/// An event this close to the next tick waits and rides in its record.
+const COALESCE: Duration = Duration::from_millis(50);
+/// The controller pings every 15 s; this long without a word is a dead session.
+const SILENCE: Duration = Duration::from_secs(60);
+const RING_CAP: usize = 256;
+
+/// What the link needs to reach and recognise the controller.
+pub struct Config {
+    /// `host:port`, resolved at each connect.
+    pub controller: String,
+    pub identity: Identity,
+    pub controller_key: [u8; 32],
+    pub hello: Hello,
+}
+
+/// Runs the link for the life of the process. `snapshot` is called with the
+/// sequence number of each snapshot, only while connected.
+pub fn run(cfg: Config, snapshot: impl FnMut(u64) -> Snapshot, events: Receiver<Event>) -> ! {
+    run_with(cfg, snapshot, &Ring::relay(events))
+}
+
+fn run_with(cfg: Config, mut snapshot: impl FnMut(u64) -> Snapshot, ring: &Ring) -> ! {
+    let client = tls::client_config(&cfg.identity, cfg.controller_key);
+    let mut backoff = BACKOFF_MIN;
+    // An unreachable controller is logged once, not at every attempt.
+    let mut failed = String::new();
+    loop {
+        match connect(&cfg.controller, &client) {
+            Ok(mut s) => {
+                backoff = BACKOFF_MIN;
+                failed.clear();
+                eprintln!("u6e-agent: link to {} up", cfg.controller);
+                let Err(e) = s.serve(&cfg.hello, ring, &mut snapshot);
+                eprintln!("u6e-agent: link to {} down: {e}", cfg.controller);
+            }
+            Err(e) => {
+                let e = e.to_string();
+                if e != failed {
+                    eprintln!("u6e-agent: link to {}: {e}", cfg.controller);
+                    failed = e;
+                }
+            }
+        }
+        thread::sleep(backoff);
+        backoff = (backoff * 2).min(BACKOFF_MAX);
+    }
+}
+
+/// Events not yet sent, the newest [`RING_CAP`], and the pipe that wakes the
+/// link when one arrives.
+struct Ring {
+    events: Mutex<VecDeque<Event>>,
+    wake_rx: UnixStream,
+    wake_tx: UnixStream,
+}
+
+impl Ring {
+    /// Starts the thread that moves events from `rx` into the ring. It drains
+    /// the channel during an outage too, so what an outage loses is the
+    /// oldest events (the ring's choice), not the newest (a full channel's).
+    fn relay(rx: Receiver<Event>) -> Arc<Ring> {
+        let (wake_rx, wake_tx) = UnixStream::pair().expect("socketpair");
+        wake_rx.set_nonblocking(true).expect("nonblocking");
+        wake_tx.set_nonblocking(true).expect("nonblocking");
+        let ring = Arc::new(Ring {
+            events: Mutex::new(VecDeque::new()),
+            wake_rx,
+            wake_tx,
+        });
+        let r = Arc::clone(&ring);
+        thread::Builder::new()
+            .name("link-events".into())
+            .spawn(move || rx.into_iter().for_each(|ev| r.push(ev)))
+            .expect("spawn link-events");
+        ring
+    }
+
+    fn lock(&self) -> MutexGuard<'_, VecDeque<Event>> {
+        self.events.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn push(&self, ev: Event) {
+        let mut q = self.lock();
+        if q.len() == RING_CAP {
+            q.pop_front();
+        }
+        q.push_back(ev);
+        drop(q);
+        // A full pipe already holds a wake-up.
+        let _ = (&self.wake_tx).write(&[0]);
+    }
+
+    fn take(&self) -> VecDeque<Event> {
+        mem::take(&mut *self.lock())
+    }
+
+    /// Empties the wake-up pipe; the caller then looks at the ring.
+    fn clear_wake(&self) {
+        let mut buf = [0; 64];
+        while matches!((&self.wake_rx).read(&mut buf), Ok(n) if n > 0) {}
+    }
+}
+
+/// Opens the TCP connection and completes the TLS handshake.
+fn connect(controller: &str, client: &Arc<ClientConfig>) -> io::Result<Session> {
+    let mut err = io::Error::new(ErrorKind::NotFound, "no address");
+    let mut found = None;
+    for addr in controller.to_socket_addrs()? {
+        match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+            Ok(s) => {
+                found = Some(s);
+                break;
+            }
+            Err(e) => err = e,
+        }
+    }
+    let mut sock = found.ok_or(err)?;
+    sock.set_nodelay(true)?;
+    sock.set_read_timeout(Some(IO_TIMEOUT))?;
+    sock.set_write_timeout(Some(IO_TIMEOUT))?;
+    // The verifier pins the key; the name only has to be well formed.
+    let host = controller.rsplit_once(':').map_or(controller, |(h, _)| h);
+    let name = ServerName::try_from(host.trim_matches(['[', ']']).to_owned())
+        .map_err(|e| io::Error::new(ErrorKind::InvalidInput, e))?;
+    let mut conn = ClientConnection::new(Arc::clone(client), name).map_err(io::Error::other)?;
+    while conn.is_handshaking() {
+        conn.complete_io(&mut sock)?;
+    }
+    Ok(Session::new(conn, sock))
+}
+
+/// The tick the controller asked for, kept within 1 to 60 s.
+fn clamp_tick(secs: u16) -> Duration {
+    Duration::from_secs(u64::from(secs.clamp(1, 60)))
+}
+
+/// Whether this tick sends a key frame rather than a delta from `prev`.
+fn needs_key(prev: &Snapshot, next: &Snapshot, want_key: bool, since_key: Duration) -> bool {
+    want_key || since_key >= KEY_EVERY || !delta::same_shape(prev, next)
+}
+
+/// One connection: what has been sent and when the next tick is due.
+struct Session {
+    conn: ClientConnection,
+    sock: TcpStream,
+    /// Decrypted bytes not yet a whole frame.
+    inbuf: Vec<u8>,
+    tick: Duration,
+    due: Instant,
+    last_tick: Instant,
+    last_key: Instant,
+    last_rx: Instant,
+    want_key: bool,
+    /// The last snapshot sent: the base of the next delta.
+    prev: Option<Snapshot>,
+    seq: u64,
+}
+
+impl Session {
+    fn new(conn: ClientConnection, sock: TcpStream) -> Self {
+        let now = Instant::now();
+        Session {
+            conn,
+            sock,
+            inbuf: Vec::new(),
+            tick: TICK_DEFAULT,
+            due: now,
+            last_tick: now,
+            last_key: now,
+            last_rx: now,
+            want_key: false,
+            prev: None,
+            seq: 0,
+        }
+    }
+
+    /// Serves the connection until it fails.
+    fn serve(
+        &mut self,
+        hello: &Hello,
+        ring: &Ring,
+        snapshot: &mut impl FnMut(u64) -> Snapshot,
+    ) -> io::Result<Infallible> {
+        let mut out = Vec::new();
+        write_frame(&mut out, &AgentMsg::Hello(hello.clone()))?;
+        loop {
+            ring.clear_wake();
+            let now = Instant::now();
+            let ticked = now >= self.due;
+            if ticked {
+                self.snapshot_into(&mut out, now, snapshot)?;
+            }
+            if ticked || self.due - now > COALESCE {
+                for ev in ring.take() {
+                    write_frame(&mut out, &AgentMsg::Event(ev))?;
+                }
+            }
+            if !out.is_empty() {
+                self.send(&out)?;
+                out.clear();
+            }
+            if self.wait(ring) {
+                self.receive()?;
+            }
+            if self.last_rx.elapsed() >= SILENCE {
+                return Err(io::Error::new(ErrorKind::TimedOut, "controller silent"));
+            }
+        }
+    }
+
+    /// Appends this tick's snapshot, as a key frame or a delta, to `out`.
+    fn snapshot_into(
+        &mut self,
+        out: &mut Vec<u8>,
+        now: Instant,
+        snapshot: &mut impl FnMut(u64) -> Snapshot,
+    ) -> io::Result<()> {
+        self.seq += 1;
+        let next = snapshot(self.seq);
+        match self.prev.take() {
+            Some(prev) if !needs_key(&prev, &next, self.want_key, now - self.last_key) => {
+                write_frame(out, &AgentMsg::Delta(delta::diff(&prev, &next)))?;
+            }
+            _ => {
+                write_frame(out, &AgentMsg::Key(next.clone()))?;
+                self.last_key = now;
+                self.want_key = false;
+            }
+        }
+        self.prev = Some(next);
+        self.last_tick = now;
+        self.due = now + self.tick;
+        Ok(())
+    }
+
+    /// Waits for the socket (true), an event or the next deadline (false).
+    fn wait(&self, ring: &Ring) -> bool {
+        let deadline = self.due.min(self.last_rx + SILENCE);
+        let left = deadline.saturating_duration_since(Instant::now());
+        let ms = i32::try_from(left.as_micros().div_ceil(1000)).unwrap_or(i32::MAX);
+        let mut fds = [self.sock.as_raw_fd(), ring.wake_rx.as_raw_fd()].map(|fd| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        });
+        // SAFETY: `fds` is a valid array of two pollfds for the call.
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, ms) };
+        n > 0 && fds[0].revents != 0
+    }
+
+    /// Writes `buf` through TLS and waits until the socket took it; a buffer
+    /// up to the record size limit goes out as one record.
+    fn send(&mut self, mut buf: &[u8]) -> io::Result<()> {
+        while !buf.is_empty() {
+            let n = self.conn.writer().write(buf)?;
+            buf = &buf[n..];
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        while self.conn.wants_write() {
+            self.conn.write_tls(&mut self.sock)?;
+        }
+        Ok(())
+    }
+
+    /// Takes in what the readable socket holds and acts on every whole frame
+    /// received so far.
+    fn receive(&mut self) -> io::Result<()> {
+        if self.conn.read_tls(&mut self.sock)? == 0 {
+            return Err(ErrorKind::UnexpectedEof.into());
+        }
+        self.conn.process_new_packets().map_err(io::Error::other)?;
+        // A key update asks for an answer.
+        self.flush()?;
+        match self.conn.reader().read_to_end(&mut self.inbuf) {
+            Ok(_) => return Err(ErrorKind::UnexpectedEof.into()),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e),
+        }
+        let mut used = 0;
+        while let Some((msg, n)) = decode_frame::<CtlMsg>(&self.inbuf[used..])? {
+            used += n;
+            self.last_rx = Instant::now();
+            self.handle(msg)?;
+        }
+        self.inbuf.drain(..used);
+        Ok(())
+    }
+
+    fn handle(&mut self, msg: CtlMsg) -> io::Result<()> {
+        match msg {
+            CtlMsg::SetTick { secs } => {
+                self.tick = clamp_tick(secs);
+                self.due = self.last_tick + self.tick;
+            }
+            CtlMsg::WantKey => {
+                self.want_key = true;
+                self.due = Instant::now();
+            }
+            CtlMsg::Ping(n) => {
+                let mut out = Vec::new();
+                write_frame(&mut out, &AgentMsg::Pong(n))?;
+                self.send(&out)?;
+            }
+            // A newer controller's messages mean nothing to this agent.
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+/// What this AP tells the controller about itself: its host name and kernel,
+/// this agent's version, and the image identity `/etc/u6e-image` records.
+pub fn local_hello() -> Hello {
+    let read = |p| fs::read_to_string(p).unwrap_or_default().trim().to_owned();
+    let image = read("/etc/u6e-image");
+    Hello {
+        ap: read("/proc/sys/kernel/hostname"),
+        hostapd: hostapd_version(&image),
+        manifest: image,
+        kernel: read("/proc/sys/kernel/osrelease"),
+        agent: env!("CARGO_PKG_VERSION").to_owned(),
+    }
+}
+
+/// The `hostapd: <version>` line of an `/etc/u6e-image`.
+fn hostapd_version(image: &str) -> String {
+    image
+        .lines()
+        .find_map(|l| l.strip_prefix("hostapd:"))
+        .map_or_else(String::new, |v| v.trim().to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::net::{SocketAddr, TcpListener};
+    use std::sync::RwLock;
+    use std::sync::mpsc::{self, SyncSender, sync_channel};
+
+    use rustls::{ServerConfig, ServerConnection};
+    use u6e_proto::msg::{EventKind, Temp};
+
+    // A throwaway Ed25519 key made for tests (the same as in u6e-proto's tls
+    // tests); it protects nothing.
+    const KEY_AGENT: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEINI3m11iy47fpTD0dKK5Q2ViMRZef+/6f8mIN8n95xZz\n-----END PRIVATE KEY-----\n";
+
+    /// How long a test waits for something that should happen, before failing.
+    const WAIT: Duration = Duration::from_secs(20);
+
+    /// A new random Ed25519 key in PKCS#8 PEM. Each fake controller has its own:
+    /// agents of finished tests keep dialing (the link never returns), and one
+    /// that reaches a later test's port must fail that fake's handshake.
+    fn random_pem() -> String {
+        use std::hash::{BuildHasher, Hasher, RandomState};
+        // The PKCS#8 header of an Ed25519 key, then a 32-byte seed: 48 bytes,
+        // so the base64 below needs no padding.
+        let mut der = vec![
+            0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22,
+            0x04, 0x20,
+        ];
+        for _ in 0..4 {
+            der.extend(RandomState::new().build_hasher().finish().to_le_bytes());
+        }
+        const ABC: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let b64: String = der
+            .chunks(3)
+            .flat_map(|c| {
+                let n = c.iter().fold(0u32, |n, &b| n << 8 | u32::from(b));
+                (0..4).map(move |i| ABC[(n >> (18 - 6 * i) & 63) as usize] as char)
+            })
+            .collect();
+        format!("-----BEGIN PRIVATE KEY-----\n{b64}\n-----END PRIVATE KEY-----\n")
+    }
+
+    fn blank(seq: u64) -> Snapshot {
+        Snapshot {
+            seq,
+            uptime_s: seq as u32,
+            load_milli: 0,
+            mem_avail_kb: 0,
+            nss_load_pct: 0,
+            temps: Vec::new(),
+            radios: Vec::new(),
+            bsss: Vec::new(),
+            stations: Vec::new(),
+        }
+    }
+
+    fn event(at_ms: u64) -> Event {
+        Event {
+            at_ms,
+            kind: EventKind::RadioUp { phy: "phy0".into() },
+        }
+    }
+
+    /// The controller end of the link.
+    struct Fake {
+        listener: TcpListener,
+        server: Arc<ServerConfig>,
+        pem: String,
+        key: [u8; 32],
+    }
+
+    struct Peer {
+        conn: ServerConnection,
+        sock: TcpStream,
+        buf: Vec<u8>,
+    }
+
+    impl Fake {
+        fn bind(addr: &str, pem: String) -> io::Result<Self> {
+            let listener = TcpListener::bind(addr)?;
+            listener.set_nonblocking(true)?;
+            let ap = Identity::from_pem(KEY_AGENT).unwrap();
+            let ctl = Identity::from_pem(&pem).unwrap();
+            let allowed = HashMap::from([(ap.public_key(), "ap1".to_owned())]);
+            Ok(Fake {
+                listener,
+                server: tls::server_config(&ctl, Arc::new(RwLock::new(allowed))),
+                key: ctl.public_key(),
+                pem,
+            })
+        }
+
+        fn new() -> Self {
+            Self::bind("127.0.0.1:0", random_pem()).unwrap()
+        }
+
+        fn addr(&self) -> SocketAddr {
+            self.listener.local_addr().unwrap()
+        }
+
+        /// The fake's successor on the same port and key, as after a restart.
+        fn restart(self) -> Self {
+            let (addr, pem) = (self.addr().to_string(), self.pem.clone());
+            drop(self);
+            let start = Instant::now();
+            loop {
+                match Self::bind(&addr, pem.clone()) {
+                    Ok(f) => return f,
+                    Err(e) if start.elapsed() < WAIT => {
+                        eprintln!("rebind {addr}: {e}");
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("rebind {addr}: {e}"),
+                }
+            }
+        }
+
+        fn accept_tcp(&self) -> TcpStream {
+            let start = Instant::now();
+            loop {
+                match self.listener.accept() {
+                    Ok((sock, _)) => return sock,
+                    Err(e) if e.kind() == ErrorKind::WouldBlock && start.elapsed() < WAIT => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("no agent connected: {e}"),
+                }
+            }
+        }
+
+        /// The TLS session on `sock`, or `None` when the dialer was not an
+        /// agent of this fake (one left over from another test).
+        fn handshake(&self, mut sock: TcpStream) -> Option<Peer> {
+            sock.set_nonblocking(false).unwrap();
+            sock.set_read_timeout(Some(WAIT)).unwrap();
+            let mut conn = ServerConnection::new(Arc::clone(&self.server)).unwrap();
+            while conn.is_handshaking() {
+                conn.complete_io(&mut sock).ok()?;
+            }
+            Some(Peer {
+                conn,
+                sock,
+                buf: Vec::new(),
+            })
+        }
+
+        fn accept(&self) -> Peer {
+            loop {
+                if let Some(p) = self.handshake(self.accept_tcp()) {
+                    return p;
+                }
+            }
+        }
+    }
+
+    impl Peer {
+        fn recv(&mut self) -> AgentMsg {
+            loop {
+                // rustls may hold decrypted data the socket no longer shows.
+                match self.conn.reader().read_to_end(&mut self.buf) {
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                    other => panic!("agent closed: {other:?}"),
+                }
+                if let Some((msg, n)) = decode_frame(&self.buf).unwrap() {
+                    self.buf.drain(..n);
+                    return msg;
+                }
+                assert!(self.conn.read_tls(&mut self.sock).unwrap() > 0, "closed");
+                self.conn.process_new_packets().unwrap();
+            }
+        }
+
+        fn send(&mut self, msg: CtlMsg) {
+            let mut out = Vec::new();
+            write_frame(&mut out, &msg).unwrap();
+            self.conn.writer().write_all(&out).unwrap();
+            while self.conn.wants_write() {
+                self.conn.write_tls(&mut self.sock).unwrap();
+            }
+        }
+
+        fn expect_key(&mut self, seq: u64) {
+            assert_eq!(self.recv(), AgentMsg::Key(blank(seq)));
+        }
+
+        fn expect_delta(&mut self, seq: u64) {
+            match self.recv() {
+                AgentMsg::Delta(d) => {
+                    assert_eq!((d.seq, d.base), (seq, seq - 1));
+                    assert_eq!(delta::apply(&blank(seq - 1), &d), Ok(blank(seq)));
+                }
+                other => panic!("expected delta {seq}, got {other:?}"),
+            }
+        }
+
+        /// Hello, then the first key frame.
+        fn start(&mut self) {
+            assert!(matches!(self.recv(), AgentMsg::Hello(_)));
+            self.expect_key(1);
+        }
+    }
+
+    /// A link running in its own thread (it lives until the test process ends).
+    struct Agent {
+        events: SyncSender<Event>,
+        /// Each snapshot taken: its seq and when.
+        ticks: mpsc::Receiver<(u64, Instant)>,
+        ring: Arc<Ring>,
+    }
+
+    impl Agent {
+        fn spawn(fake: &Fake, snapshot: impl FnMut(u64) -> Snapshot + Send + 'static) -> Self {
+            let (events, rx) = sync_channel(256);
+            let (tick_tx, ticks) = mpsc::channel();
+            let ring = Ring::relay(rx);
+            let cfg = Config {
+                controller: fake.addr().to_string(),
+                identity: Identity::from_pem(KEY_AGENT).unwrap(),
+                controller_key: fake.key,
+                hello: Hello {
+                    ap: "ap1".into(),
+                    manifest: "image: test".into(),
+                    kernel: "6.12".into(),
+                    hostapd: "2.11".into(),
+                    agent: "1.0.0".into(),
+                },
+            };
+            let r = Arc::clone(&ring);
+            let mut snapshot = snapshot;
+            thread::spawn(move || {
+                let snap = move |seq| {
+                    let _ = tick_tx.send((seq, Instant::now()));
+                    snapshot(seq)
+                };
+                run_with(cfg, snap, &r)
+            });
+            Agent {
+                events,
+                ticks,
+                ring,
+            }
+        }
+
+        /// When snapshot `seq` was taken.
+        fn tick_at(&self, seq: u64) -> Instant {
+            let (got, at) = self.ticks.recv_timeout(WAIT).expect("no snapshot");
+            assert_eq!(got, seq);
+            at
+        }
+    }
+
+    fn secs(a: Instant, b: Instant) -> f64 {
+        b.duration_since(a).as_secs_f64()
+    }
+
+    #[test]
+    fn hello_then_key_then_deltas() {
+        let fake = Fake::new();
+        let _agent = Agent::spawn(&fake, blank);
+        let mut p = fake.accept();
+        match p.recv() {
+            AgentMsg::Hello(h) => assert_eq!((h.ap.as_str(), h.hostapd.as_str()), ("ap1", "2.11")),
+            other => panic!("expected hello, got {other:?}"),
+        }
+        p.expect_key(1);
+        p.send(CtlMsg::SetTick { secs: 1 });
+        p.expect_delta(2);
+        p.expect_delta(3);
+    }
+
+    #[test]
+    fn set_tick_changes_cadence() {
+        let fake = Fake::new();
+        let agent = Agent::spawn(&fake, blank);
+        let mut p = fake.accept();
+        p.start();
+        let t1 = agent.tick_at(1);
+        // The default tick is 15 s: nothing more for a while.
+        thread::sleep(Duration::from_millis(1500));
+        assert!(agent.ticks.try_recv().is_err());
+        p.send(CtlMsg::SetTick { secs: 3 });
+        let t2 = agent.tick_at(2);
+        let t3 = agent.tick_at(3);
+        for (a, b) in [(t1, t2), (t2, t3)] {
+            assert!((2.95..4.5).contains(&secs(a, b)), "{}", secs(a, b));
+        }
+        p.expect_delta(2);
+        p.expect_delta(3);
+        // Zero is held at the 1 s minimum.
+        p.send(CtlMsg::SetTick { secs: 0 });
+        let t4 = agent.tick_at(4);
+        let t5 = agent.tick_at(5);
+        assert!((0.95..2.5).contains(&secs(t4, t5)), "{}", secs(t4, t5));
+    }
+
+    #[test]
+    fn tick_is_clamped_to_a_minute() {
+        assert_eq!(clamp_tick(0), Duration::from_secs(1));
+        assert_eq!(clamp_tick(15), Duration::from_secs(15));
+        assert_eq!(clamp_tick(u16::MAX), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn key_frame_every_minute_and_on_request() {
+        let (a, b) = (blank(1), blank(2));
+        let fresh = Duration::from_secs(1);
+        assert!(!needs_key(&a, &b, false, fresh));
+        assert!(needs_key(&a, &b, true, fresh));
+        assert!(needs_key(&a, &b, false, KEY_EVERY));
+        let hot = Snapshot {
+            temps: vec![Temp {
+                zone: "cpu".into(),
+                milli_c: 40_000,
+            }],
+            ..blank(2)
+        };
+        assert!(needs_key(&a, &hot, false, fresh));
+    }
+
+    #[test]
+    fn want_key_sends_key() {
+        let fake = Fake::new();
+        let _agent = Agent::spawn(&fake, blank);
+        let mut p = fake.accept();
+        p.start();
+        // Well inside the 15 s default tick, so the key answers the request.
+        p.send(CtlMsg::WantKey);
+        p.expect_key(2);
+        p.send(CtlMsg::SetTick { secs: 1 });
+        p.expect_delta(3);
+    }
+
+    #[test]
+    fn shape_change_sends_key() {
+        let fake = Fake::new();
+        let _agent = Agent::spawn(&fake, |seq| Snapshot {
+            temps: (seq > 2)
+                .then(|| Temp {
+                    zone: "cpu".into(),
+                    milli_c: 40_000,
+                })
+                .into_iter()
+                .collect(),
+            ..blank(seq)
+        });
+        let mut p = fake.accept();
+        p.start();
+        p.send(CtlMsg::SetTick { secs: 1 });
+        p.expect_delta(2);
+        assert!(matches!(p.recv(), AgentMsg::Key(s) if s.seq == 3 && s.temps.len() == 1));
+    }
+
+    #[test]
+    fn ping_is_answered_and_events_leave_at_once() {
+        let fake = Fake::new();
+        let agent = Agent::spawn(&fake, blank);
+        let mut p = fake.accept();
+        p.start();
+        p.send(CtlMsg::Ping(41));
+        assert_eq!(p.recv(), AgentMsg::Pong(41));
+        // The tick is 15 s: an event arriving now is not held for it.
+        let sent = Instant::now();
+        agent.events.send(event(5)).unwrap();
+        assert_eq!(p.recv(), AgentMsg::Event(event(5)));
+        assert!(sent.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn event_near_a_tick_rides_with_it() {
+        let fake = Fake::new();
+        let agent = Agent::spawn(&fake, blank);
+        let mut p = fake.accept();
+        p.start();
+        agent.tick_at(1);
+        p.send(CtlMsg::SetTick { secs: 1 });
+        let t2 = agent.tick_at(2);
+        p.expect_delta(2);
+        // 25 ms before tick 3: sent alone it would arrive before that tick.
+        thread::sleep((t2 + Duration::from_millis(975)).saturating_duration_since(Instant::now()));
+        agent.events.send(event(7)).unwrap();
+        p.expect_delta(3);
+        assert_eq!(p.recv(), AgentMsg::Event(event(7)));
+    }
+
+    #[test]
+    fn reconnect_sends_key_frame() {
+        let fake = Fake::new();
+        let agent = Agent::spawn(&fake, blank);
+        let mut p = fake.accept();
+        p.start();
+        agent.tick_at(1);
+        drop(p);
+        let killed = Instant::now();
+        let fake = fake.restart();
+        let sock = fake.accept_tcp();
+        // Backoff restarts at 1 s after a session that completed its handshake.
+        assert!(
+            killed.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            killed.elapsed()
+        );
+        // Down, the link takes no snapshots and keeps the events for later.
+        for n in 0..3 {
+            agent.events.send(event(n)).unwrap();
+        }
+        assert!(agent.ticks.try_recv().is_err());
+        let mut p = fake.handshake(sock).expect("the agent's handshake");
+        p.start();
+        for n in 0..3 {
+            assert_eq!(p.recv(), AgentMsg::Event(event(n)));
+        }
+    }
+
+    #[test]
+    fn agent_memory_flat_while_controller_down() {
+        // Down = a listener that never answers: the port stays this test's, so
+        // no other test's fake can take it while the agent waits.
+        let fake = Fake::new();
+        let agent = Agent::spawn(&fake, blank);
+        for n in 0..1000 {
+            agent.events.send(event(n)).unwrap();
+        }
+        let start = Instant::now();
+        while agent.ring.lock().back() != Some(&event(999)) {
+            assert!(start.elapsed() < WAIT, "the ring never took the last event");
+            thread::sleep(Duration::from_millis(10));
+        }
+        {
+            let ring = agent.ring.lock();
+            assert_eq!(ring.len(), RING_CAP);
+            assert_eq!(ring.front(), Some(&event(744)));
+            assert!(ring.capacity() < 2 * RING_CAP);
+        }
+        // No snapshot is taken (or kept) while down.
+        assert!(agent.ticks.try_recv().is_err());
+
+        let mut p = fake.accept();
+        p.start();
+        for n in 744..1000 {
+            assert_eq!(p.recv(), AgentMsg::Event(event(n)));
+        }
+        p.send(CtlMsg::Ping(1));
+        assert_eq!(p.recv(), AgentMsg::Pong(1));
+    }
+
+    #[test]
+    fn hello_reads_the_image_file() {
+        let image = "image: u6e-2026.10\nhostapd: 2.11\nkernel: 6.12.0";
+        assert_eq!(hostapd_version(image), "2.11");
+        assert_eq!(hostapd_version(""), "");
+        assert_eq!(hostapd_version("image: u6e-2026.10"), "");
+    }
+}

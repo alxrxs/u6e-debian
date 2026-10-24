@@ -394,6 +394,7 @@ name = "u6e-agent"
 version = "1.0.0"
 dependencies = [
  "libc",
+ "rustls",
  "u6e-proto",
 ]
 
