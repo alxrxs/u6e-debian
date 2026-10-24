@@ -433,7 +433,7 @@ mod tests {
     use std::sync::mpsc::{self, SyncSender, sync_channel};
 
     use rustls::{ServerConfig, ServerConnection};
-    use u6e_proto::msg::{Bss, EventKind, Station, Temp};
+    use u6e_proto::msg::{Bss, EventKind, RateMode, Station, Temp};
 
     // A throwaway Ed25519 key made for tests (the same as in u6e-proto's tls
     // tests); it protects nothing.
@@ -497,6 +497,10 @@ mod tests {
             rx_rate_kbps: 0,
             tx_mcs: 0,
             rx_mcs: 0,
+            tx_mode: RateMode::Legacy,
+            rx_mode: RateMode::Legacy,
+            tx_nss: 0,
+            rx_nss: 0,
             tx_airtime_us: 0,
             rx_airtime_us: 0,
             inactive_ms: 0,

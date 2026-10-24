@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::msg::{Band, FieldDelta, Radio, RecDelta, Snapshot, SnapshotDelta, Station};
+use crate::msg::{Band, FieldDelta, Radio, RateMode, RecDelta, Snapshot, SnapshotDelta, Station};
 
 /// The base of a delta is not the snapshot it is applied to, or the delta is
 /// inconsistent with it: the receiver asks for a key frame.
@@ -151,7 +151,7 @@ pub fn apply(base: &Snapshot, d: &SnapshotDelta) -> Result<Snapshot, Gap> {
         let sta = next.stations.get_mut(usize::from(r.idx)).ok_or(Gap)?;
         let mut f = station_fields(sta);
         apply_fields(&mut f, r.mask, &r.vals)?;
-        *sta = station_from(sta.mac, &f);
+        *sta = station_from(sta.mac, &f)?;
     }
     let removed: HashSet<_> = d.removed.iter().collect();
     let before = next.stations.len();
@@ -230,11 +230,17 @@ fn radio_fields(r: &Radio) -> [i64; 10] {
     ]
 }
 
-fn radio_from(phy: &str, f: &[i64; 10]) -> Result<Radio, Gap> {
-    let band = [Band::B24, Band::B5, Band::B6]
-        .get(usize::try_from(f[0]).map_err(|_| Gap)?)
+/// The variant at index `i` of `all`, the order the fields code them in.
+fn variant<T: Copy>(all: &[T], i: i64) -> Result<T, Gap> {
+    all.get(usize::try_from(i).map_err(|_| Gap)?)
         .copied()
-        .ok_or(Gap)?;
+        .ok_or(Gap)
+}
+
+const MODES: [RateMode; 4] = [RateMode::Legacy, RateMode::Ht, RateMode::Vht, RateMode::He];
+
+fn radio_from(phy: &str, f: &[i64; 10]) -> Result<Radio, Gap> {
+    let band = variant(&[Band::B24, Band::B5, Band::B6], f[0])?;
     Ok(Radio {
         phy: phy.to_owned(),
         band,
@@ -250,7 +256,7 @@ fn radio_from(phy: &str, f: &[i64; 10]) -> Result<Radio, Gap> {
     })
 }
 
-fn station_fields(s: &Station) -> [i64; 18] {
+fn station_fields(s: &Station) -> [i64; 22] {
     [
         s.bss.into(),
         s.signal.into(),
@@ -265,6 +271,10 @@ fn station_fields(s: &Station) -> [i64; 18] {
         s.rx_rate_kbps.into(),
         s.tx_mcs.into(),
         s.rx_mcs.into(),
+        s.tx_mode as i64,
+        s.rx_mode as i64,
+        s.tx_nss.into(),
+        s.rx_nss.into(),
         s.tx_airtime_us as i64,
         s.rx_airtime_us as i64,
         s.inactive_ms.into(),
@@ -273,8 +283,8 @@ fn station_fields(s: &Station) -> [i64; 18] {
     ]
 }
 
-fn station_from(mac: [u8; 6], f: &[i64; 18]) -> Station {
-    Station {
+fn station_from(mac: [u8; 6], f: &[i64; 22]) -> Result<Station, Gap> {
+    Ok(Station {
         mac,
         bss: f[0] as u16,
         signal: f[1] as i8,
@@ -289,18 +299,22 @@ fn station_from(mac: [u8; 6], f: &[i64; 18]) -> Station {
         rx_rate_kbps: f[10] as u32,
         tx_mcs: f[11] as u8,
         rx_mcs: f[12] as u8,
-        tx_airtime_us: f[13] as u64,
-        rx_airtime_us: f[14] as u64,
-        inactive_ms: f[15] as u32,
-        connected_s: f[16] as u32,
-        vlan: f[17] as u16,
-    }
+        tx_mode: variant(&MODES, f[13])?,
+        rx_mode: variant(&MODES, f[14])?,
+        tx_nss: f[15] as u8,
+        rx_nss: f[16] as u8,
+        tx_airtime_us: f[17] as u64,
+        rx_airtime_us: f[18] as u64,
+        inactive_ms: f[19] as u32,
+        connected_s: f[20] as u32,
+        vlan: f[21] as u16,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::msg::{Band, Bss, Radio, Station, Temp};
+    use crate::msg::{Band, Bss, Radio, RateMode, Station, Temp};
 
     struct Rng(u64);
 
@@ -351,6 +365,10 @@ mod tests {
                     rx_rate_kbps: 72_200 + r(1_100_000) as u32,
                     tx_mcs: r(12) as u8,
                     rx_mcs: r(12) as u8,
+                    tx_mode: [RateMode::Ht, RateMode::Vht, RateMode::He][i % 3],
+                    rx_mode: [RateMode::Legacy, RateMode::He][i % 2],
+                    tx_nss: (i % 2 + 1) as u8,
+                    rx_nss: 0,
                     tx_airtime_us: r(100_000_000_000),
                     rx_airtime_us: r(10_000_000_000),
                     inactive_ms: r(10_000) as u32,
@@ -510,6 +528,29 @@ mod tests {
         n.radios[1].up = false;
         n.radios[2].band = Band::B5;
         roundtrips(&a, &n);
+    }
+
+    #[test]
+    fn rate_mode_changed() {
+        let (a, _) = fixture();
+        let mut n = successor(&a);
+        n.stations[0].tx_mode = RateMode::Legacy;
+        n.stations[0].tx_nss = 0;
+        n.stations[1].rx_mode = RateMode::He;
+        n.stations[1].rx_nss = 2;
+        n.stations[1].rx_mcs = 11;
+        roundtrips(&a, &n);
+    }
+
+    #[test]
+    fn an_unknown_rate_mode_is_a_gap() {
+        let (a, _) = fixture();
+        let mut n = successor(&a);
+        n.stations[0].tx_mode = RateMode::Legacy;
+        let mut d = diff(&a, &n).unwrap();
+        // The mode's difference, pushed past the last mode.
+        *d.stations[0].vals.last_mut().unwrap() += 10;
+        assert_eq!(apply(&a, &d), Err(Gap));
     }
 
     #[test]
@@ -763,8 +804,9 @@ mod tests {
 
     /// The 20 stations alone keep to the measured prototype's budget (1125 B
     /// full, 426 B delta); the BSS list, radios, temperatures and each
-    /// station's VLAN come on top, and the whole frames stay within what this
-    /// fixture measures.
+    /// station's VLAN and rate modes come on top, and the whole frames stay
+    /// within what this fixture measures. The modes cost a key frame 4 B per
+    /// station and a delta nothing while they hold.
     #[test]
     fn delta_is_small() {
         let (a, b) = fixture();
@@ -791,7 +833,7 @@ mod tests {
             wire_len(&a.stations)
         );
         assert!(wire_len(&d) <= 500, "delta {} B", wire_len(&d));
-        assert!(wire_len(&a) <= 1400, "full {} B", wire_len(&a));
+        assert!(wire_len(&a) <= 1500, "full {} B", wire_len(&a));
     }
 
     #[test]

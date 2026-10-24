@@ -20,7 +20,7 @@ use u6e_controller::state::{TICK_IDLE, TICK_WATCHED};
 use u6e_controller::{Controller, start};
 use u6e_proto::frame::{decode_frame, write_frame};
 use u6e_proto::msg::{
-    AgentMsg, Band, Bss, CtlMsg, Event, EventKind, FieldDelta, Hello, Radio, Snapshot,
+    AgentMsg, Band, Bss, CtlMsg, Event, EventKind, FieldDelta, Hello, Radio, RateMode, Snapshot,
     SnapshotDelta, Station, Temp,
 };
 use u6e_proto::tls::{self, Identity};
@@ -189,6 +189,10 @@ fn station(mac: [u8; 6], bss: u16, signal: i8) -> Station {
         rx_rate_kbps: 86_700,
         tx_mcs: 7,
         rx_mcs: 8,
+        tx_mode: RateMode::Ht,
+        rx_mode: RateMode::Ht,
+        tx_nss: 0,
+        rx_nss: 0,
         tx_airtime_us: 1000,
         rx_airtime_us: 2000,
         inactive_ms: 0,

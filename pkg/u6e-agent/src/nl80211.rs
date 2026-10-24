@@ -8,7 +8,7 @@ use std::io;
 use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-use u6e_proto::msg::Station;
+use u6e_proto::msg::{RateMode, Station};
 
 const NLM_F_REQUEST: u16 = 1;
 const NLM_F_DUMP: u16 = 0x300;
@@ -81,8 +81,9 @@ const RATE_BITRATE: u16 = 1;
 const RATE_MCS: u16 = 2;
 const RATE_BITRATE32: u16 = 5;
 const RATE_VHT_MCS: u16 = 6;
+const RATE_VHT_NSS: u16 = 7;
 const RATE_HE_MCS: u16 = 13;
-const RATE_EHT_MCS: u16 = 19;
+const RATE_HE_NSS: u16 = 14;
 
 const SURVEY_FREQUENCY: u16 = 1;
 const SURVEY_NOISE: u16 = 2;
@@ -527,20 +528,38 @@ pub fn parse_interfaces(raw: &[u8]) -> Vec<Iface> {
         .collect()
 }
 
-/// A rate nested attribute as (kbit/s, MCS index).
-fn rate(d: &[u8]) -> (u32, u8) {
-    let (mut kbps, mut mcs) = (0, 0);
+/// One direction's last rate, from a rate nested attribute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Rate {
+    kbps: u32,
+    /// Which MCS attribute was present; none is a legacy rate. ath11k sends
+    /// no EHT rates.
+    mode: RateMode,
+    mcs: u8,
+    /// Only VHT and HE rates carry a stream count.
+    nss: u8,
+}
+
+fn rate(d: &[u8]) -> Rate {
+    let mut r = Rate {
+        kbps: 0,
+        mode: RateMode::Legacy,
+        mcs: 0,
+        nss: 0,
+    };
     for (ty, d) in attrs(d) {
+        let byte = d.first().copied().unwrap_or(0);
         match ty {
-            RATE_BITRATE if kbps == 0 => kbps = u32::from(u16_of(d)) * 100,
-            RATE_BITRATE32 => kbps = u32_of(d).saturating_mul(100),
-            RATE_MCS | RATE_VHT_MCS | RATE_HE_MCS | RATE_EHT_MCS => {
-                mcs = d.first().copied().unwrap_or(0)
-            }
+            RATE_BITRATE if r.kbps == 0 => r.kbps = u32::from(u16_of(d)) * 100,
+            RATE_BITRATE32 => r.kbps = u32_of(d).saturating_mul(100),
+            RATE_MCS => (r.mode, r.mcs) = (RateMode::Ht, byte),
+            RATE_VHT_MCS => (r.mode, r.mcs) = (RateMode::Vht, byte),
+            RATE_HE_MCS => (r.mode, r.mcs) = (RateMode::He, byte),
+            RATE_VHT_NSS | RATE_HE_NSS => r.nss = byte,
             _ => {}
         }
     }
-    (kbps, mcs)
+    r
 }
 
 /// The stations of one interface; `bss` and `vlan` are left for the caller,
@@ -563,6 +582,10 @@ pub fn parse_stations(raw: &[u8]) -> Vec<Station> {
             rx_rate_kbps: 0,
             tx_mcs: 0,
             rx_mcs: 0,
+            tx_mode: RateMode::Legacy,
+            rx_mode: RateMode::Legacy,
+            tx_nss: 0,
+            rx_nss: 0,
             tx_airtime_us: 0,
             rx_airtime_us: 0,
             inactive_ms: 0,
@@ -597,8 +620,14 @@ fn sta_info(s: &mut Station, info: &[u8]) {
             STA_TX_PACKETS => s.tx_packets = u64::from(u32_of(d)),
             STA_TX_RETRIES => s.tx_retries = u32_of(d),
             STA_TX_FAILED => s.tx_failed = u32_of(d),
-            STA_TX_BITRATE => (s.tx_rate_kbps, s.tx_mcs) = rate(d),
-            STA_RX_BITRATE => (s.rx_rate_kbps, s.rx_mcs) = rate(d),
+            STA_TX_BITRATE => {
+                let r = rate(d);
+                (s.tx_rate_kbps, s.tx_mode, s.tx_mcs, s.tx_nss) = (r.kbps, r.mode, r.mcs, r.nss);
+            }
+            STA_RX_BITRATE => {
+                let r = rate(d);
+                (s.rx_rate_kbps, s.rx_mode, s.rx_mcs, s.rx_nss) = (r.kbps, r.mode, r.mcs, r.nss);
+            }
             STA_CONNECTED_TIME => s.connected_s = u32_of(d),
             STA_RX_DURATION => s.rx_airtime_us = u64_of(d),
             STA_TX_DURATION => s.tx_airtime_us = u64_of(d),
@@ -695,8 +724,14 @@ mod tests {
         let s = &all[0];
         assert_eq!(s.mac, [2, 0, 0, 0, 0, 8]);
         assert_eq!((s.signal, s.signal_avg), (-54, -55));
-        assert_eq!((s.tx_rate_kbps, s.tx_mcs), (72_200, 7));
-        assert_eq!((s.rx_rate_kbps, s.rx_mcs), (72_200, 7));
+        assert_eq!(
+            (s.tx_rate_kbps, s.tx_mode, s.tx_mcs, s.tx_nss),
+            (72_200, RateMode::Ht, 7, 0)
+        );
+        assert_eq!(
+            (s.rx_rate_kbps, s.rx_mode, s.rx_mcs, s.rx_nss),
+            (72_200, RateMode::Ht, 7, 0)
+        );
         assert_eq!((s.tx_retries, s.tx_failed), (1, 2));
         assert_eq!((s.rx_bytes, s.tx_bytes), (21_367_714, 47_912_043));
         assert_eq!((s.rx_packets, s.tx_packets), (149_286, 324_102));
@@ -704,10 +739,12 @@ mod tests {
             (s.tx_airtime_us, s.inactive_ms, s.connected_s),
             (41_381_687, 48, 8754)
         );
-        let he = &all[2];
+        let vht = &all[2];
+        assert_eq!((vht.signal, vht.tx_rate_kbps), (-83, 300_000));
+        assert_eq!((vht.tx_mode, vht.tx_mcs, vht.tx_nss), (RateMode::Vht, 7, 2));
         assert_eq!(
-            (he.signal, he.tx_rate_kbps, he.rx_rate_kbps, he.rx_mcs),
-            (-83, 300_000, 130_000, 3)
+            (vht.rx_rate_kbps, vht.rx_mode, vht.rx_mcs, vht.rx_nss),
+            (130_000, RateMode::Vht, 3, 1)
         );
         assert!(parse_stations(NO_STATIONS).is_empty());
     }
@@ -883,10 +920,38 @@ mod tests {
     }
 
     #[test]
+    fn a_rate_says_its_mode() {
+        let mut he = Vec::new();
+        put_attr(&mut he, RATE_BITRATE32, &12_010u32.to_ne_bytes());
+        put_attr(&mut he, RATE_HE_MCS, &[11]);
+        put_attr(&mut he, RATE_HE_NSS, &[2]);
+        assert_eq!(
+            rate(&he),
+            Rate {
+                kbps: 1_201_000,
+                mode: RateMode::He,
+                mcs: 11,
+                nss: 2,
+            }
+        );
+        let mut legacy = Vec::new();
+        put_attr(&mut legacy, RATE_BITRATE, &60u16.to_ne_bytes());
+        assert_eq!(
+            rate(&legacy),
+            Rate {
+                kbps: 6000,
+                mode: RateMode::Legacy,
+                mcs: 0,
+                nss: 0,
+            }
+        );
+    }
+
+    #[test]
     fn a_huge_rate_saturates() {
         let mut a = Vec::new();
         put_attr(&mut a, RATE_BITRATE32, &u32::MAX.to_ne_bytes());
-        assert_eq!(rate(&a).0, u32::MAX);
+        assert_eq!(rate(&a).kbps, u32::MAX);
     }
 
     #[test]

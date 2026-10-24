@@ -109,13 +109,30 @@ pub struct Station {
     pub tx_failed: u32,
     pub tx_rate_kbps: u32,
     pub rx_rate_kbps: u32,
+    /// The MCS index of the last rate, meaningless when its mode is
+    /// [`RateMode::Legacy`]; an HT index (0–31) counts the streams in.
     pub tx_mcs: u8,
     pub rx_mcs: u8,
+    pub tx_mode: RateMode,
+    pub rx_mode: RateMode,
+    /// Spatial streams of a VHT or HE rate; 0 when the rate does not say.
+    pub tx_nss: u8,
+    pub rx_nss: u8,
     pub tx_airtime_us: u64,
     pub rx_airtime_us: u64,
     pub inactive_ms: u32,
     pub connected_s: u32,
     pub vlan: u16,
+}
+
+/// The PHY mode a rate was sent in, which says what its MCS index means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RateMode {
+    /// 802.11a/b/g: no MCS.
+    Legacy,
+    Ht,
+    Vht,
+    He,
 }
 
 /// The difference between two snapshots, applied with [`crate::delta::apply`].

@@ -337,7 +337,7 @@ impl Drop for WatchGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use u6e_proto::msg::{Bss, FieldDelta, SnapshotDelta};
+    use u6e_proto::msg::{Bss, FieldDelta, RateMode, SnapshotDelta};
 
     fn hello(ap: &str) -> Hello {
         Hello {
@@ -365,6 +365,10 @@ mod tests {
             rx_rate_kbps: 0,
             tx_mcs: 0,
             rx_mcs: 0,
+            tx_mode: RateMode::Legacy,
+            rx_mode: RateMode::Legacy,
+            tx_nss: 0,
+            rx_nss: 0,
             tx_airtime_us: 0,
             rx_airtime_us: 0,
             inactive_ms,
