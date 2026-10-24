@@ -3,7 +3,7 @@
 //! A source that is missing or odd reads as zeros and empty lists; collecting
 //! never fails.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io;
 use std::os::unix::fs::FileTypeExt;
@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use u6e_proto::msg::{Band, Bss, Radio, Snapshot, Station, Temp};
 
 use crate::kmsg::{self, Kmsg};
-use crate::neighbors::Hostapd;
+use crate::neighbors::{self, Hostapd};
 use crate::nl80211::{self, Iface, Nl80211, Survey, Watch};
 
 /// Where the collectors and the events thread look, so tests can point them
@@ -165,6 +165,8 @@ pub struct Collector {
     kmsg: Kmsg,
     paths: Paths,
     crashes: u64,
+    /// Whether each BSS's radio was up at the last answer.
+    up: HashMap<String, bool>,
 }
 
 impl Collector {
@@ -183,6 +185,7 @@ impl Collector {
             kmsg,
             paths,
             crashes,
+            up: HashMap::new(),
         }
     }
 
@@ -257,13 +260,16 @@ impl Collector {
                 survey.unwrap_or_default()
             },
             |bss| {
-                hostapd.as_mut().is_some_and(|h| {
-                    h.request(bss, "STATUS")
-                        .lines()
-                        .any(|l| l == "state=ENABLED")
-                })
+                let answer = hostapd.as_mut().map_or_else(
+                    || Err(io::ErrorKind::NotFound.into()),
+                    |h| h.try_request(bss, "STATUS"),
+                );
+                let up = radio_up(answer, self.up.get(bss).copied());
+                self.up.insert(bss.to_owned(), up);
+                up
             },
         );
+        self.up.retain(|bss, _| order.contains(bss));
         let root = &self.paths.root;
         Snapshot {
             seq,
@@ -279,6 +285,17 @@ impl Collector {
             bsss,
             stations,
         }
+    }
+}
+
+/// Whether a radio serves, from its hostapd's answer to STATUS. A hostapd
+/// too busy to answer in time keeps the radio as it last was, rather than
+/// flapping it down for a tick.
+fn radio_up(status: io::Result<String>, last: Option<bool>) -> bool {
+    match status {
+        Ok(s) => neighbors::enabled(&s),
+        Err(e) if e.kind() == io::ErrorKind::TimedOut => last.unwrap_or(false),
+        Err(_) => false,
     }
 }
 
@@ -609,7 +626,7 @@ mod tests {
         let mut asked = Vec::new();
         let enabled = |bss: &str| {
             asked.push(bss.to_owned());
-            STATUS.lines().any(|l| l == "state=ENABLED") && bss == "wlan5"
+            bss == "wlan5"
         };
         let all = radios(&all_bsss, &ifaces, survey, enabled);
         assert_eq!(asked, ["wlan24", "wlan5", "wlan6"]);
@@ -644,6 +661,17 @@ mod tests {
             ),
             (Band::B6, 85, 160, -108)
         );
+    }
+
+    #[test]
+    fn a_radio_is_up_by_its_status_and_a_silent_one_keeps_its_last() {
+        let timeout = || Err(io::ErrorKind::TimedOut.into());
+        assert!(radio_up(Ok(STATUS.to_owned()), None));
+        assert!(!radio_up(Ok("state=DISABLED\n".into()), Some(true)));
+        assert!(radio_up(timeout(), Some(true)));
+        assert!(!radio_up(timeout(), None));
+        let refused = Err(io::ErrorKind::ConnectionRefused.into());
+        assert!(!radio_up(refused, Some(true)));
     }
 
     #[test]

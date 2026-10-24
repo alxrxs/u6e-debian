@@ -7,8 +7,9 @@
 pub const ROUND_SECS: u64 = 10;
 
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -20,6 +21,8 @@ use crate::clientsock::{ClientSocket, RUN};
 pub const HOSTAPD: &str = "/run/hostapd";
 const ROUND: Duration = Duration::from_secs(ROUND_SECS);
 const TIMEOUT: Duration = Duration::from_secs(3);
+/// How long hostapd has to answer a control request.
+const ANSWER_WAIT: Duration = Duration::from_secs(1);
 
 /// A neighbor report entry: BSSID, and SSID and element in hex.
 struct Entry {
@@ -71,12 +74,12 @@ pub struct Hostapd {
 }
 
 impl Hostapd {
-    pub fn open() -> std::io::Result<Self> {
+    pub fn open() -> io::Result<Self> {
         Self::bind(Path::new(RUN), "ctrl", Path::new(HOSTAPD))
     }
 
     /// A client named after `what` in `run`, talking to the sockets in `dir`.
-    pub fn bind(run: &Path, what: &str, dir: &Path) -> std::io::Result<Self> {
+    pub fn bind(run: &Path, what: &str, dir: &Path) -> io::Result<Self> {
         Ok(Hostapd {
             sock: Self::ready(ClientSocket::bind(run, what)?)?,
             dir: dir.to_owned(),
@@ -84,35 +87,56 @@ impl Hostapd {
         })
     }
 
-    fn ready(sock: ClientSocket) -> std::io::Result<ClientSocket> {
-        sock.set_read_timeout(Some(Duration::from_secs(1)))?;
+    /// Never blocking: a hung hostapd stops reading, and once its queue is
+    /// full a blocking send would wait for as long as it hangs.
+    fn ready(sock: ClientSocket) -> io::Result<ClientSocket> {
+        sock.set_nonblocking(true)?;
         Ok(sock)
     }
 
-    /// One control interface request; "" when hostapd does not answer. A
+    /// One control interface request. `TimedOut` is a hostapd that does not
+    /// answer (busy or hung); any other error, one that is not there. A
     /// reply left over from a request that timed out is discarded first.
-    pub fn request(&mut self, iface: &str, cmd: &str) -> String {
+    pub fn try_request(&mut self, iface: &str, cmd: &str) -> io::Result<String> {
         if !self.sock.reachable() {
-            match self.sock.rebind().and_then(Self::ready) {
-                Ok(s) => self.sock = s,
-                Err(_) => return String::new(),
-            }
+            self.sock = self.sock.rebind().and_then(Self::ready)?;
         }
-        let _ = self.sock.set_nonblocking(true);
         while self.sock.recv(&mut self.buf).is_ok() {}
-        let _ = self.sock.set_nonblocking(false);
-        if self
-            .sock
+        let silent = |e: io::Error| match e.kind() {
+            ErrorKind::WouldBlock => ErrorKind::TimedOut.into(),
+            _ => e,
+        };
+        self.sock
             .send_to(cmd.as_bytes(), self.dir.join(iface))
-            .is_err()
-        {
-            return String::new();
+            .map_err(silent)?;
+        if !readable(&*self.sock, ANSWER_WAIT) {
+            return Err(ErrorKind::TimedOut.into());
         }
-        match self.sock.recv(&mut self.buf) {
-            Ok(n) => String::from_utf8_lossy(&self.buf[..n]).into_owned(),
-            Err(_) => String::new(),
-        }
+        let n = self.sock.recv(&mut self.buf).map_err(silent)?;
+        Ok(String::from_utf8_lossy(&self.buf[..n]).into_owned())
     }
+
+    /// [`Self::try_request`], "" when there is no answer.
+    pub fn request(&mut self, iface: &str, cmd: &str) -> String {
+        self.try_request(iface, cmd).unwrap_or_default()
+    }
+}
+
+/// Whether `fd` becomes readable within `wait`.
+fn readable(fd: &impl AsRawFd, wait: Duration) -> bool {
+    let mut p = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ms = i32::try_from(wait.as_millis()).unwrap_or(i32::MAX);
+    // SAFETY: one valid pollfd for the call.
+    unsafe { libc::poll(&mut p, 1, ms) > 0 }
+}
+
+/// Whether a radio's STATUS says it is serving.
+pub fn enabled(status: &str) -> bool {
+    status.lines().any(|l| l == "state=ENABLED")
 }
 
 fn fetch(peer: &SocketAddr) -> Vec<Entry> {
@@ -139,11 +163,11 @@ pub fn round(h: &mut Hostapd, own: &Mutex<String>, peers: &[SocketAddr]) -> Vec<
     for iface in ifaces {
         let list = h.request(&iface, "SHOW_NEIGHBOR");
         let status = h.request(&iface, "STATUS");
-        let enabled = status.lines().any(|l| l == "state=ENABLED");
+        let serving = enabled(&status);
         stations.push((iface.clone(), num_sta(&status, &iface)));
         let mut ssid = None;
         for e in list.lines().filter_map(own_entry) {
-            if enabled {
+            if serving {
                 up += &format!("{} {} {}\n", e.bssid, e.ssid, e.nr);
             }
             mine.insert(e.bssid);
@@ -317,6 +341,46 @@ mod tests {
         assert_eq!(resident.request("wlan5", "STATUS"), "state=ENABLED");
         drop(Hostapd::bind(t.path(), "collect", &dir).unwrap());
         assert_eq!(resident.request("wlan5", "STATUS"), "state=ENABLED");
+    }
+
+    /// A hung hostapd stops reading its socket; once its queue is full, a
+    /// blocking send would wait as long as it hangs.
+    #[test]
+    fn a_hostapd_that_reads_nothing_does_not_block_a_request() {
+        let t = crate::testdir::TestDir::new();
+        let dir = t.path().join("hostapd");
+        fs::create_dir_all(&dir).unwrap();
+        let hung = UnixDatagram::bind(dir.join("wlan5")).unwrap();
+        // Senders until one cannot send at all: then the queue is full, not
+        // just a sender's buffer.
+        let mut fillers = Vec::new();
+        loop {
+            let f = UnixDatagram::unbound().unwrap();
+            f.set_nonblocking(true).unwrap();
+            if f.send_to(b"x", dir.join("wlan5")).is_err() {
+                break;
+            }
+            while f.send_to(b"x", dir.join("wlan5")).is_ok() {}
+            fillers.push(f);
+        }
+        let mut h = Hostapd::bind(t.path(), "ctrl", &dir).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || tx.send(h.try_request("wlan5", "STATUS").is_err()));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(true));
+        drop(hung);
+    }
+
+    #[test]
+    fn a_silent_answer_is_told_from_a_refusal() {
+        let t = crate::testdir::TestDir::new();
+        let dir = t.path().join("hostapd");
+        fs::create_dir_all(&dir).unwrap();
+        let _silent = UnixDatagram::bind(dir.join("wlan5")).unwrap();
+        let mut h = Hostapd::bind(t.path(), "ctrl", &dir).unwrap();
+        let e = h.try_request("wlan5", "STATUS").unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::TimedOut);
+        let e = h.try_request("wlan6", "STATUS").unwrap_err();
+        assert_ne!(e.kind(), std::io::ErrorKind::TimedOut);
     }
 
     /// hostapd answers to the client's path; with the path gone (the run
