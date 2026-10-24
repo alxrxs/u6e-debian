@@ -73,19 +73,19 @@ mod tests {
 
     const ARP: &str =
         "IP address       HW type     Flags       HW address            Mask     Device
-10.57.1.1        0x1         0x2         a2:ad:51:1e:93:ac     *        vlan11
-10.57.1.16       0x1         0x0         00:00:00:00:00:00     *        vlan11
+192.0.2.1        0x1         0x2         02:00:00:00:00:01     *        vlan0
+192.0.2.16       0x1         0x0         00:00:00:00:00:00     *        vlan0
 ";
 
     #[test]
     fn a_resolved_gateway_is_reachable() {
-        assert!(resolved(ARP, Ipv4Addr::new(10, 57, 1, 1)));
+        assert!(resolved(ARP, Ipv4Addr::new(192, 0, 2, 1)));
     }
 
     #[test]
     fn a_failed_or_missing_entry_is_not() {
-        assert!(!resolved(ARP, Ipv4Addr::new(10, 57, 1, 16)));
-        assert!(!resolved(ARP, Ipv4Addr::new(10, 57, 1, 2)));
-        assert!(!resolved(ARP, Ipv4Addr::new(10, 57, 1, 11)));
+        assert!(!resolved(ARP, Ipv4Addr::new(192, 0, 2, 16)));
+        assert!(!resolved(ARP, Ipv4Addr::new(192, 0, 2, 2)));
+        assert!(!resolved(ARP, Ipv4Addr::new(192, 0, 2, 11)));
     }
 }
