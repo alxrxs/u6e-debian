@@ -109,6 +109,21 @@ mod tests {
     }
 
     #[test]
+    fn oversized_frame_not_written() {
+        let hello = AgentMsg::Hello(crate::msg::Hello {
+            ap: String::new(),
+            manifest: "x".repeat(MAX_FRAME as usize),
+            kernel: String::new(),
+            hostapd: String::new(),
+            agent: String::new(),
+        });
+        let mut buf = Vec::new();
+        let e = write_frame(&mut buf, &hello).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::InvalidInput);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
     fn garbage_body_is_invalid_data() {
         let mut buf = 2u32.to_le_bytes().to_vec();
         buf.extend([0xff, 0xff]);
