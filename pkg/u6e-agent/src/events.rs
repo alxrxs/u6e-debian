@@ -633,10 +633,11 @@ mod tests {
         )
         .unwrap();
         let log = paths.kmsg.clone();
+        let mut h = FakeHostapd::bind(&paths.hostapd.join("wlan6"));
         let (tx, rx) = sync_channel(16);
         Events::spawn_with(tx, paths).unwrap();
-
-        thread::sleep(Duration::from_millis(1500));
+        // The thread opens the log before it attaches to anything.
+        h.wait_attach();
         let mut f = fs::OpenOptions::new().append(true).open(log).unwrap();
         io::Write::write_all(
             &mut f,
