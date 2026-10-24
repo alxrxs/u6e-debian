@@ -8,8 +8,8 @@ use std::fmt;
 use std::sync::{Arc, RwLock};
 
 use aws_lc_rs::digest;
-use rustls::client::AlwaysResolvesClientRawPublicKeys;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::client::{AlwaysResolvesClientRawPublicKeys, Resumption};
 use rustls::crypto::aws_lc_rs::{default_provider, kx_group};
 use rustls::crypto::{
     CryptoProvider, SupportedKxGroup, WebPkiSupportedAlgorithms,
@@ -17,8 +17,8 @@ use rustls::crypto::{
 };
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
-use rustls::server::AlwaysResolvesServerRawPublicKeys;
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use rustls::server::{AlwaysResolvesServerRawPublicKeys, NoServerSessionStorage};
 use rustls::sign::CertifiedKey;
 use rustls::version::TLS13;
 use rustls::{
@@ -104,6 +104,21 @@ fn provider_with(group: &'static dyn SupportedKxGroup) -> Arc<CryptoProvider> {
     })
 }
 
+/// The provider's verification algorithms cut down to Ed25519, the only
+/// scheme a pinned key can use: nothing else is offered or accepted.
+fn ed25519_algs() -> WebPkiSupportedAlgorithms {
+    let all = default_provider().signature_verification_algorithms;
+    let at = all
+        .mapping
+        .iter()
+        .position(|(s, _)| *s == SignatureScheme::ED25519)
+        .expect("the provider verifies Ed25519");
+    WebPkiSupportedAlgorithms {
+        all: all.mapping[at].1,
+        mapping: &all.mapping[at..=at],
+    }
+}
+
 /// Pins one server key.
 #[derive(Debug)]
 struct PinnedServer {
@@ -171,12 +186,17 @@ impl ClientCertVerifier for KnownClients {
         _intermediates: &[CertificateDer<'_>],
         _now: UnixTime,
     ) -> Result<ClientCertVerified, Error> {
-        let known = ed25519_key(end_entity.as_ref())
-            .is_some_and(|k| self.allowed.read().is_ok_and(|m| m.contains_key(&k)));
-        if known {
+        let Some(key) = ed25519_key(end_entity.as_ref()) else {
+            return Err(Error::General("client key is not an Ed25519 key".into()));
+        };
+        if self.allowed.read().is_ok_and(|m| m.contains_key(&key)) {
             Ok(ClientCertVerified::assertion())
         } else {
-            Err(Error::General("client key is not enrolled".into()))
+            // The error is all the controller sees of a refused handshake.
+            Err(Error::General(format!(
+                "client key {} is not enrolled",
+                fingerprint(&key)
+            )))
         }
     }
 
@@ -214,9 +234,9 @@ fn client_with(
 ) -> Arc<ClientConfig> {
     let verifier = PinnedServer {
         key: server,
-        algs: provider.signature_verification_algorithms,
+        algs: ed25519_algs(),
     };
-    let config = ClientConfig::builder_with_provider(provider)
+    let mut config = ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&TLS13])
         .expect("the provider supports TLS 1.3")
         .dangerous()
@@ -224,6 +244,9 @@ fn client_with(
         .with_client_cert_resolver(Arc::new(AlwaysResolvesClientRawPublicKeys::new(
             me.certified.clone(),
         )));
+    // Every connection is a full handshake, so the server checks the key
+    // against its enrolment each time.
+    config.resumption = Resumption::disabled();
     Arc::new(config)
 }
 
@@ -237,15 +260,19 @@ pub fn server_config(me: &Identity, allowed: AllowedKeys) -> Arc<ServerConfig> {
     let provider = provider_with(kx_group::X25519MLKEM768);
     let verifier = KnownClients {
         allowed,
-        algs: provider.signature_verification_algorithms,
+        algs: ed25519_algs(),
     };
-    let config = ServerConfig::builder_with_provider(provider)
+    let mut config = ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&TLS13])
         .expect("the provider supports TLS 1.3")
         .with_client_cert_verifier(Arc::new(verifier))
         .with_cert_resolver(Arc::new(AlwaysResolvesServerRawPublicKeys::new(
             me.certified.clone(),
         )));
+    // A resumed session skips the client key check, so a key removed from
+    // `allowed` would still get in: no session is offered or kept.
+    config.session_storage = Arc::new(NoServerSessionStorage {});
+    config.send_tls13_tickets = 0;
     Arc::new(config)
 }
 
@@ -342,6 +369,9 @@ mod tests {
         c.writer().write_all(b"hello").unwrap();
         let (side, err) = pump(&mut c, &mut s).unwrap_err();
         assert!(err.to_string().contains("not enrolled"), "{err}");
+        // The controller logs which key was refused.
+        let fp = fingerprint(&stranger.public_key());
+        assert!(err.to_string().contains(&fp), "{err} lacks {fp}");
         assert_eq!(side, "server");
         assert!(s.reader().read(&mut [0u8; 8]).is_err());
         assert_eq!(peer_name(&s, &map), None);
@@ -363,6 +393,41 @@ mod tests {
     }
 
     #[test]
+    fn revoked_key_refused_on_reconnect() {
+        let ap = Identity::from_pem(KEY_A).unwrap();
+        let ctl = Identity::from_pem(KEY_B).unwrap();
+        let map = allowed(&[(ap.public_key(), "ap1")]);
+        let (cc, sc) = (
+            client_config(&ap, ctl.public_key()),
+            server_config(&ctl, map.clone()),
+        );
+        let (mut c, mut s) = connect(cc.clone(), sc.clone());
+        pump(&mut c, &mut s).unwrap();
+        assert_eq!(peer_name(&s, &map).as_deref(), Some("ap1"));
+        map.write().unwrap().clear();
+        let (mut c, mut s) = connect(cc, sc);
+        let (side, err) = pump(&mut c, &mut s).unwrap_err();
+        assert_eq!(side, "server", "{err}");
+        assert!(err.to_string().contains("not enrolled"), "{err}");
+    }
+
+    #[test]
+    fn every_handshake_is_a_full_one() {
+        let ap = Identity::from_pem(KEY_A).unwrap();
+        let ctl = Identity::from_pem(KEY_B).unwrap();
+        let map = allowed(&[(ap.public_key(), "ap1")]);
+        let (cc, sc) = (
+            client_config(&ap, ctl.public_key()),
+            server_config(&ctl, map),
+        );
+        for _ in 0..2 {
+            let (mut c, mut s) = connect(cc.clone(), sc.clone());
+            pump(&mut c, &mut s).unwrap();
+            assert_eq!(c.handshake_kind(), Some(rustls::HandshakeKind::Full));
+        }
+    }
+
+    #[test]
     fn x25519_only_client_refused() {
         let ap = Identity::from_pem(KEY_A).unwrap();
         let ctl = Identity::from_pem(KEY_B).unwrap();
@@ -371,5 +436,17 @@ mod tests {
         let (mut c, mut s) = connect(classical, server_config(&ctl, map));
         let (side, err) = pump(&mut c, &mut s).unwrap_err();
         assert_eq!(side, "server", "{err}");
+        assert_eq!(
+            err,
+            Error::PeerIncompatible(rustls::PeerIncompatible::NoKxGroupsInCommon)
+        );
+    }
+
+    #[test]
+    fn only_ed25519_signatures_are_offered() {
+        assert_eq!(
+            ed25519_algs().supported_schemes(),
+            [SignatureScheme::ED25519]
+        );
     }
 }
