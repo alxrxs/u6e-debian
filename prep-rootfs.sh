@@ -552,6 +552,18 @@ WantedBy=multi-user.target
 UNIT
 ln -sf /etc/systemd/system/u6e-nss.service $RF/etc/systemd/system/multi-user.target.wants/u6e-nss.service
 
+# The image's identity: images/<time>-<kernel>-<backports>-<AP>/ is where it
+# is kept, /etc/u6e-image carries that name and its versions (u6e-agent reports
+# them to the controller), and MANIFEST adds the checksums.
+g() { git -c safe.directory='*' -C "$1" log -1 --format='%h %s'; }
+A=images/$(date +%Y%m%d-%H%M%S)-$(git -c safe.directory='*' -C $K rev-parse --short HEAD)-$(git -c safe.directory='*' -C backports-7.2 rev-parse --short HEAD)
+A=$A-${U6E_AP:-default}
+versions="kernel:    $(g $K)
+backports: $(g backports-7.2)
+debian-ap: $(g .)
+hostapd:   $(dpkg-query --admindir=$RF/var/lib/dpkg -W -f '${Version}' hostapd)"
+printf 'image:     %s\n%s\n' "${A#images/}" "$versions" > $RF/etc/u6e-image
+
 # Pack: a reproducible zstd initrd (fixed mtimes, renumbered inodes) with the
 # paths this script rewrites last, so go8.sh's chunk compare only rewrites the
 # tail of the image on the eMMC; and the DTB carrying its location.
@@ -576,15 +588,9 @@ ls -la $OUT; sha256sum $OUT/*
 
 # Keep every image (~85 MB): images/<time>-<kernel>-<backports>-<AP>/ can be staged
 # again with go8.sh without a rebuild; MANIFEST records what went into it.
-g() { git -c safe.directory='*' -C "$1" log -1 --format='%h %s'; }
-A=images/$(date +%Y%m%d-%H%M%S)-$(git -c safe.directory='*' -C $K rev-parse --short HEAD)-$(git -c safe.directory='*' -C backports-7.2 rev-parse --short HEAD)
-A=$A-${U6E_AP:-default}
 install -d -m 0700 "$A"; cp -a $OUT/. "$A"/
 { echo "ap:        ${U6E_AP:-default} ($AP_HOSTNAME, $MGMT_ADDR)"
-  echo "kernel:    $(g $K)"
-  echo "backports: $(g backports-7.2)"
-  echo "debian-ap: $(g .)"
-  echo "hostapd:   $(dpkg-query --admindir=$RF/var/lib/dpkg -W -f '${Version}' hostapd)"
+  echo "$versions"
   sha256sum $OUT/*; } > "$A"/MANIFEST
 rm -rf $RF
 echo "kept as $A"
