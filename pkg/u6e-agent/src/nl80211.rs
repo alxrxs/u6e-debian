@@ -1,7 +1,8 @@
 //! A minimal nl80211 client: generic netlink over one socket, enough to dump
-//! the interfaces, the stations of an interface and the survey of a radio.
-//! Dumps come back as the kernel's raw bytes and the `parse_*` functions are
-//! pure over them, so recorded replies test the parsing without an AP.
+//! the interfaces, the stations of an interface and the survey of a radio,
+//! and a second socket that notices when the interfaces change. Dumps come
+//! back as the kernel's raw bytes and the `parse_*` functions are pure over
+//! them, so recorded replies test the parsing without an AP.
 
 use std::io;
 use std::mem;
@@ -14,15 +15,35 @@ const NLM_F_DUMP: u16 = 0x300;
 const NLMSG_ERROR: u16 = 2;
 const NLMSG_DONE: u16 = 3;
 const NLA_TYPE_MASK: u16 = 0x3fff;
+const SOL_NETLINK: libc::c_int = 270;
+const NETLINK_ADD_MEMBERSHIP: libc::c_int = 1;
 
 const GENL_ID_CTRL: u16 = 0x10;
 const CTRL_CMD_GETFAMILY: u8 = 3;
 const CTRL_ATTR_FAMILY_ID: u16 = 1;
 const CTRL_ATTR_FAMILY_NAME: u16 = 2;
+const CTRL_ATTR_MCAST_GROUPS: u16 = 7;
+const CTRL_ATTR_MCAST_GRP_NAME: u16 = 1;
+const CTRL_ATTR_MCAST_GRP_ID: u16 = 2;
+/// The multicast groups that announce new, removed and reconfigured
+/// interfaces, APs starting and stopping, and channel switches.
+const WATCHED_GROUPS: [&str; 2] = ["config", "mlme"];
 
+const CMD_NEW_WIPHY: u8 = 3;
+const CMD_DEL_WIPHY: u8 = 4;
 const CMD_GET_INTERFACE: u8 = 5;
+const CMD_SET_INTERFACE: u8 = 6;
+const CMD_NEW_INTERFACE: u8 = 7;
+const CMD_DEL_INTERFACE: u8 = 8;
+const CMD_START_AP: u8 = 15;
+const CMD_STOP_AP: u8 = 16;
 const CMD_GET_STATION: u8 = 17;
+#[cfg(test)]
+const CMD_NEW_STATION: u8 = 19;
+#[cfg(test)]
+const CMD_DEL_STATION: u8 = 20;
 const CMD_GET_SURVEY: u8 = 50;
+const CMD_CH_SWITCH_NOTIFY: u8 = 88;
 
 const ATTR_WIPHY: u16 = 1;
 const ATTR_IFINDEX: u16 = 3;
@@ -112,31 +133,14 @@ pub struct Nl80211 {
     /// and zeroing 64 KiB per request cost more than the dumps themselves.
     buf: Vec<u8>,
     out: Vec<u8>,
+    /// The ids of [`WATCHED_GROUPS`].
+    groups: Vec<u32>,
 }
 
 impl Nl80211 {
     /// Opens the socket and resolves the nl80211 family id, once.
     pub fn open() -> io::Result<Self> {
-        let raw = unsafe {
-            libc::socket(
-                libc::AF_NETLINK,
-                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-                libc::NETLINK_GENERIC,
-            )
-        };
-        if raw < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-        let mut addr: libc::sockaddr_nl = unsafe { mem::zeroed() };
-        addr.nl_family = libc::AF_NETLINK as u16;
-        let bound = unsafe {
-            libc::bind(
-                fd.as_raw_fd(),
-                (&raw const addr).cast(),
-                mem::size_of_val(&addr) as u32,
-            )
-        };
+        let fd = netlink_socket()?;
         let timeout = libc::timeval {
             tv_sec: 2,
             tv_usec: 0,
@@ -150,16 +154,41 @@ impl Nl80211 {
                 mem::size_of_val(&timeout) as u32,
             )
         };
-        if bound < 0 || set < 0 {
+        if set < 0 {
             return Err(io::Error::last_os_error());
         }
         let mut nl = Self::with_fd(fd, GENL_ID_CTRL);
         let mut name = Vec::new();
         put_attr(&mut name, CTRL_ATTR_FAMILY_NAME, b"nl80211\0");
         let reply = nl.transact(GENL_ID_CTRL, 0, CTRL_CMD_GETFAMILY, &name)?;
-        nl.family = parse_family_id(reply)
+        let family = parse_family_id(reply)
             .ok_or_else(|| io::Error::other("no nl80211 family in the reply"))?;
+        nl.groups = parse_groups(reply, &WATCHED_GROUPS);
+        nl.family = family;
         Ok(nl)
+    }
+
+    /// A socket that receives the notifications of [`WATCHED_GROUPS`].
+    pub fn watch(&self) -> io::Result<Watch> {
+        if self.groups.len() != WATCHED_GROUPS.len() {
+            return Err(io::Error::other("nl80211 lacks a notification group"));
+        }
+        let fd = netlink_socket()?;
+        for g in &self.groups {
+            let joined = unsafe {
+                libc::setsockopt(
+                    fd.as_raw_fd(),
+                    SOL_NETLINK,
+                    NETLINK_ADD_MEMBERSHIP,
+                    (&raw const *g).cast(),
+                    mem::size_of_val(g) as u32,
+                )
+            };
+            if joined < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(Watch::with_fd(fd, self.family))
     }
 
     fn with_fd(fd: OwnedFd, family: u16) -> Self {
@@ -169,6 +198,7 @@ impl Nl80211 {
             seq: 0,
             buf: vec![0; 65536],
             out: Vec::new(),
+            groups: Vec::new(),
         }
     }
 
@@ -245,6 +275,87 @@ impl Nl80211 {
             }
         }
     }
+}
+
+/// nl80211's notifications, read without blocking: whether anything that
+/// changes what an interface dump says happened since the last look.
+pub struct Watch {
+    fd: OwnedFd,
+    family: u16,
+}
+
+impl Watch {
+    fn with_fd(fd: OwnedFd, family: u16) -> Self {
+        Watch { fd, family }
+    }
+
+    /// Reads every pending notification. Lost ones (a full socket buffer)
+    /// count as a change too.
+    pub fn reconfigured(&mut self) -> bool {
+        // Each notification is one datagram; its header is all that counts,
+        // and the rest of a longer one is dropped by the read.
+        let mut head = [0u8; 20];
+        let mut changed = false;
+        loop {
+            let n = unsafe {
+                libc::recv(
+                    self.fd.as_raw_fd(),
+                    head.as_mut_ptr().cast(),
+                    head.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if n < 0 {
+                let e = io::Error::last_os_error();
+                match e.kind() {
+                    io::ErrorKind::WouldBlock => return changed,
+                    io::ErrorKind::Interrupted => continue,
+                    _ => return true,
+                }
+            }
+            let ours = n as usize == head.len() && u16_of(&head[4..6]) == self.family;
+            changed |= ours
+                && matches!(
+                    head[16],
+                    CMD_NEW_WIPHY
+                        | CMD_DEL_WIPHY
+                        | CMD_SET_INTERFACE
+                        | CMD_NEW_INTERFACE
+                        | CMD_DEL_INTERFACE
+                        | CMD_START_AP
+                        | CMD_STOP_AP
+                        | CMD_CH_SWITCH_NOTIFY
+                );
+        }
+    }
+}
+
+/// A bound generic netlink socket.
+fn netlink_socket() -> io::Result<OwnedFd> {
+    let raw = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+            libc::NETLINK_GENERIC,
+        )
+    };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let mut addr: libc::sockaddr_nl = unsafe { mem::zeroed() };
+    addr.nl_family = libc::AF_NETLINK as u16;
+    let bound = unsafe {
+        libc::bind(
+            fd.as_raw_fd(),
+            (&raw const addr).cast(),
+            mem::size_of_val(&addr) as u32,
+        )
+    };
+    if bound < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(fd)
 }
 
 fn ifindex_attr(ifindex: u32) -> Vec<u8> {
@@ -345,6 +456,29 @@ pub fn parse_family_id(raw: &[u8]) -> Option<u16> {
         .flatten()
         .find(|(ty, _)| *ty == CTRL_ATTR_FAMILY_ID)
         .map(|(_, d)| u16_of(d))
+}
+
+/// The ids of the multicast groups `names` in the reply to
+/// `CTRL_CMD_GETFAMILY`, in the order found; a missing group is left out.
+fn parse_groups(raw: &[u8], names: &[&str]) -> Vec<u32> {
+    let mut ids = Vec::new();
+    for (_, groups) in records(raw)
+        .flatten()
+        .filter(|(ty, _)| *ty == CTRL_ATTR_MCAST_GROUPS)
+    {
+        for (_, group) in attrs(groups) {
+            let (mut name, mut id) = (String::new(), None);
+            for (ty, d) in attrs(group) {
+                match ty {
+                    CTRL_ATTR_MCAST_GRP_NAME => name = str_of(d),
+                    CTRL_ATTR_MCAST_GRP_ID => id = Some(u32_of(d)),
+                    _ => {}
+                }
+            }
+            ids.extend(id.filter(|_| names.contains(&name.as_str())));
+        }
+    }
+    ids
 }
 
 fn width_mhz(w: u32) -> u16 {
@@ -689,6 +823,63 @@ mod tests {
             nl.stations(9).unwrap_err().raw_os_error(),
             Some(libc::EPERM)
         );
+    }
+
+    #[test]
+    fn reads_the_multicast_groups_from_a_reply() {
+        let group = |name: &[u8], id: u32| {
+            let mut g = Vec::new();
+            put_attr(&mut g, CTRL_ATTR_MCAST_GRP_NAME, name);
+            put_attr(&mut g, CTRL_ATTR_MCAST_GRP_ID, &id.to_ne_bytes());
+            g
+        };
+        let mut groups = Vec::new();
+        put_attr(&mut groups, 1, &group(b"config\0", 5));
+        put_attr(&mut groups, 2, &group(b"scan\0", 6));
+        put_attr(&mut groups, 3, &group(b"mlme\0", 8));
+        let mut attrs = Vec::new();
+        put_attr(&mut attrs, CTRL_ATTR_FAMILY_ID, &27u16.to_ne_bytes());
+        put_attr(&mut attrs, CTRL_ATTR_MCAST_GROUPS, &groups);
+        let reply = request(GENL_ID_CTRL, 0, 1, 1, &attrs);
+        assert_eq!(parse_groups(&reply, &["config", "mlme"]), [5, 8]);
+        assert!(parse_groups(&[], &["config"]).is_empty());
+    }
+
+    /// A notification of `cmd` as the kernel multicasts it.
+    fn notification(cmd: u8) -> Vec<u8> {
+        request(28, 0, 0, cmd, &ifindex_attr(9))
+    }
+
+    #[test]
+    fn a_watch_sees_what_changes_an_interface_and_nothing_else() {
+        let (nl, kernel) = fake_kernel();
+        let mut w = Watch::with_fd(nl.fd, nl.family);
+        assert!(!w.reconfigured());
+        queue(&kernel, &notification(CMD_NEW_STATION));
+        queue(&kernel, &notification(CMD_DEL_STATION));
+        assert!(!w.reconfigured());
+        for cmd in [
+            CMD_NEW_INTERFACE,
+            CMD_DEL_INTERFACE,
+            CMD_SET_INTERFACE,
+            CMD_NEW_WIPHY,
+            CMD_DEL_WIPHY,
+            CMD_START_AP,
+            CMD_STOP_AP,
+            CMD_CH_SWITCH_NOTIFY,
+        ] {
+            queue(&kernel, &notification(CMD_NEW_STATION));
+            queue(&kernel, &notification(cmd));
+            queue(&kernel, &notification(CMD_DEL_STATION));
+            assert!(w.reconfigured(), "{cmd}");
+            // Read once: the backlog is gone.
+            assert!(!w.reconfigured(), "{cmd}");
+        }
+        // A larger notification is cut to its header, and still counts.
+        let mut attrs = ifindex_attr(9);
+        put_attr(&mut attrs, ATTR_SSID, &[0; 4000]);
+        queue(&kernel, &request(28, 0, 0, CMD_CH_SWITCH_NOTIFY, &attrs));
+        assert!(w.reconfigured());
     }
 
     #[test]

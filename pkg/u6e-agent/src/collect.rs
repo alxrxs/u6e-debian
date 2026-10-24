@@ -8,12 +8,13 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use u6e_proto::msg::{Band, Bss, Radio, Snapshot, Station, Temp};
 
 use crate::kmsg::{self, Kmsg};
 use crate::neighbors::Hostapd;
-use crate::nl80211::{self, Iface, Nl80211, Survey};
+use crate::nl80211::{self, Iface, Nl80211, Survey, Watch};
 
 /// Where the collectors and the events thread look, so tests can point them
 /// at a scratch tree.
@@ -97,10 +98,46 @@ impl<T> Source<T> {
     }
 }
 
+/// How long the interface list stands without a notification; the transmit
+/// power, which nothing announces, is at most this old.
+const IFACES_FOR: Duration = Duration::from_secs(60);
+
+/// The interfaces as of their last dump. A dump costs a firmware round trip
+/// per AP interface under the RTNL lock (for the transmit power), so it is
+/// repeated only when nl80211 announces a change, the hostapd sockets
+/// change, or [`IFACES_FOR`] has passed.
+#[derive(Default)]
+struct Ifaces {
+    list: Vec<Iface>,
+    /// The BSS order the list was read for.
+    order: Vec<String>,
+    read_at: Option<Instant>,
+}
+
+impl Ifaces {
+    fn stale(&self, order: &[String], reconfigured: bool, now: Instant) -> bool {
+        reconfigured
+            || self.order != order
+            || self
+                .read_at
+                .is_none_or(|t| now.duration_since(t) >= IFACES_FOR)
+    }
+
+    fn store(&mut self, list: Vec<Iface>, order: Vec<String>, now: Instant) {
+        *self = Ifaces {
+            list,
+            order,
+            read_at: Some(now),
+        };
+    }
+}
+
 /// Collects the state; whatever cannot be read yet reads as empty, so the
 /// agent's other duties never depend on the collectors.
 pub struct Collector {
     nl: Source<Nl80211>,
+    watch: Source<Watch>,
+    ifaces: Ifaces,
     hostapd: Source<Hostapd>,
     kmsg: Kmsg,
     paths: Paths,
@@ -117,6 +154,8 @@ impl Collector {
         let crashes = kmsg.drain().iter().filter(|m| kmsg::is_fw_crash(m)).count() as u64;
         Collector {
             nl: Source::new("nl80211"),
+            watch: Source::new("nl80211 notifications"),
+            ifaces: Ifaces::default(),
             hostapd: Source::new("hostapd control socket"),
             kmsg,
             paths,
@@ -142,13 +181,23 @@ impl Collector {
             .iter()
             .filter(|m| kmsg::is_fw_crash(m))
             .count() as u64;
-        let mut nl = self.nl.get(Nl80211::open);
-        let ifaces = nl
-            .as_mut()
-            .and_then(|nl| nl.interfaces().ok())
-            .unwrap_or_default();
         let order = bss_order(&self.paths.hostapd);
-        let bsss = bsss(&sys, &order, &ifaces);
+        let mut nl = self.nl.get(Nl80211::open);
+        if let Some(nl) = nl.as_mut() {
+            // Notifications are read before the dump, so one that follows it
+            // brings the next.
+            let watch = self.watch.get(|| nl.watch());
+            let reconfigured = watch.is_some_and(|w| w.reconfigured());
+            let now = Instant::now();
+            if self.ifaces.stale(&order, reconfigured, now) {
+                match nl.interfaces() {
+                    Ok(list) => self.ifaces.store(list, order.clone(), now),
+                    Err(_) => self.ifaces = Ifaces::default(),
+                }
+            }
+        }
+        let ifaces = &self.ifaces.list;
+        let bsss = bsss(&sys, &order, ifaces);
         let per_iface: Vec<_> = ifaces
             .iter()
             .filter(|i| i.kind == nl80211::IFTYPE_AP || i.kind == nl80211::IFTYPE_AP_VLAN)
@@ -162,7 +211,7 @@ impl Collector {
         let mut hostapd = self.hostapd.get(|| Hostapd::bind(&client, dir));
         let radios = radios(
             &bsss,
-            &ifaces,
+            ifaces,
             |i| {
                 let survey = nl.as_mut().and_then(|nl| nl.survey(i.ifindex).ok());
                 survey.unwrap_or_default()
@@ -569,6 +618,19 @@ mod tests {
                 .all(|r| r.noise_dbm == 0 && r.active_ms == 0 && !r.up)
         );
         assert!(radios(&[], &ifaces, |_| Vec::new(), |_| true).is_empty());
+    }
+
+    #[test]
+    fn interfaces_are_read_again_on_a_change_or_after_a_minute() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        let mut cache = Ifaces::default();
+        assert!(cache.stale(&order(), false, t0));
+        cache.store(nl80211::parse_interfaces(INTERFACES), order(), t0);
+        assert!(!cache.stale(&order(), false, t0 + s(59)));
+        assert!(cache.stale(&order(), true, t0 + s(1)));
+        assert!(cache.stale(&order()[1..], false, t0 + s(1)));
+        assert!(cache.stale(&order(), false, t0 + s(60)));
     }
 
     #[test]
