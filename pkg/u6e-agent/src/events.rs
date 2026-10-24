@@ -8,12 +8,11 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use u6e_proto::msg::{Event, EventKind};
 
@@ -24,6 +23,8 @@ use crate::kmsg::{self, Kmsg};
 /// nothing arrives.
 const RESCAN_MS: i32 = 1000;
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(1);
+/// How often each attached socket is checked for a hostapd that went away.
+const PROBE_EVERY: Duration = Duration::from_secs(2);
 
 pub struct Events;
 
@@ -44,13 +45,12 @@ impl Events {
     }
 }
 
-/// A control socket attached to one hostapd BSS socket.
+/// A control socket attached to one hostapd BSS socket; it is connected to
+/// that very socket, not to the path, so a hostapd that restarted is noticed
+/// even when its new socket file takes the old one's place.
 struct Attached {
     sock: UnixDatagram,
     path: PathBuf,
-    /// Identity of the hostapd socket file at attach time: a restarted
-    /// hostapd binds a new one.
-    stamp: (u64, i64, i64),
 }
 
 impl Drop for Attached {
@@ -59,20 +59,26 @@ impl Drop for Attached {
     }
 }
 
-fn stamp(path: &Path) -> Option<(u64, i64, i64)> {
-    let m = fs::metadata(path).ok()?;
-    Some((m.ino(), m.ctime(), m.ctime_nsec()))
+impl Attached {
+    /// Whether the hostapd behind the socket is still there: a datagram to a
+    /// closed peer is refused. hostapd answers the PING; the answer is ignored.
+    fn alive(&self) -> bool {
+        match self.sock.send(b"PING") {
+            Ok(_) => true,
+            Err(e) => e.kind() == io::ErrorKind::WouldBlock,
+        }
+    }
 }
 
 fn attach(paths: &Paths, name: &str) -> Option<Attached> {
     let target = paths.hostapd.join(name);
-    let stamp = stamp(&target)?;
     let path = paths.run.join(format!("ev-{name}"));
     let _ = fs::remove_file(&path);
     let sock = UnixDatagram::bind(&path).ok()?;
-    let attached = Attached { sock, path, stamp };
+    let attached = Attached { sock, path };
     attached.sock.set_read_timeout(Some(ATTACH_TIMEOUT)).ok()?;
-    attached.sock.send_to(b"ATTACH", &target).ok()?;
+    attached.sock.connect(&target).ok()?;
+    attached.sock.send(b"ATTACH").ok()?;
     let mut reply = [0; 16];
     let n = attached.sock.recv(&mut reply).ok()?;
     (reply[..n].starts_with(b"OK")).then_some(())?;
@@ -84,11 +90,14 @@ fn run(tx: &SyncSender<Event>, paths: &Paths) {
     let mut kmsg = Kmsg::open(&paths.kmsg, true);
     let mut attached: BTreeMap<String, Attached> = BTreeMap::new();
     let mut buf = vec![0; 4096];
+    let mut last_probe = Instant::now();
     loop {
         let order = collect::bss_order(&paths.hostapd);
-        attached.retain(|name, a| {
-            order.contains(name) && stamp(&paths.hostapd.join(name)) == Some(a.stamp)
-        });
+        let probe = last_probe.elapsed() >= PROBE_EVERY;
+        if probe {
+            last_probe = Instant::now();
+        }
+        attached.retain(|name, a| order.contains(name) && (!probe || a.alive()));
         for name in &order {
             if !attached.contains_key(name)
                 && let Some(a) = attach(paths, name)
