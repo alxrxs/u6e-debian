@@ -8,7 +8,7 @@ The only thing ever written to the SPI flash (the small chip holding the boot lo
 
 ## What you need
 
-- An x86 Linux build machine with the aarch64 cross compiler (and the armhf one, for the 32-bit boot shim), `mmdebstrap`, `qemu-user-static`, `u-boot-tools`, and Rust from rustup with the `aarch64-unknown-linux-musl` target.
+- An x86 Linux build machine with the aarch64 cross compiler (and the armhf one, for the 32-bit boot shim), `mmdebstrap`, `qemu-user-static`, `u-boot-tools`, Rust from rustup with the `aarch64-unknown-linux-musl` target, and `cargo-zigbuild` with `zig` (the agent cross-builds through zig's C toolchain).
 - Optionally, an Apple silicon Mac with OrbStack, reachable over SSH (`NATIVE_BUILD` in `site.conf`): the arm64 package and root filesystem builds then run there natively, many times faster than under `qemu-user-static`.
 - SSH access to the stock firmware of each access point (the stock login set in `site.conf`).
 - `site.conf`: your site's settings. Copy `site.conf.example` and fill it in; it is never committed. It holds:
@@ -48,7 +48,7 @@ sudo BOOT=0 ./deploy.sh           # build everything, each image included, but b
 6. `pkg/iproute2-nss/build.sh`: builds Debian's `iproute2` with the NSS traffic-shaping options added to `tc`.
 7. `pkg/netlogd/build.sh`: builds Debian's `systemd-netlogd`, which forwards the log, with a fix for its journal file rotation.
 8. `mkrootfs.sh`: creates the Debian root filesystem.
-9. `pkg/u6e-agent`: builds the access point's resident agent (Rust, one static binary): the neighbor report exchange between access points, the management network check and the state line in the log.
+9. `pkg/u6e-agent` (a member of the cargo workspace in `Cargo.toml`): builds the access point's resident agent (Rust, one static binary): the neighbor report exchange between access points, the management network check and the state line in the log.
 10. For each access point whose running image was built from other inputs (this repository, `$BLOBS`, `site.conf` or the source trees): `prep-rootfs.sh` builds its image, `boot/stage.sh` boots it, and `deploy.sh` waits until all three radios are up. An access point already running the current build is left alone; `FORCE=1` boots a new image anyway. With `BOOT=0` each image is built and kept but not booted, so the access points keep running until a later run boots it.
 
 Every image is kept in `images/` with a `MANIFEST` (versions and checksums), so an earlier build can be booted again without rebuilding.
@@ -114,6 +114,8 @@ Wi-Fi starts by itself on every boot (`u6e-wifi.service`), with nothing else on 
 | `pkg/hostapd/` | hostapd build with our 29 patches |
 | `pkg/iproute2-nss/` | `iproute2` with NSS support in `tc` |
 | `pkg/netlogd/` | `systemd-netlogd` (the log forwarder) without a spurious error at each journal file rotation |
+| `pkg/u6e-proto/` | The wire protocol between the agent and the controller: messages, delta coding, framing (Rust) |
+| `pkg/u6e-controller/` | The Wi-Fi controller (Rust; a stub until it lands) |
 | `pkg/u6e-agent/` | The access point's resident agent: neighbor reports across access points, management network check, state line (Rust) |
 | `mkrootfs.sh` | Creates the Debian root filesystem |
 | `prep-rootfs.sh` | Adds the kernel, firmware and configuration, and produces one image per access point |

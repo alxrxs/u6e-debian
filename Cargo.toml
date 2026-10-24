@@ -1,0 +1,10 @@
+[workspace]
+members = ["pkg/u6e-proto", "pkg/u6e-agent", "pkg/u6e-controller"]
+resolver = "3"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

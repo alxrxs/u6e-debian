@@ -88,11 +88,11 @@ deb=pkg/netlogd/out/systemd-netlogd_${netlogd}_arm64.deb
 [ -f "$deb" ] || step netlogd "$netlogd" arm64 "$deb" 'rm -rf pkg/netlogd/work && pkg/netlogd/build.sh' pkg/netlogd
 step rootfs "$hostapd/$iproute2/$netlogd/$(head_of . HEAD:mkrootfs.sh)" arm64 rootfs 'rm -rf rootfs && ./mkrootfs.sh' \
 	mkrootfs.sh pkg/hostapd/out pkg/iproute2-nss/out pkg/netlogd/out
-# u6e-agent: a static arm64 binary, cross-built here (rustup's
-# aarch64-unknown-linux-musl target).
-[ -x pkg/u6e-agent/target/aarch64-unknown-linux-musl/release/u6e-agent ] || rm -f stamps/agent
-step agent "$(head_of . HEAD:pkg/u6e-agent)" sh -c \
-	'cd pkg/u6e-agent && PATH=$PATH:$HOME/.cargo/bin cargo build --release --locked'
+# u6e-agent: a static arm64 binary from the cargo workspace, cross-built here
+# (cargo-zigbuild: zig is the C toolchain for musl crates such as aws-lc-sys).
+[ -x target/aarch64-unknown-linux-musl/release/u6e-agent ] || rm -f stamps/agent
+step agent "$(head_of . HEAD:Cargo.toml)/$(head_of . HEAD:Cargo.lock)/$(head_of . HEAD:pkg/u6e-agent)/$(head_of . HEAD:pkg/u6e-proto)" sh -c \
+	'PATH=$PATH:$HOME/.cargo/bin cargo zigbuild --release --locked --target aarch64-unknown-linux-musl -p u6e-agent'
 
 if [ $# = 0 ]; then
 	read -ra aps <<<"$U6E_APS"

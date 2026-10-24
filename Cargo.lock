@@ -5,3 +5,11 @@ version = 4
 [[package]]
 name = "u6e-agent"
 version = "1.0.0"
+
+[[package]]
+name = "u6e-controller"
+version = "1.0.0"
+
+[[package]]
+name = "u6e-proto"
+version = "1.0.0"

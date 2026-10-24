@@ -21,7 +21,7 @@
 /pkg/iproute2-nss/out/
 /pkg/hostapd/out/
 /pkg/netlogd/out/
-/pkg/u6e-agent/target/
+/target/
 /log/
 /stamps/
 __pycache__/
