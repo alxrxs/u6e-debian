@@ -513,9 +513,14 @@ printf '%s\n' 'options ath11k nss_offload=1 frame_mode=2' 'options qca-dwmac-nss
 	'blacklist ath11k_ahb' 'blacklist ath11k_pci' > $RF/etc/modprobe.d/u6e-nss.conf
 # The OpenWrt wireless stack makes no default interface (a station vif
 # taken through NSS offload hangs the NSS core); add each radio's as an AP.
-for r in c000000.wifi:wlan24 0000:01:00.0:wlan5 0001:01:00.0:wlan6; do
-	printf 'ACTION=="add", SUBSYSTEM=="ieee80211", KERNELS=="%s", RUN+="/usr/sbin/iw phy %%k interface add %s type __ap"\n' \
-		"${r%:*}" "${r##*:}"
+# First the radio's wiphy is named after its band, by the device it sits on:
+# the kernel numbers wiphys in the order they probe, which can swap the two
+# PCI radios from one boot to the next, and the agent reports a radio, so
+# its history, by its wiphy's name.
+for r in c000000.wifi:24 0000:01:00.0:5 0001:01:00.0:6; do
+	b=${r##*:}
+	printf 'ACTION=="add", SUBSYSTEM=="ieee80211", KERNELS=="%s", RUN+="/usr/sbin/iw phy %%k set name radio%s", RUN+="/usr/sbin/iw phy radio%s interface add wlan%s type __ap"\n' \
+		"${r%:*}" $b $b $b
 done > $RF/etc/udev/rules.d/80-u6e-wlan.rules
 # The qrtr module runs the QRTR name service in the kernel: qrtr-tools' own
 # daemon would only find it taken and log an error at every boot.
