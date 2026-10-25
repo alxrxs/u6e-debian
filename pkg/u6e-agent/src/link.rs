@@ -1,8 +1,12 @@
 //! The agent's telemetry link: it dials the controller over the pinned-key TLS
-//! of `u6e_proto::tls`, says who it is, then sends a snapshot every tick (a
-//! delta against the previous one, a full key frame now and then) and the
-//! events as they happen. The controller sets the tick, asks for key frames
-//! and pings; a silent or broken connection is dropped and dialed again.
+//! of `u6e_proto::tls`, and each end states its protocol in the version frame;
+//! a controller of another protocol is not spoken to. The agent then says who
+//! it is, sends a snapshot every tick (a delta against the previous one, a
+//! full key frame now and then) and the events as they happen. The controller
+//! sets the tick, asks for key frames and pings; a silent or broken connection
+//! is dropped and dialed again. The wait before a redial doubles from 1 s to
+//! 30 s until a session is useful (the controller said something in it), so a
+//! controller that takes each session and drops it is not redialed at once.
 //!
 //! One thread owns the connection and waits with `poll` for the socket, an
 //! event or the next tick, so an event leaves at once without a polling loop.
@@ -14,6 +18,7 @@ use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::ops::RangeInclusive;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc::Receiver;
@@ -23,13 +28,14 @@ use std::{fs, mem, thread};
 
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection};
-use u6e_proto::delta;
-use u6e_proto::frame::{decode_frame, write_frame};
+use u6e_proto::frame::{decode_frame, frame_body, write_frame};
 use u6e_proto::msg::{AgentMsg, CtlMsg, Event, Hello, Snapshot};
 use u6e_proto::tls::{self, Identity};
+use u6e_proto::{PROTOCOL, delta, version};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// Longest the handshake may wait for the controller, or a write for the socket.
+/// Longest the handshake or the controller's version frame may take, or a
+/// write wait for the socket.
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -52,6 +58,9 @@ pub struct Config {
     /// How long the controller may say nothing before the session is taken
     /// for dead and dialed again.
     pub silence: Duration,
+    /// The wait before a redial: the start after a useful session, doubled
+    /// after each dial that brought none, up to the end.
+    pub backoff: RangeInclusive<Duration>,
 }
 
 impl Config {
@@ -67,6 +76,7 @@ impl Config {
             controller_key,
             hello,
             silence: SILENCE,
+            backoff: BACKOFF_MIN..=BACKOFF_MAX,
         }
     }
 }
@@ -88,7 +98,7 @@ fn run_with(
 ) -> ! {
     let client = tls::client_config(&cfg.identity, cfg.controller_key);
     let mut ring = None;
-    let mut backoff = BACKOFF_MIN;
+    let mut backoff = *cfg.backoff.start();
     // A failure that repeats is logged once, not at every attempt.
     let (mut failed, mut relay_failed) = (String::new(), String::new());
     loop {
@@ -102,24 +112,29 @@ fn run_with(
                 Err(_) => {}
             }
         }
-        match connect(&cfg.controller, &client) {
+        // A session the controller said nothing in counts as a failed dial.
+        let failure = match connect(&cfg.controller, &client) {
             Ok(mut s) => {
-                backoff = BACKOFF_MIN;
-                failed.clear();
-                eprintln!("u6e-agent: link to {} up", cfg.controller);
                 let Err(e) = s.serve(&cfg, ring.as_deref(), &mut snapshot);
-                eprintln!("u6e-agent: link to {} down: {e}", cfg.controller);
-            }
-            Err(e) => {
-                let e = e.to_string();
-                if e != failed {
-                    eprintln!("u6e-agent: link to {}: {e}", cfg.controller);
-                    failed = e;
+                if s.heard {
+                    eprintln!("u6e-agent: link to {} down: {e}", cfg.controller);
+                    backoff = *cfg.backoff.start();
+                    failed.clear();
+                    None
+                } else {
+                    Some(format!(
+                        "session ended before the controller said a word: {e}"
+                    ))
                 }
             }
+            Err(e) => Some(e.to_string()),
+        };
+        if let Some(e) = failure.filter(|e| *e != failed) {
+            eprintln!("u6e-agent: link to {}: {e}", cfg.controller);
+            failed = e;
         }
         thread::sleep(backoff);
-        backoff = (backoff * 2).min(BACKOFF_MAX);
+        backoff = (backoff * 2).min(*cfg.backoff.end());
     }
 }
 
@@ -182,7 +197,8 @@ impl Ring {
     }
 }
 
-/// Opens the TCP connection and completes the TLS handshake.
+/// Opens the TCP connection, completes the TLS handshake and agrees on the
+/// protocol.
 fn connect(controller: &str, client: &Arc<ClientConfig>) -> io::Result<Session> {
     let mut err = io::Error::new(ErrorKind::NotFound, "no address");
     let mut found = None;
@@ -207,7 +223,9 @@ fn connect(controller: &str, client: &Arc<ClientConfig>) -> io::Result<Session> 
     while conn.is_handshaking() {
         conn.complete_io(&mut sock)?;
     }
-    Ok(Session::new(conn, sock))
+    let mut s = Session::new(conn, sock);
+    s.agree()?;
+    Ok(s)
 }
 
 /// The tick the controller asked for, kept within 1 to 60 s.
@@ -236,6 +254,8 @@ struct Session {
     /// The last snapshot sent: the base of the next delta.
     prev: Option<Snapshot>,
     seq: u64,
+    /// The controller has sent a message: the session is a useful one.
+    heard: bool,
 }
 
 impl Session {
@@ -253,6 +273,38 @@ impl Session {
             want_key: false,
             prev: None,
             seq: 0,
+            heard: false,
+        }
+    }
+
+    /// Sends this agent's protocol and reads the controller's, before either
+    /// end decodes a message: a controller of another protocol, or of none
+    /// (protocol 0, from before the version frame), is not spoken to.
+    fn agree(&mut self) -> io::Result<()> {
+        self.send(&version::frame(PROTOCOL))?;
+        let theirs = self.version().map_err(|e| {
+            io::Error::new(e.kind(), format!("no protocol from the controller: {e}"))
+        })?;
+        if theirs != PROTOCOL {
+            let e = format!("the controller speaks protocol {theirs}, this agent {PROTOCOL}");
+            return Err(io::Error::new(ErrorKind::InvalidData, e));
+        }
+        Ok(())
+    }
+
+    /// The protocol the controller's first frame states.
+    fn version(&mut self) -> io::Result<u16> {
+        loop {
+            let closed = self.take_plaintext()?;
+            if let Some((body, n)) = frame_body(&self.inbuf)? {
+                let v = version::decode(body);
+                self.inbuf.drain(..n);
+                return Ok(v);
+            }
+            if closed {
+                return Err(ErrorKind::UnexpectedEof.into());
+            }
+            self.read_records()?;
         }
     }
 
@@ -266,6 +318,7 @@ impl Session {
     ) -> io::Result<Infallible> {
         let mut out = Vec::new();
         write_frame(&mut out, &AgentMsg::Hello(cfg.hello.clone()))?;
+        let mut up = false;
         loop {
             if let Some(r) = ring {
                 r.clear_wake();
@@ -284,8 +337,14 @@ impl Session {
                 self.send(&out)?;
                 out.clear();
             }
+            // On the first pass, what came with the version frame.
+            self.process()?;
             if self.wait(ring, cfg.silence) {
                 self.receive()?;
+            }
+            if self.heard && !up {
+                up = true;
+                eprintln!("u6e-agent: link to {} up", cfg.controller);
             }
             if self.last_rx.elapsed() >= cfg.silence {
                 return Err(io::Error::new(ErrorKind::TimedOut, "controller silent"));
@@ -357,23 +416,44 @@ impl Session {
     }
 
     /// Takes in what the readable socket holds and acts on every whole frame
-    /// received so far.
+    /// received so far, those that came with the controller's close too.
     fn receive(&mut self) -> io::Result<()> {
+        self.read_records()?;
+        let closed = self.take_plaintext()?;
+        self.process()?;
+        if closed {
+            return Err(ErrorKind::UnexpectedEof.into());
+        }
+        Ok(())
+    }
+
+    /// Reads what the socket holds into the TLS session.
+    fn read_records(&mut self) -> io::Result<()> {
         if self.conn.read_tls(&mut self.sock)? == 0 {
             return Err(ErrorKind::UnexpectedEof.into());
         }
         self.conn.process_new_packets().map_err(io::Error::other)?;
         // A key update asks for an answer.
-        self.flush()?;
+        self.flush()
+    }
+
+    /// Moves the decrypted bytes to `inbuf`; true when the controller closed
+    /// the session after them.
+    fn take_plaintext(&mut self) -> io::Result<bool> {
         match self.conn.reader().read_to_end(&mut self.inbuf) {
-            Ok(_) => return Err(ErrorKind::UnexpectedEof.into()),
-            Err(e) if e.kind() == ErrorKind::WouldBlock => {}
-            Err(e) => return Err(e),
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(false),
+            Err(e) => Err(e),
         }
+    }
+
+    /// Acts on every whole frame in `inbuf`.
+    fn process(&mut self) -> io::Result<()> {
         let mut used = 0;
         while let Some((msg, n)) = decode_frame::<CtlMsg>(&self.inbuf[used..])? {
             used += n;
             self.last_rx = Instant::now();
+            self.heard = true;
             self.handle(msg)?;
         }
         self.inbuf.drain(..used);
@@ -434,6 +514,7 @@ mod tests {
 
     use rustls::{ServerConfig, ServerConnection};
     use u6e_proto::msg::{Bss, EventKind, RateMode, Station, Temp};
+    use u6e_proto::version;
 
     // A throwaway Ed25519 key made for tests (the same as in u6e-proto's tls
     // tests); it protects nothing.
@@ -441,6 +522,8 @@ mod tests {
 
     /// How long a test waits for something that should happen, before failing.
     const WAIT: Duration = Duration::from_secs(20);
+    /// How often a fake looks for a new connection: how late it may see one.
+    const ACCEPT_POLL: Duration = Duration::from_millis(10);
 
     /// A new random Ed25519 key in PKCS#8 PEM. Each fake controller has its own:
     /// agents of finished tests keep dialing (the link never returns), and one
@@ -576,7 +659,7 @@ mod tests {
                 match self.listener.accept() {
                     Ok((sock, _)) => return sock,
                     Err(e) if e.kind() == ErrorKind::WouldBlock && start.elapsed() < WAIT => {
-                        thread::sleep(Duration::from_millis(10));
+                        thread::sleep(ACCEPT_POLL);
                     }
                     Err(e) => panic!("no agent connected: {e}"),
                 }
@@ -599,36 +682,86 @@ mod tests {
             })
         }
 
-        fn accept(&self) -> Peer {
+        /// The next session of an agent of this fake, TLS alone, and when its
+        /// connection came.
+        fn accept_tls(&self) -> (Peer, Instant) {
             loop {
-                if let Some(p) = self.handshake(self.accept_tcp()) {
-                    return p;
+                let sock = self.accept_tcp();
+                let at = Instant::now();
+                if let Some(p) = self.handshake(sock) {
+                    return (p, at);
                 }
             }
+        }
+
+        /// The next session, the protocols agreed.
+        fn accept(&self) -> Peer {
+            let (mut p, _) = self.accept_tls();
+            assert_eq!(p.agree(PROTOCOL), PROTOCOL);
+            p
         }
     }
 
     impl Peer {
-        fn recv(&mut self) -> AgentMsg {
+        /// What `take` makes of the frames received once it makes something,
+        /// or the error that ended the session.
+        fn next<T>(&mut self, take: impl Fn(&[u8]) -> Option<(T, usize)>) -> io::Result<T> {
             loop {
                 // rustls may hold decrypted data the socket no longer shows.
-                match self.conn.reader().read_to_end(&mut self.buf) {
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => {}
-                    other => panic!("agent closed: {other:?}"),
-                }
-                if let Some((msg, n)) = decode_frame(&self.buf).unwrap() {
+                let closed = match self.conn.reader().read_to_end(&mut self.buf) {
+                    Ok(_) => true,
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => false,
+                    Err(e) => return Err(e),
+                };
+                if let Some((v, n)) = take(&self.buf) {
                     self.buf.drain(..n);
-                    return msg;
+                    return Ok(v);
                 }
-                assert!(self.conn.read_tls(&mut self.sock).unwrap() > 0, "closed");
-                self.conn.process_new_packets().unwrap();
+                if closed || self.conn.read_tls(&mut self.sock)? == 0 {
+                    return Err(ErrorKind::UnexpectedEof.into());
+                }
+                self.conn.process_new_packets().map_err(io::Error::other)?;
+            }
+        }
+
+        fn recv(&mut self) -> AgentMsg {
+            self.next(|b| decode_frame(b).unwrap())
+                .expect("agent closed")
+        }
+
+        /// The body of the agent's next frame, undecoded.
+        fn recv_body(&mut self) -> io::Result<Vec<u8>> {
+            self.next(|b| frame_body(b).unwrap().map(|(body, n)| (body.to_vec(), n)))
+        }
+
+        /// Sends the version frame of `protocol`; the protocol the agent's states.
+        fn agree(&mut self, protocol: u16) -> u16 {
+            self.send_bytes(&version::frame(protocol));
+            version::decode(&self.recv_body().expect("no version frame"))
+        }
+
+        /// Asserts that the agent closes the session without another frame.
+        fn ends(&mut self) {
+            match self.recv_body() {
+                Err(e) => assert!(
+                    matches!(
+                        e.kind(),
+                        ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset
+                    ),
+                    "{e}"
+                ),
+                Ok(body) => panic!("a frame of {} B, not the end", body.len()),
             }
         }
 
         fn send(&mut self, msg: CtlMsg) {
             let mut out = Vec::new();
             write_frame(&mut out, &msg).unwrap();
-            self.conn.writer().write_all(&out).unwrap();
+            self.send_bytes(&out);
+        }
+
+        fn send_bytes(&mut self, bytes: &[u8]) {
+            self.conn.writer().write_all(bytes).unwrap();
             while self.conn.wants_write() {
                 self.conn.write_tls(&mut self.sock).unwrap();
             }
@@ -665,15 +798,15 @@ mod tests {
 
     impl Agent {
         fn spawn(fake: &Fake, snapshot: impl FnMut(u64) -> Snapshot + Send + 'static) -> Self {
-            Self::spawn_with(fake, SILENCE, 0, snapshot)
+            Self::spawn_with(fake, 0, |_| {}, snapshot)
         }
 
-        /// An agent whose controller may be silent for `silence`, and whose
-        /// event relay fails to start the first `relay_failures` times.
+        /// An agent whose event relay fails to start the first
+        /// `relay_failures` times, its configuration changed by `tweak`.
         fn spawn_with(
             fake: &Fake,
-            silence: Duration,
             relay_failures: u32,
+            tweak: impl FnOnce(&mut Config),
             snapshot: impl FnMut(u64) -> Snapshot + Send + 'static,
         ) -> Self {
             let (events, rx) = sync_channel(256);
@@ -691,7 +824,7 @@ mod tests {
                     agent: "1.0.0".into(),
                 },
             );
-            cfg.silence = silence;
+            tweak(&mut cfg);
             let r = Arc::clone(&ring);
             let mut failures = relay_failures;
             let relay = move || match failures.checked_sub(1) {
@@ -726,6 +859,40 @@ mod tests {
 
     fn secs(a: Instant, b: Instant) -> f64 {
         b.duration_since(a).as_secs_f64()
+    }
+
+    /// A backoff short enough for a test to watch it reach its cap.
+    const QUICK: RangeInclusive<Duration> = Duration::from_millis(25)..=Duration::from_millis(300);
+    /// What a dial may take beyond its backoff on a loaded host.
+    const SLACK: f64 = 0.4;
+
+    /// When each of the next `n` sessions was dialed, `serve` given each.
+    fn dial_times(fake: &Fake, n: usize, mut serve: impl FnMut(usize, Peer)) -> Vec<Instant> {
+        (0..n)
+            .map(|i| {
+                let (p, at) = fake.accept_tls();
+                serve(i, p);
+                at
+            })
+            .collect()
+    }
+
+    /// Asserts that the dials came at least the doubling backoff apart, and
+    /// once it reached its cap, no further.
+    fn assert_backs_off(at: &[Instant], backoff: &RangeInclusive<Duration>) {
+        let gaps: Vec<f64> = at.windows(2).map(|w| secs(w[0], w[1])).collect();
+        let mut wait = *backoff.start();
+        for (i, &gap) in gaps.iter().enumerate() {
+            let want = wait.as_secs_f64();
+            // A connection is seen up to a poll late, the next one at once.
+            let floor = want - ACCEPT_POLL.as_secs_f64();
+            assert!(gap >= floor, "gap {i} below {want} s: {gaps:?}");
+            if wait == *backoff.end() {
+                assert!(gap < want + SLACK, "gap {i} past the cap: {gaps:?}");
+            }
+            wait = (wait * 2).min(*backoff.end());
+        }
+        assert_eq!(wait, *backoff.end(), "never reached the cap: {gaps:?}");
     }
 
     #[test]
@@ -883,11 +1050,13 @@ mod tests {
         let mut p = fake.accept();
         p.start();
         agent.tick_at(1);
+        p.send(CtlMsg::Ping(1));
+        assert_eq!(p.recv(), AgentMsg::Pong(1));
         drop(p);
         let killed = Instant::now();
         let fake = fake.restart();
         let sock = fake.accept_tcp();
-        // Backoff restarts at 1 s after a session that completed its handshake.
+        // Backoff restarts at 1 s after a session the controller spoke in.
         assert!(
             killed.elapsed() < Duration::from_secs(5),
             "{:?}",
@@ -899,6 +1068,7 @@ mod tests {
         }
         assert!(agent.ticks.try_recv().is_err());
         let mut p = fake.handshake(sock).expect("the agent's handshake");
+        assert_eq!(p.agree(PROTOCOL), PROTOCOL);
         p.start();
         for n in 0..3 {
             assert_eq!(p.recv(), AgentMsg::Event(event(n)));
@@ -940,12 +1110,12 @@ mod tests {
     #[test]
     fn a_silent_controller_is_dropped_and_dialed_again() {
         let fake = Fake::new();
-        let _agent = Agent::spawn_with(&fake, Duration::from_secs(1), 0, blank);
+        let _agent = Agent::spawn_with(&fake, 0, |c| c.silence = Duration::from_secs(1), blank);
         let mut p = fake.accept();
         p.start();
         let started = Instant::now();
         let mut again = fake.accept();
-        // 1 s of silence, then the 1 s backoff after a completed handshake.
+        // 1 s of silence, then the first backoff, 1 s.
         let gone = secs(started, Instant::now());
         assert!((0.9..4.0).contains(&gone), "{gone}");
         again.start();
@@ -954,7 +1124,7 @@ mod tests {
     #[test]
     fn a_controller_that_pings_keeps_the_session() {
         let fake = Fake::new();
-        let _agent = Agent::spawn_with(&fake, Duration::from_secs(1), 0, blank);
+        let _agent = Agent::spawn_with(&fake, 0, |c| c.silence = Duration::from_secs(1), blank);
         let mut p = fake.accept();
         p.start();
         for n in 0..10 {
@@ -973,7 +1143,7 @@ mod tests {
     #[test]
     fn a_relay_that_fails_to_start_is_tried_again() {
         let fake = Fake::new();
-        let agent = Agent::spawn_with(&fake, SILENCE, 1, blank);
+        let agent = Agent::spawn_with(&fake, 1, |_| {}, blank);
         let mut p = fake.accept();
         p.start();
         agent.events.send(event(1)).unwrap();
@@ -983,6 +1153,59 @@ mod tests {
         let mut p = fake.accept();
         p.start();
         assert_eq!(p.recv(), AgentMsg::Event(event(1)));
+    }
+
+    /// A controller that takes each session and drops it at once, or after
+    /// its version frame, says nothing: each such dial backs off further.
+    #[test]
+    fn a_controller_that_drops_each_session_is_dialed_ever_more_slowly() {
+        let fake = Fake::new();
+        let _agent = Agent::spawn_with(&fake, 0, |c| c.backoff = QUICK, blank);
+        let at = dial_times(&fake, 8, |i, mut p| {
+            if i % 2 == 1 {
+                assert_eq!(p.agree(PROTOCOL), PROTOCOL);
+            }
+        });
+        assert_backs_off(&at, &QUICK);
+    }
+
+    #[test]
+    fn a_useful_session_resets_the_backoff() {
+        let backoff = Duration::from_millis(25)..=Duration::from_millis(1600);
+        let fake = Fake::new();
+        let _agent = Agent::spawn_with(&fake, 0, |c| c.backoff = backoff.clone(), blank);
+        let at = dial_times(&fake, 8, |_, p| drop(p));
+        assert_backs_off(&at, &backoff);
+        let mut p = fake.accept();
+        p.start();
+        p.send(CtlMsg::Ping(1));
+        assert_eq!(p.recv(), AgentMsg::Pong(1));
+        drop(p);
+        let ended = Instant::now();
+        let (_p, next) = fake.accept_tls();
+        // The 25 ms start, not the 1.6 s cap.
+        let gap = secs(ended, next);
+        assert!(gap < 0.8, "{gap}");
+    }
+
+    /// A newer controller, and one from before the version frame (whose first
+    /// frame is a message): the agent sends them nothing past its version
+    /// frame, and backs off as from a failed dial.
+    #[test]
+    fn a_controller_of_another_protocol_is_not_spoken_to() {
+        let fake = Fake::new();
+        let _agent = Agent::spawn_with(&fake, 0, |c| c.backoff = QUICK, blank);
+        let at = dial_times(&fake, 7, |i, mut p| {
+            if i % 2 == 0 {
+                assert_eq!(p.agree(PROTOCOL + 1), PROTOCOL);
+            } else {
+                p.send(CtlMsg::SetTick { secs: 2 });
+                let body = p.recv_body().expect("no version frame");
+                assert_eq!(version::decode(&body), PROTOCOL);
+            }
+            p.ends();
+        });
+        assert_backs_off(&at, &QUICK);
     }
 
     #[test]
