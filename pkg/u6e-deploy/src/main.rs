@@ -11,15 +11,15 @@
 //! its radios' configuration and the AP apply it, and exits 0 only when the
 //! AP applied exactly that configuration. `rollout` has the runner roll a
 //! kept image out to the AP, printing its log, and exits 0 only when the AP
-//! passed the health gate. `--stage-helper` is the root helper, serving the
-//! socket systemd passes it (see `stage`). The default
+//! passed the health gate. `--stage-helper` is the root helper, answering the
+//! one connection systemd passes it (see `stage`). The default
 //! configuration is /etc/u6e-deploy/config.toml.
 
 use std::fs;
 use std::future;
 use std::io::{self, Read};
 use std::os::fd::FromRawFd;
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 
 use u6e_deploy::config::Config;
@@ -141,8 +141,8 @@ fn rollout(config: &Config, ap: &str, image: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The root helper: the connections to the socket systemd passes it (the
-/// first descriptor past stderr, `LISTEN_FDS`), each from root or the
+/// The root helper: the one connection systemd accepted for it (`Accept=yes`,
+/// the first descriptor past stderr, `LISTEN_FDS`), from root or the
 /// configured group alone.
 fn stage_helper(config: Config) -> Result<(), String> {
     let etc_group = fs::read_to_string("/etc/group").unwrap_or_default();
@@ -152,8 +152,8 @@ fn stage_helper(config: Config) -> Result<(), String> {
     if !ours || std::env::var("LISTEN_FDS").ok().as_deref() != Some("1") {
         return Err("stage helper: not started by its socket".into());
     }
-    // SAFETY: systemd passes the listening socket as descriptor 3, which
+    // SAFETY: systemd passes the accepted connection as descriptor 3, which
     // nothing else here uses.
-    let listener = unsafe { UnixListener::from_raw_fd(3) };
-    stage::run(config, listener, gid).map_err(|e| format!("stage helper: {e}"))
+    let conn = unsafe { UnixStream::from_raw_fd(3) };
+    stage::serve_peer(&config, conn, gid).map_err(|e| format!("stage helper: {e}"))
 }

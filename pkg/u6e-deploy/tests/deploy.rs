@@ -1,7 +1,8 @@
 //! The runner against a controller in this process and fake APs, which
 //! judge every configuration as the agent does (`config::verify`, then
 //! `config::replayed` against the last one applied and the image's build
-//! time), and a stage helper on a socket of the test's own whose staging
+//! time; one with a radio marked `# refused` stands for one the AP finds
+//! wrong), and a stage helper on a socket of the test's own whose staging
 //! command logs what it is asked to stage.
 
 use std::fs;
@@ -158,11 +159,17 @@ impl Site {
             rt,
         };
         let config = site.runner_config(&site.socket, gate);
+        // The stage helper as systemd runs it: one per connection.
         let helper = std::os::unix::net::UnixListener::bind(&config.rollout.helper).unwrap();
         // SAFETY: getegid has no preconditions.
         let gid = unsafe { libc::getegid() };
-        let served = config.clone();
-        thread::spawn(move || stage::run(served, helper, gid));
+        let served = Arc::new(config.clone());
+        thread::spawn(move || {
+            for conn in helper.incoming() {
+                let served = Arc::clone(&served);
+                thread::spawn(move || stage::serve_peer(&served, conn.unwrap(), gid));
+            }
+        });
         site.start_runner(config, KEY_RUNNER);
         site
     }
@@ -422,6 +429,9 @@ fn fake_ap(
                 }),
                 CtlMsg::ApplyConfig(c) => {
                     let judged = config::verify(&runner, &hostname, &c).and_then(|()| {
+                        if c.radios.iter().any(|r| r.text.contains("# refused")) {
+                            return Err("a radio's file is wrong".into());
+                        }
                         config::replayed(c.seq, last, "the last applied", built_ms)
                             .map_or(Ok(()), Err)
                     });
@@ -478,6 +488,14 @@ fn radios() -> Vec<RadioConfig> {
     script::radios(SCRIPT).unwrap()
 }
 
+/// The rollouts the controller counts as ended with `outcome`. A caller
+/// hears the end once the result is on its way to the controller, which
+/// takes it in on its own time: tests wait for the count.
+fn ended(site: &Site, outcome: &str) -> Option<u64> {
+    let state = site.controller.state.read();
+    state.rollout_counts.get(outcome).copied()
+}
+
 fn up(site: &Site, ap: &str) -> bool {
     let state = site.controller.state.read();
     state.ap(ap).unwrap().snapshot.is_some()
@@ -524,6 +542,15 @@ fn configurations_are_signed_for_one_ap_and_never_replayed() {
     );
     // Sent again, it is a replay.
     assert!(config::replayed(first.seq, first.seq, "the last applied", built).is_some());
+
+    // One the AP refuses leaves it on the first, which stays the one to sign
+    // again.
+    let mut wrong = radios();
+    wrong[1].text.push_str("# refused\n");
+    let e = site
+        .block_on(local::apply(&site.socket, "ap1", wrong))
+        .unwrap_err();
+    assert_eq!(e, "ap1: refused: a radio's file is wrong");
 
     // A reboot onto the same image: back on the image's configuration, the
     // acknowledged one is signed again, newer.
@@ -630,13 +657,13 @@ fn a_rollout_that_passes_its_gate_is_done() {
     let lines = lines.lock().unwrap();
     assert_eq!(lines[0], "staging img-2-ap1 on ap1, as root (local) asked");
     assert!(lines.contains(&"staged".to_owned()), "{lines:?}");
+    wait_for("the result counted", || ended(&site, "done") == Some(1));
     let state = site.controller.state.read();
     let r = state.rollouts.back().unwrap();
     assert_eq!(
         (r.image_id.as_str(), r.previous.as_str()),
         ("img-2-ap1", "img-1-ap1")
     );
-    assert_eq!(state.rollout_counts.get("done"), Some(&1));
 }
 
 /// An AP that does not come back healthy in the gate's time, or whose
@@ -671,11 +698,55 @@ fn a_rollout_that_fails_its_gate_is_rolled_back() {
         .unwrap_err();
     assert_eq!(e, "refused: no image img-9-ap1 is kept");
     assert_eq!(site.staged().len(), 4);
-    let counts = site.controller.state.read().rollout_counts.clone();
-    assert_eq!(
-        (counts.get("rolled_back"), counts.get("refused")),
-        (Some(&2), Some(&1))
+    wait_for("the results counted", || {
+        (ended(&site, "rolled_back"), ended(&site, "refused")) == (Some(2), Some(1))
+    });
+}
+
+/// An AP that comes back during a rollout on another configuration than the
+/// one it acknowledged is not signed one while the rollout runs, and gets the
+/// acknowledged one again once the rollout is over: here, rolled back to the
+/// image it ran, which was built before that configuration was signed.
+#[test]
+fn an_ap_back_during_a_rollout_gets_its_configuration_after_it() {
+    let site = Site::new("after", Duration::from_secs(1));
+    wait_for("the runner", || site.runner_up());
+    let built = now_ms() - 60_000;
+    let ap1 = fake_ap(
+        &site,
+        KEY_AP1,
+        "u6e-ap1",
+        "img-1-ap1",
+        built,
+        image_config(1),
     );
+    wait_for("ap1", || up(&site, "ap1"));
+    site.block_on(local::apply(&site.socket, "ap1", radios()))
+        .unwrap();
+    let acked = ap1.seen.lock().unwrap().applied[0].sha256;
+
+    let socket = site.socket.clone();
+    let rollout = thread::spawn(move || {
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(local::rollout(&socket, "ap1", "img-slow-ap1", |_| {}))
+    });
+    wait_for("the slow staging", || site.staged().len() == 1);
+    // The AP reboots onto its image while the staging still runs.
+    drop(ap1);
+    let ap1 = fake_ap(
+        &site,
+        KEY_AP1,
+        "u6e-ap1",
+        "img-1-ap1",
+        built,
+        image_config(1),
+    );
+    let e = rollout.join().unwrap().unwrap_err();
+    assert!(e.starts_with("rolled back: no healthy gate"), "{e}");
+    wait_for("the acknowledged configuration again", || {
+        let seen = ap1.seen.lock().unwrap();
+        seen.applied.iter().any(|c| c.sha256 == acked)
+    });
 }
 
 /// One rollout at a time: another, of another AP, is refused while one runs.

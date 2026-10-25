@@ -7,14 +7,17 @@
 //! time in milliseconds (one past the last when the clock has not moved), so
 //! it is newer than every image built before it and than every configuration
 //! signed before it; the AP refuses any other (`config::replayed`). The last
-//! one signed for each AP is kept, in memory only (it holds the site's
-//! secrets), so that when the controller sees the AP come back running
-//! another than the one it acknowledged, the same one is signed again under a
-//! new sequence number (`Repush`): the old signature is a replay to the AP.
+//! one each AP applied is kept, in memory only (it holds the site's secrets),
+//! so that when the controller sees the AP come back running another than the
+//! one it acknowledged, the same one is signed again under a new sequence
+//! number (`Repush`): the old signature is a replay to the AP. One the AP
+//! refused is not kept, so it never stands in for the one the AP still runs.
 //!
 //! Rollouts run one at a time (`rollout`), whoever asked: the controller
 //! (an admin's Upgrade) or a local caller, whose ask goes through the
-//! controller so that every rollout is gated and shown the same way.
+//! controller so that every rollout is gated and shown the same way. The
+//! controller hands an ask back as a rollout of the same AP, image and user,
+//! which is how its caller finds the rollout to follow.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -38,12 +41,27 @@ use crate::stage::Helper;
 /// many, then drops log lines (never a result).
 pub const OUTBOX_CAP: usize = 1024;
 
-/// A configuration sent and not answered yet: whose the answer is.
+/// A configuration sent and not answered yet: the AP's host name, the
+/// radios (kept as its last once it applied them), and whose the answer is.
+struct Pending {
+    hostname: String,
+    radios: Vec<RadioConfig>,
+    waiting: Waiting,
+}
+
 enum Waiting {
     /// A local caller's.
     Local(oneshot::Sender<ConfigApplied>),
-    /// A re-push of the AP of this host name, which only the journal hears.
-    Repush(String),
+    /// A re-push's, which only the journal hears.
+    Repush,
+}
+
+/// A local caller's rollout, until the controller hands it back.
+struct Ask {
+    ap: String,
+    image_id: String,
+    user: String,
+    follower: mpsc::Sender<Reply>,
 }
 
 /// The rollout under way.
@@ -53,8 +71,8 @@ pub(crate) struct Current {
     pub image_id: String,
     /// The controller's gate verdict, once it came: healthy, and what it saw.
     pub gate: watch::Sender<Option<(bool, String)>>,
-    /// The local callers following it.
-    pub followers: Vec<mpsc::Sender<Reply>>,
+    /// The local caller following it, when one asked for it.
+    pub follower: Option<mpsc::Sender<Reply>>,
 }
 
 #[derive(Default)]
@@ -63,13 +81,13 @@ struct Inner {
     connected: bool,
     last_seq: u64,
     next_id: u64,
-    /// The last configuration signed for each AP, by host name.
+    /// The last configuration each AP applied, by host name.
     last: HashMap<String, Vec<RadioConfig>>,
-    applies: HashMap<u64, Waiting>,
+    applies: HashMap<u64, Pending>,
     rollout: Option<Current>,
-    /// Local callers waiting for the controller to hand their rollout of an
-    /// AP back, by AP.
-    asks: HashMap<String, Vec<mpsc::Sender<Reply>>>,
+    /// Local callers waiting for the controller to hand their rollout back,
+    /// oldest first.
+    asks: Vec<Ask>,
 }
 
 pub struct Runner {
@@ -141,8 +159,7 @@ impl Runner {
     }
 
     /// Signs `radios` for the AP of `hostname` under the next sequence
-    /// number, keeps them as its last, and sends them to the controller as
-    /// request `id`, whose answer goes to `waiting`.
+    /// number and sends them to the controller, the answer to `waiting`.
     fn send_signed(
         &self,
         inner: &mut Inner,
@@ -152,10 +169,14 @@ impl Runner {
     ) -> Result<(), String> {
         inner.last_seq = unix_ms().max(inner.last_seq + 1);
         let config = config::sign(&self.key, hostname, inner.last_seq, radios.clone());
-        inner.last.insert(hostname.to_owned(), radios);
         let id = Runner::next_id(inner);
         let (sha256, seq) = (config.sha256, config.seq);
-        inner.applies.insert(id, waiting);
+        let pending = Pending {
+            hostname: hostname.to_owned(),
+            radios,
+            waiting,
+        };
+        inner.applies.insert(id, pending);
         if self
             .outbox
             .try_send(RunnerMsg::ApplyConfig { id, config })
@@ -212,12 +233,19 @@ impl Runner {
         let ask = RunnerMsg::RolloutAsk {
             ap: ap.into(),
             image_id: image_id.into(),
-            user,
+            user: user.clone(),
         };
         self.outbox
             .try_send(ask)
             .map_err(|_| "the link to the controller is not keeping up".to_owned())?;
-        inner.asks.entry(ap.to_owned()).or_default().push(follower);
+        // A caller that stopped waiting follows nothing.
+        inner.asks.retain(|a| !a.follower.is_closed());
+        inner.asks.push(Ask {
+            ap: ap.into(),
+            image_id: image_id.into(),
+            user,
+            follower,
+        });
         Ok(())
     }
 
@@ -248,35 +276,47 @@ impl Runner {
     }
 
     fn applied(&self, id: u64, result: ConfigApplied) {
-        match self.lock().applies.remove(&id) {
-            Some(Waiting::Local(tx)) => {
+        let mut inner = self.lock();
+        let Some(Pending {
+            hostname,
+            radios,
+            waiting,
+        }) = inner.applies.remove(&id)
+        else {
+            return;
+        };
+        if result.ok && result.sha256 == config_sha256(&radios) {
+            inner.last.insert(hostname.clone(), radios);
+        }
+        match waiting {
+            Waiting::Local(tx) => {
                 let _ = tx.send(result);
             }
-            Some(Waiting::Repush(ap)) => {
+            Waiting::Repush => {
+                let ap = self.config.ap_of(&hostname).unwrap_or(&hostname);
                 let how = if result.ok { "applied" } else { "not applied" };
                 eprintln!(
                     "u6e-deploy: {ap}: the configuration signed again: {how}: {}",
                     result.detail
                 );
             }
-            None => {}
         }
     }
 
     /// The controller saw the AP of `hostname` come back running `installed`,
-    /// not `acked`: the last configuration signed for it is signed again, if
-    /// it is the acknowledged one.
+    /// not `acked`: the last configuration it applied is signed again, if it
+    /// is the acknowledged one.
     fn repush(&self, hostname: &str, acked: Option<[u8; 32]>, installed: Option<[u8; 32]>) {
         let mut inner = self.lock();
         let ap = self.config.ap_of(hostname).unwrap_or(hostname).to_owned();
         let skip = |why: String| eprintln!("u6e-deploy: {ap}: not signed again: {why}");
         let Some(radios) = inner.last.get(hostname) else {
-            return skip("nothing was signed for it since this runner started".into());
+            return skip("it applied nothing this runner signed since it started".into());
         };
         let sha256 = config_sha256(radios);
         if acked != Some(sha256) {
             return skip(format!(
-                "the last configuration signed for it ({}) is not the one it acknowledged",
+                "the last configuration it applied ({}) is not the one it acknowledged",
                 mac::hex(&sha256)
             ));
         }
@@ -292,8 +332,7 @@ impl Runner {
             installed.map_or_else(|| "none".into(), |h| mac::hex(&h)),
             mac::hex(&sha256),
         );
-        let waiting = Waiting::Repush(hostname.to_owned());
-        if let Err(why) = self.send_signed(&mut inner, hostname, radios, waiting) {
+        if let Err(why) = self.send_signed(&mut inner, hostname, radios, Waiting::Repush) {
             skip(why);
         }
     }
@@ -302,7 +341,11 @@ impl Runner {
     /// could not be rolled back, else run.
     fn start(self: &Arc<Self>, req: RolloutRequest) {
         let mut inner = self.lock();
-        let followers = inner.asks.remove(&req.ap).unwrap_or_default();
+        let asked = inner
+            .asks
+            .iter()
+            .position(|a| (&a.ap, &a.image_id, &a.user) == (&req.ap, &req.image_id, &req.user));
+        let follower = asked.map(|i| inner.asks.remove(i).follower);
         let refusal = if let Some(r) = &inner.rollout {
             Some(format!(
                 "the rollout of {} to {} is not over",
@@ -329,7 +372,7 @@ impl Runner {
             });
             eprintln!("u6e-deploy: {}: {} refused: {why}", req.ap, req.image_id);
             let _ = self.outbox.try_send(msg);
-            for f in followers {
+            if let Some(f) = follower {
                 let _ = f.try_send(Reply::Done {
                     ok: false,
                     detail: format!("refused: {why}"),
@@ -343,27 +386,29 @@ impl Runner {
             ap: req.ap.clone(),
             image_id: req.image_id.clone(),
             gate,
-            followers,
+            follower,
         });
         tokio::spawn(rollout::run(Arc::clone(self), req, gate_rx));
     }
 
     /// A line of the rollout under way's log: to the controller, its
-    /// followers and the journal. One a lagging link or follower cannot
-    /// take is dropped.
+    /// follower and the journal. One a lagging link or follower cannot take
+    /// is dropped.
     pub(crate) fn log(&self, id: u64, line: String) {
         let inner = self.lock();
         let Some(r) = inner.rollout.as_ref().filter(|r| r.id == id) else {
             return;
         };
         eprintln!("u6e-deploy: {}: {line}", r.ap);
-        for f in &r.followers {
+        if let Some(f) = &r.follower {
             let _ = f.try_send(Reply::Line(line.clone()));
         }
         let _ = self.outbox.try_send(RunnerMsg::RolloutLog { id, line });
     }
 
-    /// Ends the rollout under way: the controller and the followers hear how.
+    /// Ends the rollout under way: the controller hears how first, then the
+    /// follower, who may ask for the next rollout at once; that ask must not
+    /// reach the controller before this result.
     pub(crate) async fn finish(&self, id: u64, outcome: RolloutOutcome, detail: String) {
         let current = self.lock().rollout.take_if(|r| r.id == id);
         let Some(r) = current else {
@@ -376,15 +421,10 @@ impl Runner {
             RolloutOutcome::Refused => "refused",
         };
         eprintln!("u6e-deploy: {}: {}: {word}: {detail}", r.ap, r.image_id);
-        let ok = outcome == RolloutOutcome::Done;
-        for f in r.followers {
-            let _ = f
-                .send(Reply::Done {
-                    ok,
-                    detail: format!("{word}: {detail}"),
-                })
-                .await;
-        }
+        let done = Reply::Done {
+            ok: outcome == RolloutOutcome::Done,
+            detail: format!("{word}: {detail}"),
+        };
         let result = RunnerMsg::RolloutResult(RolloutResult {
             id,
             outcome,
@@ -392,5 +432,48 @@ impl Runner {
         });
         // The last word is never dropped: it waits for the link.
         let _ = self.outbox.send(result).await;
+        if let Some(f) = r.follower {
+            let _ = f.send(done).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aws_lc_rs::rand::SystemRandom;
+
+    use crate::config::tests::text;
+
+    /// Two callers' asks for one AP: each follows the rollout the controller
+    /// hands back for it, whichever comes first.
+    #[test]
+    fn each_caller_follows_the_rollout_it_asked_for() {
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let key = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let (runner, mut sent) = Runner::new(Config::parse(&text("")).unwrap(), key);
+        runner.set_connected(true);
+        let (first, mut first_rx) = mpsc::channel(8);
+        let (second, mut second_rx) = mpsc::channel(8);
+        let user = || "root (local)".to_owned();
+        runner.ask("ap1", "img-a-ap1", user(), first).unwrap();
+        runner.ask("ap1", "img-b-ap1", user(), second).unwrap();
+        assert!(matches!(sent.try_recv(), Ok(RunnerMsg::RolloutAsk { .. })));
+        // The second comes back first, and is refused (nothing to roll back
+        // to): only its caller hears it.
+        runner.handle(RunnerCtlMsg::Rollout(RolloutRequest {
+            id: 1,
+            ap: "ap1".into(),
+            image_id: "img-b-ap1".into(),
+            previous: String::new(),
+            user: user(),
+        }));
+        let refused = "refused: what ap1 runs is not known, so it could not be rolled back";
+        assert!(
+            matches!(second_rx.try_recv(), Ok(Reply::Done { ok: false, detail }) if detail == refused)
+        );
+        assert!(first_rx.try_recv().is_err());
+        assert_eq!(runner.lock().asks.len(), 1);
+        assert_eq!(runner.lock().asks[0].image_id, "img-a-ap1");
     }
 }

@@ -6,23 +6,28 @@
 //! else: a request names only an AP of the configuration and the image to
 //! stage there, one of the kept images named for that AP (`<images>/<id>/`
 //! with a `MANIFEST`, `<id>` ending in `-<ap>`), checked here again whatever
-//! the runner checked. systemd starts the helper on the first connection to
-//! a socket only root and the runner's group may open, and hands it that
-//! socket (`u6e-deploy --stage-helper`); the helper checks each peer too, and
-//! serves each connection, which carries one request, on a thread of its own.
+//! the runner checked. systemd starts one helper for each connection to a
+//! socket only root and the runner's group may open (`Accept=yes`) and hands
+//! it that connection (`u6e-deploy --stage-helper`); the helper checks its
+//! peer too and answers the connection's one request. So each request reads
+//! the configuration and runs the binary as they are now, and no root
+//! process outlives its request.
 //!
 //! `Check` answers whether an image could be staged; `Stage` streams the
-//! command's output, a line at a time, and then how it exited. A command
-//! once started runs to its end even if the runner goes away: an AP left
-//! between two systems is worse than a staging nobody watches.
+//! command's output, a line at a time, and then how it exited. One staging
+//! runs at a time, whoever asks: two APs rebooting at once is what the
+//! runner's one rollout at a time exists to prevent, so the root end holds to
+//! it too, by a lock on the kept images' directory held for as long as the
+//! command runs. A command once started runs to its end even if the runner
+//! goes away: an AP left between two systems is worse than a staging nobody
+//! watches.
 
+use std::fs::File;
 use std::io::{self, BufRead, BufReader, ErrorKind, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
-use std::thread;
 
 use serde::{Deserialize, Serialize};
 use u6e_proto::frame::{read_frame, write_frame};
@@ -79,6 +84,22 @@ fn argv(config: &Config, ap: &str, dir: &Path) -> Vec<String> {
     config.rollout.command.iter().map(fill).collect()
 }
 
+/// The kept images' directory, locked (`flock`) for one staging; None while
+/// another staging holds it. The lock goes with the file.
+pub fn lock(images: &Path) -> io::Result<Option<File>> {
+    let dir = File::open(images)?;
+    // SAFETY: flock on a descriptor `dir` owns and keeps open.
+    if unsafe { libc::flock(dir.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(Some(dir));
+    }
+    let e = io::Error::last_os_error();
+    if e.kind() == ErrorKind::WouldBlock {
+        Ok(None)
+    } else {
+        Err(e)
+    }
+}
+
 /// Answers the one request of a connection.
 pub fn serve(config: &Config, conn: &mut (impl io::Read + Write)) -> io::Result<()> {
     let req: Request = read_frame(conn)?;
@@ -92,6 +113,11 @@ pub fn serve(config: &Config, conn: &mut (impl io::Read + Write)) -> io::Result<
     if matches!(req, Request::Check { .. }) {
         return write_frame(conn, &Reply::Ok);
     }
+    // Held until the command exits, whether or not the runner still listens.
+    let Some(_staging) = lock(&config.rollout.images)? else {
+        let why = "another staging is under way".to_owned();
+        return write_frame(conn, &Reply::Refused(why));
+    };
     let argv = argv(config, ap, &dir);
     let (reader, writer) = io::pipe()?;
     let child = {
@@ -126,25 +152,12 @@ pub fn serve(config: &Config, conn: &mut (impl io::Read + Write)) -> io::Result<
     Ok(())
 }
 
-/// Serves the connections to `listener` for the life of the process, each
-/// from root or a process of group `gid` alone.
-pub fn run(config: Config, listener: UnixListener, gid: u32) -> io::Result<()> {
-    let config = Arc::new(config);
-    for conn in listener.incoming() {
-        let mut conn = conn?;
-        let config = Arc::clone(&config);
-        thread::spawn(move || {
-            let served = match peer(&conn) {
-                Ok((uid, g)) if crate::local::allowed(uid, g, gid) => serve(&config, &mut conn),
-                Ok((uid, _)) => Err(io::Error::other(format!("a caller of uid {uid} refused"))),
-                Err(e) => Err(e),
-            };
-            if let Err(e) = served {
-                eprintln!("u6e-deploy: stage helper: {e}");
-            }
-        });
+/// Answers `conn`, if its peer is root or a process of group `gid`.
+pub fn serve_peer(config: &Config, mut conn: UnixStream, gid: u32) -> io::Result<()> {
+    match peer(&conn)? {
+        (uid, g) if crate::local::allowed(uid, g, gid) => serve(config, &mut conn),
+        (uid, _) => Err(io::Error::other(format!("a caller of uid {uid} refused"))),
     }
-    Ok(())
 }
 
 /// The uid and gid of the process at the other end of `conn`.
@@ -250,7 +263,9 @@ impl Helper {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use std::fs;
+    use std::os::unix::net::UnixListener;
+    use std::sync::Arc;
+    use std::{fs, thread};
 
     use crate::config::tests::text;
     use crate::tests::TestDir;
@@ -275,12 +290,19 @@ pub(crate) mod tests {
         c
     }
 
-    /// The helper on its socket, serving root and the test's own group.
+    /// The helper on its socket as systemd runs it, one per connection,
+    /// serving root and the test's own group.
     pub fn listen(config: Config) {
         let listener = UnixListener::bind(&config.rollout.helper).unwrap();
         // SAFETY: getegid has no preconditions.
         let gid = unsafe { libc::getegid() };
-        thread::spawn(move || run(config, listener, gid));
+        let config = Arc::new(config);
+        thread::spawn(move || {
+            for conn in listener.incoming() {
+                let config = Arc::clone(&config);
+                thread::spawn(move || serve_peer(&config, conn.unwrap(), gid));
+            }
+        });
     }
 
     fn ask(c: &Config, req: Request) -> Vec<Reply> {
@@ -360,6 +382,49 @@ pub(crate) mod tests {
                 Reply::Exit(3),
             ]
         );
+    }
+
+    /// While one staging runs, another is refused before anything runs; a
+    /// check is still answered.
+    #[test]
+    fn one_staging_at_a_time() {
+        let t = TestDir::new();
+        let c = config(t.path(), &[IMG], "echo ran >> \"${1%/images/*}/ran\"");
+        // Another helper's staging: a process of its own, as each helper is.
+        // A lock taken in this one could outlive its drop in a child another
+        // test forks meanwhile, which shares the open file until it execs.
+        // --no-fork: the shell, and then sleep, hold the lock flock(1) took.
+        let mut held = Command::new("flock")
+            .arg("--no-fork")
+            .arg(&c.rollout.images)
+            .args(["-c", "echo locked; exec sleep 60"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut locked = String::new();
+        BufReader::new(held.stdout.take().unwrap())
+            .read_line(&mut locked)
+            .unwrap();
+        assert_eq!(locked, "locked\n");
+        assert!(lock(&c.rollout.images).unwrap().is_none());
+        let req = |stage: bool| {
+            let (ap, image) = ("ap1".into(), IMG.into());
+            if stage {
+                Request::Stage { ap, image }
+            } else {
+                Request::Check { ap, image }
+            }
+        };
+        assert_eq!(
+            ask(&c, req(true)),
+            [Reply::Refused("another staging is under way".into())]
+        );
+        assert_eq!(ask(&c, req(false)), [Reply::Ok]);
+        assert!(!t.path().join("ran").exists());
+        held.kill().unwrap();
+        held.wait().unwrap();
+        assert_eq!(ask(&c, req(true)), [Reply::Ok, Reply::Exit(0)]);
+        assert!(t.path().join("ran").exists());
     }
 
     #[test]
