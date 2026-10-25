@@ -5,10 +5,8 @@
 //! and picks up BSSs that appear, so nothing has to restart it.
 
 use std::collections::{BTreeMap, HashMap};
-use std::fs;
 use std::io;
 use std::os::fd::AsRawFd;
-use std::path::Path;
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -160,12 +158,12 @@ fn run(tx: &SyncSender<Event>, paths: &Paths) {
                         retry.remove(name);
                         // It may have come up before the attachment: its
                         // radio's next event is news either way.
-                        radios.remove(&phy_of(&paths.sys(), name));
+                        radios.remove(&collect::phy_of(&paths.sys(), name));
                     }
                     continue;
                 }
                 let msg = String::from_utf8_lossy(&buf[..n]);
-                events.extend(parse(&msg, bss, || phy_of(&paths.sys(), name)));
+                events.extend(parse(&msg, bss, || collect::phy_of(&paths.sys(), name)));
             }
         }
         events.retain(|kind| changes_radio(&mut radios, kind));
@@ -205,14 +203,6 @@ fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
-}
-
-/// The phy an interface belongs to, from sysfs.
-fn phy_of(sys: &Path, ifname: &str) -> String {
-    fs::read_link(sys.join("class/net").join(ifname).join("phy80211"))
-        .ok()
-        .and_then(|l| Some(l.file_name()?.to_string_lossy().into_owned()))
-        .unwrap_or_default()
 }
 
 fn mac(s: &str) -> Option<[u8; 6]> {
@@ -267,9 +257,10 @@ fn parse(msg: &str, bss: u16, phy: impl FnOnce() -> String) -> Option<EventKind>
 mod tests {
     use super::*;
     use crate::testdir::TestDir;
+    use std::fs;
     use std::os::unix::fs::symlink;
     use std::os::unix::net::UnixDatagram;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::mpsc::sync_channel;
 
     const STA: [u8; 6] = [2, 0, 0, 0, 0, 8];

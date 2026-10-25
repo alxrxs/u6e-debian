@@ -149,7 +149,7 @@ fn run(dir: &Path) -> std::io::Result<()> {
             if !radios.contains(&i.wiphy) {
                 radios.push(i.wiphy);
                 let survey = nl.dump_survey(i.ifindex)?;
-                fs::write(dir.join(format!("survey-{}.bin", i.phy())), survey)?;
+                fs::write(dir.join(format!("survey-wiphy{}.bin", i.wiphy)), survey)?;
             }
         }
     }

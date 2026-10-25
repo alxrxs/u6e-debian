@@ -107,13 +107,6 @@ pub struct Iface {
     pub txpower_mbm: i32,
 }
 
-impl Iface {
-    /// The wiphy's name in sysfs.
-    pub fn phy(&self) -> String {
-        format!("phy{}", self.wiphy)
-    }
-}
-
 /// One channel of a survey dump; the one in use carries the busy times.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Survey {
@@ -671,9 +664,9 @@ mod tests {
     const INTERFACES: &[u8] = include_bytes!("../tests/fixtures/interfaces.bin");
     const STATIONS: &[u8] = include_bytes!("../tests/fixtures/station-wlan5.42.bin");
     const NO_STATIONS: &[u8] = include_bytes!("../tests/fixtures/station-wlan5.bin");
-    const SURVEY_24: &[u8] = include_bytes!("../tests/fixtures/survey-phy0.bin");
-    const SURVEY_5: &[u8] = include_bytes!("../tests/fixtures/survey-phy1.bin");
-    const SURVEY_6: &[u8] = include_bytes!("../tests/fixtures/survey-phy2.bin");
+    const SURVEY_24: &[u8] = include_bytes!("../tests/fixtures/survey-wiphy0.bin");
+    const SURVEY_5: &[u8] = include_bytes!("../tests/fixtures/survey-wiphy1.bin");
+    const SURVEY_6: &[u8] = include_bytes!("../tests/fixtures/survey-wiphy2.bin");
 
     fn iface<'a>(all: &'a [Iface], name: &str) -> &'a Iface {
         all.iter().find(|i| i.name == name).unwrap()
@@ -695,13 +688,8 @@ mod tests {
             (9, 1, IFTYPE_AP, [2, 0, 0, 0, 0, 5], "ssid-a")
         );
         assert_eq!(
-            (
-                wlan5.freq_mhz,
-                wlan5.width_mhz,
-                wlan5.txpower_mbm,
-                wlan5.phy().as_str()
-            ),
-            (5745, 80, 2300, "phy1")
+            (wlan5.freq_mhz, wlan5.width_mhz, wlan5.txpower_mbm),
+            (5745, 80, 2300)
         );
         let vlan = iface(&all, "wlan5.42");
         assert_eq!((vlan.kind, vlan.ssid.as_str()), (IFTYPE_AP_VLAN, ""));

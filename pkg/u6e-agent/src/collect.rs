@@ -437,6 +437,17 @@ fn vlan_of(sys: &Path, ifname: &str) -> u16 {
         .unwrap_or(0)
 }
 
+/// The name of the wiphy an interface belongs to, from sysfs; empty for none.
+/// Never derived from the wiphy's number: the kernel numbers radios in the
+/// order they probe, which can change between boots, so the image names each
+/// one by the device it sits on.
+pub fn phy_of(sys: &Path, ifname: &str) -> String {
+    fs::read_link(sys.join("class/net").join(ifname).join("phy80211"))
+        .ok()
+        .and_then(|l| Some(l.file_name()?.to_string_lossy().into_owned()))
+        .unwrap_or_default()
+}
+
 /// One BSS per name in `order`; an interface nl80211 does not list (hostapd
 /// not yet through starting it) keeps its place, empty, so indices hold.
 fn bsss(sys: &Path, order: &[String], ifaces: &[Iface]) -> Vec<Bss> {
@@ -450,7 +461,7 @@ fn bsss(sys: &Path, order: &[String], ifaces: &[Iface]) -> Vec<Bss> {
                 ifname: name.clone(),
                 bssid: iface.map_or([0; 6], |i| i.mac),
                 ssid: iface.map_or_else(String::new, |i| i.ssid.clone()),
-                phy: iface.map_or_else(String::new, Iface::phy),
+                phy: iface.map_or_else(String::new, |_| phy_of(sys, name)),
                 vlan: vlan_of(sys, name),
             }
         })
@@ -578,9 +589,9 @@ mod tests {
     const INTERFACES: &[u8] = include_bytes!("../tests/fixtures/interfaces.bin");
     const STATIONS: &[u8] = include_bytes!("../tests/fixtures/station-wlan5.42.bin");
     const SURVEYS: [&[u8]; 3] = [
-        include_bytes!("../tests/fixtures/survey-phy0.bin"),
-        include_bytes!("../tests/fixtures/survey-phy1.bin"),
-        include_bytes!("../tests/fixtures/survey-phy2.bin"),
+        include_bytes!("../tests/fixtures/survey-wiphy0.bin"),
+        include_bytes!("../tests/fixtures/survey-wiphy1.bin"),
+        include_bytes!("../tests/fixtures/survey-wiphy2.bin"),
     ];
     const STATUS: &str = include_str!("../tests/fixtures/status-wlan5.txt");
 
@@ -596,9 +607,8 @@ mod tests {
     /// dynamic VLAN 43 ones.
     fn sys(t: &TestDir) -> PathBuf {
         let sys = t.path().join("sys");
+        link_radios(&sys);
         for i in nl80211::parse_interfaces(INTERFACES) {
-            let dir = sys.join("class/net").join(&i.name);
-            fs::create_dir_all(&dir).unwrap();
             let bridge = if i.name.ends_with(".43") {
                 "br43"
             } else {
@@ -606,12 +616,23 @@ mod tests {
             };
             symlink(
                 format!("../../../../virtual/net/{bridge}"),
-                dir.join("master"),
+                sys.join("class/net").join(&i.name).join("master"),
             )
             .unwrap();
         }
         fs::create_dir_all(sys.join("class/net/eth0")).unwrap();
         sys
+    }
+
+    /// Every interface of the fixture linked to its radio's wiphy, which
+    /// the image names after the band (`wlan5-1` is on `radio5`).
+    fn link_radios(sys: &Path) {
+        for i in nl80211::parse_interfaces(INTERFACES) {
+            let dir = sys.join("class/net").join(&i.name);
+            fs::create_dir_all(&dir).unwrap();
+            let band = i.name["wlan".len()..].split(['-', '.']).next().unwrap();
+            symlink(format!("../../ieee80211/radio{band}"), dir.join("phy80211")).unwrap();
+        }
     }
 
     #[test]
@@ -640,16 +661,65 @@ mod tests {
                 b.phy.as_str(),
                 b.vlan
             ),
-            ("wlan5", [2, 0, 0, 0, 0, 5], "ssid-a", "phy1", 42)
+            ("wlan5", [2, 0, 0, 0, 0, 5], "ssid-a", "radio5", 42)
         );
         assert_eq!(
             (all[0].ssid.as_str(), all[0].phy.as_str()),
-            ("ssid-b", "phy0")
+            ("ssid-b", "radio24")
         );
         assert_eq!(
             (all[6].ssid.as_str(), all[6].phy.as_str()),
-            ("ssid-c", "phy2")
+            ("ssid-c", "radio6")
         );
+    }
+
+    /// The kernel numbers the wiphys in the order the radios probe, and the
+    /// two PCI radios can swap from one boot to the next: a radio's name, so
+    /// its history, is its wiphy's, whatever number the kernel gave it.
+    #[test]
+    fn a_radio_keeps_its_name_whatever_order_the_radios_probe_in() {
+        let devices = [
+            ("radio24", "platform/soc@0/c000000.wifi"),
+            (
+                "radio5",
+                "platform/soc@0/a0000000.pcie/pci0000:00/0000:00:00.0/0000:01:00.0",
+            ),
+            (
+                "radio6",
+                "platform/soc@0/80000000.pcie/pci0001:00/0001:00:00.0/0001:01:00.0",
+            ),
+        ];
+        let boot = |numbers: [u32; 3]| {
+            let t = TestDir::new();
+            let sys = sys(&t);
+            for ((name, device), n) in devices.iter().zip(numbers) {
+                let dir = sys.join("class/ieee80211").join(name);
+                fs::create_dir_all(&dir).unwrap();
+                fs::write(dir.join("index"), format!("{n}\n")).unwrap();
+                symlink(format!("../../../devices/{device}"), dir.join("device")).unwrap();
+            }
+            let mut ifaces = nl80211::parse_interfaces(INTERFACES);
+            for i in &mut ifaces {
+                let radio = phy_of(&sys, &i.name);
+                i.wiphy = numbers[devices.iter().position(|d| d.0 == radio).unwrap()];
+            }
+            let all = radios(
+                &bsss(&sys, &order(), &ifaces),
+                &ifaces,
+                |_| Vec::new(),
+                |_| true,
+            );
+            all.into_iter()
+                .map(|r| (r.phy, r.band, r.channel))
+                .collect::<Vec<_>>()
+        };
+        let want = [
+            ("radio24".to_owned(), Band::B24, 13),
+            ("radio5".to_owned(), Band::B5, 149),
+            ("radio6".to_owned(), Band::B6, 85),
+        ];
+        assert_eq!(boot([0, 1, 2]), want);
+        assert_eq!(boot([0, 2, 1]), want);
     }
 
     #[test]
@@ -727,11 +797,11 @@ mod tests {
         let all = radios(&all_bsss, &ifaces, survey, enabled);
         assert_eq!(asked, ["wlan24", "wlan5", "wlan6"]);
         let phys: Vec<_> = all.iter().map(|r| r.phy.as_str()).collect();
-        assert_eq!(phys, ["phy0", "phy1", "phy2"]);
+        assert_eq!(phys, ["radio24", "radio5", "radio6"]);
         assert_eq!(
             all[1],
             Radio {
-                phy: "phy1".into(),
+                phy: "radio5".into(),
                 band: Band::B5,
                 channel: 149,
                 width_mhz: 80,
@@ -784,7 +854,7 @@ mod tests {
         let all = radios(&all_bsss, &ifaces, |_| Vec::new(), |_| true);
         assert_eq!(
             (all[1].phy.as_str(), all[1].band, all[1].channel),
-            ("phy1", Band::B5, 149)
+            ("radio5", Band::B5, 149)
         );
     }
 
@@ -857,6 +927,7 @@ mod tests {
             run,
         };
         answering_hostapds(&paths.hostapd, &ORDER);
+        link_radios(&paths.sys());
         let mut c = Collector::with_paths(paths.clone());
         c.ifaces.store(
             nl80211::parse_interfaces(INTERFACES),
@@ -873,9 +944,9 @@ mod tests {
         assert_eq!(
             state(&snap),
             [
-                ("phy0".into(), Band::B24, 13, true),
-                ("phy1".into(), Band::B5, 149, true),
-                ("phy2".into(), Band::B6, 85, true),
+                ("radio24".into(), Band::B24, 13, true),
+                ("radio5".into(), Band::B5, 149, true),
+                ("radio6".into(), Band::B6, 85, true),
             ]
         );
 
@@ -883,9 +954,9 @@ mod tests {
             fs::remove_file(paths.hostapd.join(bss)).unwrap();
         }
         let snap = c.snapshot(2);
-        assert_eq!(state(&snap)[2], ("phy2".into(), Band::B6, 0, false));
+        assert_eq!(state(&snap)[2], ("radio6".into(), Band::B6, 0, false));
         assert!(snap.radios[..2].iter().all(|r| r.up));
-        assert!(snap.bsss.iter().all(|b| b.phy != "phy2"));
+        assert!(snap.bsss.iter().all(|b| b.phy != "radio6"));
 
         for bss in ORDER {
             let _ = fs::remove_file(paths.hostapd.join(bss));
@@ -894,9 +965,9 @@ mod tests {
         assert_eq!(
             state(&snap),
             [
-                ("phy0".into(), Band::B24, 0, false),
-                ("phy1".into(), Band::B5, 0, false),
-                ("phy2".into(), Band::B6, 0, false),
+                ("radio24".into(), Band::B24, 0, false),
+                ("radio5".into(), Band::B5, 0, false),
+                ("radio6".into(), Band::B6, 0, false),
             ]
         );
         assert!(snap.bsss.is_empty() && snap.stations.is_empty());
