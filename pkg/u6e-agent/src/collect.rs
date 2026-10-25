@@ -2,7 +2,9 @@
 //! survey, hostapd for whether a radio is up, sysfs and procfs for the rest.
 //! A source that is missing or odd reads as zeros and empty lists; collecting
 //! never fails. Station rates go through `rates`, which keeps a client's
-//! HT/VHT/HE rate over the legacy samples between its data frames.
+//! HT/VHT/HE rate over the legacy samples between its data frames. A radio
+//! seen once stays in every snapshot, down while its BSSs are gone, so a
+//! hostapd that exits reads as radios down rather than as no radios.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -169,6 +171,8 @@ pub struct Collector {
     crashes: u64,
     /// Whether each BSS's radio was up at the last answer.
     up: HashMap<String, bool>,
+    /// Every radio seen since the agent started, by phy, as last seen.
+    seen: BTreeMap<String, Radio>,
     rates: RateHold,
 }
 
@@ -189,6 +193,7 @@ impl Collector {
             paths,
             crashes,
             up: HashMap::new(),
+            seen: BTreeMap::new(),
             rates: RateHold::default(),
         }
     }
@@ -275,6 +280,7 @@ impl Collector {
             },
         );
         self.up.retain(|bss, _| order.contains(bss));
+        let radios = with_gone(&mut self.seen, radios);
         let root = &self.paths.root;
         Snapshot {
             seq,
@@ -513,6 +519,31 @@ fn radios(
         .collect()
 }
 
+/// The radios of this snapshot and, down, every one seen before that has no
+/// BSS now: hostapd exited, or the driver took its interfaces away.
+fn with_gone(seen: &mut BTreeMap<String, Radio>, live: Vec<Radio>) -> Vec<Radio> {
+    let mut all: BTreeMap<String, Radio> =
+        seen.iter().map(|(phy, r)| (phy.clone(), gone(r))).collect();
+    for r in live {
+        seen.insert(r.phy.clone(), r.clone());
+        all.insert(r.phy.clone(), r);
+    }
+    all.into_values().collect()
+}
+
+/// A radio without a BSS: on no channel, its band kept so its series stay
+/// one, and its survey times held so the counters never step back.
+fn gone(r: &Radio) -> Radio {
+    Radio {
+        channel: 0,
+        width_mhz: 0,
+        txpower_mbm: 0,
+        noise_dbm: 0,
+        up: false,
+        ..r.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -745,6 +776,106 @@ mod tests {
                 .all(|r| r.noise_dbm == 0 && r.active_ms == 0 && !r.up)
         );
         assert!(radios(&[], &ifaces, |_| Vec::new(), |_| true).is_empty());
+    }
+
+    #[test]
+    fn a_radio_without_a_bss_stays_down_on_no_channel() {
+        let mut seen = BTreeMap::new();
+        let live = |phys: &[&str]| phys.iter().map(|p| radio(p)).collect::<Vec<_>>();
+        let mut busy = radio("phy1");
+        busy.busy_ms = 9_000;
+        assert_eq!(with_gone(&mut seen, vec![radio("phy0"), busy]).len(), 2);
+        let all = with_gone(&mut seen, live(&["phy0"]));
+        assert_eq!(all[0], radio("phy0"));
+        assert_eq!(
+            all[1],
+            Radio {
+                channel: 0,
+                width_mhz: 0,
+                up: false,
+                busy_ms: 9_000,
+                ..radio("phy1")
+            }
+        );
+        let none = with_gone(&mut seen, Vec::new());
+        assert!(none.iter().all(|r| !r.up && r.channel == 0));
+        assert_eq!(none.len(), 2);
+        assert_eq!(with_gone(&mut seen, live(&["phy1"]))[1], radio("phy1"));
+    }
+
+    /// hostapds that answer STATUS at each of `names` in `dir`, enabled.
+    fn answering_hostapds(dir: &Path, names: &[&str]) {
+        fs::create_dir_all(dir).unwrap();
+        for name in names {
+            let server = UnixDatagram::bind(dir.join(name)).unwrap();
+            std::thread::spawn(move || {
+                let mut buf = [0; 64];
+                while let Ok((_, from)) = server.recv_from(&mut buf) {
+                    if let Some(p) = from.as_pathname() {
+                        let _ = server.send_to(b"state=ENABLED\n", p);
+                    }
+                }
+            });
+        }
+    }
+
+    /// hostapd exiting unlinks its control sockets: the radios stay, down,
+    /// with no BSS and no station.
+    #[test]
+    fn a_radio_whose_hostapd_exits_reads_as_down() {
+        let t = TestDir::new();
+        let run = t.path().join("run");
+        fs::create_dir_all(&run).unwrap();
+        let paths = Paths {
+            root: t.path().join("root"),
+            hostapd: t.path().join("hostapd"),
+            kmsg: t.path().join("kmsg"),
+            run,
+        };
+        answering_hostapds(&paths.hostapd, &ORDER);
+        let mut c = Collector::with_paths(paths.clone());
+        c.ifaces.store(
+            nl80211::parse_interfaces(INTERFACES),
+            order(),
+            Instant::now(),
+        );
+        let state = |s: &Snapshot| {
+            s.radios
+                .iter()
+                .map(|r| (r.phy.clone(), r.band, r.channel, r.up))
+                .collect::<Vec<_>>()
+        };
+        let snap = c.snapshot(1);
+        assert_eq!(
+            state(&snap),
+            [
+                ("phy0".into(), Band::B24, 13, true),
+                ("phy1".into(), Band::B5, 149, true),
+                ("phy2".into(), Band::B6, 85, true),
+            ]
+        );
+
+        for bss in ["wlan6", "wlan6-1"] {
+            fs::remove_file(paths.hostapd.join(bss)).unwrap();
+        }
+        let snap = c.snapshot(2);
+        assert_eq!(state(&snap)[2], ("phy2".into(), Band::B6, 0, false));
+        assert!(snap.radios[..2].iter().all(|r| r.up));
+        assert!(snap.bsss.iter().all(|b| b.phy != "phy2"));
+
+        for bss in ORDER {
+            let _ = fs::remove_file(paths.hostapd.join(bss));
+        }
+        let snap = c.snapshot(3);
+        assert_eq!(
+            state(&snap),
+            [
+                ("phy0".into(), Band::B24, 0, false),
+                ("phy1".into(), Band::B5, 0, false),
+                ("phy2".into(), Band::B6, 0, false),
+            ]
+        );
+        assert!(snap.bsss.is_empty() && snap.stations.is_empty());
     }
 
     #[test]
