@@ -1,33 +1,38 @@
 //! The stage helper: the root end that stages a kept image on an AP for the
 //! runner, which runs as its own user and may not. Staging needs what the
 //! site's build host holds for it (the APs' root login, the stock firmware's
-//! password, the build tree), so the helper runs the site's command for it
-//! (`rollout.command` in the configuration, which root owns) and nothing
-//! else: a request names only an AP of the configuration and the image to
-//! stage there, one of the kept images named for that AP (`<images>/<id>/`
-//! with a `MANIFEST`, `<id>` ending in `-<ap>`), checked here again whatever
-//! the runner checked. systemd starts one helper for each connection to a
-//! socket only root and the runner's group may open (`Accept=yes`) and hands
-//! it that connection (`u6e-deploy --stage-helper`); the helper checks its
-//! peer too and answers the connection's one request. So each request reads
-//! the configuration and runs the binary as they are now, and no root
-//! process outlives its request.
+//! password), so the helper runs u6e-debian's own `boot/stage.sh` for it and
+//! nothing else, from a tree root owns (`rollout.tree`: its `boot/`,
+//! `site.conf` and `log/`), which it refuses to run unless no one but root
+//! could have written it. A request names only an AP of the configuration
+//! and the image to stage there, one of the kept images whose `MANIFEST`
+//! names that AP (`<images>/<id>/`), checked here again whatever the runner
+//! checked. systemd starts one helper for each connection to a socket only
+//! root and the runner's group may open (`Accept=yes`) and hands it that
+//! connection (`u6e-deploy --stage-helper`); the helper checks its peer too
+//! and answers the connection's one request. So each request reads the
+//! configuration and runs the binary as they are now, and no root process
+//! outlives its request.
 //!
-//! `Check` answers whether an image could be staged; `Stage` streams the
-//! command's output, a line at a time, and then how it exited. One staging
-//! runs at a time, whoever asks: two APs rebooting at once is what the
-//! runner's one rollout at a time exists to prevent, so the root end holds to
-//! it too, by a lock on the kept images' directory held for as long as the
-//! command runs. A command once started runs to its end even if the runner
+//! `Check` answers whether an image could be staged, `Newest` names an AP's
+//! newest kept image (by its name, which starts with its build time), and
+//! `Stage` streams the command's output, a line at a time, and then how it
+//! exited. One staging runs at a time, whoever asks: two APs rebooting at
+//! once is what the runner's one rollout at a time exists to prevent, so the
+//! root end holds to it too, by a lock on the kept images' directory held
+//! for as long as the command runs (the site's own image deploys take the
+//! same lock). A command once started runs to its end even if the runner
 //! goes away: an AP left between two systems is worse than a staging nobody
 //! watches.
 
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, ErrorKind, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use u6e_proto::frame::{read_frame, write_frame};
@@ -37,6 +42,10 @@ use crate::frames;
 
 /// The longest output line passed on; a longer one is cut.
 const LINE_MAX: usize = 1000;
+/// How long a caller may take to send its request.
+const REQUEST_WAIT: Duration = Duration::from_secs(10);
+/// Why a staging is refused while another runs.
+pub const BUSY: &str = "another staging is under way";
 
 /// What the runner asks of the helper.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +54,8 @@ pub enum Request {
     Check { ap: String, image: String },
     /// Stage `image` on `ap`.
     Stage { ap: String, image: String },
+    /// The newest kept image of `ap`.
+    Newest { ap: String },
 }
 
 /// What the helper answers, in order.
@@ -58,6 +69,22 @@ pub enum Reply {
     Line(String),
     /// How the command exited: its status, -1 when a signal ended it.
     Exit(i32),
+    /// The answer to `Newest`.
+    Image(String),
+}
+
+/// Whether `image` could name a kept image: one path component of letters,
+/// digits, `.`, `_` and `-`, not starting with a dot.
+fn image_name(image: &str) -> bool {
+    let ok = |c: char| c.is_ascii_alphanumeric() || "._-".contains(c);
+    (1..=128).contains(&image.len()) && !image.starts_with('.') && image.chars().all(ok)
+}
+
+/// The AP an image's `MANIFEST` names: the first word of its `ap:` line.
+fn manifest_ap(dir: &Path) -> Option<String> {
+    let text = fs::read_to_string(dir.join("MANIFEST")).ok()?;
+    let line = text.lines().find_map(|l| l.strip_prefix("ap:"))?;
+    line.split_whitespace().next().map(str::to_owned)
 }
 
 /// Whether `image` names a kept image of `ap`: its directory, or why not.
@@ -65,23 +92,78 @@ pub fn kept(config: &Config, ap: &str, image: &str) -> Result<PathBuf, String> {
     if !config.aps.contains_key(ap) {
         return Err(format!("no AP {ap:.64} in the configuration"));
     }
-    let ok = |c: char| c.is_ascii_alphanumeric() || "._-".contains(c);
-    let named = image.len() <= 128 && !image.starts_with('.') && image.chars().all(ok);
-    if !named || !image.ends_with(&format!("-{ap}")) {
-        return Err(format!("{image:.128} is not an image's name for {ap}"));
+    if !image_name(image) {
+        return Err(format!("{image:.128} is not an image's name"));
     }
     let dir = config.rollout.images.join(image);
-    if !dir.join("MANIFEST").is_file() {
-        return Err(format!("no image {image} is kept"));
+    match manifest_ap(&dir) {
+        None => Err(format!("no image {image} is kept")),
+        Some(of) if of == ap => Ok(dir),
+        Some(of) => Err(format!("{image} is {of:.64}'s image, not {ap}'s")),
     }
-    Ok(dir)
 }
 
-/// The command that stages the image in `dir` on `ap`.
-fn argv(config: &Config, ap: &str, dir: &Path) -> Vec<String> {
-    let dir = dir.display().to_string();
-    let fill = |a: &String| a.replace("{ap}", ap).replace("{image}", &dir);
-    config.rollout.command.iter().map(fill).collect()
+/// The newest kept image of `ap`, by name.
+pub fn newest(config: &Config, ap: &str) -> Result<String, String> {
+    if !config.aps.contains_key(ap) {
+        return Err(format!("no AP {ap:.64} in the configuration"));
+    }
+    let dir = &config.rollout.images;
+    let entries = fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let names = entries.filter_map(|e| e.ok()?.file_name().into_string().ok());
+    let mine = names.filter(|n| image_name(n) && manifest_ap(&dir.join(n)).as_deref() == Some(ap));
+    mine.max()
+        .ok_or_else(|| format!("no image of {ap} is kept"))
+}
+
+/// Why the staging tree could have been written by another than root (the
+/// helper's own user): an entry of `boot/`, `boot/` itself, `site.conf` or
+/// the tree owned by another, writable by its group or by anyone, or a
+/// symbolic link; an ancestor of the tree owned by another, or writable by
+/// others without the sticky bit. Root runs these files.
+fn untrusted(tree: &Path) -> Option<String> {
+    // SAFETY: geteuid has no preconditions.
+    let me = unsafe { libc::geteuid() };
+    let owned = |p: &Path, md: &fs::Metadata| -> Option<String> {
+        if md.file_type().is_symlink() {
+            return Some(format!("{} is a symbolic link", p.display()));
+        }
+        if md.uid() != me {
+            return Some(format!("{} is not root's", p.display()));
+        }
+        (md.permissions().mode() & 0o022 != 0)
+            .then(|| format!("{} is writable by others than root", p.display()))
+    };
+    let boot = tree.join("boot");
+    let mut paths = vec![tree.to_owned(), boot.clone(), tree.join("site.conf")];
+    match fs::read_dir(&boot) {
+        Ok(entries) => paths.extend(entries.filter_map(|e| Some(e.ok()?.path()))),
+        Err(e) => return Some(format!("{}: {e}", boot.display())),
+    }
+    for p in &paths {
+        match fs::symlink_metadata(p) {
+            Ok(md) => {
+                if let Some(why) = owned(p, &md) {
+                    return Some(why);
+                }
+            }
+            Err(e) => return Some(format!("{}: {e}", p.display())),
+        }
+    }
+    for dir in tree.ancestors().skip(1) {
+        let md = match fs::metadata(dir) {
+            Ok(md) => md,
+            Err(e) => return Some(format!("{}: {e}", dir.display())),
+        };
+        let mode = md.permissions().mode();
+        if (md.uid() != 0 && md.uid() != me) || (mode & 0o022 != 0 && mode & 0o1000 == 0) {
+            return Some(format!(
+                "{} could be written by others than root",
+                dir.display()
+            ));
+        }
+    }
+    None
 }
 
 /// The kept images' directory, locked (`flock`) for one staging; None while
@@ -103,7 +185,13 @@ pub fn lock(images: &Path) -> io::Result<Option<File>> {
 /// Answers the one request of a connection.
 pub fn serve(config: &Config, conn: &mut (impl io::Read + Write)) -> io::Result<()> {
     let req: Request = read_frame(conn)?;
-    let (Request::Check { ap, image } | Request::Stage { ap, image }) = &req;
+    let (ap, image) = match &req {
+        Request::Newest { ap } => {
+            let reply = newest(config, ap).map_or_else(Reply::Refused, Reply::Image);
+            return write_frame(conn, &reply);
+        }
+        Request::Check { ap, image } | Request::Stage { ap, image } => (ap, image),
+    };
     // Checked before use: the names go into a path and the command line
     // (the configuration's AP names are plain).
     let dir = match kept(config, ap, image) {
@@ -113,16 +201,21 @@ pub fn serve(config: &Config, conn: &mut (impl io::Read + Write)) -> io::Result<
     if matches!(req, Request::Check { .. }) {
         return write_frame(conn, &Reply::Ok);
     }
+    let tree = &config.rollout.tree;
+    if let Some(why) = untrusted(tree) {
+        return write_frame(conn, &Reply::Refused(format!("not staged from it: {why}")));
+    }
     // Held until the command exits, whether or not the runner still listens.
     let Some(_staging) = lock(&config.rollout.images)? else {
-        let why = "another staging is under way".to_owned();
-        return write_frame(conn, &Reply::Refused(why));
+        return write_frame(conn, &Reply::Refused(BUSY.into()));
     };
-    let argv = argv(config, ap, &dir);
     let (reader, writer) = io::pipe()?;
+    let script = tree.join("boot/stage.sh");
     let child = {
-        let mut cmd = Command::new(&argv[0]);
-        cmd.args(&argv[1..])
+        let mut cmd = Command::new("/usr/bin/env");
+        cmd.arg(format!("U6E_AP={ap}"))
+            .arg(&script)
+            .arg(&dir)
             .stdin(Stdio::null())
             .stdout(writer.try_clone()?)
             .stderr(writer);
@@ -132,7 +225,10 @@ pub fn serve(config: &Config, conn: &mut (impl io::Read + Write)) -> io::Result<
     };
     let mut child = match child {
         Ok(c) => c,
-        Err(e) => return write_frame(conn, &Reply::Refused(format!("{}: {e}", argv[0]))),
+        Err(e) => {
+            let why = format!("{}: {e}", script.display());
+            return write_frame(conn, &Reply::Refused(why));
+        }
     };
     let mut gone = write_frame(conn, &Reply::Ok).is_err();
     let mut out = BufReader::new(reader);
@@ -152,8 +248,10 @@ pub fn serve(config: &Config, conn: &mut (impl io::Read + Write)) -> io::Result<
     Ok(())
 }
 
-/// Answers `conn`, if its peer is root or a process of group `gid`.
+/// Answers `conn`, if its peer is root or a process of group `gid` and asks
+/// within [`REQUEST_WAIT`].
 pub fn serve_peer(config: &Config, mut conn: UnixStream, gid: u32) -> io::Result<()> {
+    conn.set_read_timeout(Some(REQUEST_WAIT))?;
     match peer(&conn)? {
         (uid, g) if crate::local::allowed(uid, g, gid) => serve(config, &mut conn),
         (uid, _) => Err(io::Error::other(format!("a caller of uid {uid} refused"))),
@@ -210,11 +308,24 @@ pub struct Helper {
     pub socket: PathBuf,
 }
 
+/// How long a check or a lookup may take.
+const ASK_WAIT: Duration = Duration::from_secs(30);
+
 impl Helper {
     async fn ask(&self, req: &Request) -> io::Result<tokio::net::UnixStream> {
         let mut conn = tokio::net::UnixStream::connect(&self.socket).await?;
         frames::write(&mut conn, req).await?;
         Ok(conn)
+    }
+
+    /// The one reply to `req`, within [`ASK_WAIT`].
+    async fn answer(&self, req: &Request) -> Result<Reply, String> {
+        let reply = async { frames::read(&mut self.ask(req).await?).await };
+        match tokio::time::timeout(ASK_WAIT, reply).await {
+            Ok(Ok(r)) => Ok(r),
+            Ok(Err(e)) => Err(format!("the stage helper: {e}")),
+            Err(_) => Err(format!("the stage helper: no answer in {ASK_WAIT:?}")),
+        }
     }
 
     /// Whether `image` could be staged on `ap`; why not.
@@ -223,12 +334,19 @@ impl Helper {
             ap: ap.into(),
             image: image.into(),
         };
-        let reply = async { frames::read(&mut self.ask(&req).await?).await };
-        match reply.await {
-            Ok(Reply::Ok) => Ok(()),
-            Ok(Reply::Refused(why)) => Err(why),
-            Ok(other) => Err(format!("the stage helper answered {other:?}")),
-            Err(e) => Err(format!("the stage helper: {e}")),
+        match self.answer(&req).await? {
+            Reply::Ok => Ok(()),
+            Reply::Refused(why) => Err(why),
+            other => Err(format!("the stage helper answered {other:?}")),
+        }
+    }
+
+    /// The newest kept image of `ap`.
+    pub async fn newest(&self, ap: &str) -> Result<String, String> {
+        match self.answer(&Request::Newest { ap: ap.into() }).await? {
+            Reply::Image(id) => Ok(id),
+            Reply::Refused(why) => Err(why),
+            other => Err(format!("the stage helper answered {other:?}")),
         }
     }
 
@@ -251,6 +369,9 @@ impl Helper {
                 Ok(Reply::Exit(code)) => {
                     return Staged::Failed(format!("the staging exited with {code}"));
                 }
+                Ok(Reply::Image(_)) => {
+                    return Staged::Failed("the stage helper answered out of turn".into());
+                }
                 Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
                     return Staged::Failed("the stage helper ended before the staging".into());
                 }
@@ -265,27 +386,49 @@ pub(crate) mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
     use std::sync::Arc;
-    use std::{fs, thread};
+    use std::thread;
 
     use crate::config::tests::text;
     use crate::tests::TestDir;
 
-    /// A configuration whose images are in `dir`, kept for `kept`, staged by
-    /// `command`.
-    pub fn config(dir: &Path, kept: &[&str], command: &str) -> Config {
-        for id in kept {
-            fs::create_dir_all(dir.join("images").join(id)).unwrap();
-            fs::write(dir.join("images").join(id).join("MANIFEST"), "ap: ap1\n").unwrap();
+    /// A staging tree in `dir` whose `boot/stage.sh` is `script`, root's
+    /// (the test's own user's) and written by no other.
+    pub fn tree(dir: &Path, script: &str) -> PathBuf {
+        let tree = dir.join("tree");
+        fs::create_dir_all(tree.join("boot")).unwrap();
+        fs::create_dir_all(tree.join("log")).unwrap();
+        fs::write(tree.join("site.conf"), "").unwrap();
+        fs::write(tree.join("boot/stage.sh"), format!("#!/bin/sh\n{script}\n")).unwrap();
+        for (p, mode) in [
+            (dir.to_owned(), 0o755),
+            (tree.clone(), 0o755),
+            (tree.join("boot"), 0o755),
+            (tree.join("site.conf"), 0o644),
+            (tree.join("boot/stage.sh"), 0o755),
+        ] {
+            fs::set_permissions(p, fs::Permissions::from_mode(mode)).unwrap();
         }
+        tree
+    }
+
+    /// A kept image of `ap` in `images`.
+    pub fn keep(images: &Path, id: &str, ap: &str) {
+        fs::create_dir_all(images.join(id)).unwrap();
+        let manifest = format!("ap:        {ap} (u6e-{ap}, 192.0.2.1/24)\nkernel:    x\n");
+        fs::write(images.join(id).join("MANIFEST"), manifest).unwrap();
+    }
+
+    /// A configuration whose images are in `dir`, kept for ap1 (and ap2,
+    /// `<id>` ending in `-ap2`), staged by `script`.
+    pub fn config(dir: &Path, kept: &[&str], script: &str) -> Config {
         let mut c = Config::parse(&text("")).unwrap();
         c.rollout.images = dir.join("images");
-        c.rollout.command = vec![
-            "/bin/sh".into(),
-            "-c".into(),
-            command.into(),
-            "{ap}".into(),
-            "{image}".into(),
-        ];
+        fs::create_dir_all(&c.rollout.images).unwrap();
+        for id in kept {
+            let ap = if id.ends_with("-ap2") { "ap2" } else { "ap1" };
+            keep(&c.rollout.images, id, ap);
+        }
+        c.rollout.tree = tree(dir, script);
         c.rollout.helper = dir.join("stage.sock");
         c
     }
@@ -317,31 +460,41 @@ pub(crate) mod tests {
         out
     }
 
+    fn stage(image: &str) -> Request {
+        Request::Stage {
+            ap: "ap1".into(),
+            image: image.into(),
+        }
+    }
+
     const IMG: &str = "20261025-120000-abc-def-ap1";
 
     #[test]
     fn only_a_kept_image_of_a_configured_ap_is_staged() {
         let t = TestDir::new();
-        let c = config(t.path(), &[IMG, "20261025-x-ap2"], "echo $0 $1");
+        let c = config(t.path(), &[IMG, "20261025-x-ap2"], "echo $1");
+        // An image named for ap1 whose MANIFEST names another AP.
+        keep(&c.rollout.images, "20261025-y-big-ap1", "big-ap1");
         assert_eq!(kept(&c, "ap1", IMG), Ok(t.path().join("images").join(IMG)));
         for (ap, image, why) in [
             ("ap2", "20261025-x-ap2", "no AP ap2 in the configuration"),
             (
                 "ap1",
                 "20261025-x-ap2",
-                "20261025-x-ap2 is not an image's name for ap1",
+                "20261025-x-ap2 is ap2's image, not ap1's",
+            ),
+            (
+                "ap1",
+                "20261025-y-big-ap1",
+                "20261025-y-big-ap1 is big-ap1's image, not ap1's",
             ),
             (
                 "ap1",
                 "../../etc-ap1",
-                "../../etc-ap1 is not an image's name for ap1",
+                "../../etc-ap1 is not an image's name",
             ),
-            (
-                "ap1",
-                ".hidden-ap1",
-                ".hidden-ap1 is not an image's name for ap1",
-            ),
-            ("ap1", "a b-ap1", "a b-ap1 is not an image's name for ap1"),
+            ("ap1", ".hidden-ap1", ".hidden-ap1 is not an image's name"),
+            ("ap1", "a b-ap1", "a b-ap1 is not an image's name"),
             ("ap1", "missing-ap1", "no image missing-ap1 is kept"),
         ] {
             assert_eq!(kept(&c, ap, image), Err(why.into()), "{ap} {image}");
@@ -358,6 +511,21 @@ pub(crate) mod tests {
         assert_eq!(ask(&c, req), [Reply::Ok]);
     }
 
+    /// The newest of an AP's kept images, by name, which starts with the
+    /// build time.
+    #[test]
+    fn the_newest_kept_image_of_an_ap() {
+        let t = TestDir::new();
+        let older = "20261024-120000-abc-def-ap1";
+        let c = config(t.path(), &[older, IMG, "20261026-x-ap2"], "true");
+        let newest = |ap: &str| ask(&c, Request::Newest { ap: ap.into() });
+        assert_eq!(newest("ap1"), [Reply::Image(IMG.into())]);
+        assert_eq!(
+            newest("ap9"),
+            [Reply::Refused("no AP ap9 in the configuration".into())]
+        );
+    }
+
     /// The command gets the AP and the image's directory, its output comes
     /// line by line, stderr too, and then its exit status.
     #[test]
@@ -366,15 +534,11 @@ pub(crate) mod tests {
         let c = config(
             t.path(),
             &[IMG],
-            "echo staging $1 on $0; echo oops >&2; exit 3",
+            "echo staging $1 on $U6E_AP; echo oops >&2; exit 3",
         );
-        let req = Request::Stage {
-            ap: "ap1".into(),
-            image: IMG.into(),
-        };
         let dir = t.path().join("images").join(IMG);
         assert_eq!(
-            ask(&c, req),
+            ask(&c, stage(IMG)),
             [
                 Reply::Ok,
                 Reply::Line(format!("staging {} on ap1", dir.display())),
@@ -382,6 +546,34 @@ pub(crate) mod tests {
                 Reply::Exit(3),
             ]
         );
+    }
+
+    /// Root runs the tree's files, so it refuses one another could have
+    /// written: group- or world-writable, a symbolic link, or another's.
+    #[test]
+    fn a_tree_others_could_write_is_not_run() {
+        let t = TestDir::new();
+        let c = config(t.path(), &[IMG], "echo ran > \"${1%/images/*}/ran\"");
+        let script = c.rollout.tree.join("boot/stage.sh");
+        let writable = |p: &Path, mode| fs::set_permissions(p, fs::Permissions::from_mode(mode));
+        writable(&script, 0o775).unwrap();
+        let why = format!(
+            "not staged from it: {} is writable by others than root",
+            script.display()
+        );
+        assert_eq!(ask(&c, stage(IMG)), [Reply::Refused(why)]);
+        writable(&script, 0o755).unwrap();
+        let lib = c.rollout.tree.join("boot/lib.sh");
+        std::os::unix::fs::symlink("/etc/passwd", &lib).unwrap();
+        let why = format!("not staged from it: {} is a symbolic link", lib.display());
+        assert_eq!(ask(&c, stage(IMG)), [Reply::Refused(why)]);
+        fs::remove_file(&lib).unwrap();
+        writable(&c.rollout.tree.join("boot"), 0o777).unwrap();
+        assert!(matches!(&ask(&c, stage(IMG))[..], [Reply::Refused(_)]));
+        assert!(!t.path().join("ran").exists());
+        writable(&c.rollout.tree.join("boot"), 0o755).unwrap();
+        assert_eq!(ask(&c, stage(IMG)), [Reply::Ok, Reply::Exit(0)]);
+        assert!(t.path().join("ran").exists());
     }
 
     /// While one staging runs, another is refused before anything runs; a
@@ -407,23 +599,16 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(locked, "locked\n");
         assert!(lock(&c.rollout.images).unwrap().is_none());
-        let req = |stage: bool| {
-            let (ap, image) = ("ap1".into(), IMG.into());
-            if stage {
-                Request::Stage { ap, image }
-            } else {
-                Request::Check { ap, image }
-            }
+        assert_eq!(ask(&c, stage(IMG)), [Reply::Refused(BUSY.into())]);
+        let check = Request::Check {
+            ap: "ap1".into(),
+            image: IMG.into(),
         };
-        assert_eq!(
-            ask(&c, req(true)),
-            [Reply::Refused("another staging is under way".into())]
-        );
-        assert_eq!(ask(&c, req(false)), [Reply::Ok]);
+        assert_eq!(ask(&c, check), [Reply::Ok]);
         assert!(!t.path().join("ran").exists());
         held.kill().unwrap();
         held.wait().unwrap();
-        assert_eq!(ask(&c, req(true)), [Reply::Ok, Reply::Exit(0)]);
+        assert_eq!(ask(&c, stage(IMG)), [Reply::Ok, Reply::Exit(0)]);
         assert!(t.path().join("ran").exists());
     }
 
@@ -445,6 +630,7 @@ pub(crate) mod tests {
                 helper.check("ap1", "x-ap1").await,
                 Err("no image x-ap1 is kept".into())
             );
+            assert_eq!(helper.newest("ap1").await, Ok(IMG.into()));
             let mut lines = Vec::new();
             assert_eq!(
                 helper.stage("ap1", IMG, |l| lines.push(l)).await,

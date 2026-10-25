@@ -1,7 +1,9 @@
 //! The agent listener: one task per connection. The handshake admits only the
 //! keys of configured APs and of the deploy runner; the key then says which
 //! the peer is, so an AP's key never gets the runner's session (`runner`) and
-//! the runner's never an AP's. Each end then states its protocol in the
+//! the runner's never an AP's, and which AP: an agent that names itself by
+//! another host name than that AP's, in its Hello or later, is turned away
+//! and counted. Each end then states its protocol in the
 //! version frame, and an agent of another protocol is turned away, recorded
 //! in the state for the metrics and the UI. The session then takes the
 //! agent's Hello, applies its key frames, deltas, events, flows and command
@@ -135,7 +137,7 @@ async fn connection(l: Listener, sock: TcpStream, peer: SocketAddr) {
         silence: l.timing.silence,
     };
     if l.runner == Some(key) {
-        runner::serve(conn, l.state, l.timing).await;
+        runner::serve(conn, l.state, l.timing, l.store).await;
         return;
     }
     // The verifier admitted the key; None only if it left the map since.
@@ -303,6 +305,10 @@ impl Session {
     /// Serves the session until it fails, goes silent or is replaced.
     async fn run(&mut self) -> io::Result<Infallible> {
         let hello = self.hello().await?;
+        self.state
+            .write()
+            .check_identity(&self.name, &hello.ap)
+            .map_err(|why| io::Error::new(ErrorKind::PermissionDenied, why))?;
         let agent = hello.agent.clone();
         let Some(mut reg) = self.state.write().connect(&self.name, hello) else {
             return Err(io::Error::other("not a configured AP"));
@@ -399,6 +405,11 @@ impl Session {
             }
             flows |= matches!(msg, AgentMsg::Flows(_));
             let mut state = self.state.write();
+            if let AgentMsg::Hello(h) = &msg {
+                state
+                    .check_identity(&self.name, &h.ap)
+                    .map_err(|why| io::Error::new(ErrorKind::PermissionDenied, why))?;
+            }
             let gap = state.apply(&self.name, self.id, msg).is_err();
             if key && !gap && !self.synced {
                 self.synced = true;
@@ -449,16 +460,19 @@ impl Session {
     }
 }
 
-/// Saves the policy as the state holds it now, one save at a time.
-async fn save_policy(store: Store, state: Shared) {
+/// Saves the policy as the state holds it now, one save at a time; whether
+/// it was saved.
+pub(crate) async fn save_policy(store: Store, state: Shared) -> bool {
     let path = store.lock().await;
     let p = state.read().policy();
-    if let Err(e) = policy::write(&path, p).await {
+    let saved = policy::write(&path, p).await;
+    if let Err(e) = &saved {
         eprintln!(
             "u6e-controller: {}: the policy was not saved: {e}",
             path.display()
         );
     }
+    saved.is_ok()
 }
 
 /// A socket that counts what it receives, TLS records included: what the

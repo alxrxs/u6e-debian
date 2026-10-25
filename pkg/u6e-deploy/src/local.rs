@@ -163,9 +163,12 @@ async fn caller(runner: Arc<Runner>, mut conn: UnixStream, ours: u32) {
         Request::Apply { ap, radios } => {
             let reply = match runner.apply(&ap, radios) {
                 Err(why) => done(why),
-                Ok(rx) => match timeout(APPLY_WAIT, rx).await {
+                Ok((id, rx)) => match timeout(APPLY_WAIT, rx).await {
                     Ok(Ok(c)) => Reply::Applied(c),
-                    _ => done(format!("no answer from the controller in {APPLY_WAIT:?}")),
+                    _ => {
+                        runner.forget(id);
+                        done(format!("no answer from the controller in {APPLY_WAIT:?}"))
+                    }
                 },
             };
             let _ = frames::write(&mut conn, &reply).await;

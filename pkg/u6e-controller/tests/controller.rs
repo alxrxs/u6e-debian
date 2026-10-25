@@ -2581,7 +2581,7 @@ fn a_configuration_is_relayed_and_kept_by_its_hash_alone() {
         .unwrap();
     match runner.expect_runner() {
         RunnerCtlMsg::ConfigApplied { id: 9, result } => {
-            assert_eq!(result.detail, "no AP named ap9 has connected");
+            assert_eq!(result.detail, "no AP has the host name ap9");
         }
         other => panic!("{other:?}"),
     }
@@ -2637,39 +2637,44 @@ fn a_configuration_is_relayed_and_kept_by_its_hash_alone() {
     );
 }
 
-/// An AP that comes back running another configuration than the one it
-/// acknowledged has the runner asked to sign that one again, then or once
-/// the runner connects; unless its image was built after that configuration
-/// was signed, whose own is then the newer.
+/// An AP that runs another configuration than the runner's latest for it
+/// has the runner asked to sign that one again: when the runner tells its
+/// latest as it connects, and when the AP comes back while the runner is
+/// connected; unless its image was built after that configuration was
+/// signed, whose own is then the newer.
 #[test]
-fn an_ap_back_on_another_configuration_is_repushed_unless_its_image_is_newer() {
-    let dir = TempDir::new("repush");
-    let acked = signed("ap1", 1_000, 1).sha256;
+fn an_ap_on_another_configuration_than_the_runners_latest_is_repushed() {
+    let r = controller(Timing::default());
+    let latest = signed("ap1", 1_000, 1).sha256;
     let installed = signed("ap1", 1, 9).sha256;
-    let policy = json!({
-        "blocked": [],
-        "configs": {"ap1": {"sha256": mac::hex(&acked), "seq": 1_000}},
-    });
-    fs::write(dir.0.join("policy.json"), policy.to_string()).unwrap();
-    let r = controller_in(Timing::default(), &dir.0);
 
-    // No runner yet: asked once it connects.
+    // The runner, connecting, tells its latest: the AP runs another.
     let older = "image: old\nbuilt_ms: 500\n";
     let mut ap1 = Agent::running(r.c.agents, KEY_AP1, "ap1", older);
     ap1.send(&AgentMsg::Key(running_config(1, installed)))
         .unwrap();
     ap1.expect_sync();
-    wait_for("the drift", || r.c.state.read().ap("ap1").unwrap().drifts());
+    let mut runner = Agent::runner(r.c.agents);
+    runner
+        .send_any(&RunnerMsg::Latest {
+            ap: "ap1".into(),
+            seq: 1_000,
+            sha256: latest,
+        })
+        .unwrap();
     let repush = RunnerCtlMsg::Repush {
         ap: "ap1".into(),
-        acked: Some(acked),
         installed: Some(installed),
     };
-    let mut runner = Agent::runner(r.c.agents);
     assert_eq!(runner.expect_runner(), repush);
     assert_eq!(
         metrics_of(&r, "wifi_config_drift"),
         ["wifi_config_drift{ap=\"ap1\"} 1"]
+    );
+    let config = json_get(r.c.http, "/api/config");
+    assert_eq!(
+        config["ap1"]["latest"],
+        json!({"sha256": mac::hex(&latest), "seq": 1_000})
     );
 
     // Back again, the runner connected: asked at once.
@@ -2679,20 +2684,87 @@ fn an_ap_back_on_another_configuration_is_repushed_unless_its_image_is_newer() {
     ap1.expect_sync();
     assert_eq!(runner.expect_runner(), repush);
 
+    // Back on the latest: no drift, nothing asked.
+    let mut ap1 = Agent::running(r.c.agents, KEY_AP1, "ap1", older);
+    ap1.send(&AgentMsg::Key(running_config(1, latest))).unwrap();
+    ap1.expect_sync();
+    runner.runner_hears_nothing(Duration::from_millis(300));
+
     // An image built after the configuration was signed: its own stands.
     let newer = "image: new\nbuilt_ms: 2000\n";
     let mut ap1 = Agent::running(r.c.agents, KEY_AP1, "ap1", newer);
     ap1.send(&AgentMsg::Key(running_config(1, installed)))
         .unwrap();
     ap1.expect_sync();
-    wait_for("the acknowledged one forgotten", || {
-        r.c.state.read().ap("ap1").unwrap().acked.is_none()
-    });
     runner.runner_hears_nothing(Duration::from_millis(300));
-    wait_for("the policy saved", || {
-        let text = fs::read_to_string(dir.0.join("policy.json")).unwrap();
-        serde_json::from_str::<Value>(&text).unwrap() == json!({"blocked": []})
+    assert_eq!(
+        metrics_of(&r, "wifi_config_drift"),
+        ["wifi_config_drift{ap=\"ap1\"} 0"]
+    );
+}
+
+/// An AP's key decides which AP a session is: an agent that names itself by
+/// another host name, in its Hello or later, is turned away and counted,
+/// and nothing is relayed to it. Here ap2's key claims ap1's host name while
+/// ap1 is away.
+#[test]
+fn an_agent_naming_another_ap_is_turned_away() {
+    let r = controller(Timing::default());
+    let mut runner = Agent::runner(r.c.agents);
+    wait_for("the runner", || r.c.state.read().runner.is_up());
+
+    let mut impostor = Agent::hello(r.c.agents, KEY_AP2, "ap1");
+    impostor
+        .send(&AgentMsg::Key(snapshot(1, Vec::new(), Vec::new())))
+        .unwrap();
+    impostor.ends();
+    let state = r.c.state.read();
+    assert!(!state.ap("ap1").unwrap().is_up());
+    assert!(!state.ap("ap2").unwrap().is_up());
+    drop(state);
+
+    // ap1's configuration, with ap1 away: not relayed to the impostor.
+    runner
+        .send_any(&RunnerMsg::ApplyConfig {
+            id: 1,
+            config: signed("ap1", 5, 1),
+        })
+        .unwrap();
+    match runner.expect_runner() {
+        RunnerCtlMsg::ConfigApplied { id: 1, result } => {
+            assert_eq!(
+                (result.ok, result.detail.as_str()),
+                (false, "ap1 is not connected")
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // ap2's own key, its own name first and another one later.
+    let mut ap2 = Agent::hello(r.c.agents, KEY_AP2, "ap2");
+    ap2.send(&AgentMsg::Key(snapshot(1, Vec::new(), Vec::new())))
+        .unwrap();
+    ap2.expect_sync();
+    wait_for("ap2", || r.c.state.read().ap("ap2").unwrap().is_up());
+    ap2.send(&AgentMsg::Hello(Hello {
+        ap: "ap1".into(),
+        manifest: "image: test".into(),
+        kernel: String::new(),
+        hostapd: String::new(),
+        agent: String::new(),
+    }))
+    .unwrap();
+    ap2.ends();
+    wait_for("ap2 turned away", || {
+        !r.c.state.read().ap("ap2").unwrap().is_up()
     });
+    assert_eq!(
+        metrics_of(&r, "wifi_agent_identity_refused_total"),
+        [
+            "wifi_agent_identity_refused_total{ap=\"ap1\"} 0",
+            "wifi_agent_identity_refused_total{ap=\"ap2\"} 2",
+        ]
+    );
 }
 
 /// The image the UI's admin asks for goes to the runner with the image the
@@ -2769,7 +2841,10 @@ fn an_upgrade_is_gated_by_the_ap_coming_back() {
             detail,
         } => {
             assert_eq!((gated, healthy), (id, true));
-            assert_eq!(detail, "back with img-new: 1 radios up, 1 clients");
+            assert_eq!(
+                detail,
+                "back with img-new: 1 radios up, 1 clients on the site"
+            );
         }
         other => panic!("{other:?}"),
     }
@@ -2786,9 +2861,9 @@ fn an_upgrade_is_gated_by_the_ap_coming_back() {
             detail: "healthy".into(),
         }))
         .unwrap();
-    wait_for("the result", || {
-        r.c.state.read().rollouts.iter().all(|r| !r.is_open())
-    });
+    // Acknowledged once the policy file holds it.
+    assert_eq!(runner.expect_runner(), RunnerCtlMsg::RolloutAck { id });
+    assert!(r.c.state.read().rollouts.iter().all(|r| !r.is_open()));
     let rollouts = json_get(r.c.http, "/api/rollouts");
     let done = &rollouts[id.to_string()];
     assert_eq!(done["log"], json!(["staged"]));
@@ -2827,9 +2902,21 @@ fn an_upgrade_is_gated_by_the_ap_coming_back() {
             detail: "img-new staged again".into(),
         }))
         .unwrap();
-    wait_for("the rollback", || {
-        r.c.state.read().rollouts.iter().all(|r| !r.is_open())
-    });
+    assert_eq!(runner.expect_runner(), RunnerCtlMsg::RolloutAck { id });
+    // Sent again, as a runner does until it hears the acknowledgement: it
+    // is acknowledged again and counted once.
+    runner
+        .send_any(&RunnerMsg::RolloutResult(RolloutResult {
+            id,
+            outcome: RolloutOutcome::RolledBack,
+            detail: "img-new staged again".into(),
+        }))
+        .unwrap();
+    assert_eq!(runner.expect_runner(), RunnerCtlMsg::RolloutAck { id });
+    assert_eq!(
+        metrics_of(&r, "wifi_rollout_last_failure_timestamp_seconds").len(),
+        1
+    );
     let rolled = metrics_of(&r, "wifi_rollouts_total");
     assert!(rolled.contains(&"wifi_rollouts_total{outcome=\"done\"} 1".to_owned()));
     assert!(rolled.contains(&"wifi_rollouts_total{outcome=\"rolled_back\"} 1".to_owned()));

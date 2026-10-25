@@ -35,9 +35,10 @@ use tokio::task::JoinSet;
 use u6e_proto::mac;
 use u6e_proto::msg::CommandKind;
 
+use crate::agents::save_policy;
 use crate::config::Config;
 use crate::http::{error, json_response};
-use crate::policy::{self, Policy, Store};
+use crate::policy::{self, Store};
 use crate::state::{Action, Shared, Waiter, action_name};
 
 /// The user the sign-in proxy names.
@@ -227,10 +228,10 @@ pub async fn upgrade(
         return error(StatusCode::BAD_REQUEST, "image_id is not an image's name");
     }
     let who = user(&req).unwrap_or_else(|| "(no user)".into());
-    let mut state = web.state.write();
-    match state.upgrade(&ap, &b.image_id, &who) {
-        Ok(id) => (StatusCode::ACCEPTED, json_response(&json!({ "id": id }))).into_response(),
-        Err(why) => {
+    let started = {
+        let mut state = web.state.write();
+        let started = state.upgrade(&ap, &b.image_id, &who);
+        if let Err(why) = &started {
             state.record(Action {
                 at: SystemTime::now(),
                 user: Some(who),
@@ -240,8 +241,18 @@ pub async fn upgrade(
                 ok: false,
                 detail: format!("{}: {why}", b.image_id),
             });
-            error(StatusCode::CONFLICT, &why)
         }
+        started.map(|id| (id, state.take_dirty()))
+    };
+    match started {
+        Ok((id, dirty)) => {
+            // The rollout outlives the controller from here on.
+            if dirty {
+                save_policy(web.access.policy.clone(), web.state.clone()).await;
+            }
+            (StatusCode::ACCEPTED, json_response(&json!({ "id": id }))).into_response()
+        }
+        Err(why) => error(StatusCode::CONFLICT, &why),
     }
 }
 
@@ -433,21 +444,17 @@ impl Ctx<'_> {
     /// into the state; the APs connected then, which are to be told.
     async fn save(&self, access: &Access, blocking: bool) -> std::io::Result<Vec<String>> {
         let path = access.policy.lock().await;
-        let Policy {
-            blocked: mut next,
-            configs,
-        } = self.state.read().policy();
+        let mut next = self.state.read().policy();
         let changed = if blocking {
-            next.insert(self.mac)
+            next.blocked.insert(self.mac)
         } else {
-            next.remove(&self.mac)
+            next.blocked.remove(&self.mac)
         };
         if changed {
-            let blocked = next.clone();
-            policy::write(&path, Policy { blocked, configs }).await?;
+            policy::write(&path, next.clone()).await?;
         }
         let mut state = self.state.write();
-        state.blocked = next;
+        state.blocked = next.blocked;
         Ok(state.connected())
     }
 }

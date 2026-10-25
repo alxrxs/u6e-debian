@@ -7,11 +7,13 @@
 //! text (passphrases, keys) goes from this session's buffer, wiped once
 //! decoded, to the AP's session, which wipes its frame once sent. The AP's
 //! answer goes back to the runner, as does the controller's own when the AP
-//! cannot be asked or does not answer in `Timing::apply`. The state asks the
-//! runner to sign a configuration again when an AP comes back running another
-//! than the one it acknowledged (`Repush`), queues the rollouts admins and the
-//! runner's local callers ask for, and sends each its health gate; the
-//! runner's log lines and results of them end in the state's rollouts.
+//! cannot be asked or does not answer in `Timing::apply`. The runner tells its
+//! latest configuration for each AP as the session starts; the state asks it
+//! to sign that one again when an AP runs another (`Repush`), queues the
+//! rollouts admins and the runner's local callers ask for, and sends each its
+//! health gate; the runner's log lines and results of them end in the state's
+//! rollouts. A result is acknowledged once the policy file holds it, and the
+//! runner sends it until then.
 
 use std::convert::Infallible;
 use std::io::{self, ErrorKind};
@@ -22,16 +24,18 @@ use u6e_proto::PROTOCOL;
 use u6e_proto::frame::{decode_frame, zeroize};
 use u6e_proto::msg::{RunnerCtlMsg, RunnerHello, RunnerMsg};
 
-use crate::agents::{Conn, Timing};
+use crate::agents::{Conn, Timing, save_policy};
+use crate::policy::{ConfigId, Store};
 use crate::state::Shared;
 
 /// Serves the runner's connection from its version frame to its end.
-pub(crate) async fn serve(conn: Conn, state: Shared, timing: Timing) {
+pub(crate) async fn serve(conn: Conn, state: Shared, timing: Timing, store: Store) {
     let peer = conn.peer;
     let mut s = Session {
         conn,
         state,
         timing,
+        store,
         id: 0,
         pings: 0,
     };
@@ -52,6 +56,8 @@ struct Session {
     conn: Conn,
     state: Shared,
     timing: Timing,
+    /// The policy file, which holds the rollouts.
+    store: Store,
     /// The state's id of this session, once it has said Hello.
     id: u64,
     pings: u64,
@@ -112,9 +118,11 @@ impl Session {
         }
     }
 
-    /// Takes every whole frame received so far, wiping each once decoded.
+    /// Takes every whole frame received so far, wiping each once decoded. A
+    /// result is acknowledged only once the policy file holds it.
     async fn process(&mut self) -> io::Result<()> {
         let mut answers = Vec::new();
+        let mut acks = Vec::new();
         while let Some((msg, n)) = decode_frame::<RunnerMsg>(&self.conn.inbuf)? {
             self.conn.consume(n);
             self.conn.last_rx = Instant::now();
@@ -126,7 +134,13 @@ impl Session {
                     }
                 }
                 RunnerMsg::RolloutLog { id, line } => state.rollout_log(id, line),
-                RunnerMsg::RolloutResult(r) => state.rollout_result(r),
+                RunnerMsg::RolloutResult(r) => {
+                    acks.push(RunnerCtlMsg::RolloutAck { id: r.id });
+                    state.rollout_result(r);
+                }
+                RunnerMsg::Latest { ap, seq, sha256 } => {
+                    state.latest(&ap, ConfigId { sha256, seq });
+                }
                 RunnerMsg::RolloutAsk { ap, image_id, user } => {
                     state.rollout_ask(&ap, &image_id, &user);
                 }
@@ -135,7 +149,13 @@ impl Session {
                 _ => {}
             }
         }
-        for msg in &answers {
+        let dirty = self.state.write().take_dirty();
+        if dirty && !save_policy(self.store.clone(), self.state.clone()).await {
+            // Unacknowledged, the results come again with the next frame.
+            self.state.write().mark_dirty();
+            acks.clear();
+        }
+        for msg in answers.iter().chain(&acks) {
             self.conn.send(msg).await?;
         }
         Ok(())

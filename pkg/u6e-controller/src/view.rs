@@ -9,9 +9,9 @@
 //! can still be found and unblocked; an associated client says it too.
 //!
 //! Each AP's Wi-Fi configuration is shown by hash only (`config`): the one it
-//! reports installed, the one it last acknowledged and the one the deploy
-//! runner sent it last, whether it drifts (runs another than it
-//! acknowledged), and how the last one went. The runner's link (`runner`) and
+//! reports installed, the one it last acknowledged, the deploy runner's
+//! latest for it and the one relayed to it last, whether it drifts (runs
+//! another than the runner's latest), and how the last one went. The runner's link (`runner`) and
 //! the image rollouts with their gate, result and log (`rollouts`) are beside
 //! the APs.
 
@@ -162,9 +162,9 @@ pub fn config(state: &State) -> Value {
 }
 
 /// An AP's configuration, by hash, as far as it is known: installed (while
-/// connected), acknowledged (with whether it drifts from that) and sent
-/// last, and how the last one went. An AP that reports no hash and was never
-/// sent a configuration has none of it.
+/// connected), acknowledged, the runner's latest (with whether it drifts
+/// from that) and sent last, and how the last one went. An AP that reports
+/// no hash and was never sent a configuration has none of it.
 pub fn config_of(ap: &Ap) -> Map<String, Value> {
     let id = |c: ConfigId| json!({ "sha256": mac::hex(&c.sha256), "seq": c.seq });
     let mut o = Map::new();
@@ -173,6 +173,9 @@ pub fn config_of(ap: &Ap) -> Map<String, Value> {
     }
     if let Some(c) = ap.acked {
         o.insert("acked".into(), id(c));
+    }
+    if let Some(c) = ap.latest {
+        o.insert("latest".into(), id(c));
         o.insert("drift".into(), ap.drifts().into());
     }
     if let Some(c) = ap.wanted {

@@ -1,5 +1,6 @@
 //! The controller's configuration file: where it listens, its key, the APs it
-//! admits, each by the Ed25519 public key it pins, the deploy runner it
+//! admits, each by the Ed25519 public key it pins and the host name its agent
+//! must name itself by (the AP's name unless set), the deploy runner it
 //! admits on the same listener by its own key (without one, configurations
 //! and rollouts are off), and what the operator actions need: the origin the
 //! UI is served at (required), the group allowed to act, and where the
@@ -16,6 +17,7 @@
 //!
 //! [aps.ap1]
 //! public_key = "<64 lowercase hex digits>"
+//! hostname = "u6e-ap1"
 //!
 //! [runner]
 //! public_key = "<64 lowercase hex digits>"
@@ -39,6 +41,10 @@ pub struct Config {
     pub key: PathBuf,
     /// AP name to its public key.
     pub aps: BTreeMap<String, [u8; 32]>,
+    /// AP name to the host name its agent names itself by in its Hello, and
+    /// configurations are signed for: the key decides which AP a session
+    /// is, and an agent naming another host is turned away.
+    pub hostnames: BTreeMap<String, String>,
     /// The deploy runner's public key (its link's, not the one it signs
     /// configurations with, which only the APs check).
     pub runner: Option<[u8; 32]>,
@@ -76,6 +82,7 @@ struct File {
 #[serde(deny_unknown_fields)]
 struct ApFile {
     public_key: String,
+    hostname: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -116,6 +123,10 @@ pub enum ConfigError {
     BadKey(String),
     /// Two APs share a key, so a connection could not be told apart.
     SharedKey(String, String),
+    /// An AP's `hostname` is empty or longer than 64 bytes.
+    BadHostname(String),
+    /// Two APs share a host name, so a configuration could not be routed.
+    SharedHostname(String, String),
     /// The runner's `public_key` is not 64 lowercase hex digits.
     BadRunnerKey,
     /// The runner's key is an AP's: that AP could act as the runner.
@@ -132,6 +143,8 @@ impl fmt::Display for ConfigError {
             Self::Syntax(e) => f.write_str(e.trim_end()),
             Self::BadKey(ap) => write!(f, "aps.{ap}.public_key is not 64 lowercase hex digits"),
             Self::SharedKey(a, b) => write!(f, "aps.{a} and aps.{b} have the same public_key"),
+            Self::BadHostname(ap) => write!(f, "aps.{ap}.hostname is empty or too long"),
+            Self::SharedHostname(a, b) => write!(f, "aps.{a} and aps.{b} have the same hostname"),
             Self::BadRunnerKey => f.write_str("runner.public_key is not 64 lowercase hex digits"),
             Self::RunnerIsAp(ap) => write!(f, "runner.public_key is aps.{ap}'s"),
             Self::BadOrigin => f.write_str(
@@ -148,12 +161,22 @@ impl Config {
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
         let file: File = toml::from_str(text).map_err(|e| ConfigError::Syntax(e.to_string()))?;
         let mut aps = BTreeMap::new();
+        let mut hostnames = BTreeMap::new();
         let mut owner = HashMap::new();
+        let mut host_owner = HashMap::new();
         for (name, ap) in file.aps {
             let key = parse_key(&ap.public_key).ok_or_else(|| ConfigError::BadKey(name.clone()))?;
             if let Some(first) = owner.insert(key, name.clone()) {
                 return Err(ConfigError::SharedKey(first, name));
             }
+            let hostname = ap.hostname.unwrap_or_else(|| name.clone());
+            if hostname.is_empty() || hostname.len() > 64 {
+                return Err(ConfigError::BadHostname(name));
+            }
+            if let Some(first) = host_owner.insert(hostname.clone(), name.clone()) {
+                return Err(ConfigError::SharedHostname(first, name));
+            }
+            hostnames.insert(name.clone(), hostname);
             aps.insert(name, key);
         }
         let runner = match file.runner {
@@ -175,6 +198,7 @@ impl Config {
             listen_metrics: file.listen_metrics,
             key: file.key,
             aps,
+            hostnames,
             runner,
             public_origin: file.public_origin,
             admin_group: file.admin_group,
@@ -223,6 +247,8 @@ mod tests {
         assert_eq!(c.key, PathBuf::from("/etc/wifi-controller/key.pem"));
         assert_eq!(c.aps["ap1"], [1; 32]);
         assert_eq!(c.aps["ap2"], [0xab; 32]);
+        // Without a hostname, an AP's agent names itself by the AP's name.
+        assert_eq!(c.hostnames["ap1"], "ap1");
         assert_eq!(c.runner, None);
         assert_eq!(c.public_origin, "https://wifi.example.org");
         assert_eq!(c.admin_group, "wifi-admins");
@@ -300,6 +326,31 @@ mod tests {
 
     /// The runner is admitted by a key of its own, never an AP's: the
     /// listener tells the two roles apart by the key alone.
+    #[test]
+    fn each_ap_has_a_host_name_of_its_own() {
+        let ap = |name: &str, key: &str, host: &str| {
+            format!("[aps.{name}]\npublic_key = \"{key}\"\nhostname = \"{host}\"\n")
+        };
+        let two = |h1: &str, h2: &str| {
+            Config::parse(&format!(
+                "{ORIGIN}{}{}",
+                ap("ap1", KEY1, h1),
+                ap("ap2", KEY2, h2)
+            ))
+        };
+        let c = two("u6e-ap1", "u6e-ap2").unwrap();
+        assert_eq!(c.hostnames["ap1"], "u6e-ap1");
+        assert_eq!(c.hostnames["ap2"], "u6e-ap2");
+        assert_eq!(
+            two("u6e-ap1", "u6e-ap1"),
+            Err(ConfigError::SharedHostname("ap1".into(), "ap2".into()))
+        );
+        assert_eq!(
+            two("", "u6e-ap2"),
+            Err(ConfigError::BadHostname("ap1".into()))
+        );
+    }
+
     #[test]
     fn the_runner_has_a_key_of_its_own() {
         let ap = format!("{ORIGIN}[aps.ap1]\npublic_key = \"{KEY1}\"\n");

@@ -4,9 +4,11 @@
 //! reconnects. Beside it are the operator's side: the clients blocked (kept
 //! on disk by `policy`), the commands waiting for their results, the actions
 //! taken, and the names of the clients' addresses; and the deploy runner's
-//! (`runner`): the Wi-Fi configurations it signs, relayed to the APs and
-//! known here by hash only (each AP's last acknowledged one kept on disk too),
-//! and the image rollouts with their health gate.
+//! (`runner`): the Wi-Fi configurations it signs, relayed to the AP whose
+//! configured host name they are signed for and known here by hash only
+//! (each AP's last acknowledged one kept on disk too), the runner's latest
+//! for each AP, which an AP that runs another is asked to take again, and the
+//! image rollouts with their health gate (the open ones kept on disk too).
 //!
 //! The state also sets each AP's tick and flow cadence. While a UI client
 //! watches an AP it reports every 2 s, otherwise at the 15 s scrape interval;
@@ -31,7 +33,7 @@ use u6e_proto::msg::{
 use u6e_proto::{PROTOCOL, mac};
 
 use crate::names::{self, Names};
-use crate::policy::{Blocked, ConfigId, Policy};
+use crate::policy::{Blocked, ConfigId, Policy, SavedRollout};
 use crate::spectrum::{self, Limits, Scan, Stopped};
 
 /// Events kept per AP, newest last.
@@ -158,14 +160,16 @@ pub struct Rollout {
     pub at: SystemTime,
     /// The AP's sessions numbered past this one are the AP coming back.
     after: u64,
-    /// The radios the AP had up and the clients it had when it was asked:
-    /// the gate wants as many radios up, and some clients back if it had any.
+    /// The radios the AP had up and the clients on every AP when it was
+    /// asked: the gate wants as many radios up, and the site's clients back
+    /// (on any AP: those that roamed away during the reboot count).
     radios: usize,
     clients: usize,
     /// The gate's verdict, once it was sent: healthy, and what was seen.
     pub gate: Option<(bool, String)>,
-    /// The runner's last word on it.
+    /// The runner's last word on it, and when it came.
     pub result: Option<(RolloutOutcome, String)>,
+    pub ended: Option<SystemTime>,
     pub log: VecDeque<String>,
 }
 
@@ -186,14 +190,26 @@ pub fn mechanism_name(m: Mechanism) -> &'static str {
     }
 }
 
-/// The name of a rollout's outcome, as the API and the metrics spell it.
+/// The outcomes, by the names the API, the metrics and the policy file
+/// spell them.
+const OUTCOMES: [(RolloutOutcome, &str); 4] = [
+    (RolloutOutcome::Refused, "refused"),
+    (RolloutOutcome::Done, "done"),
+    (RolloutOutcome::RolledBack, "rolled_back"),
+    (RolloutOutcome::Failed, "failed"),
+];
+
+/// The name of a rollout's outcome.
 pub fn outcome_name(o: RolloutOutcome) -> &'static str {
-    match o {
-        RolloutOutcome::Refused => "refused",
-        RolloutOutcome::Done => "done",
-        RolloutOutcome::RolledBack => "rolled_back",
-        RolloutOutcome::Failed => "failed",
-    }
+    OUTCOMES
+        .iter()
+        .find(|(x, _)| *x == o)
+        .map_or("", |(_, n)| n)
+}
+
+/// The outcome of a name [`outcome_name`] gave.
+fn outcome_of(name: &str) -> Option<RolloutOutcome> {
+    OUTCOMES.iter().find(|(_, n)| *n == name).map(|(o, _)| *o)
 }
 
 /// An answer that a configuration was not applied, for the runner.
@@ -244,6 +260,11 @@ struct Addresses {
 
 /// One configured AP.
 pub struct Ap {
+    /// The host name its agent names itself by, and configurations are
+    /// signed for: bound to its key by the configuration.
+    pub hostname: String,
+    /// The sessions refused because the agent named another host.
+    pub identity_refused: u64,
     /// What it last said it runs; kept while it is down.
     pub hello: Option<Hello>,
     /// The protocol its agent stated when it last dialed in.
@@ -274,15 +295,14 @@ pub struct Ap {
     full_asked: Option<Instant>,
     /// Its radios' scans, by radio, once one was watched.
     pub scans: BTreeMap<String, Scan>,
-    /// The configuration it last acknowledged (kept in the policy), the one
-    /// the runner sent it last, and what came of that.
+    /// The configuration it last acknowledged (kept in the policy), the
+    /// runner's latest for it (what it should run), the one relayed to it
+    /// last, and what came of that.
     pub acked: Option<ConfigId>,
+    pub latest: Option<ConfigId>,
     pub wanted: Option<ConfigId>,
     pub last_apply: Option<Applied>,
     relay: Option<Relay>,
-    /// It came back running another configuration than the one it
-    /// acknowledged while the runner was away: ask the runner once it is back.
-    repush_due: bool,
     pub(crate) session: Option<Live>,
 }
 
@@ -294,8 +314,10 @@ pub(crate) struct Live {
 }
 
 impl Ap {
-    fn new() -> Self {
+    fn new(hostname: String) -> Self {
         Ap {
+            hostname,
+            identity_refused: 0,
             hello: None,
             protocol: None,
             snapshot: None,
@@ -315,10 +337,10 @@ impl Ap {
             full_asked: None,
             scans: BTreeMap::new(),
             acked: None,
+            latest: None,
             wanted: None,
             last_apply: None,
             relay: None,
-            repush_due: false,
             session: None,
         }
     }
@@ -328,10 +350,15 @@ impl Ap {
         self.snapshot.as_ref()?.config_sha256
     }
 
-    /// Whether it runs another configuration than the one it acknowledged.
+    /// Whether it runs another configuration than the runner's latest for
+    /// it, while connected. An image built after that one was signed carries
+    /// a newer configuration of its own, which stands.
     pub fn drifts(&self) -> bool {
-        let installed = self.snapshot.as_ref().map(|s| s.config_sha256);
-        matches!((self.acked, installed), (Some(a), Some(i)) if i != Some(a.sha256))
+        let (Some(latest), Some(snap), Some(hello)) = (self.latest, &self.snapshot, &self.hello)
+        else {
+            return false;
+        };
+        snap.config_sha256 != Some(latest.sha256) && hello.built_ms() < latest.seq
     }
 
     pub fn is_up(&self) -> bool {
@@ -379,14 +406,13 @@ impl Ap {
         ended.collect()
     }
 
-    /// The runner's request to sign again the configuration this AP last
-    /// acknowledged, named as its configurations are (the AP's host name).
-    fn repush(&self) -> Option<RunnerCtlMsg> {
-        Some(RunnerCtlMsg::Repush {
-            ap: self.hello.as_ref()?.ap.clone(),
-            acked: Some(self.acked?.sha256),
+    /// The runner's request to sign its latest configuration for this AP
+    /// again, named as its configurations are (the AP's host name).
+    fn repush(&self) -> RunnerCtlMsg {
+        RunnerCtlMsg::Repush {
+            ap: self.hostname.clone(),
             installed: self.installed(),
-        })
+        }
     }
 
     /// One more watcher (`more`) or one fewer, of the AP or its flows.
@@ -491,9 +517,11 @@ pub struct State {
 }
 
 impl State {
-    pub fn new(names: impl IntoIterator<Item = String>) -> Self {
+    /// The state of the APs `aps` names, each with the host name its agent
+    /// names itself by.
+    pub fn new(aps: impl IntoIterator<Item = (String, String)>) -> Self {
         State {
-            aps: names.into_iter().map(|n| (n, Ap::new())).collect(),
+            aps: aps.into_iter().map(|(n, h)| (n, Ap::new(h))).collect(),
             next_id: 0,
             changes: broadcast::Sender::new(CHANGES_CAP),
             blocked: Blocked::new(),
@@ -514,16 +542,41 @@ impl State {
         }
     }
 
-    /// The state with a saved policy's blocks and acknowledged
-    /// configurations (of the APs still configured).
+    /// The state with a saved policy's blocks, acknowledged configurations
+    /// (of the APs still configured) and recent rollouts, the gates of those
+    /// not over going on: every session of this process is one the AP came
+    /// back with.
     pub fn with_policy(mut self, policy: Policy) -> Self {
         for (name, config) in policy.configs {
             if let Some(ap) = self.aps.get_mut(&name) {
                 ap.acked = Some(config);
             }
         }
+        let rollouts = policy.rollouts.into_iter().map(|r| {
+            let ended = r.result.as_ref().map(|(_, _, at)| *at);
+            let result = r
+                .result
+                .and_then(|(outcome, detail, _)| Some((outcome_of(&outcome)?, detail)));
+            Rollout {
+                id: r.id,
+                ap: r.ap,
+                image_id: r.image_id,
+                previous: r.previous,
+                user: r.user,
+                at: r.at,
+                after: 0,
+                radios: r.radios,
+                clients: r.clients,
+                gate: r.gate,
+                result,
+                ended,
+                log: VecDeque::new(),
+            }
+        });
         State {
             blocked: policy.blocked,
+            rollouts: rollouts.collect(),
+            next_rollout: policy.next_rollout,
             ..self
         }
     }
@@ -540,16 +593,54 @@ impl State {
             .aps
             .iter()
             .filter_map(|(n, a)| Some((n.clone(), a.acked?)));
+        let rollouts = self.rollouts.iter().map(|r| SavedRollout {
+            id: r.id,
+            ap: r.ap.clone(),
+            image_id: r.image_id.clone(),
+            previous: r.previous.clone(),
+            user: r.user.clone(),
+            at: r.at,
+            radios: r.radios,
+            clients: r.clients,
+            gate: r.gate.clone(),
+            result: r
+                .result
+                .clone()
+                .zip(r.ended)
+                .map(|((outcome, detail), at)| (outcome_name(outcome).to_owned(), detail, at)),
+        });
         Policy {
             blocked: self.blocked.clone(),
             configs: acked.collect(),
+            rollouts: rollouts.collect(),
+            next_rollout: self.next_rollout,
         }
+    }
+
+    /// Whether the agent holding `ap`'s key may name itself `claimed` in its
+    /// Hello: only by the AP's own host name. Every refusal is counted, for
+    /// the metrics and their alert.
+    pub fn check_identity(&mut self, ap: &str, claimed: &str) -> Result<(), String> {
+        let entry = self.aps.get_mut(ap).ok_or("not a configured AP")?;
+        if entry.hostname == claimed {
+            return Ok(());
+        }
+        entry.identity_refused += 1;
+        Err(format!(
+            "it holds {ap}'s key, whose host name is {}, and named itself {claimed:.64}",
+            entry.hostname
+        ))
     }
 
     /// Whether the policy changed since this was last asked, which the asker
     /// then saves.
     pub fn take_dirty(&mut self) -> bool {
         std::mem::take(&mut self.policy_dirty)
+    }
+
+    /// Marks the policy as still to be saved, after a save that failed.
+    pub fn mark_dirty(&mut self) {
+        self.policy_dirty = true;
     }
 
     /// The state with its scans stopped after `spectrum`.
@@ -905,16 +996,21 @@ impl State {
     }
 
     /// Hands the runner's link to a new connection, which said it runs
-    /// `version`; a connection already serving it is told to stop. The
-    /// re-pushes asked for while no runner was connected go first.
+    /// `version`; a connection already serving it is told to stop. The gate
+    /// verdicts of the open rollouts go first: one sent while no runner was
+    /// connected, or to one that restarted since, was never heard.
     pub fn runner_connect(&mut self, version: String) -> RunnerRegistration {
         self.next_id += 1;
         let id = self.next_id;
         let (stop_tx, stop) = oneshot::channel();
         let (outbox_tx, outbox) = mpsc::channel(OUTBOX_CAP);
-        for ap in self.aps.values_mut().filter(|a| a.repush_due) {
-            if let Some(msg) = ap.repush() {
-                ap.repush_due = outbox_tx.try_send(msg).is_err();
+        for r in self.rollouts.iter().filter(|r| r.is_open()) {
+            if let Some((healthy, detail)) = &r.gate {
+                let _ = outbox_tx.try_send(RunnerCtlMsg::RolloutGate {
+                    id: r.id,
+                    healthy: *healthy,
+                    detail: detail.clone(),
+                });
             }
         }
         self.runner.session = Some(RunnerLive {
@@ -945,9 +1041,11 @@ impl State {
     }
 
     /// Relays `config`, the runner's request `id`, to the AP it is signed for:
-    /// the one whose agent says it is `config.ap`. Only its hash and sequence
-    /// stay here; the text goes to the AP's session and nowhere else. `Err`
-    /// is the runner's answer when it cannot go, which is recorded.
+    /// the one whose configured host name is `config.ap`, which only that
+    /// AP's key holds a session of. It becomes the AP's latest. Only its hash
+    /// and sequence stay here; the text goes to the AP's session and nowhere
+    /// else. `Err` is the runner's answer when it cannot go, which is
+    /// recorded.
     pub fn relay(&mut self, id: u64, config: SignedConfig) -> Result<(), ConfigApplied> {
         let ap = config.ap.clone();
         let sent = self.send_config(id, config);
@@ -964,15 +1062,13 @@ impl State {
             sha256,
             seq: config.seq,
         };
-        let found = self.aps.iter_mut().find(|(_, a)| {
-            let hello = a.hello.as_ref();
-            hello.is_some_and(|h| h.ap == config.ap)
-        });
+        let found = self.aps.iter_mut().find(|(_, a)| a.hostname == config.ap);
         let Some((name, entry)) = found else {
-            let why = format!("no AP named {:.64} has connected", config.ap);
+            let why = format!("no AP has the host name {:.64}", config.ap);
             return Err(not_applied(sha256, why));
         };
         let name = name.clone();
+        entry.latest = Some(signed);
         let Some(live) = &entry.session else {
             return Err(not_applied(sha256, format!("{name} is not connected")));
         };
@@ -1068,11 +1164,26 @@ impl State {
         }
     }
 
-    /// At the first key frame of session `id`, and when a rollout of the AP
-    /// ends: whether the AP runs the configuration it last acknowledged. If not, the runner is asked to
-    /// sign that one again (now, or once it is connected), unless the AP's
-    /// image was built after it was signed: then the image's own is the
-    /// newer, and stands.
+    /// The runner's latest configuration for the AP of host name `hostname`,
+    /// as it tells each session it opens: an AP that runs another is asked
+    /// to take it again.
+    pub fn latest(&mut self, hostname: &str, latest: ConfigId) {
+        let Some((name, entry)) = self.aps.iter_mut().find(|(_, a)| a.hostname == hostname) else {
+            return;
+        };
+        entry.latest = Some(latest);
+        let (name, session) = (name.clone(), entry.session.as_ref().map(|s| s.id));
+        self.notify(Change::Deploy);
+        if let Some(id) = session {
+            self.check_installed(&name, id);
+        }
+    }
+
+    /// At the first key frame of session `id`, when the runner tells its
+    /// latest, and when a rollout of the AP ends: whether the AP runs the
+    /// runner's latest configuration for it ([`Ap::drifts`]). If not, the
+    /// runner is asked to sign that one again; a runner not connected now is
+    /// asked when it tells its latest on connecting.
     pub fn check_installed(&mut self, ap: &str, id: u64) {
         let Some(entry) = self.live(ap, id) else {
             return;
@@ -1080,37 +1191,18 @@ impl State {
         if !entry.drifts() || entry.relay.is_some() {
             return;
         }
-        let (Some(acked), Some(hello)) = (entry.acked, &entry.hello) else {
-            return;
-        };
-        let installed = entry.installed();
-        if hello.built_ms() >= acked.seq {
-            entry.acked = None;
-            self.policy_dirty = true;
-            let detail = format!(
-                "its image was built after the configuration it acknowledged ({}), so the \
-                 image's own ({}) stands",
-                short(Some(acked.sha256)),
-                short(installed)
-            );
-            self.record_deploy("repush", ap, None, true, detail);
-            return;
-        }
-        let msg = entry.repush();
-        let sent = msg.is_some_and(|m| self.to_runner(m));
+        let (installed, latest, msg) = (entry.installed(), entry.latest, entry.repush());
+        let sent = self.to_runner(msg);
         let detail = format!(
-            "runs {}, not the acknowledged {}: {}",
+            "runs {}, not the runner's latest {}: {}",
             short(installed),
-            short(Some(acked.sha256)),
+            short(latest.map(|l| l.sha256)),
             if sent {
                 "the runner is asked to sign it again"
             } else {
                 "the runner is asked once it is connected"
             }
         );
-        if let Some(entry) = self.aps.get_mut(ap) {
-            entry.repush_due = !sent;
-        }
         self.record_deploy("repush", ap, None, true, detail);
     }
 
@@ -1192,7 +1284,7 @@ impl State {
         let previous = entry.hello.as_ref().map_or("", Hello::image).to_owned();
         let snap = entry.snapshot.as_ref();
         let radios = snap.map_or(0, |s| s.radios.iter().filter(|r| r.up).count());
-        let clients = snap.map_or(0, |s| s.stations.len());
+        let clients = self.site_clients();
         let id = self.next_rollout + 1;
         let request = RolloutRequest {
             id,
@@ -1220,10 +1312,18 @@ impl State {
             clients,
             gate: None,
             result: None,
+            ended: None,
             log: VecDeque::new(),
         });
+        self.policy_dirty = true;
         self.notify(Change::Deploy);
         Ok(id)
+    }
+
+    /// The clients associated with any AP now.
+    fn site_clients(&self) -> usize {
+        let snaps = self.aps.values().filter_map(|a| a.snapshot.as_ref());
+        snaps.map(|s| s.stations.len()).sum()
     }
 
     /// A line of rollout `id`'s log, from the runner.
@@ -1238,7 +1338,8 @@ impl State {
         self.notify(Change::Deploy);
     }
 
-    /// The runner's last word on a rollout.
+    /// The runner's last word on a rollout. The runner sends it until it is
+    /// acknowledged, so it may come again, and is then recorded once.
     pub fn rollout_result(&mut self, res: RolloutResult) {
         let Some(r) = self
             .rollouts
@@ -1248,6 +1349,8 @@ impl State {
             return;
         };
         r.result = Some((res.outcome, res.detail.clone()));
+        r.ended = Some(SystemTime::now());
+        self.policy_dirty = true;
         let (ap, user, image) = (r.ap.clone(), r.user.clone(), r.image_id.clone());
         let outcome = outcome_name(res.outcome);
         *self.rollout_counts.entry(outcome).or_default() += 1;
@@ -1275,8 +1378,9 @@ impl State {
 
     /// The health gate of the open rollout of `ap`, after a snapshot: healthy
     /// once a session newer than the request runs the image with as many
-    /// radios up as before (at least one) and, if it had clients then, some
-    /// again.
+    /// radios up as before (at least one) and, if the site had clients then,
+    /// at least half as many associated with any AP (clients roam to the
+    /// other AP while this one reboots, and need not come back to it).
     fn gate(&mut self, ap: &str) {
         let Some(entry) = self.aps.get(ap) else {
             return;
@@ -1288,7 +1392,7 @@ impl State {
         let (session, image) = (live.id, hello.image().to_owned());
         let up = snap.radios.iter().filter(|r| r.up).count();
         let all_up = snap.radios.iter().all(|r| r.up);
-        let clients = snap.stations.len();
+        let clients = self.site_clients();
         let Some(r) = self.gating(ap) else {
             return;
         };
@@ -1296,13 +1400,14 @@ impl State {
             || image != r.image_id
             || !all_up
             || up < r.radios.max(1)
-            || (r.clients > 0 && clients == 0)
+            || clients * 2 < r.clients
         {
             return;
         }
-        let detail = format!("back with {image}: {up} radios up, {clients} clients");
+        let detail = format!("back with {image}: {up} radios up, {clients} clients on the site");
         r.gate = Some((true, detail.clone()));
         let id = r.id;
+        self.policy_dirty = true;
         self.to_runner(RunnerCtlMsg::RolloutGate {
             id,
             healthy: true,
@@ -1318,6 +1423,7 @@ impl State {
         };
         r.gate = Some((false, why.clone()));
         let id = r.id;
+        self.policy_dirty = true;
         self.to_runner(RunnerCtlMsg::RolloutGate {
             id,
             healthy: false,
@@ -1532,7 +1638,7 @@ mod tests {
     }
 
     fn state(names: &[&str]) -> State {
-        State::new(names.iter().map(|n| n.to_string()))
+        State::new(names.iter().map(|n| (n.to_string(), n.to_string())))
     }
 
     #[test]

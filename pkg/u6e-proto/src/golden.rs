@@ -345,6 +345,14 @@ fn samples() -> Samples {
                 user: "root".into(),
             },
         ),
+        (
+            "Latest",
+            RunnerMsg::Latest {
+                ap: "ap1".into(),
+                seq: (1 << 42) + 4,
+                sha256: [0x84; 32],
+            },
+        ),
     ];
     let runner_ctl = vec![
         ("RunnerPing", RunnerCtlMsg::Ping(1 << 50)),
@@ -359,8 +367,7 @@ fn samples() -> Samples {
             "Repush",
             RunnerCtlMsg::Repush {
                 ap: "ap1".into(),
-                acked: Some([0x83; 32]),
-                installed: None,
+                installed: Some([0x83; 32]),
             },
         ),
         (
@@ -381,6 +388,7 @@ fn samples() -> Samples {
                 detail: "radios up".into(),
             },
         ),
+        ("RolloutAck", RunnerCtlMsg::RolloutAck { id }),
     ];
     Samples {
         agent,

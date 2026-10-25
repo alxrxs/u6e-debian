@@ -1,8 +1,8 @@
 //! The runner's configuration file, which its root stage helper reads too:
 //! the controller it dials and the key it pins there, its own two keys (the
 //! link's, and the one it signs configurations with, which the APs' images
-//! pin), its local socket, the health gate's time, the APs, and how a kept
-//! image is staged on one.
+//! pin), its local socket and state directory, the health gate's time, the
+//! APs, and how a kept image is staged on one.
 //!
 //! ```toml
 //! controller = "controller.example.net:8443"
@@ -10,6 +10,7 @@
 //! tls_key = "/run/credentials/u6e-deploy.service/tls-key.pem"
 //! signing_key = "/run/credentials/u6e-deploy.service/signing-key.pem"
 //! socket = "/run/u6e-deploy/sock"
+//! state = "/var/lib/u6e-deploy"
 //! gate_secs = 420
 //!
 //! # Each AP by the name the site, its images and the controller give it,
@@ -20,8 +21,9 @@
 //! [rollout]
 //! # The kept images, each a directory <images>/<id>/ with a MANIFEST.
 //! images = "/srv/u6e-debian/images"
-//! # How one is staged, {ap} and {image} (its directory) filled in.
-//! command = ["/usr/bin/env", "U6E_AP={ap}", "/srv/u6e-debian/boot/stage.sh", "{image}"]
+//! # The root-owned tree whose boot/stage.sh stages one (with its boot/,
+//! # site.conf and log/, as in a u6e-debian checkout).
+//! tree = "/usr/local/lib/u6e-deploy"
 //! # The stage helper's socket, and the group whose processes it serves.
 //! helper = "/run/u6e-deploy-stage.sock"
 //! group = "u6e-deploy"
@@ -48,6 +50,8 @@ pub struct Config {
     pub signing_key: PathBuf,
     /// Where local callers ask for applies and rollouts.
     pub socket: PathBuf,
+    /// Where what outlives the runner is kept (`store`).
+    pub state: PathBuf,
     /// How long after staging an image the AP has to pass the health gate.
     pub gate: Duration,
     /// AP name to the host name its configurations are signed for.
@@ -59,8 +63,8 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rollout {
     pub images: PathBuf,
-    /// The argv; `{ap}` and `{image}` are filled in.
-    pub command: Vec<String>,
+    /// The root-owned tree whose `boot/stage.sh` stages an image.
+    pub tree: PathBuf,
     pub helper: PathBuf,
     pub group: String,
 }
@@ -73,6 +77,7 @@ struct File {
     tls_key: PathBuf,
     signing_key: PathBuf,
     socket: PathBuf,
+    state: PathBuf,
     #[serde(default = "default_gate")]
     gate_secs: u64,
     aps: BTreeMap<String, ApFile>,
@@ -89,7 +94,7 @@ struct ApFile {
 #[serde(deny_unknown_fields)]
 struct RolloutFile {
     images: PathBuf,
-    command: Vec<String>,
+    tree: PathBuf,
     helper: PathBuf,
     group: String,
 }
@@ -110,8 +115,8 @@ pub enum ConfigError {
     /// An AP's name or host name is not a plain lowercase name.
     BadName(String),
     NoAps,
-    /// The command does not stage `{image}`.
-    BadCommand,
+    /// `rollout.tree` is not an absolute path.
+    BadTree,
     NoGate,
 }
 
@@ -126,7 +131,7 @@ impl fmt::Display for ConfigError {
                 "aps.{ap}: the AP's name and hostname must be lowercase letters, digits and -"
             ),
             Self::NoAps => f.write_str("no aps"),
-            Self::BadCommand => f.write_str("rollout.command must name {image}"),
+            Self::BadTree => f.write_str("rollout.tree is not an absolute path"),
             Self::NoGate => f.write_str("gate_secs is 0"),
         }
     }
@@ -165,8 +170,8 @@ impl Config {
             }
             aps.insert(name, ap.hostname);
         }
-        if !file.rollout.command.iter().any(|a| a.contains("{image}")) {
-            return Err(ConfigError::BadCommand);
+        if !file.rollout.tree.is_absolute() {
+            return Err(ConfigError::BadTree);
         }
         if file.gate_secs == 0 {
             return Err(ConfigError::NoGate);
@@ -178,11 +183,12 @@ impl Config {
             tls_key: file.tls_key,
             signing_key: file.signing_key,
             socket: file.socket,
+            state: file.state,
             gate: Duration::from_secs(file.gate_secs),
             aps,
             rollout: Rollout {
                 images: r.images,
-                command: r.command,
+                tree: r.tree,
                 helper: r.helper,
                 group: r.group,
             },
@@ -212,10 +218,10 @@ pub(crate) mod tests {
         format!(
             "controller = \"controller.example.net:8443\"\ncontroller_key = \"{KEY}\"\n\
              tls_key = \"/k/tls.pem\"\nsigning_key = \"/k/sign.pem\"\nsocket = \"/run/d/sock\"\n\
+             state = \"/var/lib/d\"\n\
              {extra}\
              [aps.ap1]\nhostname = \"u6e-ap1\"\n\
-             [rollout]\nimages = \"/srv/images\"\n\
-             command = [\"/usr/bin/env\", \"U6E_AP={{ap}}\", \"/srv/boot/stage.sh\", \"{{image}}\"]\n\
+             [rollout]\nimages = \"/srv/images\"\ntree = \"/usr/local/lib/d\"\n\
              helper = \"/run/stage.sock\"\ngroup = \"u6e-deploy\"\n"
         )
     }
@@ -229,7 +235,8 @@ pub(crate) mod tests {
         assert_eq!(c.hostname("ap1"), Some("u6e-ap1"));
         assert_eq!(c.ap_of("u6e-ap1"), Some("ap1"));
         assert_eq!((c.hostname("ap2"), c.ap_of("ap1")), (None, None));
-        assert_eq!(c.rollout.command[3], "{image}");
+        assert_eq!(c.rollout.tree, PathBuf::from("/usr/local/lib/d"));
+        assert_eq!(c.state, PathBuf::from("/var/lib/d"));
         assert_eq!(c.rollout.group, "u6e-deploy");
         let c = Config::parse(&text("gate_secs = 60\n")).unwrap();
         assert_eq!(c.gate, Duration::from_secs(60));
@@ -252,7 +259,10 @@ pub(crate) mod tests {
             bad(&t.replace("[aps.ap1]", "[aps.\"../x\"]")),
             ConfigError::BadName("../x".into())
         );
-        assert_eq!(bad(&t.replace("{image}", "{img}")), ConfigError::BadCommand);
+        assert_eq!(
+            bad(&t.replace("/usr/local/lib/d", "lib/d")),
+            ConfigError::BadTree
+        );
         let none = t.replace("[aps.ap1]\nhostname = \"u6e-ap1\"\n", "[aps]\n");
         assert_eq!(bad(&none), ConfigError::NoAps);
     }

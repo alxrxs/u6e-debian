@@ -556,6 +556,14 @@ pub enum RunnerMsg {
         image_id: String,
         user: String,
     },
+    /// The latest configuration the runner signed for the AP of host name
+    /// `ap`, by its sequence number and hash: what the AP should run. Sent
+    /// for every AP when the session starts and with each one signed.
+    Latest {
+        ap: String,
+        seq: u64,
+        sha256: [u8; 32],
+    },
 }
 
 /// Everything the controller sends the deploy runner.
@@ -571,14 +579,14 @@ pub enum RunnerCtlMsg {
         id: u64,
         result: ConfigApplied,
     },
-    /// The AP reconnected with an installed configuration other than the
-    /// one it last acknowledged (`acked`): sign the runner's last
-    /// configuration for it again, under a new sequence number (the old one
-    /// is a replay to the AP), and send it. `ap` is the name configurations
-    /// are signed for (the AP's host name).
+    /// The AP runs another configuration (`installed`) than the runner's
+    /// latest for it ([`RunnerMsg::Latest`]): sign that latest one again,
+    /// under a new sequence number (the old one is a replay to the AP), and
+    /// send it. `ap` is the name configurations are signed for (the AP's
+    /// host name, as the controller's configuration binds it to the AP's
+    /// key).
     Repush {
         ap: String,
-        acked: Option<[u8; 32]>,
         installed: Option<[u8; 32]>,
     },
     /// Roll an image out to an AP, as an admin asked; the runner may refuse.
@@ -592,6 +600,11 @@ pub enum RunnerCtlMsg {
         id: u64,
         healthy: bool,
         detail: String,
+    },
+    /// The controller has recorded the [`RunnerMsg::RolloutResult`] of
+    /// rollout `id`: the runner stops sending it again.
+    RolloutAck {
+        id: u64,
     },
 }
 
@@ -611,9 +624,10 @@ pub struct RolloutRequest {
     pub ap: String,
     /// The kept build to stage, as the image names itself.
     pub image_id: String,
-    /// The image the AP runs now, as its agent reported it: what a failed
-    /// health gate rolls it back to. Empty when the controller does not know,
-    /// and the runner then refuses.
+    /// The image the AP runs now, as its agent reported it. The runner rolls
+    /// a failed gate back to the image it staged there itself, and takes
+    /// this only for an AP it has staged nothing on yet. Empty when the
+    /// controller does not know.
     pub previous: String,
     /// Who asked, for the runner's audit.
     pub user: String,

@@ -56,7 +56,7 @@ pub async fn start(
     let path = &config.policy_path;
     let saved = policy::load(path)
         .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
-    let mut state = State::new(config.aps.keys().cloned())
+    let mut state = State::new(config.hostnames.clone())
         .with_policy(saved)
         .with_spectrum(timing.spectrum);
     if config.runner.is_some() {

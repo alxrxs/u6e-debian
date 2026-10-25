@@ -6,24 +6,30 @@
 //! A configuration is signed under a sequence number that is the signing
 //! time in milliseconds (one past the last when the clock has not moved), so
 //! it is newer than every image built before it and than every configuration
-//! signed before it; the AP refuses any other (`config::replayed`). The last
-//! one each AP applied is kept, in memory only (it holds the site's secrets),
-//! so that when the controller sees the AP come back running another than the
-//! one it acknowledged, the same one is signed again under a new sequence
-//! number (`Repush`): the old signature is a replay to the AP. One the AP
-//! refused is not kept, so it never stands in for the one the AP still runs.
+//! signed before it, and valid for ten minutes (`config::VALIDITY_MS`); the
+//! AP refuses any other. The latest one signed for each AP is kept, in the
+//! state directory (`store`, its own alone: it holds the site's secrets), and
+//! told to the controller as each session starts (`RunnerMsg::Latest`): when
+//! the controller sees an AP run another, that one is signed again under a
+//! new sequence number (`Repush`), whatever the controller says the AP
+//! acknowledged, so it can never have an older one signed again.
 //!
 //! Rollouts run one at a time (`rollout`), whoever asked: the controller
 //! (an admin's Upgrade) or a local caller, whose ask goes through the
 //! controller so that every rollout is gated and shown the same way. The
 //! controller hands an ask back as a rollout of the same AP, image and user,
-//! which is how its caller finds the rollout to follow.
+//! which is how its caller finds the rollout to follow; one the controller
+//! asks for itself may only roll out the AP's newest kept image. The image
+//! the runner staged on each AP is kept, and a failed gate rolls the AP back
+//! to it. The rollout under way is kept too, so a restarted runner goes on
+//! with it, and each result is sent until the controller acknowledges it.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use aws_lc_rs::signature::Ed25519KeyPair;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, watch};
 use u6e_proto::config::{self, config_sha256};
 use u6e_proto::mac;
@@ -36,24 +42,34 @@ use crate::config::Config;
 use crate::local::Reply;
 use crate::rollout;
 use crate::stage::Helper;
+use crate::store::Store;
 
 /// Messages queued for the controller: a link down for long holds this
-/// many, then drops log lines (never a result).
+/// many, then drops log lines (a result is kept on disk until acknowledged).
 pub const OUTBOX_CAP: usize = 1024;
 
-/// A configuration sent and not answered yet: the AP's host name, the
-/// radios (kept as its last once it applied them), and whose the answer is.
-struct Pending {
-    hostname: String,
-    radios: Vec<RadioConfig>,
-    waiting: Waiting,
+/// The files of the state directory.
+const IMAGES: &str = "images";
+const ROLLOUT: &str = "rollout";
+const RESULTS: &str = "results";
+
+fn latest_file(hostname: &str) -> String {
+    format!("latest-{hostname}")
 }
 
+/// The latest configuration signed for an AP.
+#[derive(Serialize, Deserialize)]
+struct Latest {
+    seq: u64,
+    radios: Vec<RadioConfig>,
+}
+
+/// A configuration sent and not answered yet: whose answer it is.
 enum Waiting {
     /// A local caller's.
     Local(oneshot::Sender<ConfigApplied>),
     /// A re-push's, which only the journal hears.
-    Repush,
+    Repush(String),
 }
 
 /// A local caller's rollout, until the controller hands it back.
@@ -62,6 +78,35 @@ struct Ask {
     image_id: String,
     user: String,
     follower: mpsc::Sender<Reply>,
+}
+
+/// A rollout as it outlives the runner: what was asked, and where it got to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct InFlight {
+    pub id: u64,
+    pub ap: String,
+    pub image_id: String,
+    /// What a failed gate rolls the AP back to.
+    pub previous: String,
+    pub user: String,
+    /// Asked for by a local caller, who may roll out any kept image.
+    pub local: bool,
+    pub phase: Phase,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum Phase {
+    /// Checking the images; nothing is kept of it.
+    Checking,
+    Staging,
+    /// Staged; the gate's verdict is awaited until `deadline_ms`.
+    Gate {
+        deadline_ms: u64,
+    },
+    /// Staging the previous image again, after `why`.
+    RollingBack {
+        why: String,
+    },
 }
 
 /// The rollout under way.
@@ -77,14 +122,18 @@ pub(crate) struct Current {
 
 #[derive(Default)]
 struct Inner {
-    /// Whether a session with the controller is up.
-    connected: bool,
+    /// Since when a session with the controller is up.
+    linked_at: Option<Instant>,
     last_seq: u64,
     next_id: u64,
-    /// The last configuration each AP applied, by host name.
-    last: HashMap<String, Vec<RadioConfig>>,
-    applies: HashMap<u64, Pending>,
+    /// The latest configuration signed for each AP, by host name.
+    latest: HashMap<String, Latest>,
+    /// The image the runner staged on each AP, by AP.
+    images: BTreeMap<String, String>,
+    applies: HashMap<u64, Waiting>,
     rollout: Option<Current>,
+    /// Results the controller has not acknowledged.
+    unacked: Vec<RolloutResult>,
     /// Local callers waiting for the controller to hand their rollout back,
     /// oldest first.
     asks: Vec<Ask>,
@@ -94,6 +143,7 @@ pub struct Runner {
     pub config: Config,
     key: Ed25519KeyPair,
     pub(crate) helper: Helper,
+    store: Store,
     inner: Mutex<Inner>,
     outbox: mpsc::Sender<RunnerMsg>,
 }
@@ -118,15 +168,30 @@ pub fn mechanism(m: Mechanism) -> &'static str {
     }
 }
 
-fn unix_ms() -> u64 {
+pub(crate) fn unix_ms() -> u64 {
     let since = SystemTime::now().duration_since(UNIX_EPOCH);
     since.map_or(0, |d| d.as_millis() as u64)
 }
 
 impl Runner {
-    /// The runner, and the queue of what it sends the controller, which the
-    /// link drains.
-    pub fn new(config: Config, key: Ed25519KeyPair) -> (Arc<Self>, mpsc::Receiver<RunnerMsg>) {
+    /// The runner with what its state directory keeps, the rollout it was
+    /// running among it, and the queue of what it sends the controller,
+    /// which the link drains.
+    pub(crate) fn new(
+        config: Config,
+        key: Ed25519KeyPair,
+    ) -> std::io::Result<(Arc<Self>, Option<InFlight>, mpsc::Receiver<RunnerMsg>)> {
+        let store = Store::open(&config.state)?;
+        let mut inner = Inner::default();
+        for hostname in config.aps.values() {
+            if let Some(l) = store.load::<Latest>(&latest_file(hostname))? {
+                inner.last_seq = inner.last_seq.max(l.seq);
+                inner.latest.insert(hostname.clone(), l);
+            }
+        }
+        inner.images = store.load(IMAGES)?.unwrap_or_default();
+        inner.unacked = store.load(RESULTS)?.unwrap_or_default();
+        let resumed = store.load::<InFlight>(ROLLOUT)?;
         let (outbox, rx) = mpsc::channel(OUTBOX_CAP);
         let helper = Helper {
             socket: config.rollout.helper.clone(),
@@ -135,22 +200,72 @@ impl Runner {
             config,
             key,
             helper,
-            inner: Mutex::new(Inner::default()),
+            store,
+            inner: Mutex::new(inner),
             outbox,
         };
-        (Arc::new(runner), rx)
+        Ok((Arc::new(runner), resumed, rx))
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    pub(crate) fn set_connected(&self, up: bool) {
-        self.lock().connected = up;
+    /// Keeps `v` as `name`; a failure is the journal's, as the state in
+    /// memory stands.
+    fn keep<T: Serialize>(&self, name: &str, v: &T) {
+        if let Err(e) = self.store.save(name, v) {
+            eprintln!("u6e-deploy: {}: not kept: {e}", self.config.state.display());
+        }
     }
 
-    pub fn is_connected(&self) -> bool {
-        self.lock().connected
+    /// What a new session with the controller says first, after its Hello:
+    /// the latest configuration for each AP, and the results not yet
+    /// acknowledged.
+    pub(crate) fn linked(&self) -> Vec<RunnerMsg> {
+        let mut inner = self.lock();
+        inner.linked_at = Some(Instant::now());
+        let latest = inner.latest.iter().map(|(ap, l)| RunnerMsg::Latest {
+            ap: ap.clone(),
+            seq: l.seq,
+            sha256: config_sha256(&l.radios),
+        });
+        let mut said: Vec<RunnerMsg> = latest.collect();
+        said.extend(inner.unacked.iter().cloned().map(RunnerMsg::RolloutResult));
+        said
+    }
+
+    /// The session ended: the configurations that waited for an answer have
+    /// none, and their callers hear so.
+    pub(crate) fn unlinked(&self) {
+        let mut inner = self.lock();
+        inner.linked_at = None;
+        for (_, waiting) in inner.applies.drain() {
+            if let Waiting::Local(tx) = waiting {
+                let _ = tx.send(ConfigApplied {
+                    sha256: [0; 32],
+                    ok: false,
+                    radios: Vec::new(),
+                    detail: "the link to the controller went down before the AP answered".into(),
+                });
+            }
+        }
+    }
+
+    /// Since when the link has been up.
+    pub(crate) fn linked_at(&self) -> Option<Instant> {
+        self.lock().linked_at
+    }
+
+    /// Whether request `id` still waits for an answer: one given up on is
+    /// not sent.
+    pub(crate) fn is_pending(&self, id: u64) -> bool {
+        self.lock().applies.contains_key(&id)
+    }
+
+    /// Gives up on request `id`, whose caller stopped waiting.
+    pub(crate) fn forget(&self, id: u64) {
+        self.lock().applies.remove(&id);
     }
 
     fn next_id(inner: &mut Inner) -> u64 {
@@ -159,24 +274,24 @@ impl Runner {
     }
 
     /// Signs `radios` for the AP of `hostname` under the next sequence
-    /// number and sends them to the controller, the answer to `waiting`.
+    /// number, keeps them as its latest, and sends them to the controller as
+    /// request `id`, the answer to `waiting`.
     fn send_signed(
         &self,
         inner: &mut Inner,
         hostname: &str,
         radios: Vec<RadioConfig>,
         waiting: Waiting,
-    ) -> Result<(), String> {
+    ) -> Result<u64, String> {
         inner.last_seq = unix_ms().max(inner.last_seq + 1);
-        let config = config::sign(&self.key, hostname, inner.last_seq, radios.clone());
+        let seq = inner.last_seq;
+        let config = config::sign(&self.key, hostname, seq, radios.clone());
+        let latest = Latest { seq, radios };
+        self.keep(&latest_file(hostname), &latest);
+        inner.latest.insert(hostname.to_owned(), latest);
         let id = Runner::next_id(inner);
-        let (sha256, seq) = (config.sha256, config.seq);
-        let pending = Pending {
-            hostname: hostname.to_owned(),
-            radios,
-            waiting,
-        };
-        inner.applies.insert(id, pending);
+        let sha256 = config.sha256;
+        inner.applies.insert(id, waiting);
         if self
             .outbox
             .try_send(RunnerMsg::ApplyConfig { id, config })
@@ -187,30 +302,30 @@ impl Runner {
         }
         let ap = self.config.ap_of(hostname).unwrap_or(hostname);
         eprintln!("u6e-deploy: {ap}: signed {} under {seq}", mac::hex(&sha256));
-        Ok(())
+        Ok(id)
     }
 
-    /// A local caller's configuration for `ap`, signed and sent; the AP's
-    /// answer comes on the receiver.
+    /// A local caller's configuration for `ap`, signed and sent: its
+    /// request's id, and the AP's answer on the receiver.
     pub fn apply(
         &self,
         ap: &str,
         radios: Vec<RadioConfig>,
-    ) -> Result<oneshot::Receiver<ConfigApplied>, String> {
+    ) -> Result<(u64, oneshot::Receiver<ConfigApplied>), String> {
         let hostname = self
             .config
             .hostname(ap)
             .ok_or_else(|| format!("no AP {ap:.64} in the configuration"))?;
         let mut inner = self.lock();
-        if !inner.connected {
+        if inner.linked_at.is_none() {
             return Err("no link to the controller".into());
         }
         if inner.rollout.as_ref().is_some_and(|r| r.ap == ap) {
             return Err(format!("{ap} is being rolled out to"));
         }
         let (tx, rx) = oneshot::channel();
-        self.send_signed(&mut inner, hostname, radios, Waiting::Local(tx))?;
-        Ok(rx)
+        let id = self.send_signed(&mut inner, hostname, radios, Waiting::Local(tx))?;
+        Ok((id, rx))
     }
 
     /// A local caller's rollout of `image_id` to `ap`, asked of the
@@ -227,7 +342,7 @@ impl Runner {
             return Err(format!("no AP {ap:.64} in the configuration"));
         }
         let mut inner = self.lock();
-        if !inner.connected {
+        if inner.linked_at.is_none() {
             return Err("no link to the controller".into());
         }
         let ask = RunnerMsg::RolloutAsk {
@@ -254,11 +369,7 @@ impl Runner {
         match msg {
             RunnerCtlMsg::Ping(n) => return Some(RunnerMsg::Pong(n)),
             RunnerCtlMsg::ConfigApplied { id, result } => self.applied(id, result),
-            RunnerCtlMsg::Repush {
-                ap,
-                acked,
-                installed,
-            } => self.repush(&ap, acked, installed),
+            RunnerCtlMsg::Repush { ap, installed } => self.repush(&ap, installed),
             RunnerCtlMsg::Rollout(req) => self.start(req),
             RunnerCtlMsg::RolloutGate {
                 id,
@@ -269,6 +380,11 @@ impl Runner {
                     r.gate.send_replace(Some((healthy, detail)));
                 }
             }
+            RunnerCtlMsg::RolloutAck { id } => {
+                let mut inner = self.lock();
+                inner.unacked.retain(|r| r.id != id);
+                self.keep(RESULTS, &inner.unacked);
+            }
             // A message of a newer protocol's would not have been decoded.
             _ => {}
         }
@@ -276,23 +392,14 @@ impl Runner {
     }
 
     fn applied(&self, id: u64, result: ConfigApplied) {
-        let mut inner = self.lock();
-        let Some(Pending {
-            hostname,
-            radios,
-            waiting,
-        }) = inner.applies.remove(&id)
-        else {
+        let Some(waiting) = self.lock().applies.remove(&id) else {
             return;
         };
-        if result.ok && result.sha256 == config_sha256(&radios) {
-            inner.last.insert(hostname.clone(), radios);
-        }
         match waiting {
             Waiting::Local(tx) => {
                 let _ = tx.send(result);
             }
-            Waiting::Repush => {
+            Waiting::Repush(hostname) => {
                 let ap = self.config.ap_of(&hostname).unwrap_or(&hostname);
                 let how = if result.ok { "applied" } else { "not applied" };
                 eprintln!(
@@ -303,42 +410,38 @@ impl Runner {
         }
     }
 
-    /// The controller saw the AP of `hostname` come back running `installed`,
-    /// not `acked`: the last configuration it applied is signed again, if it
-    /// is the acknowledged one.
-    fn repush(&self, hostname: &str, acked: Option<[u8; 32]>, installed: Option<[u8; 32]>) {
+    /// The controller saw the AP of `hostname` run `installed`, not the
+    /// latest configuration signed for it: that one is signed again.
+    fn repush(&self, hostname: &str, installed: Option<[u8; 32]>) {
         let mut inner = self.lock();
         let ap = self.config.ap_of(hostname).unwrap_or(hostname).to_owned();
         let skip = |why: String| eprintln!("u6e-deploy: {ap}: not signed again: {why}");
-        let Some(radios) = inner.last.get(hostname) else {
-            return skip("it applied nothing this runner signed since it started".into());
+        let Some(latest) = inner.latest.get(hostname) else {
+            return skip("nothing was signed for it".into());
         };
-        let sha256 = config_sha256(radios);
-        if acked != Some(sha256) {
-            return skip(format!(
-                "the last configuration it applied ({}) is not the one it acknowledged",
-                mac::hex(&sha256)
-            ));
-        }
+        let sha256 = config_sha256(&latest.radios);
         if installed == Some(sha256) {
             return skip("it runs it".into());
         }
         if inner.rollout.as_ref().is_some_and(|r| r.ap == ap) {
             return skip("it is being rolled out to".into());
         }
-        let radios = radios.clone();
+        let radios = latest.radios.clone();
         eprintln!(
-            "u6e-deploy: {ap}: runs {}, not the acknowledged {}: signing it again",
+            "u6e-deploy: {ap}: runs {}, not the latest {}: signing it again",
             installed.map_or_else(|| "none".into(), |h| mac::hex(&h)),
             mac::hex(&sha256),
         );
-        if let Err(why) = self.send_signed(&mut inner, hostname, radios, Waiting::Repush) {
+        let waiting = Waiting::Repush(hostname.to_owned());
+        if let Err(why) = self.send_signed(&mut inner, hostname, radios, waiting) {
             skip(why);
         }
     }
 
     /// A rollout the controller hands over: refused when another runs or it
-    /// could not be rolled back, else run.
+    /// could not be rolled back, else run. Its way back is the image the
+    /// runner staged on the AP, or, on an AP it has staged nothing on yet,
+    /// the one the controller says it runs.
     fn start(self: &Arc<Self>, req: RolloutRequest) {
         let mut inner = self.lock();
         let asked = inner
@@ -346,6 +449,11 @@ impl Runner {
             .iter()
             .position(|a| (&a.ap, &a.image_id, &a.user) == (&req.ap, &req.image_id, &req.user));
         let follower = asked.map(|i| inner.asks.remove(i).follower);
+        let previous = inner
+            .images
+            .get(&req.ap)
+            .cloned()
+            .unwrap_or(req.previous.clone());
         let refusal = if let Some(r) = &inner.rollout {
             Some(format!(
                 "the rollout of {} to {} is not over",
@@ -353,42 +461,98 @@ impl Runner {
             ))
         } else if self.config.hostname(&req.ap).is_none() {
             Some(format!("no AP {:.64} in the configuration", req.ap))
-        } else if req.previous.is_empty() {
+        } else if previous.is_empty() {
             Some(format!(
                 "what {} runs is not known, so it could not be rolled back",
                 req.ap
             ))
-        } else if req.image_id == req.previous {
+        } else if req.image_id == previous {
             Some(format!("{} runs {} already", req.ap, req.image_id))
         } else {
             None
         };
         if let Some(why) = refusal {
             drop(inner);
-            let msg = RunnerMsg::RolloutResult(RolloutResult {
-                id: req.id,
-                outcome: RolloutOutcome::Refused,
-                detail: why.clone(),
-            });
-            eprintln!("u6e-deploy: {}: {} refused: {why}", req.ap, req.image_id);
-            let _ = self.outbox.try_send(msg);
-            if let Some(f) = follower {
-                let _ = f.try_send(Reply::Done {
-                    ok: false,
-                    detail: format!("refused: {why}"),
-                });
-            }
+            self.refuse(req.id, &req.ap, &req.image_id, why, follower);
             return;
         }
+        let flight = InFlight {
+            id: req.id,
+            ap: req.ap,
+            image_id: req.image_id,
+            previous,
+            user: req.user,
+            local: follower.is_some(),
+            phase: Phase::Checking,
+        };
+        let gate = self.current(&mut inner, &flight, follower);
+        tokio::spawn(rollout::run(Arc::clone(self), flight, gate));
+    }
+
+    /// Goes on with the rollout the state directory kept, which a runner
+    /// that stopped was running.
+    pub(crate) fn resume(self: &Arc<Self>, flight: InFlight) {
+        eprintln!(
+            "u6e-deploy: {}: going on with the rollout of {} ({:?})",
+            flight.ap, flight.image_id, flight.phase
+        );
+        let gate = self.current(&mut self.lock(), &flight, None);
+        tokio::spawn(rollout::run(Arc::clone(self), flight, gate));
+    }
+
+    /// Makes `flight` the rollout under way; the receiver of its gate.
+    fn current(
+        &self,
+        inner: &mut Inner,
+        flight: &InFlight,
+        follower: Option<mpsc::Sender<Reply>>,
+    ) -> watch::Receiver<Option<(bool, String)>> {
         let (gate, gate_rx) = watch::channel(None);
         inner.rollout = Some(Current {
-            id: req.id,
-            ap: req.ap.clone(),
-            image_id: req.image_id.clone(),
+            id: flight.id,
+            ap: flight.ap.clone(),
+            image_id: flight.image_id.clone(),
             gate,
             follower,
         });
-        tokio::spawn(rollout::run(Arc::clone(self), req, gate_rx));
+        gate_rx
+    }
+
+    /// Refuses rollout `id`: nothing was staged.
+    fn refuse(
+        &self,
+        id: u64,
+        ap: &str,
+        image_id: &str,
+        why: String,
+        follower: Option<mpsc::Sender<Reply>>,
+    ) {
+        eprintln!("u6e-deploy: {ap}: {image_id} refused: {why}");
+        let result = RolloutResult {
+            id,
+            outcome: RolloutOutcome::Refused,
+            detail: why.clone(),
+        };
+        self.record(result);
+        if let Some(f) = follower {
+            let _ = f.try_send(Reply::Done {
+                ok: false,
+                detail: format!("refused: {why}"),
+            });
+        }
+    }
+
+    /// Keeps `result` until the controller acknowledges it, and sends it.
+    fn record(&self, result: RolloutResult) {
+        let mut inner = self.lock();
+        inner.unacked.push(result.clone());
+        self.keep(RESULTS, &inner.unacked);
+        let _ = self.outbox.try_send(RunnerMsg::RolloutResult(result));
+    }
+
+    /// Keeps where `flight` got to, for a runner that restarts.
+    pub(crate) fn persist(&self, flight: &InFlight) {
+        self.keep(ROLLOUT, flight);
     }
 
     /// A line of the rollout under way's log: to the controller, its
@@ -406,14 +570,39 @@ impl Runner {
         let _ = self.outbox.try_send(RunnerMsg::RolloutLog { id, line });
     }
 
-    /// Ends the rollout under way: the controller hears how first, then the
-    /// follower, who may ask for the next rollout at once; that ask must not
-    /// reach the controller before this result.
-    pub(crate) async fn finish(&self, id: u64, outcome: RolloutOutcome, detail: String) {
-        let current = self.lock().rollout.take_if(|r| r.id == id);
+    /// Ends the rollout under way: the image the AP runs is recorded, the
+    /// result kept until the controller acknowledges it and sent, and then
+    /// the follower hears how, who may ask for the next rollout at once; that
+    /// ask must not reach the controller before this result.
+    pub(crate) async fn finish(&self, flight: &InFlight, outcome: RolloutOutcome, detail: String) {
+        let current = self.lock().rollout.take_if(|r| r.id == flight.id);
         let Some(r) = current else {
             return;
         };
+        {
+            let mut inner = self.lock();
+            match outcome {
+                RolloutOutcome::Done => {
+                    inner
+                        .images
+                        .insert(flight.ap.clone(), flight.image_id.clone());
+                }
+                RolloutOutcome::RolledBack => {
+                    inner
+                        .images
+                        .insert(flight.ap.clone(), flight.previous.clone());
+                }
+                // Where staging stopped, nothing is known.
+                RolloutOutcome::Failed => {
+                    inner.images.remove(&flight.ap);
+                }
+                RolloutOutcome::Refused => {}
+            }
+            self.keep(IMAGES, &inner.images);
+        }
+        if let Err(e) = self.store.remove(ROLLOUT) {
+            eprintln!("u6e-deploy: {}: {e}", self.config.state.display());
+        }
         let word = match outcome {
             RolloutOutcome::Done => "done",
             RolloutOutcome::RolledBack => "rolled back",
@@ -425,13 +614,11 @@ impl Runner {
             ok: outcome == RolloutOutcome::Done,
             detail: format!("{word}: {detail}"),
         };
-        let result = RunnerMsg::RolloutResult(RolloutResult {
-            id,
+        self.record(RolloutResult {
+            id: flight.id,
             outcome,
             detail,
         });
-        // The last word is never dropped: it waits for the link.
-        let _ = self.outbox.send(result).await;
         if let Some(f) = r.follower {
             let _ = f.send(done).await;
         }
@@ -444,15 +631,24 @@ mod tests {
     use aws_lc_rs::rand::SystemRandom;
 
     use crate::config::tests::text;
+    use crate::tests::TestDir;
+
+    fn runner(t: &TestDir) -> (Arc<Runner>, mpsc::Receiver<RunnerMsg>) {
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let key = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let mut config = Config::parse(&text("")).unwrap();
+        config.state = t.path().join("state");
+        let (runner, _, sent) = Runner::new(config, key).unwrap();
+        runner.linked();
+        (runner, sent)
+    }
 
     /// Two callers' asks for one AP: each follows the rollout the controller
     /// hands back for it, whichever comes first.
     #[test]
     fn each_caller_follows_the_rollout_it_asked_for() {
-        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
-        let key = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
-        let (runner, mut sent) = Runner::new(Config::parse(&text("")).unwrap(), key);
-        runner.set_connected(true);
+        let t = TestDir::new();
+        let (runner, mut sent) = runner(&t);
         let (first, mut first_rx) = mpsc::channel(8);
         let (second, mut second_rx) = mpsc::channel(8);
         let user = || "root (local)".to_owned();
@@ -475,5 +671,32 @@ mod tests {
         assert!(first_rx.try_recv().is_err());
         assert_eq!(runner.lock().asks.len(), 1);
         assert_eq!(runner.lock().asks[0].image_id, "img-a-ap1");
+    }
+
+    /// A result is kept until the controller acknowledges it, across a
+    /// restart, and said again at each new session.
+    #[test]
+    fn a_result_is_sent_until_acknowledged() {
+        let t = TestDir::new();
+        let (runner, _sent) = runner(&t);
+        runner.handle(RunnerCtlMsg::Rollout(RolloutRequest {
+            id: 4,
+            ap: "ap1".into(),
+            image_id: "img-b-ap1".into(),
+            previous: String::new(),
+            user: "admin".into(),
+        }));
+        drop(runner);
+        let (again, _sent) = super::tests::runner(&t);
+        let said = again.linked();
+        assert!(
+            matches!(&said[..], [RunnerMsg::RolloutResult(r)] if r.id == 4),
+            "{said:?}"
+        );
+        again.handle(RunnerCtlMsg::RolloutAck { id: 4 });
+        assert!(again.linked().is_empty());
+        drop(again);
+        let (third, _sent) = super::tests::runner(&t);
+        assert!(third.linked().is_empty());
     }
 }

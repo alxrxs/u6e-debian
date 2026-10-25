@@ -5,7 +5,9 @@
 //! spectrum series are per radio that scans, of every AP with a snapshot.
 //! The deploy runner's series exist only when the configuration admits one;
 //! the configurations relayed and the rollouts ended are counted by result,
-//! every result always exported.
+//! every result always exported, and the last rollout that failed is timed
+//! from the rollouts the policy file keeps, so that its alert outlives a
+//! restart. The sessions refused for naming another AP are counted per AP.
 
 use std::collections::BTreeSet;
 use std::fmt::Write;
@@ -18,7 +20,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use u6e_proto::PROTOCOL;
 use u6e_proto::mac;
-use u6e_proto::msg::{Radio, Snapshot, Station};
+use u6e_proto::msg::{Radio, RolloutOutcome, Snapshot, Station};
 
 use crate::spectrum::{RADIOS, Scan};
 use crate::state::{Ap, Shared, State};
@@ -233,6 +235,14 @@ pub fn render(state: &State) -> String {
         }
     }
     m.family(
+        "wifi_agent_identity_refused_total",
+        COUNTER,
+        "Sessions of the AP's key turned away because the agent named itself by another host name than the AP's.",
+    );
+    for &(ap, a) in &aps {
+        m.sample(&[("ap", ap)], a.identity_refused as f64);
+    }
+    m.family(
         "wifi_agent_last_seen_timestamp_seconds",
         GAUGE,
         "When the AP's agent last sent anything.",
@@ -440,10 +450,10 @@ fn deploy(m: &mut Text, state: &State, aps: &[(&str, &Ap)]) {
     m.family(
         "wifi_config_drift",
         GAUGE,
-        "Whether the connected AP runs another Wi-Fi configuration than the one it last acknowledged.",
+        "Whether the connected AP runs another Wi-Fi configuration than the deploy runner's latest for it.",
     );
     for &(ap, a) in aps {
-        if a.acked.is_some() && a.snapshot.is_some() {
+        if a.latest.is_some() && a.snapshot.is_some() {
             m.sample(&[("ap", ap)], f64::from(u8::from(a.drifts())));
         }
     }
@@ -464,6 +474,23 @@ fn deploy(m: &mut Text, state: &State, aps: &[(&str, &Ap)]) {
     for outcome in OUTCOMES {
         let n = state.rollout_counts.get(outcome).copied();
         m.sample(&[("outcome", outcome)], n.unwrap_or(0) as f64);
+    }
+    // From the rollouts the policy file keeps, so a restart loses no alert.
+    let failed = state.rollouts.iter().filter(|r| {
+        let outcome = r.result.as_ref().map(|(o, _)| *o);
+        matches!(
+            outcome,
+            Some(RolloutOutcome::RolledBack | RolloutOutcome::Failed)
+        )
+    });
+    if let Some(last) = failed.filter_map(|r| r.ended).max() {
+        m.family(
+            "wifi_rollout_last_failure_timestamp_seconds",
+            GAUGE,
+            "When the last image rollout that ended rolled back or failed ended.",
+        );
+        let at = last.duration_since(UNIX_EPOCH).unwrap_or_default();
+        m.sample(&[], at.as_secs_f64());
     }
 }
 

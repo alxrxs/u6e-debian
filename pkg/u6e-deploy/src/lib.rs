@@ -7,8 +7,11 @@
 //! it on its socket for exactly two things, an apply and a rollout (`local`);
 //! the controller hands it the rollouts admins ask for and gates each.
 //! Rollouts run one at a time (`rollout`), each staged by a root helper that
-//! runs the site's staging command and nothing else (`stage`), and an AP
-//! that does not come back healthy is rolled back to the image it ran.
+//! runs u6e-debian's `boot/stage.sh` from a tree only root writes, and
+//! nothing else (`stage`), and an AP that does not come back healthy is
+//! rolled back to the image the runner staged on it. What outlives the
+//! runner, its latest configuration per AP, the image it staged on each and
+//! the rollout under way, is in its state directory (`store`).
 //! Configurations come as `boot/wifi-up.sh --print` renders them (`script`).
 
 pub mod config;
@@ -19,6 +22,7 @@ mod rollout;
 pub mod runner;
 pub mod script;
 pub mod stage;
+mod store;
 
 use std::fs::{self, Permissions};
 use std::io;
@@ -66,9 +70,12 @@ pub async fn start(
     let listener = UnixListener::bind(&socket)
         .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", socket.display())))?;
     fs::set_permissions(&socket, Permissions::from_mode(0o660))?;
-    let (runner, outbox) = Runner::new(config, key);
+    let (runner, resumed, outbox) = Runner::new(config, key)?;
     tokio::spawn(link::run(Arc::clone(&runner), identity, outbox));
     tokio::spawn(local::serve(Arc::clone(&runner), listener));
+    if let Some(flight) = resumed {
+        runner.resume(flight);
+    }
     Ok(runner)
 }
 

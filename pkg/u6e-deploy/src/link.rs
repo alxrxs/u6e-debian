@@ -2,7 +2,9 @@
 //! X25519MLKEM768 key exchange, the controller pinned by its key and the
 //! runner admitted by its own (`u6e_proto::tls`). Each session opens with the
 //! version frames, and only a controller of this protocol is spoken to; the
-//! runner then says Hello, sends what is queued for the controller and takes
+//! runner then says Hello, its latest configuration for each AP and the
+//! rollout results not yet acknowledged, sends what is queued for the
+//! controller (but no configuration whose caller stopped waiting) and takes
 //! what the controller sends. A session silent for a minute is dropped (the
 //! controller pings every 15 s), and the link redials after 1 s, doubling to
 //! 30 s while sessions end before the controller says anything.
@@ -49,7 +51,7 @@ pub async fn run(runner: Arc<Runner>, identity: Identity, mut outbox: mpsc::Rece
             heard: false,
         };
         let e = s.run(&connector, &mut outbox, &mut unsent).await;
-        runner.set_connected(false);
+        runner.unlinked();
         eprintln!(
             "u6e-deploy: the controller {}: {e}",
             runner.config.controller
@@ -117,8 +119,10 @@ impl Session<'_> {
             "u6e-deploy: linked to the controller {}",
             self.runner.config.controller
         );
-        self.runner.set_connected(true);
-        if let Some(msg) = unsent.take() {
+        for msg in self.runner.linked() {
+            write(&mut tls, &msg).await?;
+        }
+        if let Some(msg) = unsent.take().filter(|m| self.still_wanted(m)) {
             write_or_keep(&mut tls, msg, unsent).await?;
         }
         let mut last_rx = Instant::now();
@@ -142,12 +146,23 @@ impl Session<'_> {
                 }
                 msg = outbox.recv() => {
                     let msg = msg.ok_or_else(|| io::Error::other("the runner is gone"))?;
-                    write_or_keep(&mut tls, msg, unsent).await?;
+                    if self.still_wanted(&msg) {
+                        write_or_keep(&mut tls, msg, unsent).await?;
+                    }
                 }
                 () = sleep_until(last_rx + SILENCE) => {
                     return Err(io::Error::new(ErrorKind::TimedOut, "the controller is silent"));
                 }
             }
+        }
+    }
+
+    /// Whether `msg` is still to go: a configuration whose request was given
+    /// up on (its caller stopped waiting, or the link went down) is not.
+    fn still_wanted(&self, msg: &RunnerMsg) -> bool {
+        match msg {
+            RunnerMsg::ApplyConfig { id, .. } => self.runner.is_pending(*id),
+            _ => true,
         }
     }
 

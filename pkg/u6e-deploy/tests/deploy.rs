@@ -1,13 +1,15 @@
 //! The runner against a controller in this process and fake APs, which
 //! judge every configuration as the agent does (`config::verify`, then
 //! `config::replayed` against the last one applied and the image's build
-//! time; one with a radio marked `# refused` stands for one the AP finds
-//! wrong), and a stage helper on a socket of the test's own whose staging
-//! command logs what it is asked to stage.
+//! time, and `config::expired`; one with a radio marked `# refused` stands
+//! for one the AP finds wrong), and a stage helper on a socket of the test's
+//! own whose staging script logs what it is asked to stage. The controller
+//! and the runner can each be restarted, their files kept.
 
 use std::fs;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -106,58 +108,51 @@ const KEPT: [&str; 5] = [
     "img-1-ap2",
 ];
 
-/// The staging command: logs the AP and the image, takes its time for a
-/// slow one and fails a bad one.
-const STAGE: &str = "echo \"$0 ${1##*/}\" >> \"${1%/images/*}/staged\"; echo staging $0; \
+/// The staging script, `boot/stage.sh` of the site's root-owned tree: logs
+/// the AP and the image, takes its time for a slow one and fails a bad one.
+const STAGE: &str = "echo \"$U6E_AP ${1##*/}\" >> \"${1%/images/*}/staged\"; \
+                     echo staging $U6E_AP; \
                      case $1 in *slow*) sleep 1.5 ;; *bad*) exit 1 ;; esac; echo staged";
 
-/// A controller, a runner and a stage helper, all in this process.
+fn runtime() -> Runtime {
+    Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+/// A controller, a runner and a stage helper, all in this process; the
+/// controller and the runner each on a runtime of its own, which a restart
+/// drops and makes anew, their files kept.
 struct Site {
     dir: TempDir,
     controller: u6e_controller::Controller,
+    controller_rt: Option<Runtime>,
+    runner_rt: Option<Runtime>,
     socket: PathBuf,
-    rt: Runtime,
+    gate: Duration,
 }
 
 impl Site {
     fn new(name: &str, gate: Duration) -> Site {
         let dir = TempDir::new(name);
-        let rt = Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let hex = |pem| mac::hex(&identity(pem).public_key());
-        let text = format!(
-            "listen_agents = \"127.0.0.1:0\"\nlisten_http = \"127.0.0.1:0\"\n\
-             listen_metrics = \"127.0.0.1:0\"\nkey = \"unused.pem\"\n\
-             public_origin = \"https://wifi.example.org\"\npolicy_path = \"{}\"\n\
-             [runner]\npublic_key = \"{}\"\n[aps.ap1]\npublic_key = \"{}\"\n\
-             [aps.ap2]\npublic_key = \"{}\"\n",
-            dir.0.join("policy.json").display(),
-            hex(KEY_RUNNER),
-            hex(KEY_AP1),
-            hex(KEY_AP2),
-        );
-        let config = u6e_controller::config::Config::parse(&text).unwrap();
-        let controller = rt
-            .block_on(u6e_controller::start(
-                &config,
-                &identity(KEY_CONTROLLER),
-                Timing::default(),
-                Arc::new(NoNames),
-            ))
-            .unwrap();
-        for id in KEPT {
-            fs::create_dir_all(dir.0.join("images").join(id)).unwrap();
-            fs::write(dir.0.join("images").join(id).join("MANIFEST"), "test\n").unwrap();
-        }
-        let site = Site {
+        let rt = runtime();
+        let controller = start_controller(&rt, &dir.0, "127.0.0.1:0").unwrap();
+        let mut site = Site {
             socket: dir.0.join("runner.sock"),
             dir,
             controller,
-            rt,
+            controller_rt: Some(rt),
+            runner_rt: None,
+            gate,
         };
+        fs::create_dir_all(site.dir.0.join("images")).unwrap();
+        for id in KEPT {
+            let ap = if id.ends_with("-ap2") { "ap2" } else { "ap1" };
+            keep(&site.dir.0.join("images"), id, ap);
+        }
+        tree(&site.dir.0);
         let config = site.runner_config(&site.socket, gate);
         // The stage helper as systemd runs it: one per connection.
         let helper = std::os::unix::net::UnixListener::bind(&config.rollout.helper).unwrap();
@@ -170,37 +165,89 @@ impl Site {
                 thread::spawn(move || stage::serve_peer(&served, conn.unwrap(), gid));
             }
         });
-        site.start_runner(config, KEY_RUNNER);
+        let rt = runtime();
+        start_runner(&rt, config, KEY_RUNNER);
+        site.runner_rt = Some(rt);
         site
     }
 
-    /// The runner's configuration, its socket `socket`.
+    /// The runner's configuration, its socket `socket` and its state in a
+    /// directory beside it.
     fn runner_config(&self, socket: &Path, gate: Duration) -> Config {
         let text = format!(
             "controller = \"{}\"\ncontroller_key = \"{}\"\ntls_key = \"unused\"\n\
-             signing_key = \"unused\"\nsocket = \"{}\"\ngate_secs = {}\n\
+             signing_key = \"unused\"\nsocket = \"{}\"\nstate = \"{}\"\ngate_secs = {}\n\
              [aps.ap1]\nhostname = \"u6e-ap1\"\n[aps.ap2]\nhostname = \"u6e-ap2\"\n\
-             [rollout]\nimages = \"{}\"\ncommand = [\"/bin/sh\", \"-c\", {STAGE:?}, \"{{ap}}\", \"{{image}}\"]\n\
+             [rollout]\nimages = \"{}\"\ntree = \"{}\"\n\
              helper = \"{}\"\ngroup = \"root\"\n",
             self.controller.agents,
             mac::hex(&identity(KEY_CONTROLLER).public_key()),
             socket.display(),
+            socket.with_extension("state").display(),
             gate.as_secs(),
             self.dir.0.join("images").display(),
+            self.dir.0.join("tree").display(),
             self.dir.0.join("stage.sock").display(),
         );
         Config::parse(&text).unwrap()
     }
 
-    fn start_runner(&self, config: Config, tls: &str) {
-        let key = u6e_deploy::signing_key(KEY_SIGNING, &identity(tls)).unwrap();
-        let started = self
-            .rt
-            .block_on(u6e_deploy::start(config, identity(tls), key));
-        started.unwrap();
+    /// Another runner, of the link key `tls`, its socket `socket`.
+    fn start_runner(&self, socket: &Path, tls: &str) -> Runtime {
+        let rt = runtime();
+        start_runner(&rt, self.runner_config(socket, self.gate), tls);
+        rt
     }
 
-    /// What the staging command was asked, in order: `<ap> <image>` lines.
+    /// Stops the runner and starts it again, its state directory kept.
+    fn restart_runner(&mut self) {
+        if let Some(rt) = self.runner_rt.take() {
+            rt.shutdown_background();
+        }
+        wait_for("the runner gone", || !self.runner_up());
+        let rt = runtime();
+        start_runner(&rt, self.runner_config(&self.socket, self.gate), KEY_RUNNER);
+        self.runner_rt = Some(rt);
+    }
+
+    /// Stops the runner, to be started again later.
+    fn stop_runner(&mut self) {
+        if let Some(rt) = self.runner_rt.take() {
+            rt.shutdown_background();
+        }
+        wait_for("the runner gone", || !self.runner_up());
+    }
+
+    /// Starts the runner stopped by [`Site::stop_runner`].
+    fn start_runner_again(&mut self) {
+        let rt = runtime();
+        start_runner(&rt, self.runner_config(&self.socket, self.gate), KEY_RUNNER);
+        self.runner_rt = Some(rt);
+    }
+
+    /// Stops the controller and starts it again on the same address, its
+    /// policy file kept.
+    fn restart_controller(&mut self) {
+        let agents = self.controller.agents.to_string();
+        if let Some(rt) = self.controller_rt.take() {
+            rt.shutdown_background();
+        }
+        let rt = runtime();
+        let start = Instant::now();
+        // The old listener's port is free once its runtime has dropped it.
+        self.controller = loop {
+            match start_controller(&rt, &self.dir.0, &agents) {
+                Ok(c) => break c,
+                Err(e) => {
+                    assert!(start.elapsed() < WAIT, "{e}");
+                    thread::sleep(Duration::from_millis(50));
+                }
+            }
+        };
+        self.controller_rt = Some(rt);
+    }
+
+    /// What the staging script was asked, in order: `<ap> <image>` lines.
     fn staged(&self) -> Vec<String> {
         let text = fs::read_to_string(self.dir.0.join("staged")).unwrap_or_default();
         text.lines().map(str::to_owned).collect()
@@ -217,6 +264,77 @@ impl Site {
     fn runner_up(&self) -> bool {
         self.controller.state.read().runner.is_up()
     }
+
+    /// The runner's state directory.
+    fn state(&self) -> PathBuf {
+        self.socket.with_extension("state")
+    }
+}
+
+/// A controller on `rt` listening for agents at `agents`, its policy in
+/// `dir`, admitting the two APs, each by its key and host name, and the
+/// runner.
+fn start_controller(
+    rt: &Runtime,
+    dir: &Path,
+    agents: &str,
+) -> io::Result<u6e_controller::Controller> {
+    let hex = |pem| mac::hex(&identity(pem).public_key());
+    let text = format!(
+        "listen_agents = \"{agents}\"\nlisten_http = \"127.0.0.1:0\"\n\
+         listen_metrics = \"127.0.0.1:0\"\nkey = \"unused.pem\"\n\
+         public_origin = \"https://wifi.example.org\"\npolicy_path = \"{}\"\n\
+         [runner]\npublic_key = \"{}\"\n\
+         [aps.ap1]\npublic_key = \"{}\"\nhostname = \"u6e-ap1\"\n\
+         [aps.ap2]\npublic_key = \"{}\"\nhostname = \"u6e-ap2\"\n",
+        dir.join("policy.json").display(),
+        hex(KEY_RUNNER),
+        hex(KEY_AP1),
+        hex(KEY_AP2),
+    );
+    let config = u6e_controller::config::Config::parse(&text).unwrap();
+    rt.block_on(u6e_controller::start(
+        &config,
+        &identity(KEY_CONTROLLER),
+        Timing::default(),
+        Arc::new(NoNames),
+    ))
+}
+
+/// A kept image of `ap`, as `prep-rootfs.sh` keeps one.
+fn keep(images: &Path, id: &str, ap: &str) {
+    fs::create_dir_all(images.join(id)).unwrap();
+    let manifest = format!(
+        "ap:        {ap} (u6e-{ap}, 192.0.2.1/24)
+kernel:    x
+"
+    );
+    fs::write(images.join(id).join("MANIFEST"), manifest).unwrap();
+}
+
+/// The root-owned staging tree in `dir`, its `boot/stage.sh` [`STAGE`]:
+/// written by no one but its owner, or the stage helper would not run it.
+fn tree(dir: &Path) {
+    let tree = dir.join("tree");
+    fs::create_dir_all(tree.join("boot")).unwrap();
+    fs::create_dir_all(tree.join("log")).unwrap();
+    fs::write(tree.join("site.conf"), "").unwrap();
+    fs::write(tree.join("boot/stage.sh"), format!("#!/bin/sh\n{STAGE}\n")).unwrap();
+    for (p, mode) in [
+        (dir.to_owned(), 0o755),
+        (tree.clone(), 0o755),
+        (tree.join("boot"), 0o755),
+        (tree.join("site.conf"), 0o644),
+        (tree.join("boot/stage.sh"), 0o755),
+    ] {
+        fs::set_permissions(p, fs::Permissions::from_mode(mode)).unwrap();
+    }
+}
+
+fn start_runner(rt: &Runtime, config: Config, tls: &str) {
+    let key = u6e_deploy::signing_key(KEY_SIGNING, &identity(tls)).unwrap();
+    let started = rt.block_on(u6e_deploy::start(config, identity(tls), key));
+    started.unwrap();
 }
 
 /// The AP end of the link, as the controller tests' agent.
@@ -228,6 +346,11 @@ struct Link {
 
 impl Link {
     fn dial(addr: SocketAddr, pem: &str) -> Link {
+        Link::speaking(addr, pem, PROTOCOL)
+    }
+
+    /// Dials as an agent of `protocol`.
+    fn speaking(addr: SocketAddr, pem: &str, protocol: u16) -> Link {
         let config = tls::client_config(&identity(pem), identity(KEY_CONTROLLER).public_key());
         let mut sock = TcpStream::connect(addr).unwrap();
         sock.set_read_timeout(Some(Duration::from_millis(50)))
@@ -246,7 +369,7 @@ impl Link {
             sock,
             buf: Vec::new(),
         };
-        l.send_bytes(&version::frame(PROTOCOL)).unwrap();
+        l.send_bytes(&version::frame(protocol)).unwrap();
         let start = Instant::now();
         loop {
             assert!(start.elapsed() < WAIT, "no version frame");
@@ -309,6 +432,7 @@ impl Link {
 /// What a fake AP saw of the configurations it was sent.
 #[derive(Default)]
 struct Seen {
+    received: Vec<SignedConfig>,
     applied: Vec<SignedConfig>,
     refused: Vec<String>,
 }
@@ -432,10 +556,13 @@ fn fake_ap(
                         if c.radios.iter().any(|r| r.text.contains("# refused")) {
                             return Err("a radio's file is wrong".into());
                         }
-                        config::replayed(c.seq, last, "the last applied", built_ms)
+                        let replay = config::replayed(c.seq, last, "the last applied", built_ms);
+                        replay
+                            .or_else(|| config::expired(&c, Some(now_ms())))
                             .map_or(Ok(()), Err)
                     });
                     let mut seen = s.lock().unwrap();
+                    seen.received.push(c.clone());
                     let (ok, detail) = match judged {
                         Ok(()) => {
                             (last, installed) = (c.seq, c.sha256);
@@ -503,9 +630,9 @@ fn up(site: &Site, ap: &str) -> bool {
 
 /// The runner signs each configuration with its own key, under a sequence
 /// number the AP has not seen and its image was not built after; after a
-/// reboot onto the same image it signs the acknowledged one again under a
-/// newer one, and after a reboot onto an image built since, the old
-/// signature is a replay the image refuses and nothing is signed again.
+/// reboot onto the same image it signs its latest one again under a newer
+/// one, and after a reboot onto an image built since, the old signature is a
+/// replay the image refuses and nothing is signed again.
 #[test]
 fn configurations_are_signed_for_one_ap_and_never_replayed() {
     let site = Site::new("signed", Duration::from_secs(420));
@@ -543,17 +670,8 @@ fn configurations_are_signed_for_one_ap_and_never_replayed() {
     // Sent again, it is a replay.
     assert!(config::replayed(first.seq, first.seq, "the last applied", built).is_some());
 
-    // One the AP refuses leaves it on the first, which stays the one to sign
-    // again.
-    let mut wrong = radios();
-    wrong[1].text.push_str("# refused\n");
-    let e = site
-        .block_on(local::apply(&site.socket, "ap1", wrong))
-        .unwrap_err();
-    assert_eq!(e, "ap1: refused: a radio's file is wrong");
-
     // A reboot onto the same image: back on the image's configuration, the
-    // acknowledged one is signed again, newer.
+    // latest one is signed again, newer.
     drop(ap1);
     let ap1 = fake_ap(
         &site,
@@ -583,17 +701,10 @@ fn configurations_are_signed_for_one_ap_and_never_replayed() {
         rebuilt,
         image_config(2),
     );
-    wait_for("the acknowledged one forgotten", || {
-        site.controller
-            .state
-            .read()
-            .ap("ap1")
-            .unwrap()
-            .acked
-            .is_none()
-    });
+    wait_for("ap1 back", || up(&site, "ap1"));
     thread::sleep(Duration::from_millis(300));
-    assert!(ap1.seen.lock().unwrap().applied.is_empty());
+    assert!(ap1.seen.lock().unwrap().received.is_empty());
+    assert!(!site.controller.state.read().ap("ap1").unwrap().drifts());
     assert_eq!(
         config::replayed(again.seq, 0, "the last applied", rebuilt),
         Some(format!(
@@ -606,7 +717,7 @@ fn configurations_are_signed_for_one_ap_and_never_replayed() {
     let e = site
         .block_on(local::apply(&site.socket, "ap2", radios()))
         .unwrap_err();
-    assert_eq!(e, "ap2: no AP named u6e-ap2 has connected");
+    assert_eq!(e, "ap2: ap2 is not connected");
     drop(ap1);
 }
 
@@ -617,10 +728,9 @@ fn a_runner_with_an_aps_key_is_not_the_runner() {
     let site = Site::new("roles", Duration::from_secs(420));
     wait_for("the runner", || site.runner_up());
     let impostor = site.dir.0.join("impostor.sock");
-    let config = site.runner_config(&impostor, Duration::from_secs(420));
     let version = |s: &Site| s.controller.state.read().runner.connected_since;
     let before = version(&site);
-    site.start_runner(config, KEY_AP2);
+    let _rt = site.start_runner(&impostor, KEY_AP2);
     thread::sleep(Duration::from_millis(1500));
     // Still the first runner's session, and no AP took ap2's place.
     assert_eq!(version(&site), before);
@@ -652,7 +762,10 @@ fn a_rollout_that_passes_its_gate_is_done() {
     drop(ap1);
     let _ap1 = fake_ap(&site, KEY_AP1, "u6e-ap1", "img-2-ap1", 2, image_config(2));
     let done = asked.join().unwrap().unwrap();
-    assert_eq!(done, "done: back with img-2-ap1: 1 radios up, 1 clients");
+    assert_eq!(
+        done,
+        "done: back with img-2-ap1: 1 radios up, 1 clients on the site"
+    );
     assert_eq!(site.staged(), ["ap1 img-2-ap1"]);
     let lines = lines.lock().unwrap();
     assert_eq!(lines[0], "staging img-2-ap1 on ap1, as root (local) asked");
@@ -704,8 +817,8 @@ fn a_rollout_that_fails_its_gate_is_rolled_back() {
 }
 
 /// An AP that comes back during a rollout on another configuration than the
-/// one it acknowledged is not signed one while the rollout runs, and gets the
-/// acknowledged one again once the rollout is over: here, rolled back to the
+/// runner's latest for it is not signed one while the rollout runs, and gets
+/// the latest one again once the rollout is over: here, rolled back to the
 /// image it ran, which was built before that configuration was signed.
 #[test]
 fn an_ap_back_during_a_rollout_gets_its_configuration_after_it() {
@@ -774,4 +887,219 @@ fn rollouts_run_one_at_a_time() {
     let e = slow.join().unwrap().unwrap_err();
     assert!(e.starts_with("rolled back: no healthy gate"), "{e}");
     assert_eq!(site.staged(), ["ap1 img-slow-ap1", "ap1 img-1-ap1"]);
+}
+
+/// The runner signs again only the latest configuration it signed for an
+/// AP, whatever was acknowledged: an AP that refused the latest is offered
+/// it again, never the older one it last applied (which a controller saying
+/// the latest failed could otherwise have signed again).
+#[test]
+fn the_latest_is_signed_again_never_an_older_one() {
+    let site = Site::new("latest", Duration::from_secs(420));
+    wait_for("the runner", || site.runner_up());
+    let built = now_ms() - 60_000;
+    let image = || image_config(1);
+    let ap1 = fake_ap(&site, KEY_AP1, "u6e-ap1", "img-1-ap1", built, image());
+    wait_for("ap1", || up(&site, "ap1"));
+    site.block_on(local::apply(&site.socket, "ap1", radios()))
+        .unwrap();
+    let mut wrong = radios();
+    wrong[1].text.push_str("# refused\n");
+    let e = site
+        .block_on(local::apply(&site.socket, "ap1", wrong.clone()))
+        .unwrap_err();
+    assert_eq!(e, "ap1: refused: a radio's file is wrong");
+    let refused = ap1.seen.lock().unwrap().received[1].seq;
+
+    // A reboot onto its image: the latest, the one it refused, comes again.
+    drop(ap1);
+    let ap1 = fake_ap(&site, KEY_AP1, "u6e-ap1", "img-1-ap1", built, image());
+    wait_for("the latest again", || {
+        !ap1.seen.lock().unwrap().received.is_empty()
+    });
+    thread::sleep(Duration::from_millis(300));
+    let seen = ap1.seen.lock().unwrap();
+    assert_eq!(seen.received.len(), 1);
+    assert_eq!(seen.received[0].sha256, config_sha256(&wrong));
+    assert!(seen.received[0].seq > refused);
+    assert!(seen.applied.is_empty());
+}
+
+/// The latest configuration outlives the runner, in its state directory
+/// (its own alone): after a restart, an AP back on its image's
+/// configuration is signed the latest again.
+#[test]
+fn a_restarted_runner_still_signs_its_latest_again() {
+    let mut site = Site::new("restart-latest", Duration::from_secs(420));
+    wait_for("the runner", || site.runner_up());
+    let built = now_ms() - 60_000;
+    let ap1 = fake_ap(
+        &site,
+        KEY_AP1,
+        "u6e-ap1",
+        "img-1-ap1",
+        built,
+        image_config(1),
+    );
+    wait_for("ap1", || up(&site, "ap1"));
+    site.block_on(local::apply(&site.socket, "ap1", radios()))
+        .unwrap();
+    let first = ap1.seen.lock().unwrap().applied[0].clone();
+    let kept = site.state().join("latest-u6e-ap1");
+    let mode = fs::metadata(&kept).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+
+    site.restart_runner();
+    wait_for("the runner again", || site.runner_up());
+    drop(ap1);
+    let ap1 = fake_ap(
+        &site,
+        KEY_AP1,
+        "u6e-ap1",
+        "img-1-ap1",
+        built,
+        image_config(1),
+    );
+    wait_for("the latest again", || {
+        !ap1.seen.lock().unwrap().applied.is_empty()
+    });
+    let again = ap1.seen.lock().unwrap().applied[0].clone();
+    assert_eq!(again.sha256, first.sha256);
+    assert!(again.seq > first.seq);
+}
+
+/// A rollout a local caller asks for, staged, and its follower thread.
+fn roll_out(site: &Site, ap: &str, image: &str) -> JoinHandle<Result<String, String>> {
+    let (socket, ap, image) = (site.socket.clone(), ap.to_owned(), image.to_owned());
+    thread::spawn(move || {
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(local::rollout(&socket, &ap, &image, |_| {}))
+    })
+}
+
+/// A runner restarted while it awaits a rollout's gate goes on with it: the
+/// AP came back healthy meanwhile, so the rollout is done, nothing staged
+/// again, and the rollout no longer kept.
+#[test]
+fn a_runner_restarted_during_the_gate_goes_on_with_the_rollout() {
+    let mut site = Site::new("restart-gate", Duration::from_secs(30));
+    wait_for("the runner", || site.runner_up());
+    let ap1 = fake_ap(&site, KEY_AP1, "u6e-ap1", "img-1-ap1", 1, image_config(1));
+    wait_for("ap1", || up(&site, "ap1"));
+    let asked = roll_out(&site, "ap1", "img-2-ap1");
+    wait_for("the staging", || site.staged().len() == 1);
+    wait_for("the rollout kept", || site.state().join("rollout").exists());
+
+    site.stop_runner();
+    // The AP comes back with the image while the runner is away: the gate
+    // is given, and the runner cannot hear it.
+    drop(ap1);
+    let _ap1 = fake_ap(&site, KEY_AP1, "u6e-ap1", "img-2-ap1", 2, image_config(2));
+    wait_for("the gate", || {
+        let state = site.controller.state.read();
+        state.rollouts.back().unwrap().gate.is_some()
+    });
+    site.start_runner_again();
+    wait_for("the result counted", || ended(&site, "done") == Some(1));
+    assert_eq!(site.staged(), ["ap1 img-2-ap1"]);
+    wait_for("the rollout no longer kept", || {
+        !site.state().join("rollout").exists()
+    });
+    // Its caller's link went with the first runner.
+    assert!(asked.join().unwrap().is_err());
+}
+
+/// A controller restarted while a rollout's gate is awaited goes on with
+/// the rollout, kept in its policy file: the AP back healthy at the new
+/// controller is done, and the new controller counts it.
+#[test]
+fn a_controller_restarted_during_the_gate_goes_on_with_the_rollout() {
+    let mut site = Site::new("restart-controller", Duration::from_secs(30));
+    wait_for("the runner", || site.runner_up());
+    let ap1 = fake_ap(&site, KEY_AP1, "u6e-ap1", "img-1-ap1", 1, image_config(1));
+    wait_for("ap1", || up(&site, "ap1"));
+    let asked = roll_out(&site, "ap1", "img-2-ap1");
+    wait_for("the staging", || site.staged().len() == 1);
+    drop(ap1);
+
+    site.restart_controller();
+    wait_for("the runner back", || site.runner_up());
+    let _ap1 = fake_ap(&site, KEY_AP1, "u6e-ap1", "img-2-ap1", 2, image_config(2));
+    let done = asked.join().unwrap().unwrap();
+    assert_eq!(
+        done,
+        "done: back with img-2-ap1: 1 radios up, 1 clients on the site"
+    );
+    wait_for("the result counted", || ended(&site, "done") == Some(1));
+    assert_eq!(site.staged(), ["ap1 img-2-ap1"]);
+}
+
+/// An AP that comes back with an agent the controller turns away fails its
+/// gate at once: the runner rolls it back without waiting out the gate.
+#[test]
+fn an_unhealthy_gate_is_rolled_back_at_once() {
+    let site = Site::new("unhealthy", Duration::from_secs(60));
+    wait_for("the runner", || site.runner_up());
+    let ap1 = fake_ap(&site, KEY_AP1, "u6e-ap1", "img-1-ap1", 1, image_config(1));
+    wait_for("ap1", || up(&site, "ap1"));
+    let started = Instant::now();
+    let asked = roll_out(&site, "ap1", "img-2-ap1");
+    wait_for("the staging", || site.staged().len() == 1);
+    drop(ap1);
+    let _other = Link::speaking(site.controller.agents, KEY_AP1, PROTOCOL + 1);
+    let e = asked.join().unwrap().unwrap_err();
+    let unhealthy = format!(
+        "rolled back: unhealthy: its agent speaks protocol {}, this controller {PROTOCOL}",
+        PROTOCOL + 1
+    );
+    assert!(e.starts_with(&unhealthy), "{e}");
+    assert!(started.elapsed() < Duration::from_secs(30));
+    assert_eq!(site.staged(), ["ap1 img-2-ap1", "ap1 img-1-ap1"]);
+}
+
+/// The controller may roll out only an AP's newest kept image, and a failed
+/// gate rolls the AP back to the image the runner staged on it, not to one
+/// the controller names.
+#[test]
+fn the_controller_rolls_out_only_the_newest_image() {
+    let site = Site::new("newest", Duration::from_secs(1));
+    wait_for("the runner", || site.runner_up());
+    let ap1 = fake_ap(&site, KEY_AP1, "u6e-ap1", "img-1-ap1", 1, image_config(1));
+    wait_for("ap1", || up(&site, "ap1"));
+    let upgrade = |image: &str| {
+        let mut state = site.controller.state.write();
+        state.upgrade("ap1", image, "admin").unwrap();
+    };
+
+    // An admin's upgrade to an image that is not the newest: refused.
+    upgrade("img-2-ap1");
+    wait_for("the refusal", || ended(&site, "refused") == Some(1));
+    let refused = {
+        let state = site.controller.state.read();
+        state.rollouts.back().unwrap().result.clone().unwrap().1
+    };
+    assert!(
+        refused.starts_with("only ap1's newest kept image, img-slow-ap1, rolls out"),
+        "{refused}"
+    );
+    assert!(site.staged().is_empty());
+
+    // A local caller may: the runner then knows the AP runs img-2.
+    let asked = roll_out(&site, "ap1", "img-2-ap1");
+    wait_for("the staging", || site.staged().len() == 1);
+    drop(ap1);
+    let ap1 = fake_ap(&site, KEY_AP1, "u6e-ap1", "img-2-ap1", 2, image_config(2));
+    asked.join().unwrap().unwrap();
+
+    // The AP said to run another (as a controller might lie): the newest
+    // image fails its gate and goes back to what the runner staged.
+    drop(ap1);
+    let _ap1 = fake_ap(&site, KEY_AP1, "u6e-ap1", "img-bad-ap1", 3, image_config(3));
+    wait_for("ap1", || up(&site, "ap1"));
+    upgrade("img-slow-ap1");
+    wait_for("the rollback", || ended(&site, "rolled_back") == Some(1));
+    assert_eq!(
+        site.staged(),
+        ["ap1 img-2-ap1", "ap1 img-slow-ap1", "ap1 img-2-ap1"]
+    );
 }
