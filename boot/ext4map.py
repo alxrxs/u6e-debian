@@ -1,13 +1,11 @@
-# ext4map.py <inode>: the eMMC sectors of a file on stock's /tmp/log (ext4 on
-# mmcblk0p5), read over SSH from the stock firmware; go8.sh turns them into
-# U-Boot "mmc read" commands. Needs APPW and U6E_STOCK from boot/lib.sh.
-import os
+# ext4map.py <inode> <ssh command>...: the eMMC sectors of a file on stock's
+# /tmp/log (ext4 on mmcblk0p5), read over SSH from the stock firmware; go8.sh
+# turns them into U-Boot "mmc read" commands. The ssh command is boot/lib.sh's
+# stock login with its target, each command to run appended to it.
 import struct
 import subprocess
 import sys
-AP = ['sshpass', '-f', os.environ['APPW'], 'ssh', '-n', '-o', 'StrictHostKeyChecking=no',
-      '-o', 'UserKnownHostsFile=/dev/null', '-o', 'LogLevel=ERROR', '-o', 'PubkeyAuthentication=no',
-      os.environ['U6E_STOCK']]
+AP = sys.argv[2:]
 def rd(dev, off, n):
     bs = 512; skip = off // bs; cnt = (off + n + bs - 1) // bs - skip
     out = subprocess.run(AP + [f'dd if={dev} bs={bs} skip={skip} count={cnt} 2>/dev/null'], capture_output=True, check=True).stdout

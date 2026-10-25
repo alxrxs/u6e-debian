@@ -26,6 +26,23 @@ R=$(cat $K/include/config/kernel.release)
 echo "$AP_HOSTNAME" > $RF/etc/hostname
 install -d -m0700 $RF/root/.ssh
 install -m0600 "$ROOT_AUTHORIZED_KEYS" $RF/root/.ssh/authorized_keys
+# SSH host key: never the rootfs's own, which every image built from it would
+# share. ssh_host_key (site.conf) gives the AP its own Ed25519 key, the same in
+# every image, for the boot tooling to pin (AP_KNOWN_HOSTS); without it the
+# image makes new keys at every boot, as it lives in RAM.
+rm -f $RF/etc/ssh/ssh_host_*
+if declare -F ssh_host_key > /dev/null; then
+	(umask 077; ssh_host_key > $RF/etc/ssh/ssh_host_ed25519_key)
+	ssh-keygen -y -P '' -f $RF/etc/ssh/ssh_host_ed25519_key > $RF/etc/ssh/ssh_host_ed25519_key.pub ||
+		{ echo "ssh_host_key: no unencrypted OpenSSH private key" >&2; exit 1; }
+	grep -q '^ssh-ed25519 ' $RF/etc/ssh/ssh_host_ed25519_key.pub || { echo "ssh_host_key: not an Ed25519 key" >&2; exit 1; }
+	printf 'HostKey /etc/ssh/ssh_host_ed25519_key\n' > $RF/etc/ssh/sshd_config.d/u6e-host-key.conf
+else
+	# sshd-keygen runs on a first boot only (ConditionFirstBoot), and the
+	# image's empty machine-id makes none a first boot.
+	install -d $RF/etc/systemd/system/sshd-keygen.service.d
+	printf '[Unit]\nConditionFirstBoot=\n' > $RF/etc/systemd/system/sshd-keygen.service.d/u6e.conf
+fi
 install -d $RF/etc/systemd/system/serial-getty@ttyMSM0.service.d
 printf '[Service]\nExecStart=\nExecStart=-/sbin/agetty --autologin root --keep-baud 115200 %%I $TERM\n' \
 	> $RF/etc/systemd/system/serial-getty@ttyMSM0.service.d/autologin.conf

@@ -20,7 +20,8 @@ The only thing ever written to the SPI flash (the small chip holding the boot lo
   - the Wi-Fi plan: country, one line per SSID (name, kind, bands, default VLAN), channels, transmit power, and the optional 6 GHz Multiple BSSID setting;
   - how secrets are fetched: passphrases, the roaming key, the RADIUS-over-TLS certificate and the stock login are read by small shell functions, so they can come from a file or a password manager;
   - optionally, the controller `u6e-agent` streams to: its address and its public key (plain values), with each access point's own private key read by a shell function in that access point's block;
-  - one block per access point (hostname, address, LED colour, Wi-Fi colours), and the test client for `test/`;
+  - one block per access point (hostname, address, LED colour, Wi-Fi colours, and optionally its SSH host key, read by a shell function), and the test client for `test/`;
+  - optionally, `AP_KNOWN_HOSTS`: the known_hosts file the boot tooling checks the access points' host keys against (see [Booting](#booting));
   - `U6E_PERSIST` (see [Booting](#booting)) and `BLOBS`, the location of the proprietary files below.
 - `$BLOBS`: a separate private repository with the proprietary files the build reads from it. They are not redistributable, so they are not included here:
 
@@ -75,6 +76,8 @@ Patches keep their original authors. We are sending our patches to the upstream 
 Ubiquiti's boot loader (U-Boot) is 32-bit and only starts its own signed images, but it will start any 32-bit ARM kernel. `shim/` is a tiny 32-bit program (208 bytes) that asks the chip's TrustZone (its built-in secure firmware) to restart the processor in 64-bit mode at our kernel.
 
 `boot/go8.sh` does the staging while the stock firmware is running. It copies the shim, the kernel, the device tree and the initial filesystem into stock's data partition on the eMMC (changing only the parts that differ), and writes a one-shot U-Boot boot command that loads them. The next reboot starts Debian. The reboot after that returns to stock, because the command removes itself as it runs. `boot/stage.sh` does the whole cycle for one access point, from either system, and `boot/apstate.sh` tells you which system is running.
+
+Both systems answer SSH on the access point's address, each with its own host keys. An image never carries the root filesystem's keys, which every image built from it would share: with `ssh_host_key` in its block in `site.conf`, an access point's image carries that Ed25519 key, the same in every image of it; without it, the image makes new keys at every boot, as it lives in RAM. With `AP_KNOWN_HOSTS` set, the boot tooling checks every host key against that file, our image's under the alias `<AP_HOSTNAME>` and stock's under `<AP_HOSTNAME>-stock`, and refuses a key it does not hold; without it, it checks none.
 
 Persistent mode: with `U6E_PERSIST=1` in `site.conf`, the image re-arms the boot command once the management network is reachable (`u6e-agent` checks it every minute and starts `u6e-arm`), so reboots and power cuts come back into Debian. If the network never comes up, or is lost later, `u6e-fallback` removes the boot command and the access point returns to stock instead of looping. `u6e-arm disarm` does the same by hand. Each Debian boot in persistent mode writes the 64 KiB U-Boot settings area twice.
 

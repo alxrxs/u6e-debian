@@ -50,7 +50,7 @@ for o in range(0, len(d), c): print(hashlib.sha256(d[o:o + c]).hexdigest())' "$w
 	mapfile -t have < <(staged_hashes "$n" "$chunks")
 	[ "${want[*]}" = "${have[*]}" ] || { echo "$n: verify failed"; exit 1; }
 	ino=$(ap -n "ls -i $STAGE/$n" | awk '{print $1}')
-	T=300 python3 "$here/ext4map.py" "$ino" > "$work/map_$n"
+	T=300 python3 "$here/ext4map.py" "$ino" "${STOCK_SSH[@]}" -n "$U6E_STOCK" > "$work/map_$n"
 	echo "$n: $((written * CHUNK / 1024)) of $((chunks * CHUNK / 1024)) KiB written, $(grep -c ^EXT "$work/map_$n") extent(s)"
 }
 stage u6e.zimg "$1"; stage u6e.dtb "$2"; stage u6e.initrd "$3"

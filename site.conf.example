@@ -20,6 +20,12 @@ CLIENT_VLAN=42
 WIFI_VLANS="42 43"
 # root's authorized_keys in the image.
 ROOT_AUTHORIZED_KEYS=/root/.ssh/id_ed25519.pub
+# Optional: the known_hosts file the boot tooling checks each AP's host keys
+# against, two entries per AP since both of its systems answer on its address:
+# "<AP_HOSTNAME> <key>" for our image (its ssh_host_key's public half) and
+# "<AP_HOSTNAME>-stock <key>" for each of the stock firmware's keys. Unset, no
+# host key is checked.
+AP_KNOWN_HOSTS=~/.config/u6e/known_hosts
 # Proprietary inputs (Wi-Fi firmware, the stock board data): see README.md.
 BLOBS=../u6e-blobs
 # Optional: "<ssh login> <OrbStack machine>" on an Apple silicon Mac, where
@@ -98,6 +104,10 @@ ap1)
 	# With CONTROLLER: a command printing this AP's Ed25519 private key
 	# (PKCS#8 PEM) for the controller link.
 	agent_key() { cat ~/.config/u6e/agent-ap1.pem; }
+	# Optional: a command printing this AP's SSH host key, an unencrypted
+	# Ed25519 key in OpenSSH's format (ssh-keygen -t ed25519 -N ''), the
+	# image's only one. Unset, the image makes new keys at every boot.
+	ssh_host_key() { cat ~/.config/u6e/ssh-host-ap1; }
 	# boot/powercycle.sh: cut and restore the AP's power, e.g. its PoE
 	# injector's smart plug.
 	power_off() { echo "power_off: not configured" >&2; return 1; }
