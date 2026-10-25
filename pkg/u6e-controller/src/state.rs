@@ -41,6 +41,9 @@ pub struct Ap {
     pub snapshot: Option<Snapshot>,
     /// When `snapshot` was last brought up to date.
     pub snapshot_at: Option<SystemTime>,
+    /// The snapshot before it in this session and when it came: the base
+    /// the UI's rates are worked out from.
+    pub previous: Option<(Snapshot, SystemTime)>,
     pub connected_since: Option<SystemTime>,
     /// When the agent last sent anything.
     pub last_seen: Option<SystemTime>,
@@ -65,6 +68,7 @@ impl Ap {
             hello: None,
             snapshot: None,
             snapshot_at: None,
+            previous: None,
             connected_since: None,
             last_seen: None,
             events: VecDeque::new(),
@@ -93,10 +97,18 @@ impl Ap {
         self.events.push_back(ev);
     }
 
+    /// Makes `next` the current snapshot, the current one its predecessor.
+    fn advance(&mut self, next: Snapshot, now: SystemTime) {
+        let prev = self.snapshot.replace(next);
+        self.previous = prev.zip(self.snapshot_at);
+        self.snapshot_at = Some(now);
+    }
+
     /// Forgets what only a live connection knows.
     fn reset_session(&mut self) {
         self.snapshot = None;
         self.snapshot_at = None;
+        self.previous = None;
         self.connected_since = None;
     }
 }
@@ -224,14 +236,12 @@ impl State {
                 if !delta::valid(&s) {
                     return Err(Gap);
                 }
-                entry.snapshot = Some(s);
-                entry.snapshot_at = Some(now);
+                entry.advance(s, now);
                 Some(Change::Snapshot(ap.to_owned()))
             }
             AgentMsg::Delta(d) => {
                 let next = delta::apply(entry.snapshot.as_ref().ok_or(Gap)?, &d)?;
-                entry.snapshot = Some(next);
-                entry.snapshot_at = Some(now);
+                entry.advance(next, now);
                 Some(Change::Snapshot(ap.to_owned()))
             }
             AgentMsg::Event(ev) => {
@@ -426,6 +436,30 @@ mod tests {
         assert_eq!(s.ap("ap1").unwrap().snapshot.as_ref().unwrap().seq, 1);
         s.apply("ap1", id, AgentMsg::Delta(delta(2, 1))).unwrap();
         assert_eq!(s.ap("ap1").unwrap().snapshot.as_ref().unwrap().seq, 2);
+    }
+
+    #[test]
+    fn the_previous_snapshot_is_kept_for_the_session() {
+        let mut s = state(&["ap1"]);
+        let id = s.connect("ap1", hello("ap1")).unwrap().id;
+        let seq = |s: &State| {
+            let ap = s.ap("ap1").unwrap();
+            let prev = ap.previous.as_ref().map(|(p, _)| p.seq);
+            (ap.snapshot.as_ref().map(|s| s.seq), prev)
+        };
+        s.apply("ap1", id, AgentMsg::Key(snap(1, Vec::new())))
+            .unwrap();
+        assert_eq!(seq(&s), (Some(1), None));
+        s.apply("ap1", id, AgentMsg::Delta(delta(2, 1))).unwrap();
+        assert_eq!(seq(&s), (Some(2), Some(1)));
+        s.apply("ap1", id, AgentMsg::Key(snap(3, Vec::new())))
+            .unwrap();
+        assert_eq!(seq(&s), (Some(3), Some(2)));
+        let id = s.connect("ap1", hello("ap1")).unwrap().id;
+        assert_eq!(seq(&s), (None, None));
+        s.apply("ap1", id, AgentMsg::Key(snap(1, Vec::new())))
+            .unwrap();
+        assert_eq!(seq(&s), (Some(1), None));
     }
 
     #[test]

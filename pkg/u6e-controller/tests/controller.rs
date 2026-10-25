@@ -3,6 +3,7 @@
 //! result) on ports of its own, and speaks the link to it with u6e-proto
 //! alone: a blocking rustls client, the framing and the messages.
 
+use std::hash::{DefaultHasher, Hasher};
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::process::{Child, Command, Stdio};
@@ -11,9 +12,12 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{fs, path::PathBuf};
 
+use serde_json::{Value, json};
 use tokio::runtime::{Builder, Runtime};
 use tokio_rustls::rustls::ClientConnection;
 use tokio_rustls::rustls::pki_types::ServerName;
+use tungstenite::client::IntoClientRequest;
+use tungstenite::{HandshakeError, Message};
 use u6e_controller::agents::Timing;
 use u6e_controller::config::Config;
 use u6e_controller::state::{TICK_IDLE, TICK_WATCHED};
@@ -25,10 +29,12 @@ use u6e_proto::msg::{
 };
 use u6e_proto::tls::{self, Identity};
 
-// Throwaway Ed25519 keys made for these tests; they protect nothing.
-const KEY_CONTROLLER: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIEZogZFun3kTnHUQKsmU/gMxlixXfjEFyH6X85yqEioY\n-----END PRIVATE KEY-----\n";
-const KEY_AP1: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIBgvv4PJkRQCwyPHnupFVVMyEm+MuDRJKdMcw2LFTdXm\n-----END PRIVATE KEY-----\n";
-const KEY_AP2: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEICcOkuS8HTyirFXBzOm3U1r3J9KPtlgeo+FcKuJyese8\n-----END PRIVATE KEY-----\n";
+#[path = "common/keys.rs"]
+mod keys;
+
+use keys::{KEY_AP1, KEY_AP2, KEY_CONTROLLER};
+
+// Throwaway, like the keys of `keys`: an AP that is not enrolled.
 const KEY_STRANGER: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIIN98nA5U+8ay1kTe7TR4rEzYomCSC7d4p/BpYYuf1qw\n-----END PRIVATE KEY-----\n";
 
 /// How long a test waits for something that should happen, before failing.
@@ -649,4 +655,302 @@ fn rx_bytes_are_counted() {
     wait_for("the pong's bytes", || {
         r.c.state.read().ap("ap1").unwrap().rx_bytes() > at_key
     });
+}
+
+/// A GET over HTTP/1.1 with extra header lines: the status line and headers
+/// (lowercased), and the body.
+fn http_request(addr: SocketAddr, path: &str, headers: &str) -> (String, String) {
+    let mut sock = TcpStream::connect(addr).unwrap();
+    sock.set_read_timeout(Some(WAIT)).unwrap();
+    write!(
+        sock,
+        "GET {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n{headers}\r\n"
+    )
+    .unwrap();
+    let mut resp = String::new();
+    sock.read_to_string(&mut resp).unwrap();
+    let (head, body) = resp.split_once("\r\n\r\n").unwrap();
+    (head.to_lowercase(), body.to_owned())
+}
+
+fn json_get(addr: SocketAddr, path: &str) -> Value {
+    serde_json::from_str(&http_get(addr, path)).unwrap()
+}
+
+fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines()
+        .find_map(|l| l.strip_prefix(name)?.strip_prefix(':'))
+        .map(str::trim)
+}
+
+#[test]
+fn api_aps_lists_connected() {
+    let r = controller(Timing::default());
+    let mut a = Agent::hello(r.c.agents, KEY_AP1, "ap1");
+    let bsss = vec![bss("wlan5", "ssid-a")];
+    a.send(&AgentMsg::Key(snapshot(
+        1,
+        bsss,
+        vec![station(MAC, 0, -54)],
+    )))
+    .unwrap();
+    wait_for("key frame", || seq_of(&r, "ap1") == Some(1));
+
+    let aps = json_get(r.c.http, "/api/aps");
+    let ap1 = &aps["ap1"];
+    assert_eq!(ap1["up"], true);
+    assert_eq!(ap1["image"], "test");
+    assert_eq!(ap1["agent"], "1.0.0");
+    assert_eq!(ap1["uptime"], 3600);
+    assert_eq!(ap1["nss"], 37);
+    assert_eq!(ap1["temps"]["cpu"], 47.5);
+    let radio = &ap1["radios"]["phy0"];
+    assert_eq!(radio["band"], "5");
+    assert_eq!(
+        (&radio["channel"], &radio["width"]),
+        (&json!(36), &json!(80))
+    );
+    assert_eq!(radio["txpower"], 23.0);
+    assert_eq!(radio["clients"], 1);
+    assert_eq!(ap1["bsss"]["wlan5"]["ssid"], "ssid-a");
+    // Known but never connected: only that it is down.
+    assert_eq!(aps["ap2"], json!({"up": false}));
+
+    let clients = json_get(r.c.http, "/api/clients");
+    let c = &clients["02:00:00:00:00:01"];
+    assert_eq!((&c["ap"], &c["ssid"]), (&json!("ap1"), &json!("ssid-a")));
+    assert_eq!((&c["band"], &c["signal"]), (&json!("5"), &json!(-54)));
+    assert_eq!(c["tx"], json!({"mbps": 72.2, "mode": "HT", "mcs": 7}));
+
+    a.send(&AgentMsg::Event(Event {
+        at_ms: 5,
+        kind: EventKind::Assoc { mac: MAC, bss: 0 },
+    }))
+    .unwrap();
+    wait_for("the event", || {
+        r.c.state.read().ap("ap1").unwrap().events.len() == 1
+    });
+    let events = json_get(r.c.http, "/api/events?ap=ap1");
+    let assoc = json!({"ap": "ap1", "at": 5, "kind": "assoc", "mac": "02:00:00:00:00:01",
+        "bss": "wlan5", "ssid": "ssid-a", "band": "5"});
+    assert_eq!(events, json!([assoc]));
+    assert_eq!(json_get(r.c.http, "/api/events"), json!([assoc]));
+    assert_eq!(json_get(r.c.http, "/api/events?ap=ap2"), json!([]));
+}
+
+#[test]
+fn assets_served_with_cache_headers() {
+    let r = controller(Timing::default());
+    let (head, page) = http_request(r.c.http, "/", "");
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert_eq!(header(&head, "cache-control"), Some("no-cache"));
+    assert!(header(&head, "content-security-policy").is_some());
+    let page_tag = header(&head, "etag").unwrap().to_owned();
+    let (head, _) = http_request(r.c.http, "/", &format!("If-None-Match: {page_tag}\r\n"));
+    assert!(head.starts_with("http/1.1 304"), "{head}");
+
+    // The page points at the files under their version.
+    let at = page.find("/assets/").unwrap() + "/assets/".len();
+    let version = page[at..].split('/').next().unwrap();
+    assert_eq!(version.len(), 12, "{page}");
+    let app = include_bytes!("../ui/app.js");
+    let mut h = DefaultHasher::new();
+    h.write(app);
+    let tag = format!("\"{:016x}\"", h.finish());
+
+    let path = format!("/assets/{version}/app.js");
+    let (head, body) = http_request(r.c.http, &path, "");
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert_eq!(body.as_bytes(), app);
+    assert_eq!(header(&head, "etag"), Some(tag.as_str()));
+    assert_eq!(
+        header(&head, "content-type"),
+        Some("text/javascript; charset=utf-8")
+    );
+    assert_eq!(
+        header(&head, "cache-control"),
+        Some("public, max-age=31536000, immutable")
+    );
+    let (head, body) = http_request(r.c.http, &path, &format!("If-None-Match: {tag}\r\n"));
+    assert!(head.starts_with("http/1.1 304"), "{head}");
+    assert!(body.is_empty());
+
+    // Without the version, the same file is revalidated each time.
+    let (head, _) = http_request(r.c.http, "/assets/app.js", "");
+    assert_eq!(header(&head, "etag"), Some(tag.as_str()));
+    assert_eq!(header(&head, "cache-control"), Some("no-cache"));
+    for missing in [
+        "/assets/nope.js",
+        "/assets/0123456789ab/app.js",
+        "/assets/../Cargo.toml",
+    ] {
+        let (head, _) = http_request(r.c.http, missing, "");
+        assert!(head.starts_with("http/1.1 404"), "{missing}: {head}");
+    }
+}
+
+/// A WebSocket client of the web listener.
+struct Ui(tungstenite::WebSocket<TcpStream>);
+
+impl Ui {
+    fn open(addr: SocketAddr, headers: &[(&'static str, &str)]) -> Result<Ui, tungstenite::Error> {
+        let sock = TcpStream::connect(addr).unwrap();
+        sock.set_read_timeout(Some(WAIT)).unwrap();
+        let mut req = format!("ws://{addr}/ws").into_client_request().unwrap();
+        for (k, v) in headers {
+            req.headers_mut().insert(*k, v.parse().unwrap());
+        }
+        match tungstenite::client(req, sock) {
+            Ok((ws, _)) => Ok(Ui(ws)),
+            Err(HandshakeError::Failure(e)) => Err(e),
+            Err(HandshakeError::Interrupted(_)) => unreachable!("a blocking socket"),
+        }
+    }
+
+    fn subscribe(addr: SocketAddr, aps: Value) -> Ui {
+        let mut ui = Ui::open(addr, &[]).unwrap();
+        ui.send(&json!({ "subscribe": aps }));
+        ui
+    }
+
+    fn send(&mut self, v: &Value) {
+        self.0.send(Message::text(v.to_string())).unwrap();
+    }
+
+    fn recv(&mut self) -> Value {
+        loop {
+            match self.0.read().unwrap() {
+                Message::Text(t) => return serde_json::from_str(&t).unwrap(),
+                Message::Ping(_) | Message::Pong(_) => {}
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn ws_subscribe_counts_watcher() {
+    let r = controller(Timing::default());
+    let watchers = |ap: &str| r.c.state.read().watchers(ap);
+    let mut one = Ui::subscribe(r.c.http, json!(["ap1", "ap9"]));
+    assert_eq!(one.recv()["key"]["aps"], json!({"ap1": {"up": false}}));
+    assert_eq!((watchers("ap1"), watchers("ap2")), (1, 0));
+    let mut all = Ui::subscribe(r.c.http, json!("*"));
+    assert_eq!(all.recv()["key"]["aps"].as_object().unwrap().len(), 2);
+    assert_eq!((watchers("ap1"), watchers("ap2")), (2, 1));
+
+    // The agent hears it is watched as soon as it connects.
+    let mut a = Agent::hello(r.c.agents, KEY_AP1, "ap1");
+    assert_eq!(a.expect(), CtlMsg::SetTick { secs: TICK_WATCHED });
+    drop(one);
+    wait_for("the first socket's watch to end", || watchers("ap1") == 1);
+    drop(all);
+    wait_for("every watch to end", || {
+        watchers("ap1") + watchers("ap2") == 0
+    });
+    assert_eq!(a.expect(), CtlMsg::SetTick { secs: TICK_IDLE });
+
+    // A socket that never says what it watches watches nothing.
+    let _silent = Ui::open(r.c.http, &[]).unwrap();
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(watchers("ap1"), 0);
+}
+
+#[test]
+fn ws_sends_only_what_changed() {
+    let r = controller(Timing::default());
+    let mut a = Agent::hello(r.c.agents, KEY_AP1, "ap1");
+    let bsss = vec![bss("wlan5", "ssid-a")];
+    a.send(&AgentMsg::Key(snapshot(
+        1,
+        bsss,
+        vec![station(MAC, 0, -54)],
+    )))
+    .unwrap();
+    wait_for("key frame", || seq_of(&r, "ap1") == Some(1));
+
+    let user = [("x-forwarded-preferred-username", "alice")];
+    let mut ui = Ui::open(r.c.http, &user).unwrap();
+    ui.send(&json!({"subscribe": ["ap1"]}));
+    let key = ui.recv();
+    assert_eq!(key["user"], "alice");
+    let client = &key["key"]["clients"]["02:00:00:00:00:01"];
+    assert_eq!(client["signal"], -54);
+    // One snapshot: nothing to work rates out from yet.
+    assert!(client.get("down").is_none(), "{client}");
+
+    let uptime_up = || FieldDelta {
+        mask: 1,
+        vals: vec![1],
+    };
+    a.send(&AgentMsg::Delta(SnapshotDelta {
+        scalars: uptime_up(),
+        ..delta(2, 1)
+    }))
+    .unwrap();
+    let patch = ui.recv();
+    let p = &patch["patch"];
+    assert_eq!(p["aps"]["ap1"]["uptime"], 3601, "{patch}");
+    // The second snapshot gives the counters a base: rates appear.
+    assert_eq!(p["clients"]["02:00:00:00:00:01"]["down"], 0, "{patch}");
+    // The radio's survey clock stood still: no utilization to tell.
+    assert!(p["aps"]["ap1"].get("radios").is_none(), "{patch}");
+
+    // The same update again sends nothing: what comes next is the next change.
+    a.send(&AgentMsg::Delta(delta(3, 2))).unwrap();
+    wait_for("delta 3", || seq_of(&r, "ap1") == Some(3));
+    a.send(&AgentMsg::Delta(SnapshotDelta {
+        scalars: uptime_up(),
+        ..delta(4, 3)
+    }))
+    .unwrap();
+    assert_eq!(
+        ui.recv(),
+        json!({"patch": {"aps": {"ap1": {"uptime": 3602}}}})
+    );
+
+    // Events come as they happen; a client leaving is a null where it was.
+    a.send(&AgentMsg::Event(Event {
+        at_ms: 9,
+        kind: EventKind::Disassoc { mac: MAC, bss: 0 },
+    }))
+    .unwrap();
+    let ev = ui.recv();
+    assert_eq!(
+        (&ev["events"][0]["kind"], &ev["events"][0]["ssid"]),
+        (&json!("disassoc"), &json!("ssid-a")),
+        "{ev}"
+    );
+    a.send(&AgentMsg::Delta(SnapshotDelta {
+        removed: vec![MAC],
+        ..delta(5, 4)
+    }))
+    .unwrap();
+    let patch = ui.recv();
+    assert_eq!(
+        patch["patch"]["clients"],
+        json!({"02:00:00:00:00:01": null})
+    );
+
+    // An AP going down takes its radios with it and says when it was seen.
+    drop(a);
+    let patch = ui.recv();
+    let ap1 = &patch["patch"]["aps"]["ap1"];
+    assert_eq!(ap1["up"], false, "{patch}");
+    assert_eq!(ap1["radios"], Value::Null, "{patch}");
+    assert!(ap1["seen"].is_u64(), "{patch}");
+}
+
+#[test]
+fn ws_refuses_another_sites_page() {
+    let r = controller(Timing::default());
+    let refused = Ui::open(r.c.http, &[("origin", "https://elsewhere.example")]);
+    match refused {
+        Err(tungstenite::Error::Http(resp)) => assert_eq!(resp.status(), 403),
+        other => panic!("{:?}", other.map(|_| ())),
+    }
+    let origin = format!("http://{}", r.c.http);
+    let mut ok = Ui::open(r.c.http, &[("origin", &origin)]).unwrap();
+    ok.send(&json!({"subscribe": "*"}));
+    assert!(ok.recv()["key"].is_object());
 }

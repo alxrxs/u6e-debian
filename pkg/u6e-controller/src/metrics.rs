@@ -11,9 +11,10 @@ use axum::extract::State as Ext;
 use axum::http::header;
 use axum::response::IntoResponse;
 use axum::routing::get;
-use u6e_proto::msg::{Band, Radio, Snapshot, Station};
+use u6e_proto::msg::{Radio, Snapshot, Station};
 
 use crate::state::{Ap, Shared, State};
+use crate::view::{band, mac};
 
 const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
@@ -69,18 +70,6 @@ fn escape(v: &str) -> String {
         }
     }
     out
-}
-
-fn mac(m: &[u8; 6]) -> String {
-    m.map(|b| format!("{b:02x}")).join(":")
-}
-
-fn band(b: Band) -> &'static str {
-    match b {
-        Band::B24 => "2.4",
-        Band::B5 => "5",
-        Band::B6 => "6",
-    }
 }
 
 fn unix_seconds(t: SystemTime) -> f64 {
@@ -334,10 +323,5 @@ mod tests {
             m.out,
             "# HELP x An x.\n# TYPE x gauge\nx -54\nx{a=\"1\",b=\"\\\"\"} 0.25\n"
         );
-    }
-
-    #[test]
-    fn mac_is_lower_hex() {
-        assert_eq!(mac(&[0x02, 0, 0, 0xab, 0, 0x2f]), "02:00:00:ab:00:2f");
     }
 }

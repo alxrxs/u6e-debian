@@ -1,13 +1,14 @@
 //! The Wi-Fi controller: the APs' agents dial in over the post-quantum,
 //! key-pinned TLS of `u6e_proto::tls`, and their snapshots and events become
-//! a live state in RAM, served to Prometheus (`metrics`) and the web listener
-//! (`http`).
+//! a live state in RAM, served to Prometheus (`metrics`) and to the web UI
+//! (`http`, which reads it through `view`).
 
 pub mod agents;
 pub mod config;
 pub mod http;
 pub mod metrics;
 pub mod state;
+pub mod view;
 
 use std::collections::HashMap;
 use std::io;

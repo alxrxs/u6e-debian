@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Wi-Fi controller</title>
+<link rel="icon" href="{{assets}}/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="{{assets}}/style.css">
+<script src="{{assets}}/theme.js"></script>
+<link rel="modulepreload" href="{{assets}}/util.js">
+<link rel="modulepreload" href="{{assets}}/charts.js">
+<link rel="modulepreload" href="{{assets}}/views/devices.js">
+<link rel="modulepreload" href="{{assets}}/views/clients.js">
+<link rel="modulepreload" href="{{assets}}/views/client.js">
+<link rel="modulepreload" href="{{assets}}/views/events.js">
+<script type="module" src="{{assets}}/app.js"></script>
+</head>
+<body>
+<header class="bar">
+  <a class="brand" href="#/devices">
+    <img src="{{assets}}/icon.svg" alt="" width="22" height="22">
+    <span>Wi-Fi</span>
+  </a>
+  <nav class="tabs" aria-label="Views">
+    <a href="#/devices" data-view="devices">Devices</a>
+    <a href="#/clients" data-view="clients">Clients <span class="tally" id="tally"></span></a>
+    <a href="#/events" data-view="events">Events</a>
+  </nav>
+  <div class="session">
+    <span class="live" id="live" data-state="connecting">Connecting</span>
+    <span class="user" id="user" hidden></span>
+    <button class="theme" id="theme" type="button"></button>
+  </div>
+</header>
+<p class="banner" id="banner" role="status" hidden></p>
+<main id="view"></main>
+</body>
+</html>
