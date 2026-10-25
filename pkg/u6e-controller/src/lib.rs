@@ -3,6 +3,7 @@
 //! become a live state in RAM, served to Prometheus (`metrics`) and to the web
 //! UI (`http`, which reads it through `view`). The UI's operators act on
 //! clients through `actions`; what must outlive the process is in `policy`.
+//! The radios' spectrum scans run while the UI watches them (`spectrum`).
 
 pub mod actions;
 pub mod agents;
@@ -11,6 +12,7 @@ pub mod http;
 pub mod metrics;
 pub mod names;
 pub mod policy;
+pub mod spectrum;
 pub mod state;
 pub mod view;
 
@@ -48,7 +50,9 @@ pub async fn start(
     let path = &config.policy_path;
     let blocked = policy::load(path)
         .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
-    let state = State::new(config.aps.keys().cloned()).with_blocked(blocked);
+    let state = State::new(config.aps.keys().cloned())
+        .with_blocked(blocked)
+        .with_spectrum(timing.spectrum);
     let state = Shared::new(state);
     let keys: HashMap<_, _> = config.aps.iter().map(|(n, k)| (*k, n.clone())).collect();
     let allowed: AllowedKeys = Arc::new(RwLock::new(keys));
@@ -78,6 +82,7 @@ pub async fn start(
     let access = Access::new(config, timing.command);
     let web = http::router(state.clone(), access);
     tokio::spawn(serve_http("http", http, web));
+    tokio::spawn(spectrum::supervise(state.clone()));
     tokio::spawn(serve_http("metrics", metrics, metrics::router(state)));
     Ok(controller)
 }

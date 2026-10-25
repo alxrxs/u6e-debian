@@ -2,10 +2,11 @@
 //! `/block`, `/unblock` and `/steer` (`{"target_bssid": "<mac>"}`).
 //!
 //! A request acts only when it comes from the UI's own page and from an
-//! admin, checked in that order:
-//! - it says `Content-Type: application/json`, which no cross-site form can
-//!   send without a preflight this listener never grants, and its `Origin` is
-//!   the one the UI is served at (403 `cross-site`);
+//! admin, checked in that order ([`refusal`], which also gates the start of a
+//! radio's spectrum scan over the WebSocket, since a scan costs airtime):
+//! - its `Origin` is the one the UI is served at, and a POST says
+//!   `Content-Type: application/json`, which no cross-site form can send
+//!   without a preflight this listener never grants (403 `cross-site`);
 //! - the sign-in proxy's groups header (`X-Auth-Request-Groups`, which the
 //!   reverse proxy strips from what clients send) names the admin group (403
 //!   `not an admin`).
@@ -97,8 +98,18 @@ pub fn is_admin(req: &HeaderMap, group: &str) -> bool {
     groups.map(str::trim).any(|g| g == group)
 }
 
+/// How a request to act reaches the listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Via {
+    /// A POST, whose body must say it is JSON.
+    Post,
+    /// A WebSocket's handshake: it has no body, and a browser always says
+    /// which page opens one.
+    WebSocket,
+}
+
 /// Whether the request could have come from another site's page.
-fn cross_site(req: &HeaderMap, origin: &str) -> bool {
+fn cross_site(req: &HeaderMap, origin: &str, via: Via) -> bool {
     let kind = req.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok());
     let json = kind
         .and_then(|k| k.split(';').next())
@@ -106,7 +117,24 @@ fn cross_site(req: &HeaderMap, origin: &str) -> bool {
     let ours = req
         .get(header::ORIGIN)
         .is_some_and(|o| o.as_bytes() == origin.as_bytes());
-    !(json && ours)
+    !(ours && (json || via == Via::WebSocket))
+}
+
+/// Why `req` may not act, if it may not, and logs the refusal of `what`.
+pub fn refusal(req: &HeaderMap, access: &Access, via: Via, what: &str) -> Option<&'static str> {
+    let why = if cross_site(req, &access.public_origin, via) {
+        "cross-site"
+    } else if !is_admin(req, &access.admin_group) {
+        "not an admin"
+    } else {
+        return None;
+    };
+    // Quoted: the client spells what it asks for.
+    eprintln!(
+        "u6e-controller: {} {what:?} refused: {why}",
+        user(req).as_deref().unwrap_or("(no user)")
+    );
+    Some(why)
 }
 
 /// `GET /api/me`: who the UI's user is, and whether they may act.
@@ -165,22 +193,10 @@ async fn act(
     mac: &str,
     kind: impl FnOnce([u8; 6]) -> Result<CommandKind, &'static str>,
 ) -> Response {
-    let who = user(req);
-    let refused = if cross_site(req, &web.access.public_origin) {
-        Some("cross-site")
-    } else if !is_admin(req, &web.access.admin_group) {
-        Some("not an admin")
-    } else {
-        None
-    };
-    if let Some(why) = refused {
-        // Quoted: the path is the client's to spell.
-        eprintln!(
-            "u6e-controller: {} {action} {mac:?} refused: {why}",
-            who.as_deref().unwrap_or("(no user)")
-        );
+    if let Some(why) = refusal(req, &web.access, Via::Post, &format!("{action} {mac}")) {
         return error(StatusCode::FORBIDDEN, why);
     }
+    let who = user(req);
     let Some(mac) = mac::parse(mac) else {
         return error(StatusCode::BAD_REQUEST, "not a MAC");
     };
@@ -406,12 +422,23 @@ mod tests {
             ("content-type", "application/json"),
             ("origin", "https://wifi.example.org"),
         ];
-        assert!(!cross_site(&headers(&ok), ORIGIN));
+        assert!(!cross_site(&headers(&ok), ORIGIN, Via::Post));
         let params = [
             ("content-type", "Application/JSON; charset=utf-8"),
             ("origin", "https://wifi.example.org"),
         ];
-        assert!(!cross_site(&headers(&params), ORIGIN));
+        assert!(!cross_site(&headers(&params), ORIGIN, Via::Post));
+        // A WebSocket's handshake has no body; only its origin counts.
+        let page = [("origin", "https://wifi.example.org")];
+        assert!(!cross_site(&headers(&page), ORIGIN, Via::WebSocket));
+        for bad in [
+            &[][..],
+            &[("origin", "https://elsewhere.example")],
+            &[("origin", "http://wifi.example.org")],
+            &[("origin", "null")],
+        ] {
+            assert!(cross_site(&headers(bad), ORIGIN, Via::WebSocket), "{bad:?}");
+        }
         for bad in [
             &[("content-type", "application/json")][..],
             &[("origin", "https://wifi.example.org")],
@@ -429,7 +456,7 @@ mod tests {
             ],
             &[("content-type", "application/json"), ("origin", "null")],
         ] {
-            assert!(cross_site(&headers(bad), ORIGIN), "{bad:?}");
+            assert!(cross_site(&headers(bad), ORIGIN, Via::Post), "{bad:?}");
         }
     }
 

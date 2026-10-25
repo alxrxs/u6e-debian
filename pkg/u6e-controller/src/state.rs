@@ -8,7 +8,8 @@
 //! The state also sets each AP's tick and flow cadence. While a UI client
 //! watches an AP it reports every 2 s, otherwise at the 15 s scrape interval;
 //! while one watches its flows they come every 10 s, otherwise every minute.
-//! The session follows per-AP channels holding what the watchers want.
+//! The session follows per-AP channels holding what the watchers want. The
+//! scans of the APs' radios are kept here too, watched as `spectrum` says.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::IpAddr;
@@ -16,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime};
 
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
 use u6e_proto::delta::{self, Gap};
 use u6e_proto::msg::{
     AgentMsg, Command, CommandKind, CommandResult, CtlMsg, Event, EventKind, Flows, Hello,
@@ -26,6 +27,7 @@ use u6e_proto::{PROTOCOL, mac};
 
 use crate::names::{self, Names};
 use crate::policy::Blocked;
+use crate::spectrum::{self, Limits, Scan, Stopped};
 
 /// Events kept per AP, newest last.
 pub const EVENTS_CAP: usize = 1000;
@@ -61,6 +63,8 @@ pub enum Change {
     /// A client's name came or changed.
     Names,
     Action(Action),
+    /// The scan of a radio (AP, radio) started, stopped or was joined.
+    Spectrum(String, String),
 }
 
 /// One operator action on one AP (or on none, when no AP was connected to
@@ -138,14 +142,16 @@ pub struct Ap {
     full: Vec<oneshot::Sender<Flows>>,
     /// When the agent was last asked for it.
     full_asked: Option<Instant>,
-    session: Option<Live>,
+    /// Its radios' scans, by radio, once one was watched.
+    pub scans: BTreeMap<String, Scan>,
+    pub(crate) session: Option<Live>,
 }
 
 /// The connection currently serving an AP; dropping `stop` ends it.
-struct Live {
+pub(crate) struct Live {
     id: u64,
     _stop: oneshot::Sender<()>,
-    outbox: mpsc::Sender<CtlMsg>,
+    pub(crate) outbox: mpsc::Sender<CtlMsg>,
 }
 
 impl Ap {
@@ -168,6 +174,7 @@ impl Ap {
             cadence: watch::Sender::new(FLOWS_IDLE),
             full: Vec::new(),
             full_asked: None,
+            scans: BTreeMap::new(),
             session: None,
         }
     }
@@ -202,14 +209,19 @@ impl Ap {
         self.snapshot_at = Some(now);
     }
 
-    /// Forgets what only a live connection knows.
-    fn reset_session(&mut self) {
+    /// Forgets what only a live connection knows; the radios whose scans
+    /// ended with it, which its agent stops as the link goes.
+    fn reset_session(&mut self) -> Vec<String> {
         self.snapshot = None;
         self.snapshot_at = None;
         self.previous = None;
         self.connected_since = None;
         self.flows = None;
         self.full.clear();
+        let scans = self.scans.iter_mut();
+        let ended =
+            scans.filter_map(|(radio, scan)| scan.end(Stopped::Link).then(|| radio.clone()));
+        ended.collect()
     }
 
     /// One more watcher (`more`) or one fewer, of the AP or its flows.
@@ -284,7 +296,7 @@ pub struct Registration {
 
 /// The live state of every configured AP.
 pub struct State {
-    aps: BTreeMap<String, Ap>,
+    pub(crate) aps: BTreeMap<String, Ap>,
     next_id: u64,
     changes: broadcast::Sender<Change>,
     /// The clients blocked, as saved in the policy file.
@@ -297,6 +309,10 @@ pub struct State {
     pub action_counts: BTreeMap<(&'static str, &'static str), u64>,
     names: Names,
     addresses: HashMap<[u8; 6], Addresses>,
+    /// When the scans stop.
+    pub spectrum: Limits,
+    /// Wakes `spectrum::supervise` when a scan's deadline may have moved.
+    pub(crate) wake: Arc<Notify>,
 }
 
 impl State {
@@ -312,12 +328,19 @@ impl State {
             action_counts: BTreeMap::new(),
             names: Names::default(),
             addresses: HashMap::new(),
+            spectrum: Limits::default(),
+            wake: Arc::new(Notify::new()),
         }
     }
 
     /// The state with the clients a saved policy blocks.
     pub fn with_blocked(self, blocked: Blocked) -> Self {
         State { blocked, ..self }
+    }
+
+    /// The state with its scans stopped after `spectrum`.
+    pub fn with_spectrum(self, spectrum: Limits) -> Self {
+        State { spectrum, ..self }
     }
 
     /// Every configured AP by name, connected or not.
@@ -341,7 +364,7 @@ impl State {
         self.aps.get(ap).map_or(0, |a| a.flow_watchers)
     }
 
-    fn notify(&self, change: Change) {
+    pub(crate) fn notify(&self, change: Change) {
         // No receiver is not an error: nobody has the UI open.
         let _ = self.changes.send(change);
     }
@@ -361,7 +384,7 @@ impl State {
         });
         // Each connection numbers its snapshots from 1 again, so a delta must
         // never meet the previous connection's snapshot.
-        entry.reset_session();
+        let ended = entry.reset_session();
         let now = SystemTime::now();
         entry.connected_since = Some(now);
         entry.last_seen = Some(now);
@@ -377,6 +400,7 @@ impl State {
         };
         // The previous connection's commands went with it.
         self.drop_pending(ap);
+        self.scans_ended(ap, ended);
         self.notify(Change::Up(ap.to_owned()));
         Some(reg)
     }
@@ -396,8 +420,9 @@ impl State {
         entry.protocol = Some(protocol);
         entry.hello = None;
         entry.session = None;
-        entry.reset_session();
+        let ended = entry.reset_session();
         self.drop_pending(ap);
+        self.scans_ended(ap, ended);
         self.notify(Change::Down(ap.to_owned()));
         true
     }
@@ -408,9 +433,17 @@ impl State {
             return;
         };
         entry.session = None;
-        entry.reset_session();
+        let ended = entry.reset_session();
         self.drop_pending(ap);
+        self.scans_ended(ap, ended);
         self.notify(Change::Down(ap.to_owned()));
+    }
+
+    /// Tells the watchers of the scans of `radios` on `ap` they ended.
+    fn scans_ended(&self, ap: &str, radios: Vec<String>) {
+        for radio in radios {
+            self.notify(Change::Spectrum(ap.to_owned(), radio));
+        }
     }
 
     /// Forgets the commands sent to `ap`: their waiters hear it went away.
@@ -478,6 +511,31 @@ impl State {
             AgentMsg::Result(r) => {
                 self.result(ap, r);
                 None
+            }
+            // Frames go to the watchers apart from the changes: they are
+            // not part of the view.
+            AgentMsg::Spectrum(f) => {
+                if spectrum::RADIOS.contains(&f.radio.as_str()) {
+                    let key = format!("{ap}/{}", f.radio);
+                    entry
+                        .scans
+                        .entry(f.radio.clone())
+                        .or_default()
+                        .frame(&key, &f);
+                }
+                None
+            }
+            AgentMsg::SpectrumState {
+                radio,
+                running,
+                reason,
+            } => {
+                if !spectrum::RADIOS.contains(&radio.as_str()) {
+                    return Ok(());
+                }
+                let scan = entry.scans.entry(radio.clone()).or_default();
+                scan.report(running, reason);
+                Some(Change::Spectrum(ap.to_owned(), radio))
             }
             // A Pong only proves the agent is alive.
             _ => None,

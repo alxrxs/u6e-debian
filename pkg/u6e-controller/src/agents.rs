@@ -33,19 +33,21 @@ use u6e_proto::tls::{self, AllowedKeys};
 use u6e_proto::{PROTOCOL, version};
 
 use crate::names::Lookups;
+use crate::spectrum::Limits;
 use crate::state::{FLOWS_WATCHED, Registration, Shared, TICK_WATCHED};
 
 /// Longest a handshake, or a write to a stalled agent, may take.
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How often the session pings, how long it waits for any word from the
-/// agent before dropping it (the agent keeps the same 60 s on its side), and
-/// how long an operator waits for a command's result.
+/// agent before dropping it (the agent keeps the same 60 s on its side), how
+/// long an operator waits for a command's result, and when scans stop.
 #[derive(Debug, Clone, Copy)]
 pub struct Timing {
     pub ping: Duration,
     pub silence: Duration,
     pub command: Duration,
+    pub spectrum: Limits,
 }
 
 impl Default for Timing {
@@ -54,6 +56,7 @@ impl Default for Timing {
             ping: Duration::from_secs(15),
             silence: Duration::from_secs(60),
             command: Duration::from_secs(5),
+            spectrum: Limits::default(),
         }
     }
 }

@@ -228,6 +228,36 @@ pub fn band(b: Band) -> &'static str {
     }
 }
 
+/// The scan of `radio` on `ap`: whether the AP is asked to scan, since when,
+/// and for how long at most (`limit`, seconds); whether the AP says it does;
+/// how many watch it; and why it stopped, once it has (`stopped`: `idle`,
+/// `limit`, `link` or `ap`, the AP's own reason in `detail`).
+pub fn spectrum(state: &State, ap: &str, radio: &str) -> Value {
+    let mut o = json!({
+        "key": format!("{ap}/{radio}"),
+        "limit": state.spectrum.limit.as_secs(),
+        "scanning": false,
+        "running": false,
+        "watchers": 0,
+    });
+    let Some(scan) = state.ap(ap).and_then(|a| a.scans.get(radio)) else {
+        return o;
+    };
+    o["running"] = scan.running.into();
+    o["watchers"] = scan.watchers().into();
+    if let Some(since) = scan.since() {
+        o["scanning"] = true.into();
+        o["since"] = unix_ms(since).into();
+    }
+    if let Some(why) = scan.stopped {
+        o["stopped"] = why.as_str().into();
+    }
+    if !scan.detail.is_empty() {
+        o["detail"] = scan.detail.clone().into();
+    }
+    o
+}
+
 fn unix_ms(t: SystemTime) -> u64 {
     t.duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)

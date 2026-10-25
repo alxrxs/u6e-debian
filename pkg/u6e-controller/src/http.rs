@@ -12,6 +12,14 @@
 //! those APs reports every 2 s, and its flows every 10 s while the socket asks
 //! for them, which it can change at any time with `{"flows":true|false}`.
 //!
+//! `{"spectrum":"<ap>/<radio>"}` on an open socket watches that radio's scan,
+//! starting it if it is not running, and `{"spectrum":null}` stops watching;
+//! it is refused unless the socket's page could act (`actions::refusal`). The
+//! socket then gets the scan's state as `{"spectrum":{…}}` whenever it changes
+//! and each frame as one binary message (the layout is in `spectrum`). While
+//! it watches, it is pinged every second, and one silent for 3 s is dropped:
+//! a page whose network went away lets its scan stop as soon as one closed.
+//!
 //! `GET /api/flows?ap=&client=` is the latest flows, `GET /api/flows/full?ap=`
 //! asks the AP for every connection it forwards (at most every 10 s) and
 //! waits for the answer.
@@ -23,7 +31,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -34,10 +42,11 @@ use axum::routing::{get, post};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::broadcast::error::RecvError;
-use tokio::time::timeout;
+use tokio::time::{interval, timeout};
 use u6e_proto::mac;
 
-use crate::actions::{self, Access, Web};
+use crate::actions::{self, Access, Via, Web};
+use crate::spectrum::{self, Watching};
 use crate::state::{Change, Full, Shared, WatchGuard};
 use crate::view;
 
@@ -45,6 +54,10 @@ use crate::view;
 const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// A subscription is a list of AP names; nothing a client sends is larger.
 const MAX_MESSAGE: usize = 4096;
+/// While a socket watches a scan: how often it is pinged (a browser answers
+/// by itself), and how long it may stay silent before it counts as gone.
+const SCAN_PING: Duration = Duration::from_secs(1);
+const SCAN_SILENCE: Duration = Duration::from_secs(3);
 
 const HTML: &str = "text/html; charset=utf-8";
 const CSS: &str = "text/css; charset=utf-8";
@@ -297,14 +310,32 @@ fn same_origin(req: &HeaderMap) -> bool {
     host.is_some() && origin_host == host
 }
 
-async fn ws(Ext(state): Ext<Shared>, req: HeaderMap, upgrade: WebSocketUpgrade) -> Response {
+async fn ws(Ext(web): Ext<Web>, req: HeaderMap, upgrade: WebSocketUpgrade) -> Response {
     if !same_origin(&req) {
         return StatusCode::FORBIDDEN.into_response();
     }
     let user = actions::user(&req);
+    let scans = Gate {
+        req,
+        access: web.access,
+    };
     upgrade
         .max_message_size(MAX_MESSAGE)
-        .on_upgrade(move |socket| live(socket, state, user))
+        .on_upgrade(move |socket| live(socket, web.state, user, scans))
+}
+
+/// Whether a socket may start scans: the headers of its handshake, judged as
+/// an action's are, each time it asks for one.
+struct Gate {
+    req: HeaderMap,
+    access: Access,
+}
+
+impl Gate {
+    fn refusal(&self, key: &str) -> Option<&'static str> {
+        let what = format!("spectrum {key}");
+        actions::refusal(&self.req, &self.access, Via::WebSocket, &what)
+    }
 }
 
 #[derive(Deserialize)]
@@ -341,11 +372,14 @@ async fn subscription(ws: &mut WebSocket, state: &Shared) -> Option<(Vec<String>
     Some((aps, sub.flows))
 }
 
-/// What a socket says after its subscription: whether it shows the flows.
+/// What a socket says after its subscription: whether it shows the flows,
+/// or which radio's scan it watches, if any.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ShowFlows {
-    flows: bool,
+enum Ask {
+    #[serde(rename = "flows")]
+    Flows(bool),
+    #[serde(rename = "spectrum")]
+    Spectrum(Option<String>),
 }
 
 async fn send(ws: &mut WebSocket, msg: &Value) -> Result<(), axum::Error> {
@@ -362,8 +396,28 @@ async fn patch(ws: &mut WebSocket, sent: &mut Value, next: Value) -> Result<(), 
     Ok(())
 }
 
+/// The next frame of the scan watched, if one is.
+async fn next_frame(scan: &mut Option<Watching>) -> Result<axum::body::Bytes, RecvError> {
+    match scan {
+        Some(w) => w.frames.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The state of the scan `key` names, with why it is not watched if it is not.
+fn scan_state(state: &Shared, key: &str, refused: Option<&str>) -> Value {
+    let mut v = match spectrum::parse(key) {
+        Some((ap, radio)) => view::spectrum(&state.read(), ap, radio),
+        None => json!({ "key": key }),
+    };
+    if let Some(why) = refused {
+        v["error"] = why.into();
+    }
+    json!({ "spectrum": v })
+}
+
 /// Serves one WebSocket until either end closes it.
-async fn live(mut ws: WebSocket, state: Shared, user: Option<String>) {
+async fn live(mut ws: WebSocket, state: Shared, user: Option<String>, scans: Gate) {
     let Some((names, mut flows)) = subscription(&mut ws, &state).await else {
         return;
     };
@@ -376,6 +430,10 @@ async fn live(mut ws: WebSocket, state: Shared, user: Option<String>) {
         names.filter_map(|n| state.watch_flows(n)).collect()
     };
     let mut _watching_flows = watch_flows(flows);
+    // The scan the socket watches, and when the socket was last heard from.
+    let mut scan: Option<Watching> = None;
+    let mut heard = Instant::now();
+    let mut ping = interval(SCAN_PING);
     // Subscribed first, so nothing between the key and the first patch is lost.
     let mut changes = state.read().subscribe();
     let mut sent = view::view(&state.read(), wanted, flows);
@@ -388,26 +446,85 @@ async fn live(mut ws: WebSocket, state: Shared, user: Option<String>) {
     loop {
         let change = tokio::select! {
             c = changes.recv() => c,
-            m = ws.recv() => match m {
-                Some(Ok(Message::Text(text))) => {
-                    // Anything else a client says means nothing yet.
-                    let Ok(show) = serde_json::from_str::<ShowFlows>(&text) else {
+            m = ws.recv() => {
+                let text = match m {
+                    Some(Ok(Message::Text(text))) => text,
+                    // A pong, most likely: the page is still there.
+                    Some(Ok(_)) => {
+                        heard = Instant::now();
                         continue;
-                    };
-                    if show.flows != flows {
-                        flows = show.flows;
+                    }
+                    _ => return,
+                };
+                heard = Instant::now();
+                let out = match serde_json::from_str::<Ask>(&text) {
+                    Ok(Ask::Flows(show)) if show != flows => {
+                        flows = show;
                         _watching_flows = watch_flows(flows);
                         // The flows come, or go, with this patch.
                         let next = view::view(&state.read(), wanted, flows);
                         if patch(&mut ws, &mut sent, next).await.is_err() {
                             return;
                         }
+                        None
                     }
-                    continue;
+                    Ok(Ask::Spectrum(Some(key))) => {
+                        let watched = match (scans.refusal(&key), spectrum::parse(&key)) {
+                            (Some(why), _) => Err(why),
+                            (None, None) => Err("not a radio that scans"),
+                            (None, Some((ap, radio))) => state.watch_spectrum(ap, radio),
+                        };
+                        let refused = watched.as_ref().err().copied();
+                        // The new watch is taken before the old one goes, so
+                        // a scan asked for again does not start to linger.
+                        scan = watched.ok();
+                        Some(scan_state(&state, &key, refused))
+                    }
+                    Ok(Ask::Spectrum(None)) => {
+                        scan = None;
+                        None
+                    }
+                    // Anything else a client says means nothing yet.
+                    _ => None,
+                };
+                if let Some(msg) = out
+                    && send(&mut ws, &msg).await.is_err()
+                {
+                    return;
                 }
-                Some(Ok(_)) => continue,
-                _ => return,
-            },
+                continue;
+            }
+            f = next_frame(&mut scan) => {
+                let frame = match f {
+                    Ok(frame) => frame,
+                    // Behind: the next frame is the newest.
+                    Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Closed) => return,
+                };
+                match timeout(SCAN_SILENCE, ws.send(Message::Binary(frame))).await {
+                    Ok(Ok(())) => continue,
+                    Ok(Err(_)) => return,
+                    // Not reading: gone since it was last heard.
+                    Err(_) => {
+                        if let Some(w) = scan.take() {
+                            w.gone_since(heard);
+                        }
+                        return;
+                    }
+                }
+            }
+            _ = ping.tick(), if scan.is_some() => {
+                if heard.elapsed() > SCAN_SILENCE {
+                    if let Some(w) = scan.take() {
+                        w.gone_since(heard);
+                    }
+                    return;
+                }
+                if ws.send(Message::Ping(Default::default())).await.is_err() {
+                    return;
+                }
+                continue;
+            }
         };
         let (relevant, out) = match change {
             Ok(Change::Event(ap, ev)) if wanted(&ap) => {
@@ -422,7 +539,15 @@ async fn live(mut ws: WebSocket, state: Shared, user: Option<String>) {
             Ok(Change::Action(a)) if a.ap.as_deref().is_none_or(wanted) => {
                 (true, Some(json!({ "events": [view::action(&a)] })))
             }
-            Ok(Change::Event(..) | Change::Action(_)) => (false, None),
+            Ok(Change::Spectrum(ap, radio))
+                if scan
+                    .as_ref()
+                    .is_some_and(|w| w.ap == ap && w.radio == radio) =>
+            {
+                let key = format!("{ap}/{radio}");
+                (false, Some(scan_state(&state, &key, None)))
+            }
+            Ok(Change::Event(..) | Change::Action(_) | Change::Spectrum(..)) => (false, None),
             // Too slow to keep up: the state is whole again with the next
             // patch, the events missed are told of.
             Err(RecvError::Lagged(_)) => (true, Some(json!({ "lost": true }))),

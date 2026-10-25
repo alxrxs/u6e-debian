@@ -24,13 +24,15 @@ use tungstenite::{HandshakeError, Message};
 use u6e_controller::agents::Timing;
 use u6e_controller::config::Config;
 use u6e_controller::names::Resolve;
+use u6e_controller::spectrum::Limits;
 use u6e_controller::state::{FLOWS_IDLE, FLOWS_WATCHED, TICK_IDLE, TICK_WATCHED};
 use u6e_controller::{Controller, start};
 use u6e_proto::PROTOCOL;
 use u6e_proto::frame::{decode_frame, frame_body, write_frame};
 use u6e_proto::msg::{
     AgentMsg, Band, Bss, ClientFlows, CommandKind, CommandResult, CtlMsg, Event, EventKind,
-    FieldDelta, Flow, Flows, Hello, Radio, RateMode, Snapshot, SnapshotDelta, Station, Temp,
+    FieldDelta, Flow, Flows, Hello, Radio, RateMode, Snapshot, SnapshotDelta, SpectrumFrame,
+    Station, Temp,
 };
 use u6e_proto::tls::{self, Identity};
 use u6e_proto::{mac, version};
@@ -1975,4 +1977,340 @@ fn names_resolved_from_the_flows_addresses() {
     let mut asked = r.dns.asked.lock().unwrap().clone();
     asked.sort();
     assert_eq!(asked, [v4, v6]);
+}
+
+/// The headers of the UI's own page, opened by an admin.
+const ADMIN_PAGE: [(&str, &str); 3] = [
+    ("host", "wifi.example.org"),
+    ("origin", ORIGIN),
+    ("x-auth-request-groups", "staff,wifi-admins"),
+];
+
+/// A socket of the UI's page watching ap1's clients, by an admin unless
+/// `headers` say otherwise.
+fn scan_page(r: &Running, headers: &[(&'static str, &str)]) -> Ui {
+    let mut ui = Ui::open(r.c.http, headers).unwrap();
+    ui.send(&json!({"subscribe": ["ap1"]}));
+    assert!(ui.recv()["key"].is_object());
+    ui
+}
+
+impl Ui {
+    /// The next message about a scan.
+    fn scan_state(&mut self) -> Value {
+        loop {
+            match self.0.read().unwrap() {
+                Message::Text(t) => {
+                    let v: Value = serde_json::from_str(&t).unwrap();
+                    if let Some(s) = v.get("spectrum") {
+                        return s.clone();
+                    }
+                }
+                Message::Binary(_) | Message::Ping(_) | Message::Pong(_) => {}
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    /// The next message about a scan that `want` says yes to.
+    fn scan_state_where(&mut self, want: impl Fn(&Value) -> bool) -> Value {
+        loop {
+            let s = self.scan_state();
+            if want(&s) {
+                return s;
+            }
+        }
+    }
+
+    /// The key and bins of the next frame, in the layout `spectrum` documents.
+    fn frame(&mut self) -> (String, Vec<i8>) {
+        loop {
+            match self.0.read().unwrap() {
+                Message::Binary(b) => {
+                    assert_eq!(b[0], 1, "layout");
+                    let n = usize::from(u16::from_le_bytes([b[6], b[7]]));
+                    let k = usize::from(b[24]);
+                    let key = String::from_utf8(b[25..25 + k].to_vec()).unwrap();
+                    assert_eq!(b.len(), 25 + k + n);
+                    return (key, b[25 + k..].iter().map(|&x| x as i8).collect());
+                }
+                Message::Text(_) | Message::Ping(_) | Message::Pong(_) => {}
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+}
+
+impl Agent {
+    /// The next message about a scan; the ticks and cadences the sockets
+    /// set pass by.
+    fn expect_scan(&mut self) -> CtlMsg {
+        loop {
+            match self.expect() {
+                CtlMsg::SetTick { .. } | CtlMsg::FlowCadence { .. } => {}
+                msg => return msg,
+            }
+        }
+    }
+
+    fn scanning(&mut self, radio: &str, running: bool) {
+        let radio = radio.into();
+        let reason = if running { "started" } else { "stopped" }.into();
+        self.send(&AgentMsg::SpectrumState {
+            radio,
+            running,
+            reason,
+        })
+        .unwrap();
+    }
+
+    fn spectrum(&mut self, radio: &str, bins: Vec<i8>) {
+        self.send(&AgentMsg::Spectrum(SpectrumFrame {
+            radio: radio.into(),
+            at_ms: 1_000,
+            center_mhz: 5210,
+            width_mhz: 80,
+            first_mhz_x10: 51_700,
+            step_khz: 312,
+            bins,
+            noise_dbm: -95,
+        }))
+        .unwrap();
+    }
+}
+
+fn scan_start(radio: &str) -> CtlMsg {
+    CtlMsg::SpectrumStart {
+        radio: radio.into(),
+    }
+}
+
+fn scan_stop(radio: &str) -> CtlMsg {
+    CtlMsg::SpectrumStop {
+        radio: radio.into(),
+    }
+}
+
+/// Starting a scan costs airtime: only an admin on the UI's own page starts
+/// one, and nothing else reaches the AP.
+#[test]
+fn a_scan_needs_an_admin_on_the_uis_page() {
+    let r = controller(Timing::default());
+    let mut a = ap_with_client(&r, KEY_AP1, "ap1", &[]);
+    let ask = |headers: &[(&'static str, &str)], key: &str| {
+        let mut ui = scan_page(&r, headers);
+        ui.send(&json!({ "spectrum": key }));
+        ui.scan_state()
+    };
+    let error = |headers: &[(&'static str, &str)], key: &str| ask(headers, key)["error"].clone();
+    let page = [("host", "wifi.example.org"), ("origin", ORIGIN)];
+    assert_eq!(error(&page, "ap1/radio5"), "not an admin");
+    let wrong_groups = [
+        ("host", "wifi.example.org"),
+        ("origin", ORIGIN),
+        ("x-auth-request-groups", "staff,wifi-admins-old"),
+        ("x-forwarded-groups", "wifi-admins"),
+    ];
+    assert_eq!(error(&wrong_groups, "ap1/radio5"), "not an admin");
+    // Refused before the groups are looked at: no page, or another
+    // scheme's (the socket itself is let in by its host alone).
+    let groups = ("x-auth-request-groups", "wifi-admins");
+    assert_eq!(error(&[groups], "ap1/radio5"), "cross-site");
+    let http = [
+        ("host", "wifi.example.org"),
+        ("origin", "http://wifi.example.org"),
+        groups,
+    ];
+    assert_eq!(error(&http, "ap1/radio5"), "cross-site");
+    // An admin is told why a radio cannot scan.
+    assert_eq!(error(&ADMIN_PAGE, "ap1/phy0"), "not a radio that scans");
+    assert_eq!(
+        error(&ADMIN_PAGE, "ap1/../radio5"),
+        "not a radio that scans"
+    );
+    assert_eq!(error(&ADMIN_PAGE, "ap9/radio5"), "not a configured AP");
+    assert_eq!(error(&ADMIN_PAGE, "ap2/radio5"), "the AP is not connected");
+
+    let state = ask(&ADMIN_PAGE, "ap1/radio5");
+    assert_eq!(
+        (&state["key"], &state["scanning"], &state["limit"]),
+        (&json!("ap1/radio5"), &json!(true), &json!(600)),
+        "{state}"
+    );
+    assert!(state.get("error").is_none(), "{state}");
+    // The first thing the AP hears of a scan is the admin's.
+    assert_eq!(a.expect_scan(), scan_start("radio5"));
+}
+
+/// Review focus 1: the scan stops 5 s after its last watcher closes the page,
+/// and 5 s after one whose network went was last heard from.
+#[test]
+fn scan_stops_when_last_watcher_leaves() {
+    let r = controller(Timing::default());
+    let mut a = ap_with_client(&r, KEY_AP1, "ap1", &[]);
+    let linger = Duration::from_secs(5);
+    let scanning = || {
+        let s = r.c.state.read();
+        let scan = s.ap("ap1").and_then(|a| a.scans.get("radio5"));
+        scan.is_some_and(|s| s.since().is_some())
+    };
+
+    let mut ui = scan_page(&r, &ADMIN_PAGE);
+    ui.send(&json!({"spectrum": "ap1/radio5"}));
+    assert_eq!(a.expect_scan(), scan_start("radio5"));
+    a.scanning("radio5", true);
+    drop(ui);
+    let left = Instant::now();
+    assert_eq!(a.expect_scan(), scan_stop("radio5"));
+    let after = left.elapsed();
+    assert!(
+        after >= linger - Duration::from_millis(100) && after < linger + Duration::from_secs(1),
+        "stopped {after:?} after the page closed"
+    );
+    assert!(!scanning());
+    a.scanning("radio5", false);
+
+    // A page whose network goes: it never answers the pings.
+    let mut ui = scan_page(&r, &ADMIN_PAGE);
+    ui.send(&json!({"spectrum": "ap1/radio5"}));
+    let heard = Instant::now();
+    assert_eq!(a.expect_scan(), scan_start("radio5"));
+    a.scanning("radio5", true);
+    a.spectrum("radio5", vec![-90; 64]);
+    assert_eq!(a.expect_scan(), scan_stop("radio5"));
+    let after = heard.elapsed();
+    assert!(
+        after >= linger - Duration::from_millis(100) && after < linger + Duration::from_secs(1),
+        "stopped {after:?} after the page was last heard"
+    );
+    assert!(!scanning());
+    drop(ui);
+}
+
+/// Review focus 3: two watchers of one radio and one of another make one scan
+/// per radio, each frame reaches the watchers of its radio only, and each
+/// radio stops when its own last watcher leaves.
+#[test]
+fn one_scan_per_radio_fanout() {
+    let timing = Timing {
+        spectrum: Limits {
+            linger: Duration::from_millis(300),
+            ..Limits::default()
+        },
+        ..Timing::default()
+    };
+    let r = controller(timing);
+    let mut a = ap_with_client(&r, KEY_AP1, "ap1", &[]);
+    let (mut one, mut two, mut other) = (
+        scan_page(&r, &ADMIN_PAGE),
+        scan_page(&r, &ADMIN_PAGE),
+        scan_page(&r, &ADMIN_PAGE),
+    );
+    one.send(&json!({"spectrum": "ap1/radio5"}));
+    assert_eq!(one.scan_state()["watchers"], 1);
+    two.send(&json!({"spectrum": "ap1/radio5"}));
+    assert_eq!(two.scan_state()["watchers"], 2);
+    other.send(&json!({"spectrum": "ap1/radio24"}));
+    assert_eq!(other.scan_state()["scanning"], true);
+    assert_eq!(a.expect_scan(), scan_start("radio5"));
+    assert_eq!(a.expect_scan(), scan_start("radio24"));
+
+    a.scanning("radio5", true);
+    a.scanning("radio24", true);
+    for ui in [&mut one, &mut two] {
+        let s = ui.scan_state_where(|s| s["running"] == true);
+        assert_eq!(
+            (&s["key"], &s["watchers"]),
+            (&json!("ap1/radio5"), &json!(2))
+        );
+    }
+    a.spectrum("radio5", vec![-60, -70, -80]);
+    a.spectrum("radio24", vec![-50; 4]);
+    let five = ("ap1/radio5".to_owned(), vec![-60, -70, -80]);
+    assert_eq!(one.frame(), five);
+    assert_eq!(two.frame(), five);
+    assert_eq!(other.frame(), ("ap1/radio24".to_owned(), vec![-50; 4]));
+    wait_for("the frames counted", || {
+        metrics_of(&r, "wifi_spectrum_frames_total{")
+            == [
+                "wifi_spectrum_frames_total{ap=\"ap1\",radio=\"radio24\"} 1",
+                "wifi_spectrum_frames_total{ap=\"ap1\",radio=\"radio5\"} 1",
+            ]
+    });
+    assert_eq!(
+        metrics_of(&r, "wifi_spectrum_scans_running{"),
+        [
+            "wifi_spectrum_scans_running{ap=\"ap1\",radio=\"radio24\"} 1",
+            "wifi_spectrum_scans_running{ap=\"ap1\",radio=\"radio5\"} 1",
+        ]
+    );
+
+    // radio24's watcher leaves: it stops, radio5 scans on.
+    drop(other);
+    assert_eq!(a.expect_scan(), scan_stop("radio24"));
+    drop(one);
+    thread::sleep(Duration::from_secs(1));
+    a.spectrum("radio5", vec![-61; 3]);
+    assert_eq!(two.frame(), ("ap1/radio5".to_owned(), vec![-61; 3]));
+    drop(two);
+    assert_eq!(a.expect_scan(), scan_stop("radio5"));
+}
+
+/// A scan stops after its limit, watched or not, and the watcher may start
+/// it again; one whose AP's link went down ends with it, and does not start
+/// again by itself.
+#[test]
+fn a_scan_stops_at_its_limit_and_with_its_link() {
+    let timing = Timing {
+        spectrum: Limits {
+            limit: Duration::from_secs(1),
+            ..Limits::default()
+        },
+        ..Timing::default()
+    };
+    let r = controller(timing);
+    let mut a = ap_with_client(&r, KEY_AP1, "ap1", &[]);
+    let mut ui = scan_page(&r, &ADMIN_PAGE);
+    ui.send(&json!({"spectrum": "ap1/radio6"}));
+    let asked = Instant::now();
+    let s = ui.scan_state();
+    assert_eq!((&s["scanning"], &s["limit"]), (&json!(true), &json!(1)));
+    assert!(s["since"].is_u64(), "{s}");
+    assert_eq!(a.expect_scan(), scan_start("radio6"));
+    assert_eq!(a.expect_scan(), scan_stop("radio6"));
+    let after = asked.elapsed();
+    assert!(
+        after >= Duration::from_millis(900),
+        "stopped after {after:?}"
+    );
+    let s = ui.scan_state_where(|s| s.get("stopped").is_some());
+    assert_eq!(
+        (&s["scanning"], &s["stopped"]),
+        (&json!(false), &json!("limit"))
+    );
+
+    // Asked again, it starts again.
+    ui.send(&json!({"spectrum": "ap1/radio6"}));
+    assert_eq!(ui.scan_state()["scanning"], true);
+    assert_eq!(a.expect_scan(), scan_start("radio6"));
+    a.scanning("radio6", true);
+    ui.scan_state_where(|s| s["running"] == true);
+
+    // The link goes: the agent stops the scan with it.
+    drop(a);
+    let s = ui.scan_state_where(|s| s["scanning"] == false);
+    assert_eq!(
+        (&s["scanning"], &s["stopped"]),
+        (&json!(false), &json!("link"))
+    );
+    let mut a = Agent::hello(r.c.agents, KEY_AP1, "ap1");
+    a.send(&AgentMsg::Key(snapshot(1, Vec::new(), Vec::new())))
+        .unwrap();
+    wait_for("ap1 back", || seq_of(&r, "ap1") == Some(1));
+    let since = |r: &Running| r.c.state.read().ap("ap1").unwrap().scans["radio6"].since();
+    assert_eq!(since(&r), None);
+    // Until the page asks again.
+    ui.send(&json!({"spectrum": "ap1/radio6"}));
+    assert_eq!(a.expect_scan(), scan_start("radio6"));
+    assert!(since(&r).is_some());
 }

@@ -1,7 +1,8 @@
 //! `/metrics` in the Prometheus text exposition format, rendered from the live
 //! state at each scrape. Client series exist only for associated clients, so
 //! their number follows the clients on the air, not every MAC ever seen; the
-//! connection counts only for those of an AP that has sent its flows.
+//! connection counts only for those of an AP that has sent its flows. The
+//! spectrum series are per radio that scans, of every AP with a snapshot.
 
 use std::collections::BTreeSet;
 use std::fmt::Write;
@@ -16,6 +17,7 @@ use u6e_proto::PROTOCOL;
 use u6e_proto::mac;
 use u6e_proto::msg::{Radio, Snapshot, Station};
 
+use crate::spectrum::{RADIOS, Scan};
 use crate::state::{Ap, Shared, State};
 use crate::view::band;
 
@@ -168,6 +170,24 @@ const CLIENT_FAMILIES: [(&str, &str, &str, StationValue); 5] = [
     ),
 ];
 
+/// A radio's scan, if it was ever watched.
+type ScanValue = fn(Option<&Scan>) -> f64;
+
+const SPECTRUM_FAMILIES: [(&str, &str, &str, ScanValue); 2] = [
+    (
+        "wifi_spectrum_scans_running",
+        GAUGE,
+        "Whether the radio's spectrum scan runs, as the AP says.",
+        |s| f64::from(u8::from(s.is_some_and(|s| s.running))),
+    ),
+    (
+        "wifi_spectrum_frames_total",
+        COUNTER,
+        "Spectrum frames received from the radio.",
+        |s| s.map_or(0, |s| s.frames_total) as f64,
+    ),
+];
+
 /// The whole exposition for `state`.
 pub fn render(state: &State) -> String {
     let mut m = Text::default();
@@ -294,6 +314,22 @@ pub fn render(state: &State) -> String {
                 for r in &s.radios {
                     m.sample(&[("ap", ap), ("phy", &r.phy)], value(r));
                 }
+            }
+        }
+    }
+
+    for (name, kind, help, value) in SPECTRUM_FAMILIES {
+        m.family(name, kind, help);
+        for &(ap, a) in &aps {
+            // The radios that scan, of the snapshot or that have scanned.
+            let radios = a.snapshot.iter().flat_map(|s| &s.radios);
+            let radios: BTreeSet<&str> = radios
+                .map(|r| r.phy.as_str())
+                .filter(|r| RADIOS.contains(r))
+                .chain(a.scans.keys().map(String::as_str))
+                .collect();
+            for radio in radios {
+                m.sample(&[("ap", ap), ("radio", radio)], value(a.scans.get(radio)));
             }
         }
     }
