@@ -1068,8 +1068,8 @@ impl State {
         }
     }
 
-    /// At the first key frame of session `id`: whether the AP runs the
-    /// configuration it last acknowledged. If not, the runner is asked to
+    /// At the first key frame of session `id`, and when a rollout of the AP
+    /// ends: whether the AP runs the configuration it last acknowledged. If not, the runner is asked to
     /// sign that one again (now, or once it is connected), unless the AP's
     /// image was built after it was signed: then the image's own is the
     /// newer, and stands.
@@ -1255,6 +1255,12 @@ impl State {
         let detail = format!("{image}: {}: {}", outcome.replace('_', " "), res.detail);
         self.record_deploy("rollout", &ap, Some(user), ok, detail);
         self.notify(Change::Deploy);
+        // The runner signs nothing for an AP under rollout, so an AP that
+        // came back during it is checked again now that it is over.
+        let session = self.aps.get(&ap).and_then(|a| a.session.as_ref());
+        if let Some(id) = session.map(|s| s.id) {
+            self.check_installed(&ap, id);
+        }
     }
 
     /// The open rollout of `ap` whose gate has not spoken yet, if any.
