@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value, json};
 use u6e_proto::PROTOCOL;
+use u6e_proto::mac;
 use u6e_proto::msg::{Band, Event, EventKind, Radio, RateMode, Snapshot, Station};
 
 use crate::state::{Ap, ClientView, State};
@@ -36,7 +37,7 @@ pub fn clients(state: &State, wanted: impl Fn(&str) -> bool) -> Value {
         .clients()
         .iter()
         .filter(|c| wanted(&c.ap))
-        .map(|c| (mac(&c.station.mac), client_view(state, c)))
+        .map(|c| (mac::format(c.station.mac), client_view(state, c)))
         .collect();
     Value::Object(clients)
 }
@@ -75,7 +76,7 @@ pub fn event(ap_name: &str, ap: &Ap, ev: &Event) -> Option<Value> {
     o.insert("kind".into(), kind.into());
     match who {
         Ok((m, bss)) => {
-            o.insert("mac".into(), mac(m).into());
+            o.insert("mac".into(), mac::format(*m).into());
             // The BSS list as it is now; it changes only with the AP's config.
             let snap = ap.snapshot.as_ref();
             if let Some(b) = snap.and_then(|s| s.bsss.get(usize::from(bss))) {
@@ -117,10 +118,6 @@ pub fn diff(old: &Value, new: &Value) -> Option<Value> {
         patch.insert(k.clone(), Value::Null);
     }
     (!patch.is_empty()).then_some(Value::Object(patch))
-}
-
-pub fn mac(m: &[u8; 6]) -> String {
-    m.map(|b| format!("{b:02x}")).join(":")
 }
 
 pub fn band(b: Band) -> &'static str {
@@ -202,7 +199,7 @@ fn ap_view(ap: &Ap) -> Value {
                 "ssid": b.ssid,
                 "phy": b.phy,
                 "vlan": b.vlan,
-                "bssid": mac(&b.bssid),
+                "bssid": mac::format(b.bssid),
                 "clients": n,
             });
             (b.ifname.clone(), v)
@@ -376,11 +373,6 @@ mod tests {
             connected_s: 0,
             vlan: 0,
         }
-    }
-
-    #[test]
-    fn mac_is_lower_hex() {
-        assert_eq!(mac(&[0x02, 0, 0, 0xab, 0, 0x2f]), "02:00:00:ab:00:2f");
     }
 
     #[test]

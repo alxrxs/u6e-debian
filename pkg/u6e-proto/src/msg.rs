@@ -2,6 +2,8 @@
 //! postcard encodes them without a schema, so every change to their layout
 //! (a field, a variant, an order) bumps [`crate::PROTOCOL`].
 
+use std::net::IpAddr;
+
 use serde::{Deserialize, Serialize};
 
 /// Everything the agent sends.
@@ -19,6 +21,11 @@ pub enum AgentMsg {
     Event(Event),
     /// Answer to [`CtlMsg::Ping`], echoing its value.
     Pong(u64),
+    /// The connections of the AP's clients, at the cadence
+    /// [`CtlMsg::FlowCadence`] sets or on [`CtlMsg::WantFlows`].
+    Flows(Flows),
+    /// The outcome of a [`CtlMsg::Command`].
+    Result(CommandResult),
 }
 
 /// Everything the controller sends.
@@ -34,6 +41,17 @@ pub enum CtlMsg {
     /// Send a complete snapshot next (after a gap in the deltas).
     WantKey,
     Ping(u64),
+    /// Send the flows next: every connection (up to the agent's cap) when
+    /// `full`, else each client's summary and top flows.
+    WantFlows {
+        full: bool,
+    },
+    /// Seconds between flow summaries.
+    FlowCadence {
+        secs: u16,
+    },
+    /// An operator action, answered by an [`AgentMsg::Result`] of its id.
+    Command(Command),
 }
 
 /// What the AP is running, sent once per connection.
@@ -214,4 +232,103 @@ pub enum EventKind {
     RadioUp { phy: String },
     RadioDown { phy: String },
     FwCrash { phy: String },
+}
+
+/// The connections the AP forwards, per client, as the NSS connection
+/// manager tracks them.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Flows {
+    pub seq: u64,
+    /// False when the agent's cap on connections cut the table short.
+    pub complete: bool,
+    pub clients: Vec<ClientFlows>,
+}
+
+/// One client's connections: totals over all of them, and the largest.
+///
+/// Bytes and packets are counted from the client's point of view: `tx` is
+/// what it sent, `rx` what it received.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientFlows {
+    pub mac: [u8; 6],
+    pub conns: u32,
+    /// Connections the NSS hardware forwards, past the CPU.
+    pub offloaded: u32,
+    pub tx_bytes: u64,
+    pub rx_bytes: u64,
+    pub tx_packets: u64,
+    pub rx_packets: u64,
+    /// The client's connections with the most bytes, most first.
+    pub top: Vec<Flow>,
+}
+
+/// One connection of a client; `src` is the end that opened it.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Flow {
+    /// The IP protocol number (6 TCP, 17 UDP, ...).
+    pub proto: u8,
+    pub src: IpAddr,
+    pub sport: u16,
+    pub dst: IpAddr,
+    pub dport: u16,
+    /// From the client's point of view, as in [`ClientFlows`].
+    pub tx_bytes: u64,
+    pub rx_bytes: u64,
+    pub tx_packets: u64,
+    pub rx_packets: u64,
+    pub offloaded: bool,
+    pub age_s: u32,
+}
+
+/// An operator action for the agent to carry out.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Command {
+    /// Chosen by the controller; echoed in the [`CommandResult`].
+    pub id: u64,
+    pub kind: CommandKind,
+}
+
+/// The closed set of actions. None carries free-form text, and the set is
+/// exhaustive, so a new action is a compile error at every end that must
+/// carry it out.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CommandKind {
+    /// Deauthenticate the client from the BSS it is on.
+    Kick {
+        mac: [u8; 6],
+    },
+    /// Refuse the client on every BSS of the AP, and kick it.
+    Block {
+        mac: [u8; 6],
+    },
+    Unblock {
+        mac: [u8; 6],
+    },
+    /// Ask the client to move to the BSS `target_bssid` (802.11v BSS
+    /// transition management).
+    Steer {
+        mac: [u8; 6],
+        target_bssid: [u8; 6],
+    },
+}
+
+/// What came of a [`Command`].
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandResult {
+    pub id: u64,
+    pub ok: bool,
+    /// hostapd's answer, or why the command was refused.
+    pub detail: String,
 }

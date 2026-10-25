@@ -282,7 +282,8 @@ impl State {
                 entry.push_event(ev.clone());
                 Some(Change::Event(ap.to_owned(), ev))
             }
-            // A Pong only proves the agent is alive.
+            // A Pong only proves the agent is alive; flows and command results
+            // are not kept.
             _ => None,
         };
         if let Some(c) = change {

@@ -11,6 +11,7 @@ use std::sync::mpsc::{SyncSender, TrySendError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use u6e_proto::mac;
 use u6e_proto::msg::{Event, EventKind};
 
 use crate::clientsock::ClientSocket;
@@ -205,15 +206,6 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-fn mac(s: &str) -> Option<[u8; 6]> {
-    let mut out = [0; 6];
-    let mut parts = s.split(':');
-    for b in &mut out {
-        *b = u8::from_str_radix(parts.next().filter(|p| p.len() == 2)?, 16).ok()?;
-    }
-    parts.next().is_none().then_some(out)
-}
-
 /// The event a hostapd message reports, "<3>NAME [MAC ...]" (the priority
 /// prefix stripped); none for what is not one of ours. `phy` names the phy of
 /// the BSS, for the events about the radio.
@@ -224,7 +216,7 @@ fn parse(msg: &str, bss: u16, phy: impl FnOnce() -> String) -> Option<EventKind>
         .map_or(msg, |(_, m)| m);
     let mut f = msg.split_whitespace();
     let name = f.next()?;
-    let station = |f: &mut std::str::SplitWhitespace| mac(f.next()?);
+    let station = |f: &mut std::str::SplitWhitespace| mac::parse(f.next()?);
     Some(match name {
         "AP-STA-CONNECTED" => EventKind::Assoc {
             mac: station(&mut f)?,

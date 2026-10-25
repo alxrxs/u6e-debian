@@ -29,7 +29,7 @@ use std::{fs, mem, thread};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection};
 use u6e_proto::frame::{decode_frame, frame_body, write_frame};
-use u6e_proto::msg::{AgentMsg, CtlMsg, Event, Hello, Snapshot};
+use u6e_proto::msg::{AgentMsg, CommandResult, CtlMsg, Event, Hello, Snapshot};
 use u6e_proto::tls::{self, Identity};
 use u6e_proto::{PROTOCOL, delta, version};
 
@@ -475,6 +475,20 @@ impl Session {
                 write_frame(&mut out, &AgentMsg::Pong(n))?;
                 self.send(&out)?;
             }
+            // Every command is answered, so the controller never waits out
+            // one this agent does not carry out.
+            CtlMsg::Command(c) => {
+                let result = CommandResult {
+                    id: c.id,
+                    ok: false,
+                    detail: "not implemented".into(),
+                };
+                let mut out = Vec::new();
+                write_frame(&mut out, &AgentMsg::Result(result))?;
+                self.send(&out)?;
+            }
+            // This agent reads no flows, so it has none to send.
+            CtlMsg::WantFlows { .. } | CtlMsg::FlowCadence { .. } => {}
             // A newer controller's messages mean nothing to this agent.
             _ => {}
         }
@@ -513,7 +527,7 @@ mod tests {
     use std::sync::mpsc::{self, SyncSender, sync_channel};
 
     use rustls::{ServerConfig, ServerConnection};
-    use u6e_proto::msg::{Bss, EventKind, RateMode, Station, Temp};
+    use u6e_proto::msg::{Bss, Command, CommandKind, EventKind, RateMode, Station, Temp};
     use u6e_proto::version;
 
     // A throwaway Ed25519 key made for tests (the same as in u6e-proto's tls
@@ -1026,6 +1040,31 @@ mod tests {
         assert!(sent.elapsed() < Duration::from_secs(3));
     }
 
+    /// A command is refused with its id, and the flow requests are taken
+    /// without an answer or an end to the session.
+    #[test]
+    fn a_command_is_answered_not_implemented() {
+        let fake = Fake::new();
+        let _agent = Agent::spawn(&fake, blank);
+        let mut p = fake.accept();
+        p.start();
+        p.send(CtlMsg::WantFlows { full: true });
+        p.send(CtlMsg::FlowCadence { secs: 10 });
+        let mac = [0x02, 0, 0, 0, 0, 1];
+        p.send(CtlMsg::Command(Command {
+            id: 9,
+            kind: CommandKind::Kick { mac },
+        }));
+        let refused = CommandResult {
+            id: 9,
+            ok: false,
+            detail: "not implemented".into(),
+        };
+        assert_eq!(p.recv(), AgentMsg::Result(refused));
+        p.send(CtlMsg::Ping(2));
+        assert_eq!(p.recv(), AgentMsg::Pong(2));
+    }
+
     #[test]
     fn event_near_a_tick_rides_with_it() {
         let fake = Fake::new();
@@ -1203,6 +1242,19 @@ mod tests {
                 let body = p.recv_body().expect("no version frame");
                 assert_eq!(version::decode(&body), PROTOCOL);
             }
+            p.ends();
+        });
+        assert_backs_off(&at, &QUICK);
+    }
+
+    /// A controller of protocol 1, from before flows and commands, would
+    /// misread the messages this agent sends: its version frame turns it away.
+    #[test]
+    fn a_protocol_1_controller_is_not_spoken_to() {
+        let fake = Fake::new();
+        let _agent = Agent::spawn_with(&fake, 0, |c| c.backoff = QUICK, blank);
+        let at = dial_times(&fake, 7, |_, mut p| {
+            assert_eq!(p.agree(1), PROTOCOL);
             p.ends();
         });
         assert_backs_off(&at, &QUICK);

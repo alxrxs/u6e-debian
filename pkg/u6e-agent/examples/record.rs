@@ -18,6 +18,8 @@ use std::path::Path;
 use std::time::Duration;
 use std::{env, fs, process};
 
+use u6e_proto::mac;
+
 const HOSTAPD: &str = "/run/hostapd";
 const ATTR_MAC: u16 = 6;
 const ATTR_SSID: u16 = 52;
@@ -32,8 +34,8 @@ struct Scrub {
 }
 
 impl Scrub {
-    fn mac(&mut self, m: &[u8]) -> Vec<u8> {
-        vec![2, 0, 0, 0, 0, index(&mut self.macs, m) as u8 + 1]
+    fn mac(&mut self, m: &[u8]) -> [u8; 6] {
+        [2, 0, 0, 0, 0, index(&mut self.macs, m) as u8 + 1]
     }
 
     fn ssid(&mut self, s: &[u8]) -> Vec<u8> {
@@ -59,7 +61,7 @@ impl Scrub {
                 let ty = u16::from_ne_bytes([attrs[2], attrs[3]]);
                 let data = &attrs[4..alen];
                 let data = match ty & NLA_TYPE_MASK {
-                    ATTR_MAC => self.mac(data),
+                    ATTR_MAC => self.mac(data).to_vec(),
                     ATTR_SSID => self.ssid(data),
                     _ => data.to_vec(),
                 };
@@ -83,15 +85,8 @@ impl Scrub {
         for line in text.lines() {
             let (key, value) = line.split_once('=').unwrap_or((line, ""));
             let value = if key.starts_with("bssid[") {
-                let mac: Vec<u8> = value
-                    .split(':')
-                    .filter_map(|h| u8::from_str_radix(h, 16).ok())
-                    .collect();
-                let m = self.mac(&mac);
-                m.iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect::<Vec<_>>()
-                    .join(":")
+                let m = mac::parse(value).unwrap_or_default();
+                mac::format(self.mac(&m))
             } else if key.starts_with("ssid[") {
                 String::from_utf8_lossy(&self.ssid(value.as_bytes())).into_owned()
             } else if key == "country_code" {

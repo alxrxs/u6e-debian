@@ -11,6 +11,7 @@
 //! The write refuses to replace the golden of a protocol with other bytes.
 
 use std::collections::BTreeSet;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use std::{env, fs};
 
@@ -18,9 +19,11 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::PROTOCOL;
+use crate::mac::hex;
 use crate::msg::{
-    AgentMsg, Band, Bss, CtlMsg, Event, EventKind, FieldDelta, Hello, Radio, RateMode, RecDelta,
-    Snapshot, SnapshotDelta, Station, Temp,
+    AgentMsg, Band, Bss, ClientFlows, Command, CommandKind, CommandResult, CtlMsg, Event,
+    EventKind, FieldDelta, Flow, Flows, Hello, Radio, RateMode, RecDelta, Snapshot, SnapshotDelta,
+    Station, Temp,
 };
 
 const HOW: &str = "bump u6e_proto::PROTOCOL (pkg/u6e-proto/src/version.rs) and write the \
@@ -175,16 +178,66 @@ fn samples() -> (Named<AgentMsg>, Named<CtlMsg>) {
         let at_ms = 1 << 41;
         agent.push((name, AgentMsg::Event(Event { at_ms, kind })));
     }
-    let ctl = vec![
+    agent.push(("Flows", AgentMsg::Flows(flows())));
+    agent.push((
+        "Result",
+        AgentMsg::Result(CommandResult {
+            id: 1 << 42,
+            ok: true,
+            detail: "OK".into(),
+        }),
+    ));
+    let mut ctl = vec![
         ("SetTick", CtlMsg::SetTick { secs: 300 }),
         ("WantKey", CtlMsg::WantKey),
         ("Ping", CtlMsg::Ping(1 << 50)),
+        ("WantFlows", CtlMsg::WantFlows { full: true }),
+        ("FlowCadence", CtlMsg::FlowCadence { secs: 300 }),
     ];
+    let target_bssid = [0x02, 0, 0, 0, 0x20, 0x01];
+    let commands = [
+        ("Kick", CommandKind::Kick { mac }),
+        ("Block", CommandKind::Block { mac }),
+        ("Unblock", CommandKind::Unblock { mac }),
+        ("Steer", CommandKind::Steer { mac, target_bssid }),
+    ];
+    for (name, kind) in commands {
+        ctl.push((name, CtlMsg::Command(Command { id: 1 << 42, kind })));
+    }
     (agent, ctl)
 }
 
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
+/// A client's flows, one of each address family.
+fn flows() -> Flows {
+    let flow = |src: IpAddr, dst: IpAddr| Flow {
+        proto: 200,
+        src,
+        sport: 60_001,
+        dst,
+        dport: 60_002,
+        tx_bytes: 1 << 33,
+        rx_bytes: (1 << 34) + 1,
+        tx_packets: (1 << 35) + 2,
+        rx_packets: (1 << 36) + 3,
+        offloaded: true,
+        age_s: 70_009,
+    };
+    let v4 = |last| IpAddr::V4(Ipv4Addr::new(192, 0, 2, last));
+    let v6 = |last| IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, last));
+    Flows {
+        seq: (1 << 40) + 2,
+        complete: true,
+        clients: vec![ClientFlows {
+            mac: [0x02, 0, 0, 0, 0, 1],
+            conns: 70_010,
+            offloaded: 70_011,
+            tx_bytes: (1 << 37) + 4,
+            rx_bytes: (1 << 38) + 5,
+            tx_packets: (1 << 39) + 6,
+            rx_packets: (1 << 40) + 7,
+            top: vec![flow(v4(10), v4(200)), flow(v6(0x10), v6(0x200))],
+        }],
+    }
 }
 
 /// The golden text: one `<name> <hex>` line per message.
@@ -208,7 +261,7 @@ fn every_variant_has_an_instance() {
     let agent: Vec<AgentMsg> = agent.into_iter().map(|(_, m)| m).collect();
     let ctl: Vec<CtlMsg> = ctl.into_iter().map(|(_, m)| m).collect();
     let mut events = Vec::new();
-    let (mut bands, mut modes) = (Vec::new(), Vec::new());
+    let (mut bands, mut modes, mut addrs) = (Vec::new(), Vec::new(), Vec::new());
     for m in &agent {
         match m {
             AgentMsg::Event(e) => events.push(e.kind.clone()),
@@ -216,14 +269,27 @@ fn every_variant_has_an_instance() {
                 bands.extend(s.radios.iter().map(|r| r.band));
                 modes.extend(s.stations.iter().map(|st| st.tx_mode));
             }
+            AgentMsg::Flows(f) => {
+                let flows = f.clients.iter().flat_map(|c| &c.top);
+                addrs.extend(flows.flat_map(|f| [f.src, f.dst]));
+            }
             _ => {}
         }
     }
+    let commands: Vec<CommandKind> = ctl
+        .iter()
+        .filter_map(|m| match m {
+            CtlMsg::Command(c) => Some(c.kind.clone()),
+            _ => None,
+        })
+        .collect();
     assert_every_variant("AgentMsg", &agent);
     assert_every_variant("CtlMsg", &ctl);
     assert_every_variant("EventKind", &events);
     assert_every_variant("Band", &bands);
     assert_every_variant("RateMode", &modes);
+    assert_every_variant("IpAddr", &addrs);
+    assert_every_variant("CommandKind", &commands);
 }
 
 #[test]

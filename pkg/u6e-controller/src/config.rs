@@ -17,6 +17,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use serde::Deserialize;
+use u6e_proto::mac;
 
 /// The parsed, checked configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,14 +115,10 @@ impl Config {
 /// The 32 bytes of 64 lowercase hex digits: one spelling per key, so a key
 /// written twice in different case is still caught as shared.
 fn parse_key(hex: &str) -> Option<[u8; 32]> {
-    if hex.len() != 64 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+    if hex.bytes().any(|b| b.is_ascii_uppercase()) {
         return None;
     }
-    let mut key = [0; 32];
-    for (i, b) in key.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok()?;
-    }
-    Some(key)
+    mac::unhex(hex)
 }
 
 #[cfg(test)]

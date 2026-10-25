@@ -32,7 +32,7 @@ use u6e_proto::msg::{
     AgentMsg, Band, Bss, CtlMsg, Event, EventKind, Hello, Radio, RateMode, Snapshot, Station, Temp,
 };
 use u6e_proto::tls::{self, Identity};
-use u6e_proto::{PROTOCOL, delta, version};
+use u6e_proto::{PROTOCOL, delta, mac, version};
 
 /// The script's length; it starts over after.
 const CYCLE: f64 = 120.0;
@@ -635,16 +635,12 @@ async fn read<R: AsyncRead + Unpin>(r: &mut R, chunk: &mut [u8]) -> io::Result<u
     }
 }
 
-fn hex(key: [u8; 32]) -> String {
-    key.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> io::Result<()> {
     let web = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:8080".into());
-    let public = |pem| Identity::from_pem(pem).map(|i| hex(i.public_key()));
+    let public = |pem| Identity::from_pem(pem).map(|i| mac::hex(&i.public_key()));
     let config = format!(
         "listen_agents = \"127.0.0.1:0\"\nlisten_http = \"{web}\"\nlisten_metrics = \"127.0.0.1:0\"\n\
          [aps.ap1]\npublic_key = \"{}\"\n[aps.ap2]\npublic_key = \"{}\"\n",

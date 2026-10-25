@@ -32,6 +32,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 use std::{env, process, thread};
 
+use u6e_proto::mac;
 use u6e_proto::tls::Identity;
 
 /// The state line: first 2 minutes after start, then every 5.
@@ -54,19 +55,6 @@ struct Args {
     link: Option<LinkArgs>,
 }
 
-/// The 32 bytes of a 64-digit hex string.
-fn parse_key(hex: &str) -> Option<[u8; 32]> {
-    // from_str_radix alone would also take a sign.
-    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    let mut key = [0; 32];
-    for (i, b) in key.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok()?;
-    }
-    Some(key)
-}
-
 fn args() -> Option<Args> {
     let (mut listen, mut port, mut gateway, mut arm, mut peers) =
         (None, None, None, false, Vec::new());
@@ -81,7 +69,7 @@ fn args() -> Option<Args> {
             "--peer" => peers.push(a.next()?.parse().ok()?),
             "--controller" => controller = Some(a.next()?),
             "--key" => key = Some(a.next()?),
-            "--controller-key" => controller_key = Some(parse_key(&a.next()?)?),
+            "--controller-key" => controller_key = Some(mac::unhex(&a.next()?)?),
             _ => return None,
         }
     }
@@ -258,15 +246,5 @@ mod tests {
         assert!(rx.recv_timeout(wait).unwrap().contains("clients: wlan5=3 "));
         *stations.lock().unwrap() = vec![("wlan5".to_owned(), 4)];
         while !rx.recv_timeout(wait).unwrap().contains("clients: wlan5=4 ") {}
-    }
-
-    #[test]
-    fn controller_key_is_64_hex_digits() {
-        let hex = "00ff".repeat(16);
-        let key = parse_key(&hex).unwrap();
-        assert_eq!((key[0], key[1], key[31]), (0x00, 0xff, 0xff));
-        assert_eq!(parse_key(&hex[2..]), None);
-        assert_eq!(parse_key(&format!("{}zz", &hex[2..])), None);
-        assert_eq!(parse_key(&format!("+f{}", &hex[2..])), None);
     }
 }

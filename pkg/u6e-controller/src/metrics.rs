@@ -12,10 +12,11 @@ use axum::http::header;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use u6e_proto::PROTOCOL;
+use u6e_proto::mac;
 use u6e_proto::msg::{Radio, Snapshot, Station};
 
 use crate::state::{Ap, Shared, State};
-use crate::view::{band, mac};
+use crate::view::band;
 
 const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
@@ -317,7 +318,7 @@ pub fn render(state: &State) -> String {
     for (name, kind, help, value) in CLIENT_FAMILIES {
         m.family(name, kind, help);
         for c in &clients {
-            let mac = mac(&c.station.mac);
+            let mac = mac::format(c.station.mac);
             let labels = [
                 ("ap", c.ap.as_str()),
                 ("ssid", c.ssid.as_str()),

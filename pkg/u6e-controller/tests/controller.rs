@@ -29,7 +29,7 @@ use u6e_proto::msg::{
     SnapshotDelta, Station, Temp,
 };
 use u6e_proto::tls::{self, Identity};
-use u6e_proto::version;
+use u6e_proto::{mac, version};
 
 #[path = "common/keys.rs"]
 mod keys;
@@ -48,10 +48,6 @@ fn identity(pem: &str) -> Identity {
     Identity::from_pem(pem).unwrap()
 }
 
-fn hex(key: [u8; 32]) -> String {
-    key.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 /// A configuration on loopback ports of the system's choosing, admitting
 /// `ap1` and, with `ap2`, `ap2`.
 fn config_text(key: &str, ap2: bool) -> String {
@@ -59,10 +55,10 @@ fn config_text(key: &str, ap2: bool) -> String {
         "listen_agents = \"127.0.0.1:0\"\nlisten_http = \"127.0.0.1:0\"\n\
          listen_metrics = \"127.0.0.1:0\"\nkey = \"{key}\"\n\
          [aps.ap1]\npublic_key = \"{}\"\n",
-        hex(identity(KEY_AP1).public_key())
+        mac::hex(&identity(KEY_AP1).public_key())
     );
     if ap2 {
-        let k = hex(identity(KEY_AP2).public_key());
+        let k = mac::hex(&identity(KEY_AP2).public_key());
         text.push_str(&format!("[aps.ap2]\npublic_key = \"{k}\"\n"));
     }
     text
@@ -1071,6 +1067,28 @@ fn an_unversioned_agent_is_turned_away_once() {
     let ap1 = &json_get(b.http, "/api/aps")["ap1"];
     assert_eq!(ap1["up"], false);
     assert_eq!(ap1["mismatch"], json!({"ap": 0, "controller": PROTOCOL}));
+}
+
+/// An agent of protocol 1, from before flows and commands, would misread the
+/// commands this controller sends: its version frame turns it away.
+#[test]
+fn a_protocol_1_agent_is_turned_away() {
+    let r = controller(Timing::default());
+    for _ in 0..3 {
+        let (mut a, theirs) = Agent::versioned(r.c.agents, KEY_AP1, 1);
+        assert_eq!(theirs, PROTOCOL);
+        a.ends();
+    }
+    let ap1 = &json_get(r.c.http, "/api/aps")["ap1"];
+    assert_eq!(ap1["up"], false);
+    assert_eq!(ap1["mismatch"], json!({"ap": 1, "controller": PROTOCOL}));
+    let body = http_get(r.c.metrics, "/metrics");
+    for line in [
+        "wifi_agent_protocol{ap=\"ap1\"} 1",
+        "wifi_agent_compatible{ap=\"ap1\"} 0",
+    ] {
+        assert!(body.lines().any(|l| l == line), "missing {line}\n{body}");
+    }
 }
 
 #[test]

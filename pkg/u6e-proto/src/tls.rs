@@ -26,6 +26,8 @@ use rustls::{
     SignatureScheme,
 };
 
+use crate::mac;
+
 /// Public key to AP name, shared with the controller so enrolment changes
 /// take effect on the next handshake without rebuilding the config.
 pub type AllowedKeys = Arc<RwLock<HashMap<[u8; 32], String>>>;
@@ -91,10 +93,7 @@ fn ed25519_key(spki: &[u8]) -> Option<[u8; 32]> {
 
 /// The first 8 bytes of the key's SHA-256, hex: a short stable name for logs.
 pub fn fingerprint(key: &[u8; 32]) -> String {
-    digest::digest(&digest::SHA256, key).as_ref()[..8]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    mac::hex(&digest::digest(&digest::SHA256, key).as_ref()[..8])
 }
 
 fn provider_with(group: &'static dyn SupportedKxGroup) -> Arc<CryptoProvider> {

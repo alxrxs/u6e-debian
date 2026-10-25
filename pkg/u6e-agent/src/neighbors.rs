@@ -16,6 +16,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{fs, thread};
 
+use u6e_proto::mac;
+
 use crate::clientsock::{self, ClientSocket};
 
 pub const HOSTAPD: &str = "/run/hostapd";
@@ -36,7 +38,7 @@ fn hex(s: &str) -> bool {
 }
 
 fn bssid(s: &str) -> bool {
-    s.len() == 17 && s.bytes().all(|c| c.is_ascii_hexdigit() || c == b':')
+    mac::parse(s).is_some()
 }
 
 /// The BSS's own entry in SHOW_NEIGHBOR: "<BSSID> ssid=<hex> nr=<hex> ... stat".
@@ -270,6 +272,7 @@ mod tests {
             "bb:bb:bb:bb:bb:01 47756573 74 bb01",
             "bb:bb:bb:bb:bb:01 4775657374 bb01;REMOVE_NEIGHBOR",
             "bb:bb:bb:bb:bb:0 4775657374 bb01",
+            "bbbb:bb:bb:bb::01 4775657374 bb01",
             "bb:bb:bb:bb:bb:01  bb01",
         ] {
             assert!(peer_entry(l).is_none(), "{l}");
