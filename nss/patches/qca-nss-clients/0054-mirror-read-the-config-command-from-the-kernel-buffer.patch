@@ -1,0 +1,38 @@
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Subject: [PATCH] mirror: read the config command from the kernel buffer the handler is given
+
+Since Linux 5.8 a sysctl proc_handler receives the written text in kernel
+memory (commit 32927393dc1c, "sysctl: pass kernel pointers to
+->proc_handler"). nss_mirror_ctl_config_handler() still copies it with
+copy_from_user(), which refuses a kernel address, so every write to
+/proc/sys/dev/nss/mirror/config fails with EFAULT ("Bad address") before
+the command is parsed: no mirror instance can be created, configured or
+enabled from userspace. Copy it with memcpy(), as the match client's
+handler does since 0032-match-fix-procfs-read-write.
+---
+--- a/mirror/nss_mirror_ctl.c
++++ b/mirror/nss_mirror_ctl.c
+@@ -755,7 +755,7 @@
+  *	Mirror sysctl config handler.
+  */
+ static int nss_mirror_ctl_config_handler(compat_const struct ctl_table *ctl, int write,
+-		 void __user *buf, size_t *lenp, loff_t *ppos)
++		 void *buf, size_t *lenp, loff_t *ppos)
+ {
+ 	char *buffer, *pfree;
+ 	char * nextarg;
+@@ -778,10 +778,10 @@
+ 
+ 	pfree = buffer;
+ 
+-	if (copy_from_user(buffer, buf, count)) {
+-		vfree(pfree);
+-		return -EFAULT;
+-	}
++	/*
++	 * A sysctl handler is given the written text in kernel memory.
++	 */
++	memcpy(buffer, buf, count);
+ 
+ 	nextarg = nss_mirror_ctl_read_nextarg(&buffer);
+ 	if (!nextarg) {
