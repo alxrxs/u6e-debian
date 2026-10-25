@@ -2,11 +2,13 @@
 //! of `u6e_proto::tls`, and each end states its protocol in the version frame;
 //! a controller of another protocol is not spoken to. The agent then says who
 //! it is, sends a snapshot every tick (a delta against the previous one, a
-//! full key frame now and then) and the events as they happen. The controller
-//! sets the tick, asks for key frames and pings; a silent or broken connection
-//! is dropped and dialed again. The wait before a redial doubles from 1 s to
-//! 30 s until a session is useful (the controller said something in it), so a
-//! controller that takes each session and drops it is not redialed at once.
+//! full key frame now and then), the events as they happen, and its clients'
+//! connections every minute, or at the cadence the controller sets. The
+//! controller sets the tick and that cadence, asks for key frames and flows,
+//! and pings; a silent or broken connection is dropped and dialed again. The
+//! wait before a redial doubles from 1 s to 30 s until a session is useful
+//! (the controller said something in it), so a controller that takes each
+//! session and drops it is not redialed at once.
 //!
 //! One thread owns the connection and waits with `poll` for the socket, an
 //! event or the next tick, so an event leaves at once without a polling loop.
@@ -29,7 +31,7 @@ use std::{fs, mem, thread};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection};
 use u6e_proto::frame::{decode_frame, frame_body, write_frame};
-use u6e_proto::msg::{AgentMsg, CommandResult, CtlMsg, Event, Hello, Snapshot};
+use u6e_proto::msg::{AgentMsg, CommandResult, CtlMsg, Event, Flows, Hello, Snapshot};
 use u6e_proto::tls::{self, Identity};
 use u6e_proto::{PROTOCOL, delta, version};
 
@@ -42,6 +44,12 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// The tick until the controller sets one: the estate's scrape interval.
 const TICK_DEFAULT: Duration = Duration::from_secs(15);
 const KEY_EVERY: Duration = Duration::from_secs(60);
+/// The flows' cadence until the controller sets one; what it may set is
+/// held between [`FLOWS_MIN`] and this.
+const FLOWS_DEFAULT: Duration = Duration::from_secs(60);
+/// Each read of ECM's table costs about half a millisecond of CPU per
+/// connection in it: no faster than this.
+const FLOWS_MIN: Duration = Duration::from_secs(10);
 /// An event this close to the next tick waits and rides in its record.
 const COALESCE: Duration = Duration::from_millis(50);
 /// The controller pings every 15 s; this long without a word is a dead session.
@@ -81,11 +89,24 @@ impl Config {
     }
 }
 
+/// What reads the flows: called with the seq of the message, the stations
+/// of the last snapshot and whether every connection is wanted; `None` when
+/// there are none to send.
+pub trait FlowSource: FnMut(u64, &[[u8; 6]], bool) -> Option<Flows> {}
+
+impl<F: FnMut(u64, &[[u8; 6]], bool) -> Option<Flows>> FlowSource for F {}
+
 /// Runs the link for the life of the process. `snapshot` is called with the
-/// sequence number of each snapshot, only while connected.
-pub fn run(cfg: Config, snapshot: impl FnMut(u64) -> Snapshot, events: Receiver<Event>) -> ! {
+/// sequence number of each snapshot, and `flows` for each flows message;
+/// both only while connected.
+pub fn run(
+    cfg: Config,
+    snapshot: impl FnMut(u64) -> Snapshot,
+    flows: impl FlowSource,
+    events: Receiver<Event>,
+) -> ! {
     let events = Arc::new(Mutex::new(Some(events)));
-    run_with(cfg, snapshot, || Ring::relay(&events))
+    run_with(cfg, snapshot, flows, || Ring::relay(&events))
 }
 
 /// The link. `relay` starts the ring the events go through; it is tried again
@@ -94,6 +115,7 @@ pub fn run(cfg: Config, snapshot: impl FnMut(u64) -> Snapshot, events: Receiver<
 fn run_with(
     cfg: Config,
     mut snapshot: impl FnMut(u64) -> Snapshot,
+    mut flows: impl FlowSource,
     mut relay: impl FnMut() -> io::Result<Arc<Ring>>,
 ) -> ! {
     let client = tls::client_config(&cfg.identity, cfg.controller_key);
@@ -115,7 +137,7 @@ fn run_with(
         // A session the controller said nothing in counts as a failed dial.
         let failure = match connect(&cfg.controller, &client) {
             Ok(mut s) => {
-                let Err(e) = s.serve(&cfg, ring.as_deref(), &mut snapshot);
+                let Err(e) = s.serve(&cfg, ring.as_deref(), &mut snapshot, &mut flows);
                 if s.heard {
                     eprintln!("u6e-agent: link to {} down: {e}", cfg.controller);
                     backoff = *cfg.backoff.start();
@@ -233,6 +255,12 @@ fn clamp_tick(secs: u16) -> Duration {
     Duration::from_secs(u64::from(secs.clamp(1, 60)))
 }
 
+/// The flows' cadence the controller asked for, kept within [`FLOWS_MIN`]
+/// and [`FLOWS_DEFAULT`].
+fn clamp_flows(secs: u16) -> Duration {
+    Duration::from_secs(u64::from(secs)).clamp(FLOWS_MIN, FLOWS_DEFAULT)
+}
+
 /// Whether this tick sends a key frame whatever the snapshot; otherwise it
 /// does only when no delta can carry the change.
 fn key_due(want_key: bool, since_key: Duration) -> bool {
@@ -254,6 +282,12 @@ struct Session {
     /// The last snapshot sent: the base of the next delta.
     prev: Option<Snapshot>,
     seq: u64,
+    flow_every: Duration,
+    flows_due: Instant,
+    last_flows: Instant,
+    /// The next flows carry every connection.
+    want_full: bool,
+    flow_seq: u64,
     /// The controller has sent a message: the session is a useful one.
     heard: bool,
 }
@@ -273,6 +307,11 @@ impl Session {
             want_key: false,
             prev: None,
             seq: 0,
+            flow_every: FLOWS_DEFAULT,
+            flows_due: now,
+            last_flows: now,
+            want_full: false,
+            flow_seq: 0,
             heard: false,
         }
     }
@@ -309,12 +348,13 @@ impl Session {
     }
 
     /// Serves the connection until it fails; without a ring, the snapshots
-    /// alone.
+    /// and flows alone.
     fn serve(
         &mut self,
         cfg: &Config,
         ring: Option<&Ring>,
         snapshot: &mut impl FnMut(u64) -> Snapshot,
+        flows: &mut impl FlowSource,
     ) -> io::Result<Infallible> {
         let mut out = Vec::new();
         write_frame(&mut out, &AgentMsg::Hello(cfg.hello.clone()))?;
@@ -327,6 +367,9 @@ impl Session {
             let ticked = now >= self.due;
             if ticked {
                 self.snapshot_into(&mut out, now, snapshot)?;
+            }
+            if now >= self.flows_due {
+                self.flows_into(&mut out, now, flows)?;
             }
             if ticked || self.due - now > COALESCE {
                 for ev in ring.map(Ring::take).unwrap_or_default() {
@@ -380,9 +423,32 @@ impl Session {
         Ok(())
     }
 
+    /// Appends the flows of the last snapshot's stations to `out`, unless
+    /// there are none to send (ECM cannot be read).
+    fn flows_into(
+        &mut self,
+        out: &mut Vec<u8>,
+        now: Instant,
+        flows: &mut impl FlowSource,
+    ) -> io::Result<()> {
+        let stations: Vec<[u8; 6]> = self
+            .prev
+            .iter()
+            .flat_map(|s| s.stations.iter().map(|st| st.mac))
+            .collect();
+        if let Some(f) = flows(self.flow_seq + 1, &stations, self.want_full) {
+            write_frame(out, &AgentMsg::Flows(f))?;
+            self.flow_seq += 1;
+        }
+        self.want_full = false;
+        self.last_flows = now;
+        self.flows_due = now + self.flow_every;
+        Ok(())
+    }
+
     /// Waits for the socket (true), an event or the next deadline (false).
     fn wait(&self, ring: Option<&Ring>, silence: Duration) -> bool {
-        let deadline = self.due.min(self.last_rx + silence);
+        let deadline = self.due.min(self.flows_due).min(self.last_rx + silence);
         let left = deadline.saturating_duration_since(Instant::now());
         let ms = i32::try_from(left.as_micros().div_ceil(1000)).unwrap_or(i32::MAX);
         // poll skips a negative fd: without a ring, the socket alone.
@@ -487,8 +553,14 @@ impl Session {
                 write_frame(&mut out, &AgentMsg::Result(result))?;
                 self.send(&out)?;
             }
-            // This agent reads no flows, so it has none to send.
-            CtlMsg::WantFlows { .. } | CtlMsg::FlowCadence { .. } => {}
+            CtlMsg::WantFlows { full } => {
+                self.want_full |= full;
+                self.flows_due = Instant::now();
+            }
+            CtlMsg::FlowCadence { secs } => {
+                self.flow_every = clamp_flows(secs);
+                self.flows_due = self.last_flows + self.flow_every;
+            }
             // A newer controller's messages mean nothing to this agent.
             _ => {}
         }
@@ -816,12 +888,32 @@ mod tests {
         }
 
         /// An agent whose event relay fails to start the first
-        /// `relay_failures` times, its configuration changed by `tweak`.
+        /// `relay_failures` times, its configuration changed by `tweak`, on
+        /// an AP without ECM.
         fn spawn_with(
             fake: &Fake,
             relay_failures: u32,
             tweak: impl FnOnce(&mut Config),
             snapshot: impl FnMut(u64) -> Snapshot + Send + 'static,
+        ) -> Self {
+            Self::start(fake, relay_failures, tweak, snapshot, |_, _, _| None)
+        }
+
+        /// An agent whose flows come from `flows`.
+        fn spawn_flows(
+            fake: &Fake,
+            snapshot: impl FnMut(u64) -> Snapshot + Send + 'static,
+            flows: impl FlowSource + Send + 'static,
+        ) -> Self {
+            Self::start(fake, 0, |_| {}, snapshot, flows)
+        }
+
+        fn start(
+            fake: &Fake,
+            relay_failures: u32,
+            tweak: impl FnOnce(&mut Config),
+            snapshot: impl FnMut(u64) -> Snapshot + Send + 'static,
+            flows: impl FlowSource + Send + 'static,
         ) -> Self {
             let (events, rx) = sync_channel(256);
             let (tick_tx, ticks) = mpsc::channel();
@@ -854,7 +946,7 @@ mod tests {
                     let _ = tick_tx.send((seq, Instant::now()));
                     snapshot(seq)
                 };
-                run_with(cfg, snap, relay)
+                run_with(cfg, snap, flows, relay)
             });
             Agent {
                 events,
@@ -1040,8 +1132,8 @@ mod tests {
         assert!(sent.elapsed() < Duration::from_secs(3));
     }
 
-    /// A command is refused with its id, and the flow requests are taken
-    /// without an answer or an end to the session.
+    /// A command is refused with its id, and on an AP without ECM the flow
+    /// requests are taken without an answer or an end to the session.
     #[test]
     fn a_command_is_answered_not_implemented() {
         let fake = Fake::new();
@@ -1063,6 +1155,95 @@ mod tests {
         assert_eq!(p.recv(), AgentMsg::Result(refused));
         p.send(CtlMsg::Ping(2));
         assert_eq!(p.recv(), AgentMsg::Pong(2));
+    }
+
+    #[test]
+    fn flows_cadence_is_clamped() {
+        assert_eq!(clamp_flows(0), FLOWS_MIN);
+        assert_eq!(clamp_flows(10), Duration::from_secs(10));
+        assert_eq!(clamp_flows(30), Duration::from_secs(30));
+        assert_eq!(clamp_flows(u16::MAX), FLOWS_DEFAULT);
+    }
+
+    /// Flows that say which call made them: its seq, stations and `full`.
+    struct FlowCalls {
+        rx: mpsc::Receiver<(u64, Vec<[u8; 6]>, bool, Instant)>,
+    }
+
+    impl FlowCalls {
+        fn source() -> (Self, impl FlowSource + Send + 'static) {
+            let (tx, rx) = mpsc::channel();
+            let flows = move |seq, stations: &[[u8; 6]], full| {
+                let _ = tx.send((seq, stations.to_vec(), full, Instant::now()));
+                Some(Flows {
+                    seq,
+                    complete: full,
+                    clients: Vec::new(),
+                })
+            };
+            (FlowCalls { rx }, flows)
+        }
+
+        fn next(&self) -> (u64, Vec<[u8; 6]>, bool, Instant) {
+            self.rx.recv_timeout(WAIT).expect("no flows read")
+        }
+    }
+
+    fn with_station(seq: u64) -> Snapshot {
+        Snapshot {
+            stations: vec![station()],
+            ..blank(seq)
+        }
+    }
+
+    fn expect_flows(p: &mut Peer, seq: u64, full: bool) {
+        match p.recv() {
+            AgentMsg::Flows(f) => assert_eq!((f.seq, f.complete), (seq, full)),
+            other => panic!("expected flows {seq}, got {other:?}"),
+        }
+    }
+
+    /// The first flows follow the first snapshot, for its stations; then
+    /// they come at the cadence the controller sets.
+    #[test]
+    fn flows_follow_the_first_snapshot_then_the_cadence() {
+        let fake = Fake::new();
+        let (calls, flows) = FlowCalls::source();
+        let _agent = Agent::spawn_flows(&fake, with_station, flows);
+        let mut p = fake.accept();
+        assert!(matches!(p.recv(), AgentMsg::Hello(_)));
+        assert!(matches!(p.recv(), AgentMsg::Key(s) if s.seq == 1));
+        expect_flows(&mut p, 1, false);
+        let (seq, stations, full, first) = calls.next();
+        assert_eq!((seq, stations, full), (1, vec![station().mac], false));
+        p.send(CtlMsg::FlowCadence { secs: 10 });
+        expect_flows(&mut p, 2, false);
+        let (_, _, _, second) = calls.next();
+        let gap = secs(first, second);
+        assert!((9.9..12.0).contains(&gap), "{gap}");
+    }
+
+    /// A request is answered at once, every connection when it asks for
+    /// them, and the cadence carries on with summaries.
+    #[test]
+    fn want_flows_is_answered_at_once() {
+        let fake = Fake::new();
+        let (calls, flows) = FlowCalls::source();
+        let _agent = Agent::spawn_flows(&fake, with_station, flows);
+        let mut p = fake.accept();
+        assert!(matches!(p.recv(), AgentMsg::Hello(_)));
+        assert!(matches!(p.recv(), AgentMsg::Key(_)));
+        expect_flows(&mut p, 1, false);
+        calls.next();
+        let asked = Instant::now();
+        p.send(CtlMsg::WantFlows { full: true });
+        expect_flows(&mut p, 2, true);
+        p.send(CtlMsg::WantFlows { full: false });
+        expect_flows(&mut p, 3, false);
+        // Well inside the minute of the default cadence.
+        assert!(asked.elapsed() < Duration::from_secs(5));
+        let fulls: Vec<_> = (0..2).map(|_| calls.next().2).collect();
+        assert_eq!(fulls, [true, false]);
     }
 
     #[test]

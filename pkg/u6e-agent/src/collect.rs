@@ -4,7 +4,8 @@
 //! never fails. Station rates go through `rates`, which keeps a client's
 //! HT/VHT/HE rate over the legacy samples between its data frames. A radio
 //! seen once stays in every snapshot, down while its BSSs are gone, so a
-//! hostapd that exits reads as radios down rather than as no radios.
+//! hostapd that exits reads as radios down rather than as no radios. The
+//! clients' connections come from ECM (see `ecm`), at the link's cadence.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
@@ -13,8 +14,9 @@ use std::os::unix::fs::{FileExt, FileTypeExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use u6e_proto::msg::{Band, Bss, Radio, Snapshot, Station, Temp};
+use u6e_proto::msg::{Band, Bss, Flows, Radio, Snapshot, Station, Temp};
 
+use crate::ecm;
 use crate::kmsg::{self, Kmsg};
 use crate::neighbors::{self, Hostapd};
 use crate::nl80211::{self, Iface, Nl80211, Survey, Watch};
@@ -172,6 +174,8 @@ pub struct Collector {
     watch: Source<Watch>,
     ifaces: Ifaces,
     hostapd: Source<Hostapd>,
+    /// ECM's state device, opened afresh for each dump; held for its log.
+    ecm: Source<()>,
     kmsg: Kmsg,
     paths: Paths,
     /// The NSS load file as passed open; without it, it is opened by path.
@@ -202,6 +206,7 @@ impl Collector {
             watch: Source::new("nl80211 notifications"),
             ifaces: Ifaces::default(),
             hostapd: Source::new("hostapd control socket"),
+            ecm: Source::new("ECM connection table"),
             kmsg,
             paths,
             nss_load: None,
@@ -310,6 +315,22 @@ impl Collector {
             radios,
             bsss,
             stations,
+        }
+    }
+
+    /// The connections of `stations`, as [`ecm::EcmTable::flows`] sums
+    /// them; `None` while ECM cannot be read.
+    pub fn flows(&mut self, seq: u64, stations: &[[u8; 6]], full: bool) -> Option<Flows> {
+        let root = &self.paths.root;
+        match ecm::read(&root.join(ecm::DEVICE), ecm::CAP) {
+            Ok(t) => {
+                self.ecm.ok();
+                Some(t.flows(seq, stations, full, ecm::clock(root)))
+            }
+            Err(e) => {
+                self.ecm.report(&e);
+                None
+            }
         }
     }
 }
@@ -1169,5 +1190,34 @@ mod tests {
         assert_eq!(snap.bsss.len(), 1);
         assert_eq!(snap.bsss[0].ifname, "wlan5");
         assert_eq!(c.fw_crashes(), 1);
+    }
+
+    /// The flows come from the ECM device under the root, aged by ECM's
+    /// clock; without the device there are none to send.
+    #[test]
+    fn flows_read_the_ecm_device() {
+        let t = TestDir::new();
+        let root = t.path().to_owned();
+        let mut c = Collector::with_paths(Paths {
+            root: root.clone(),
+            hostapd: root.join("hostapd"),
+            kmsg: root.join("kmsg"),
+            run: root.join("run"),
+        });
+        let station = [2, 0, 0, 0, 0, 8];
+        assert_eq!(c.flows(1, &[station], false), None);
+        for (path, text) in [
+            (ecm::DEVICE, include_str!("../tests/fixtures/ecm-state.txt")),
+            ("proc/uptime", "910.5 1800.0\n"),
+            (ecm::EPOCH, "10.2\n"),
+        ] {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+        let f = c.flows(2, &[station], false).unwrap();
+        assert_eq!((f.seq, f.clients.len()), (2, 1));
+        // ECM's clock is at 900; the newest connection was added at 896.
+        assert_eq!(f.clients[0].top[0].age_s, 4);
     }
 }

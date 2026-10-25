@@ -276,7 +276,8 @@ if [ -n "${CONTROLLER:-}" ]; then
 fi
 # The agent runs as its own user with no capabilities: hostapd gives that
 # user's group its control sockets (ctrl_interface_group, boot/wifi-up.sh),
-# systemd opens the root-only NSS load file for it, and it asks for
+# u6e-nss its ECM state device, systemd opens the root-only NSS load file
+# for it, and it asks for
 # u6e-arm/u6e-fallback by a file (below) rather than starting them. Every
 # sandbox setting is at its most restrictive but where a comment says what
 # the agent's work needs instead.
@@ -287,7 +288,7 @@ install -m0755 target/aarch64-unknown-linux-musl/release/u6e-agent $RF/usr/local
 cat > $RF/etc/systemd/system/u6e-agent.service <<UNIT
 [Unit]
 Description=U6E agent: neighbor reports across APs, management network check, state, controller link
-After=u6e-wifi.service
+After=u6e-nss.service u6e-wifi.service
 
 [Service]
 ExecStart=/usr/local/sbin/u6e-agent --listen $MGMT_IP --port $NR_PORT --gateway $MGMT_GW $arm $peers $link
@@ -313,9 +314,11 @@ ProtectProc=invisible
 # /proc/uptime, loadavg, meminfo, net/arp and sys/kernel: the state it reports.
 ProcSubset=all
 PrivateDevices=yes
-# The Wi-Fi firmware crashes are counted from the kernel log.
+# The Wi-Fi firmware crashes are counted from the kernel log, and the
+# clients' flows read from ECM's state device, its major looked up by name.
 DeviceAllow=/dev/kmsg r
-BindReadOnlyPaths=/dev/kmsg
+DeviceAllow=char-ecm_state r
+BindReadOnlyPaths=/dev/kmsg -/dev/ecm_state
 ProtectKernelLogs=no
 ProtectClock=yes
 ProtectHostname=yes
@@ -613,6 +616,20 @@ modprobe -a qca-nss-crypto qca-nss-cfi-cryptoapi qca-mcs nat46 qca-nss-qdisc act
 modprobe nf_conntrack
 s net.netfilter.nf_conntrack_tcp_no_window_check=1 net.netfilter.nf_conntrack_max=32768
 modprobe ecm front_end_selection=1
+# For u6e-agent's flows (pkg/u6e-agent/src/ecm.rs): the uptime ECM's clock
+# counts from, for the connections' ages; its state dump of connections only;
+# and that dump's device, which ECM registers with a dynamic major and no
+# uevent, for the agent's group (each open is a new dump, so the agent opens
+# it itself, rather than being passed it once).
+mkdir -p /run/u6e-nss && cut -d' ' -f1 /proc/uptime > /run/u6e-nss/ecm-epoch
+s net.ecm.ecm_state.state_file_output_mask=1
+major=$(awk '$2 == "ecm_state" {print $1}' /proc/devices)
+rm -f /dev/ecm_state
+if [ -n "$major" ] && mknod -m 0440 /dev/ecm_state c "$major" 0; then
+	chgrp u6e-agent /dev/ecm_state
+else
+	echo "u6e-nss: no ECM state device" >&2
+fi
 modprobe qca-nss-netlink
 NSS
 sed -i "s/@MGMT_IF@/$MGMT_IF/g; s/@CLIENT_IF@/$CLIENT_IF/g" $RF/usr/local/sbin/u6e-nss

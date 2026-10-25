@@ -7,12 +7,15 @@
 //!             [--peer <address>]...
 //!             [--controller <host:port> --key <path> --controller-key <hex>]
 //!   u6e-agent --print-snapshot
+//!   u6e-agent --print-flows [--full]
 //!
 //! With the three controller options it also streams telemetry to the
-//! controller (see `link`).
+//! controller (see `link`). `--print-flows` prints the flows the link would
+//! send now, and what reading them cost.
 
 mod clientsock;
 mod collect;
+mod ecm;
 mod events;
 mod kmsg;
 mod link;
@@ -27,12 +30,15 @@ mod testdir;
 
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::Path;
 use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
-use std::{env, process, thread};
+use std::time::{Duration, Instant};
+use std::{env, mem, process, thread};
 
+use u6e_proto::frame::write_frame;
 use u6e_proto::mac;
+use u6e_proto::msg::AgentMsg;
 use u6e_proto::tls::Identity;
 
 /// The state line: first 2 minutes after start, then every 5.
@@ -116,14 +122,12 @@ fn start_link(l: LinkArgs, collector: &Arc<Mutex<collect::Collector>>) {
         l.controller_key,
         link::local_hello(),
     );
-    let collector = Arc::clone(collector);
+    let (collector, flows) = (Arc::clone(collector), Arc::clone(collector));
     spawn_or_log("link", move || {
         link::run(
             cfg,
-            move |seq| {
-                let mut c = lock(&collector);
-                c.snapshot(seq)
-            },
+            move |seq| lock(&collector).snapshot(seq),
+            move |seq, stations, full| lock(&flows).flows(seq, stations, full),
             rx,
         )
     });
@@ -138,8 +142,54 @@ fn spawn_or_log(name: &str, f: impl FnOnce() + Send + 'static) {
     }
 }
 
+/// The CPU time this process has used, the kernel's on its behalf included
+/// (the kernel splits the two by sampling, so only their sum is exact).
+fn cpu() -> Duration {
+    // SAFETY: a zeroed rusage is a valid one for getrusage to fill.
+    let mut u: libc::rusage = unsafe { mem::zeroed() };
+    // SAFETY: `u` is a valid rusage for the call.
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) };
+    let d = |t: libc::timeval| {
+        Duration::from_secs(t.tv_sec as u64) + Duration::from_micros(t.tv_usec as u64)
+    };
+    d(u.ru_utime) + d(u.ru_stime)
+}
+
+/// Prints the flows of this AP's stations as the link would send them, and
+/// on stderr what the read of ECM's table cost.
+fn print_flows(nss_load: Option<fs::File>, full: bool) {
+    let mut c = collect::Collector::new(nss_load);
+    let stations: Vec<_> = c.snapshot(0).stations.iter().map(|s| s.mac).collect();
+    drop(c);
+    let (used, start) = (cpu(), Instant::now());
+    let table = ecm::read(&Path::new("/").join(ecm::DEVICE), ecm::CAP).unwrap_or_else(|e| {
+        eprintln!("u6e-agent: ECM connection table: {e}");
+        process::exit(1);
+    });
+    let flows = table.flows(1, &stations, full, ecm::clock(Path::new("/")));
+    let (used, wall) = (cpu() - used, start.elapsed());
+    let mut frame = Vec::new();
+    // Into a Vec: it cannot fail.
+    let _ = write_frame(&mut frame, &AgentMsg::Flows(flows.clone()));
+    println!("{flows:#?}");
+    eprintln!(
+        "{} connections (complete: {}), {} of {} stations with some: {:.1} ms CPU, {:.1} ms wall, {} B framed",
+        table.conns.len(),
+        table.complete,
+        flows.clients.len(),
+        stations.len(),
+        used.as_secs_f64() * 1e3,
+        wall.as_secs_f64() * 1e3,
+        frame.len(),
+    );
+}
+
 fn main() {
     let nss_load = passed::take(collect::NSS_LOAD_NAME);
+    if env::args().nth(1).as_deref() == Some("--print-flows") {
+        print_flows(nss_load, env::args().nth(2).as_deref() == Some("--full"));
+        return;
+    }
     if env::args().nth(1).as_deref() == Some("--print-snapshot") {
         let mut c = collect::Collector::new(nss_load);
         println!("{:#?}", c.snapshot(0));
