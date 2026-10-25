@@ -12,6 +12,7 @@ use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, SystemTime};
 
 use tokio::sync::{broadcast, oneshot, watch};
+use u6e_proto::PROTOCOL;
 use u6e_proto::delta::{self, Gap};
 use u6e_proto::msg::{AgentMsg, Event, EventKind, Hello, Snapshot, Station};
 
@@ -37,6 +38,8 @@ pub enum Change {
 pub struct Ap {
     /// What it last said it runs; kept while it is down.
     pub hello: Option<Hello>,
+    /// The protocol its agent stated when it last dialed in.
+    pub protocol: Option<u16>,
     /// The current snapshot, only while connected.
     pub snapshot: Option<Snapshot>,
     /// When `snapshot` was last brought up to date.
@@ -66,6 +69,7 @@ impl Ap {
     fn new() -> Self {
         Ap {
             hello: None,
+            protocol: None,
             snapshot: None,
             snapshot_at: None,
             previous: None,
@@ -82,6 +86,12 @@ impl Ap {
 
     pub fn is_up(&self) -> bool {
         self.session.is_some()
+    }
+
+    /// The protocol of its agent, when that is not this controller's and the
+    /// agent is therefore turned away.
+    pub fn mismatch(&self) -> Option<u16> {
+        self.protocol.filter(|&p| p != PROTOCOL)
     }
 
     /// Bytes received from the agent on the wire, TLS included, over every
@@ -189,6 +199,7 @@ impl State {
         entry.connected_since = Some(now);
         entry.last_seen = Some(now);
         entry.hello = Some(hello);
+        entry.protocol = Some(PROTOCOL);
         let reg = Registration {
             id,
             tick: entry.tick.subscribe(),
@@ -197,6 +208,26 @@ impl State {
         };
         self.notify(Change::Up(ap.to_owned()));
         Some(reg)
+    }
+
+    /// Records that the AP dialed in speaking `protocol`, not this
+    /// controller's, and ends any session it held: it no longer runs what
+    /// that session said. True when its protocol was another before, so that
+    /// a change is told once and not at each redial.
+    pub fn refuse(&mut self, ap: &str, protocol: u16) -> bool {
+        let Some(entry) = self.aps.get_mut(ap) else {
+            return false;
+        };
+        entry.last_seen = Some(SystemTime::now());
+        if entry.protocol == Some(protocol) {
+            return false;
+        }
+        entry.protocol = Some(protocol);
+        entry.hello = None;
+        entry.session = None;
+        entry.reset_session();
+        self.notify(Change::Down(ap.to_owned()));
+        true
     }
 
     /// Ends session `id`; a no-op when a newer connection has taken over.
@@ -565,6 +596,33 @@ mod tests {
                 Change::Down(ap1())
             ]
         );
+    }
+
+    #[test]
+    fn a_refused_protocol_is_told_once_per_change() {
+        let mut s = state(&["ap1"]);
+        let mut rx = s.subscribe();
+        let reg = s.connect("ap1", hello("ap1")).unwrap();
+        assert_eq!(s.ap("ap1").unwrap().mismatch(), None);
+        assert!(s.refuse("ap1", 0));
+        // An old agent redials: nothing new to tell.
+        assert!(!s.refuse("ap1", 0));
+        let mut stop = reg.stop;
+        assert!(matches!(
+            stop.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+        let ap = s.ap("ap1").unwrap();
+        assert!(!ap.is_up());
+        assert_eq!((ap.mismatch(), &ap.hello), (Some(0), &None));
+        assert!(s.refuse("ap1", PROTOCOL + 1));
+        s.connect("ap1", hello("ap1")).unwrap();
+        assert_eq!(s.ap("ap1").unwrap().mismatch(), None);
+        assert!(s.refuse("ap1", PROTOCOL + 1));
+        assert!(!s.refuse("ap9", 0));
+        let got: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let (up, down) = (Change::Up("ap1".into()), Change::Down("ap1".into()));
+        assert_eq!(got, [up.clone(), down.clone(), down.clone(), up, down]);
     }
 
     #[test]

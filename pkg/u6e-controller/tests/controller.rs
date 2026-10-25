@@ -22,12 +22,14 @@ use u6e_controller::agents::Timing;
 use u6e_controller::config::Config;
 use u6e_controller::state::{TICK_IDLE, TICK_WATCHED};
 use u6e_controller::{Controller, start};
-use u6e_proto::frame::{decode_frame, write_frame};
+use u6e_proto::PROTOCOL;
+use u6e_proto::frame::{decode_frame, frame_body, write_frame};
 use u6e_proto::msg::{
     AgentMsg, Band, Bss, CtlMsg, Event, EventKind, FieldDelta, Hello, Radio, RateMode, Snapshot,
     SnapshotDelta, Station, Temp,
 };
 use u6e_proto::tls::{self, Identity};
+use u6e_proto::version;
 
 #[path = "common/keys.rs"]
 mod keys;
@@ -122,9 +124,19 @@ impl Agent {
         })
     }
 
-    /// An enrolled AP that has said Hello.
-    fn hello(addr: SocketAddr, pem: &str, ap: &str) -> Agent {
+    /// Dials as an agent of `protocol`: its version frame sent, and the
+    /// protocol the controller's states.
+    fn versioned(addr: SocketAddr, pem: &str, protocol: u16) -> (Agent, u16) {
         let mut a = Agent::dial(addr, pem).unwrap();
+        a.send_bytes(&version::frame(protocol)).unwrap();
+        let theirs = version::decode(&a.recv_body().unwrap());
+        (a, theirs)
+    }
+
+    /// An enrolled AP of this protocol that has said Hello.
+    fn hello(addr: SocketAddr, pem: &str, ap: &str) -> Agent {
+        let (mut a, theirs) = Agent::versioned(addr, pem, PROTOCOL);
+        assert_eq!(theirs, PROTOCOL);
         a.send(&AgentMsg::Hello(Hello {
             ap: ap.into(),
             manifest: "image: test".into(),
@@ -139,29 +151,53 @@ impl Agent {
     fn send(&mut self, msg: &AgentMsg) -> io::Result<()> {
         let mut out = Vec::new();
         write_frame(&mut out, msg)?;
-        self.conn.writer().write_all(&out)?;
+        self.send_bytes(&out)
+    }
+
+    fn send_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.conn.writer().write_all(bytes)?;
         while self.conn.wants_write() {
             self.conn.write_tls(&mut self.sock)?;
         }
         Ok(())
     }
 
-    /// The next message from the controller, pings included.
-    fn recv(&mut self) -> io::Result<CtlMsg> {
+    /// What `take` makes of the frames received, once it makes something.
+    fn next<T>(&mut self, take: impl Fn(&[u8]) -> io::Result<Option<(T, usize)>>) -> io::Result<T> {
         loop {
-            match self.conn.reader().read_to_end(&mut self.buf) {
-                Ok(_) => return Err(ErrorKind::UnexpectedEof.into()),
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+            // Ok: the controller closed, after what it sent with the close.
+            let closed = match self.conn.reader().read_to_end(&mut self.buf) {
+                Ok(_) => true,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => false,
                 Err(e) => return Err(e),
-            }
-            if let Some((msg, n)) = decode_frame(&self.buf)? {
+            };
+            if let Some((v, n)) = take(&self.buf)? {
                 self.buf.drain(..n);
-                return Ok(msg);
+                return Ok(v);
             }
-            if self.conn.read_tls(&mut self.sock)? == 0 {
+            if closed || self.conn.read_tls(&mut self.sock)? == 0 {
                 return Err(ErrorKind::UnexpectedEof.into());
             }
             self.conn.process_new_packets().map_err(io::Error::other)?;
+        }
+    }
+
+    /// The next message from the controller, pings included.
+    fn recv(&mut self) -> io::Result<CtlMsg> {
+        self.next(decode_frame)
+    }
+
+    /// The body of the next frame from the controller, undecoded.
+    fn recv_body(&mut self) -> io::Result<Vec<u8>> {
+        self.next(|buf| Ok(frame_body(buf)?.map(|(body, n)| (body.to_vec(), n))))
+    }
+
+    /// Asserts that the controller ends the session, and does not merely
+    /// keep quiet.
+    fn ends(&mut self) {
+        match self.recv_body() {
+            Err(e) => assert_eq!(e.kind(), ErrorKind::UnexpectedEof, "{e}"),
+            Ok(body) => panic!("a frame of {} B, not the end", body.len()),
         }
     }
 
@@ -387,9 +423,16 @@ impl Drop for TempDir {
     }
 }
 
-/// The controller binary, its log lines, and the agents and metrics addresses
-/// it reported.
-fn spawn_binary(dir: &TempDir) -> (Proc, Receiver<String>, SocketAddr, SocketAddr) {
+/// The controller binary, its log lines, and the addresses it reported.
+struct Binary {
+    _proc: Proc,
+    log: Receiver<String>,
+    agents: SocketAddr,
+    http: SocketAddr,
+    metrics: SocketAddr,
+}
+
+fn spawn_binary(dir: &TempDir) -> Binary {
     let key = dir.0.join("key.pem");
     fs::write(&key, KEY_CONTROLLER).unwrap();
     let config = dir.0.join("config.toml");
@@ -415,7 +458,13 @@ fn spawn_binary(dir: &TempDir) -> (Proc, Receiver<String>, SocketAddr, SocketAdd
         let rest = line.split_once(after).unwrap().1;
         rest.split(',').next().unwrap().parse().unwrap()
     };
-    (proc, log, addr("agents on "), addr("metrics on "))
+    Binary {
+        _proc: proc,
+        log,
+        agents: addr("agents on "),
+        http: addr("http on "),
+        metrics: addr("metrics on "),
+    }
 }
 
 /// The first log line that matches.
@@ -433,21 +482,23 @@ fn wait_line(log: &Receiver<String>, matches: impl Fn(&str) -> bool) -> String {
 #[test]
 fn unknown_ap_not_listed() {
     let dir = TempDir::new("unknown-ap");
-    let (_proc, log, agents, metrics) = spawn_binary(&dir);
+    let b = spawn_binary(&dir);
 
     // TLS 1.3 completes the client's side first; the refusal shows at the read.
-    let mut stranger = Agent::dial(agents, KEY_STRANGER).unwrap();
+    let mut stranger = Agent::dial(b.agents, KEY_STRANGER).unwrap();
     let local = stranger.sock.local_addr().unwrap();
     let _ = stranger.send(&AgentMsg::Pong(0));
     assert!(stranger.recv().is_err());
-    let refused = wait_line(&log, |l| l.contains(&format!("{local}: handshake refused")));
+    let refused = wait_line(&b.log, |l| {
+        l.contains(&format!("{local}: handshake refused"))
+    });
     let fp = tls::fingerprint(&identity(KEY_STRANGER).public_key());
     assert!(
         refused.contains(&format!("client key {fp} is not enrolled")),
         "{refused}"
     );
 
-    let body = http_get(metrics, "/metrics");
+    let body = http_get(b.metrics, "/metrics");
     let up: Vec<_> = body
         .lines()
         .filter(|l| l.starts_with("wifi_ap_up"))
@@ -455,12 +506,12 @@ fn unknown_ap_not_listed() {
     assert_eq!(up, ["wifi_ap_up{ap=\"ap1\"} 0"]);
 
     // The enrolled AP is still served.
-    let mut a = Agent::hello(agents, KEY_AP1, "ap1");
+    let mut a = Agent::hello(b.agents, KEY_AP1, "ap1");
     a.send(&AgentMsg::Key(snapshot(1, Vec::new(), Vec::new())))
         .unwrap();
-    wait_line(&log, |l| l.contains("ap1 up from"));
+    wait_line(&b.log, |l| l.contains("ap1 up from"));
     wait_for("ap1 up in the metrics", || {
-        http_get(metrics, "/metrics").contains("wifi_ap_up{ap=\"ap1\"} 1\n")
+        http_get(b.metrics, "/metrics").contains("wifi_ap_up{ap=\"ap1\"} 1\n")
     });
 }
 
@@ -592,6 +643,15 @@ fn metrics_exposition() {
         assert!(body.lines().any(|l| l == line), "missing {line}\n{body}");
     }
     assert!(body.contains("\nwifi_agent_last_seen_timestamp_seconds{ap=\"ap1\"} 1"));
+    for line in [
+        format!("wifi_controller_protocol {PROTOCOL}"),
+        format!("wifi_agent_protocol{{ap=\"ap1\"}} {PROTOCOL}"),
+        "wifi_agent_compatible{ap=\"ap1\"} 1".to_owned(),
+    ] {
+        assert!(body.lines().any(|l| l == line), "missing {line}\n{body}");
+    }
+    // ap2 has never dialed in: no protocol to tell.
+    assert!(!body.contains("wifi_agent_protocol{ap=\"ap2\"}"), "{body}");
     assert!(promtool_accepts(&body));
 
     // A client that leaves takes its series with it.
@@ -953,4 +1013,108 @@ fn ws_refuses_another_sites_page() {
     let mut ok = Ui::open(r.c.http, &[("origin", &origin)]).unwrap();
     ok.send(&json!({"subscribe": "*"}));
     assert!(ok.recv()["key"].is_object());
+}
+
+fn unhex(s: &str) -> Vec<u8> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+/// The first two frames of the agent deployed before the version frame
+/// (58e88f8, protocol 0): its Hello and a key frame whose Station lacks the
+/// rate modes of 828aeae, as that agent's own u6e-proto (`write_frame`)
+/// encodes them.
+const HELLO_V0: &str = "2100000000036170310b696d6167653a207465737404362e313204322e313105312e302e30";
+const KEY_V0: &str = "640000000101901cfa01c09a0c25010363707598e605010470687930012450f823a1904ec413e807f403010105776c616e3002000000100105477565737404706879302a0102000000000100cacac0c407f1f72764c801030188b404aca5050708e807d00f003c2a";
+
+/// What the log says of `ap` until it has been quiet for a while.
+fn lines_of(log: &Receiver<String>, ap: &str) -> Vec<String> {
+    let quiet = Duration::from_millis(500);
+    std::iter::from_fn(|| log.recv_timeout(quiet).ok())
+        .filter(|l| l.contains(ap))
+        .collect()
+}
+
+#[test]
+fn an_unversioned_agent_is_turned_away_once() {
+    let dir = TempDir::new("unversioned");
+    let b = spawn_binary(&dir);
+    let opening = [unhex(HELLO_V0), unhex(KEY_V0)].concat();
+    // An old agent redials after each session; every one is turned away.
+    for _ in 0..5 {
+        let mut a = Agent::dial(b.agents, KEY_AP1).unwrap();
+        a.send_bytes(&opening).unwrap();
+        // The controller's version frame, which such an agent fails to read.
+        assert_eq!(version::decode(&a.recv_body().unwrap()), PROTOCOL);
+        a.ends();
+    }
+    let lines = lines_of(&b.log, "ap1");
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    assert!(
+        lines[0].contains(&format!("protocol 0, this controller {PROTOCOL}")),
+        "{}",
+        lines[0]
+    );
+
+    let body = http_get(b.metrics, "/metrics");
+    for line in [
+        "wifi_ap_up{ap=\"ap1\"} 0".to_owned(),
+        "wifi_agent_protocol{ap=\"ap1\"} 0".to_owned(),
+        "wifi_agent_compatible{ap=\"ap1\"} 0".to_owned(),
+        format!("wifi_controller_protocol {PROTOCOL}"),
+    ] {
+        assert!(body.lines().any(|l| l == line), "missing {line}\n{body}");
+    }
+    assert!(promtool_accepts(&body));
+    let ap1 = &json_get(b.http, "/api/aps")["ap1"];
+    assert_eq!(ap1["up"], false);
+    assert_eq!(ap1["mismatch"], json!({"ap": 0, "controller": PROTOCOL}));
+}
+
+#[test]
+fn an_agent_of_another_protocol_is_turned_away() {
+    let r = controller(Timing::default());
+    let up = |ap: &str| r.c.state.read().ap(ap).unwrap().is_up();
+    let newer = PROTOCOL + 1;
+    for _ in 0..3 {
+        let (mut a, theirs) = Agent::versioned(r.c.agents, KEY_AP1, newer);
+        assert_eq!(theirs, PROTOCOL);
+        a.ends();
+    }
+    let ap1 = &json_get(r.c.http, "/api/aps")["ap1"];
+    assert_eq!(ap1["up"], false);
+    assert_eq!(
+        ap1["mismatch"],
+        json!({"ap": newer, "controller": PROTOCOL})
+    );
+    let body = http_get(r.c.metrics, "/metrics");
+    for line in [
+        format!("wifi_agent_protocol{{ap=\"ap1\"}} {newer}"),
+        "wifi_agent_compatible{ap=\"ap1\"} 0".to_owned(),
+    ] {
+        assert!(body.lines().any(|l| l == line), "missing {line}\n{body}");
+    }
+
+    // Updated to this protocol, it is served again.
+    let _a = Agent::hello(r.c.agents, KEY_AP1, "ap1");
+    wait_for("ap1 up", || up("ap1"));
+    let ap1 = &json_get(r.c.http, "/api/aps")["ap1"];
+    assert!(ap1.get("mismatch").is_none(), "{ap1}");
+    let body = http_get(r.c.metrics, "/metrics");
+    assert!(
+        body.contains("wifi_agent_compatible{ap=\"ap1\"} 1\n"),
+        "{body}"
+    );
+
+    // An AP that comes back with another protocol ends the session it held.
+    let mut old = Agent::hello(r.c.agents, KEY_AP2, "ap2");
+    wait_for("ap2 up", || up("ap2"));
+    let (mut a, _) = Agent::versioned(r.c.agents, KEY_AP2, newer);
+    a.ends();
+    assert!(!up("ap2"));
+    while let Ok(msg) = old.recv() {
+        assert!(matches!(msg, CtlMsg::Ping(_)), "{msg:?}");
+    }
 }

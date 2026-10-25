@@ -27,12 +27,12 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::ServerName;
 use u6e_controller::agents::Timing;
 use u6e_controller::config::Config;
-use u6e_proto::delta;
-use u6e_proto::frame::{decode_frame, write_frame};
+use u6e_proto::frame::{decode_frame, frame_body, write_frame};
 use u6e_proto::msg::{
     AgentMsg, Band, Bss, CtlMsg, Event, EventKind, Hello, Radio, RateMode, Snapshot, Station, Temp,
 };
 use u6e_proto::tls::{self, Identity};
+use u6e_proto::{PROTOCOL, delta, version};
 
 /// The script's length; it starts over after.
 const CYCLE: f64 = 120.0;
@@ -551,6 +551,22 @@ async fn agent(addr: SocketAddr, ap: usize, pem: &str, world: Arc<Mutex<World>>)
     let name = ServerName::try_from("controller").map_err(io::Error::other)?;
     let link = connector.connect(name, tcp).await?;
     let (mut rd, mut wr) = tokio::io::split(link);
+    wr.write_all(&version::frame(PROTOCOL)).await?;
+    let (mut buf, mut chunk) = (Vec::new(), [0; 4096]);
+    let theirs = loop {
+        if let Some((body, n)) = frame_body(&buf)? {
+            let v = version::decode(body);
+            buf.drain(..n);
+            break v;
+        }
+        let n = read(&mut rd, &mut chunk).await?;
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    if theirs != PROTOCOL {
+        return Err(io::Error::other(format!(
+            "controller speaks protocol {theirs}"
+        )));
+    }
     let hello = {
         let w = world.lock().unwrap_or_else(|e| e.into_inner());
         let a = &w.aps[ap];
@@ -568,8 +584,20 @@ async fn agent(addr: SocketAddr, ap: usize, pem: &str, world: Arc<Mutex<World>>)
     let mut next = tokio::time::Instant::now();
     let mut events = interval(Duration::from_millis(250));
     let (mut seq, mut last, mut want_key) = (0, None::<Snapshot>, true);
-    let (mut buf, mut chunk) = (Vec::new(), [0; 4096]);
     loop {
+        // What came with the version frame too.
+        while let Some((msg, used)) = decode_frame::<CtlMsg>(&buf)? {
+            buf.drain(..used);
+            match msg {
+                CtlMsg::SetTick { secs } => {
+                    tick = Duration::from_secs(secs.into());
+                    next = tokio::time::Instant::now();
+                }
+                CtlMsg::WantKey => want_key = true,
+                CtlMsg::Ping(n) => send(&mut wr, &AgentMsg::Pong(n)).await?,
+                _ => {}
+            }
+        }
         tokio::select! {
             () = sleep_until(next) => {
                 if world.lock().unwrap_or_else(|e| e.into_inner()).away(ap) {
@@ -595,21 +623,7 @@ async fn agent(addr: SocketAddr, ap: usize, pem: &str, world: Arc<Mutex<World>>)
                     send(&mut wr, &AgentMsg::Event(ev)).await?;
                 }
             }
-            n = read(&mut rd, &mut chunk) => {
-                buf.extend_from_slice(&chunk[..n?]);
-                while let Some((msg, used)) = decode_frame::<CtlMsg>(&buf)? {
-                    buf.drain(..used);
-                    match msg {
-                        CtlMsg::SetTick { secs } => {
-                            tick = Duration::from_secs(secs.into());
-                            next = tokio::time::Instant::now();
-                        }
-                        CtlMsg::WantKey => want_key = true,
-                        CtlMsg::Ping(n) => send(&mut wr, &AgentMsg::Pong(n)).await?,
-                        _ => {}
-                    }
-                }
-            }
+            n = read(&mut rd, &mut chunk) => buf.extend_from_slice(&chunk[..n?]),
         }
     }
 }

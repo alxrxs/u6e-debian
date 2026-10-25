@@ -1,7 +1,9 @@
 //! The agent listener: one task per connection. The handshake admits only the
-//! keys of configured APs; the session then takes the agent's Hello, applies
-//! its key frames, deltas and events to the state, pings it, and sets its tick
-//! from the AP's watchers.
+//! keys of configured APs; each end then states its protocol in the version
+//! frame, and an agent of another protocol is turned away, recorded in the
+//! state for the metrics and the UI. The session then takes the agent's Hello,
+//! applies its key frames, deltas and events to the state, pings it, and sets
+//! its tick from the AP's watchers.
 //!
 //! Received bytes collect in a buffer and are cut into frames only when whole,
 //! so a read cancelled by another branch of the session's `select!` never
@@ -22,9 +24,10 @@ use tokio::time::{Instant, interval_at, sleep, sleep_until, timeout};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::server::TlsStream;
-use u6e_proto::frame::{decode_frame, write_frame};
+use u6e_proto::frame::{decode_frame, frame_body, write_frame};
 use u6e_proto::msg::{AgentMsg, CtlMsg, Hello};
 use u6e_proto::tls::{self, AllowedKeys};
+use u6e_proto::{PROTOCOL, version};
 
 use crate::state::{Registration, Shared, TICK_WATCHED};
 
@@ -122,7 +125,15 @@ async fn connection(
         awaiting_key: false,
         pings: 0,
     };
-    let Err(e) = s.run().await;
+    let r = match s.agree().await {
+        Ok(true) => s.run().await,
+        Ok(false) => {
+            let _ = timeout(IO_TIMEOUT, s.tls.shutdown()).await;
+            return;
+        }
+        Err(e) => Err(e),
+    };
+    let Err(e) = r;
     eprintln!("u6e-controller: {} ({peer}) down: {e}", s.name);
     s.state.write().disconnect(&s.name, s.id);
     let _ = timeout(IO_TIMEOUT, s.tls.shutdown()).await;
@@ -147,6 +158,26 @@ struct Session {
 }
 
 impl Session {
+    /// Sends this controller's protocol and reads the agent's, before either
+    /// end decodes a message; false turns the agent away. The log tells of an
+    /// AP's protocol when it changes, not at each redial of an old agent.
+    async fn agree(&mut self) -> io::Result<bool> {
+        self.send_bytes(&version::frame(PROTOCOL)).await?;
+        let read = |buf: &[u8]| Ok(frame_body(buf)?.map(|(b, n)| (version::decode(b), n)));
+        let theirs = self.wait_frame(read, "version frame").await?;
+        if theirs == PROTOCOL {
+            return Ok(true);
+        }
+        if self.state.write().refuse(&self.name, theirs) {
+            eprintln!(
+                "u6e-controller: {} ({}) speaks protocol {theirs}, this controller {PROTOCOL}: \
+                 turned away until they match",
+                self.name, self.peer
+            );
+        }
+        Ok(false)
+    }
+
     /// Serves the session until it fails, goes silent or is replaced.
     async fn run(&mut self) -> io::Result<Infallible> {
         let hello = self.hello().await?;
@@ -197,20 +228,30 @@ impl Session {
 
     /// Waits for the agent's first message, which must be its Hello.
     async fn hello(&mut self) -> io::Result<Hello> {
+        match self.wait_frame(decode_frame::<AgentMsg>, "Hello").await? {
+            AgentMsg::Hello(h) => Ok(h),
+            _ => Err(io::Error::new(ErrorKind::InvalidData, "no Hello first")),
+        }
+    }
+
+    /// The next whole frame as `read` makes it out; `what` names it in the
+    /// error of an agent that stays silent.
+    async fn wait_frame<T>(
+        &mut self,
+        read: impl Fn(&[u8]) -> io::Result<Option<(T, usize)>>,
+        what: &str,
+    ) -> io::Result<T> {
         let mut chunk = [0; 4096];
         loop {
-            if let Some((msg, n)) = decode_frame::<AgentMsg>(&self.inbuf)? {
+            if let Some((v, n)) = read(&self.inbuf)? {
                 self.inbuf.drain(..n);
                 self.last_rx = Instant::now();
-                return match msg {
-                    AgentMsg::Hello(h) => Ok(h),
-                    _ => Err(io::Error::new(ErrorKind::InvalidData, "no Hello first")),
-                };
+                return Ok(v);
             }
             let deadline = self.last_rx + self.timing.silence;
             let n = tokio::time::timeout_at(deadline, self.tls.read(&mut chunk))
                 .await
-                .map_err(|_| io::Error::new(ErrorKind::TimedOut, "no Hello"))??;
+                .map_err(|_| io::Error::new(ErrorKind::TimedOut, format!("no {what}")))??;
             self.take(&chunk[..n])?;
         }
     }
@@ -259,8 +300,12 @@ impl Session {
     async fn send(&mut self, msg: &CtlMsg) -> io::Result<()> {
         let mut out = Vec::new();
         write_frame(&mut out, msg)?;
+        self.send_bytes(&out).await
+    }
+
+    async fn send_bytes(&mut self, out: &[u8]) -> io::Result<()> {
         let write = async {
-            self.tls.write_all(&out).await?;
+            self.tls.write_all(out).await?;
             self.tls.flush().await
         };
         timeout(IO_TIMEOUT, write)

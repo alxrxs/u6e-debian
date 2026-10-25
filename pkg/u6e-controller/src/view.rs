@@ -7,6 +7,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value, json};
+use u6e_proto::PROTOCOL;
 use u6e_proto::msg::{Band, Event, EventKind, Radio, RateMode, Snapshot, Station};
 
 use crate::state::{Ap, ClientView, State};
@@ -159,6 +160,9 @@ fn ap_view(ap: &Ap) -> Value {
         o.insert("kernel".into(), h.kernel.clone().into());
         o.insert("hostapd".into(), h.hostapd.clone().into());
         o.insert("agent".into(), h.agent.clone().into());
+    }
+    if let Some(p) = ap.mismatch() {
+        o.insert("mismatch".into(), json!({"ap": p, "controller": PROTOCOL}));
     }
     if let Some(t) = ap.connected_since {
         o.insert("since".into(), unix_ms(t).into());

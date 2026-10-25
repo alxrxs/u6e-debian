@@ -11,6 +11,7 @@ use axum::extract::State as Ext;
 use axum::http::header;
 use axum::response::IntoResponse;
 use axum::routing::get;
+use u6e_proto::PROTOCOL;
 use u6e_proto::msg::{Radio, Snapshot, Station};
 
 use crate::state::{Ap, Shared, State};
@@ -173,6 +174,32 @@ pub fn render(state: &State) -> String {
     m.family("wifi_ap_up", GAUGE, "Whether the AP's agent is connected.");
     for &(ap, a) in &aps {
         m.sample(&[("ap", ap)], f64::from(u8::from(a.is_up())));
+    }
+    m.family(
+        "wifi_controller_protocol",
+        GAUGE,
+        "The link protocol this controller speaks.",
+    );
+    m.sample(&[], f64::from(PROTOCOL));
+    m.family(
+        "wifi_agent_protocol",
+        GAUGE,
+        "The link protocol the AP's agent stated when it last dialed in.",
+    );
+    for &(ap, a) in &aps {
+        if let Some(p) = a.protocol {
+            m.sample(&[("ap", ap)], f64::from(p));
+        }
+    }
+    m.family(
+        "wifi_agent_compatible",
+        GAUGE,
+        "Whether the AP's agent speaks this controller's protocol; one that does not is turned away.",
+    );
+    for &(ap, a) in &aps {
+        if a.protocol.is_some() {
+            m.sample(&[("ap", ap)], f64::from(u8::from(a.mismatch().is_none())));
+        }
     }
     m.family(
         "wifi_agent_last_seen_timestamp_seconds",

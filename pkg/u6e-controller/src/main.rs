@@ -60,11 +60,13 @@ fn main() -> ExitCode {
         match u6e_controller::start(&config, &identity, Timing::default()).await {
             Ok(c) => {
                 eprintln!(
-                    "u6e-controller: agents on {}, http on {}, metrics on {}, {} APs configured",
+                    "u6e-controller: agents on {}, http on {}, metrics on {}, {} APs configured, \
+                     protocol {}",
                     c.agents,
                     c.http,
                     c.metrics,
-                    config.aps.len()
+                    config.aps.len(),
+                    u6e_proto::PROTOCOL
                 );
                 future::pending::<ExitCode>().await
             }

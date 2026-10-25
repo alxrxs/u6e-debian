@@ -60,16 +60,28 @@ function radioPanel(store, name, phy, r, tempC) {
       tempC === undefined ? fact('Temp', h('span', { class: 'muted', title: 'This image reports no radio temperature' }, 'n/a')) : fact('Temp', temp(tempC))));
 }
 
+/** The AP's connection state and what it says, as [class, label, detail]. */
+function connection(ap) {
+  const m = ap.mismatch;
+  if (ap.up) return ['ok', 'Connected', `for ${duration((Date.now() - ap.since) / 1000)}`];
+  if (m) return ['bad', 'Protocol mismatch', `AP runs protocol ${m.ap}, controller runs ${m.controller}`];
+  return ['bad', 'Offline', ap.seen ? `last seen ${ago(ap.seen)}` : 'has not connected since the controller started'];
+}
+
 function apPanel(store, name, ap) {
   const open = (store.ui.manifests ||= new Set());
+  const [cls, label, detail] = connection(ap);
   const top = h('div', { class: 'ap-top' },
     h('h2', {}, name),
-    ap.up
-      ? h('span', { class: 'state ok' }, 'Connected')
-      : h('span', { class: 'state bad' }, 'Offline'),
-    h('span', { class: 'since' },
-      ap.up ? `for ${duration((Date.now() - ap.since) / 1000)}` : ap.seen ? `last seen ${ago(ap.seen)}` : 'has not connected since the controller started'));
+    h('span', { class: `state ${cls}` }, label),
+    h('span', { class: 'since' }, detail));
 
+  const m = ap.mismatch;
+  if (m) {
+    const fix = m.ap < m.controller ? `an image of ${name} built with this controller` : 'a controller as new as its agent';
+    return h('section', { class: 'panel ap' }, top,
+      h('p', { class: 'offline' }, `${name}’s agent dials in, but the controller turns it away: they speak different versions of the link. Wi-Fi on it keeps working; its figures return with ${fix}.`));
+  }
   if (!ap.agent) {
     return h('section', { class: 'panel ap' }, top,
       h('p', { class: 'offline' }, `${name} is configured, but its agent has not dialled in yet. Its image, versions and radios appear here once it does.`));
