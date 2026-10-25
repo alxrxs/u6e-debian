@@ -1583,6 +1583,7 @@ fn flow(src: &str, dst: &str, bytes: u64, offloaded: bool) -> Flow {
         rx_packets: 20,
         offloaded,
         age_s: 30,
+        client_is_src: true,
     }
 }
 
@@ -1626,10 +1627,10 @@ fn flows_api_shape() {
         "top": [
             {"proto": 6, "src": "192.0.2.10", "sport": 50000, "dst": "198.51.100.1",
              "dport": 443, "tx_bytes": 1000, "rx_bytes": 10000, "tx_packets": 10,
-             "rx_packets": 20, "offloaded": true, "age": 30},
+             "rx_packets": 20, "offloaded": true, "age": 30, "client_is_src": true},
             {"proto": 6, "src": "2001:db8::10", "sport": 50000, "dst": "2001:db8:1::1",
              "dport": 443, "tx_bytes": 10, "rx_bytes": 100, "tx_packets": 10,
-             "rx_packets": 20, "offloaded": false, "age": 30},
+             "rx_packets": 20, "offloaded": false, "age": 30, "client_is_src": true},
         ],
     });
     let want = json!({"ap1": {"at": at, "seq": 1, "complete": true,
@@ -1680,26 +1681,34 @@ fn flows_api_shape() {
 }
 
 #[test]
-fn a_full_table_not_answered_in_time_is_a_504() {
+fn a_full_table_is_asked_for_once_per_interval() {
     let timing = Timing {
         command: Duration::from_millis(300),
+        ping: Duration::from_millis(200),
         ..Timing::default()
     };
     let r = controller(timing);
     let mut a = ap_with_client(&r, KEY_AP1, "ap1", &[]);
-    let (head, _) = http_send(r.c.http, "GET", "/api/flows/full?ap=ap1", "", "");
-    assert!(head.starts_with("http/1.1 504"), "{head}");
+    // Two requests at once: one ask, unanswered, so both time out.
+    let full = move || http_send(r.c.http, "GET", "/api/flows/full?ap=ap1", "", "");
+    let (one, two) = (thread::spawn(full), thread::spawn(full));
     assert_eq!(a.expect(), CtlMsg::WantFlows { full: true });
-    // The request that gave up does not keep the next one from asking.
-    let t = thread::spawn(move || http_send(r.c.http, "GET", "/api/flows/full?ap=ap1", "", ""));
-    assert_eq!(a.expect(), CtlMsg::WantFlows { full: true });
-    a.send(&AgentMsg::Flows(flows(
-        1,
-        vec![flow("192.0.2.10", "198.51.100.1", 1, true)],
-        1,
-    )))
-    .unwrap();
-    assert!(t.join().unwrap().0.starts_with("http/1.1 200"));
+    for t in [one, two] {
+        let (head, _) = t.join().unwrap();
+        assert!(head.starts_with("http/1.1 504"), "{head}");
+    }
+    // The AP was asked a moment ago: refused until the interval is out,
+    // and the AP hears nothing; the next message it gets is its own ping.
+    let (head, body) = full();
+    assert!(head.starts_with("http/1.1 429"), "{head}");
+    let wait: u64 = header(&head, "retry-after").unwrap().parse().unwrap();
+    assert!((1..=10).contains(&wait), "{wait}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap(),
+        json!({"error": "the AP was asked moments ago"})
+    );
+    a.send(&AgentMsg::Pong(0)).unwrap();
+    assert!(matches!(a.recv().unwrap(), CtlMsg::Ping(_)));
 }
 
 #[test]
@@ -1741,6 +1750,32 @@ fn cadence_follows_watchers() {
     assert_eq!(a.expect(), CtlMsg::FlowCadence { secs: FLOWS_IDLE });
     drop(plain);
     assert_eq!(a.expect(), CtlMsg::SetTick { secs: TICK_IDLE });
+}
+
+/// A client whose only connection was opened from outside is named by its
+/// own address, never by the end that opened it.
+#[test]
+fn a_flow_opened_from_outside_names_the_client() {
+    let r = controller(Timing::default());
+    let mut a = ap_with_client(&r, KEY_AP1, "ap1", &[]);
+    let (client, opener) = (
+        "192.0.2.20".parse().unwrap(),
+        "198.51.100.9".parse().unwrap(),
+    );
+    let mut names = r.dns.names.lock().unwrap();
+    names.insert(client, "printer.lan.example".into());
+    names.insert(opener, "scanner.elsewhere.example".into());
+    drop(names);
+    let inbound = Flow {
+        client_is_src: false,
+        ..flow("198.51.100.9", "192.0.2.20", 5, true)
+    };
+    a.send(&AgentMsg::Flows(flows(1, vec![inbound], 1)))
+        .unwrap();
+    wait_for("the client's name", || {
+        r.c.state.read().name_of(&MAC) == Some("printer.lan.example")
+    });
+    assert_eq!(*r.dns.asked.lock().unwrap(), [client]);
 }
 
 #[test]

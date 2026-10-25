@@ -320,6 +320,7 @@ fn flow(c: &Conn, opened: bool) -> Flow {
         rx_packets,
         offloaded: c.offloaded,
         age_s: c.age_s,
+        client_is_src: opened,
     }
 }
 
@@ -504,6 +505,7 @@ mod tests {
                         rx_packets: 26,
                         offloaded: true,
                         age_s: 0,
+                        client_is_src: true,
                     },
                     Flow {
                         proto: 17,
@@ -517,6 +519,7 @@ mod tests {
                         rx_packets: 5,
                         offloaded: true,
                         age_s: 0,
+                        client_is_src: true,
                     },
                     Flow {
                         proto: 17,
@@ -530,6 +533,8 @@ mod tests {
                         rx_packets: 1,
                         offloaded: true,
                         age_s: 0,
+                        // Opened by the wired host: the client is the far end.
+                        client_is_src: false,
                     },
                 ],
             }
@@ -580,6 +585,9 @@ mod tests {
             ]
         );
         assert_eq!(f.clients[0].top[0].src, f.clients[1].top[0].src);
+        // Each says which end it is: the one that opened it, and the other.
+        let ends: Vec<_> = f.clients.iter().map(|c| c.top[0].client_is_src).collect();
+        assert_eq!(ends, [true, false, true]);
     }
 
     #[test]

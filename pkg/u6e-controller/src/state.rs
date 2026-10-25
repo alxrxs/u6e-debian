@@ -40,6 +40,9 @@ pub const TICK_IDLE: u16 = 15;
 pub const FLOWS_WATCHED: u16 = 10;
 /// The flow cadence otherwise, which is the agent's until it is told one.
 pub const FLOWS_IDLE: u16 = 60;
+/// The least time between two requests to an AP for its whole flow table:
+/// each costs the AP a dump of every connection.
+pub const FULL_INTERVAL: Duration = Duration::from_secs(10);
 /// How long a client's addresses are remembered after its flows last showed
 /// them, so that a client quiet for a while keeps its name.
 const ADDRESSES_KEPT: Duration = Duration::from_secs(3600);
@@ -133,6 +136,8 @@ pub struct Ap {
     cadence: watch::Sender<u16>,
     /// Requests for the whole table, answered by the next flows that hold it.
     full: Vec<oneshot::Sender<Flows>>,
+    /// When the agent was last asked for it.
+    full_asked: Option<Instant>,
     session: Option<Live>,
 }
 
@@ -162,6 +167,7 @@ impl Ap {
             flow_watchers: 0,
             cadence: watch::Sender::new(FLOWS_IDLE),
             full: Vec::new(),
+            full_asked: None,
             session: None,
         }
     }
@@ -230,6 +236,15 @@ impl Ap {
             }
         }
     }
+}
+
+/// Why a request for the whole flow table is not made.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Full {
+    /// No session serves the AP (or it is too far behind to take one).
+    NotConnected,
+    /// The AP was asked less than [`FULL_INTERVAL`] ago: this much is left.
+    TooSoon(Duration),
 }
 
 /// Whether `f` lists every connection it counts, as an answer to a request
@@ -541,20 +556,26 @@ impl State {
     }
 
     /// A request for the whole flow table of `ap`, answered by the agent's
-    /// next table that lists every connection; the agent is asked when no
-    /// request is out already. `None` when no session serves the AP.
-    pub fn want_full(&mut self, ap: &str) -> Option<oneshot::Receiver<Flows>> {
-        let entry = self.aps.get_mut(ap)?;
-        let live = entry.session.as_ref()?;
+    /// next table that lists every connection. A request while one is out
+    /// waits for the same answer; otherwise the agent is asked, at most once
+    /// per [`FULL_INTERVAL`].
+    pub fn want_full(&mut self, ap: &str, now: Instant) -> Result<oneshot::Receiver<Flows>, Full> {
+        let entry = self.aps.get_mut(ap).ok_or(Full::NotConnected)?;
+        let live = entry.session.as_ref().ok_or(Full::NotConnected)?;
         entry.full.retain(|w| !w.is_closed());
         if entry.full.is_empty() {
-            live.outbox
-                .try_send(CtlMsg::WantFlows { full: true })
-                .ok()?;
+            let since = entry.full_asked.map(|t| now.saturating_duration_since(t));
+            let left = since.and_then(|s| FULL_INTERVAL.checked_sub(s));
+            if let Some(left) = left.filter(|l| !l.is_zero()) {
+                return Err(Full::TooSoon(left));
+            }
+            let ask = CtlMsg::WantFlows { full: true };
+            live.outbox.try_send(ask).map_err(|_| Full::NotConnected)?;
+            entry.full_asked = Some(now);
         }
         let (tx, rx) = oneshot::channel();
         entry.full.push(tx);
-        Some(rx)
+        Ok(rx)
     }
 
     /// Records an operator action, for the events and the journal.
@@ -581,15 +602,14 @@ impl State {
         let Some((flows, _)) = self.aps.get(ap).and_then(|a| a.flows.as_ref()) else {
             return;
         };
-        let clients: Vec<_> = flows
+        let learnt: Vec<_> = flows
             .clients
             .iter()
-            .map(|c| (c.mac, c.top.as_slice()))
+            .map(|c| (c.mac, names::addresses(&c.top)))
+            .filter(|(_, ips)| !ips.is_empty())
             .collect();
-        for (mac, ips) in names::addresses(&clients) {
-            if !ips.is_empty() {
-                self.addresses.insert(mac, Addresses { ips, at: now });
-            }
+        for (mac, ips) in learnt {
+            self.addresses.insert(mac, Addresses { ips, at: now });
         }
         let kept = |a: &Addresses| now.duration_since(a.at).is_ok_and(|d| d < ADDRESSES_KEPT);
         self.addresses.retain(|_, a| kept(a));
@@ -1064,6 +1084,7 @@ mod tests {
             rx_packets: 0,
             offloaded: false,
             age_s: 0,
+            client_is_src: true,
         };
         Flows {
             seq,
@@ -1088,8 +1109,9 @@ mod tests {
         let seq = |s: &State| s.ap("ap1").unwrap().flows.as_ref().map(|(f, _)| f.seq);
         s.apply("ap1", reg.id, AgentMsg::Flows(flows(1, 9, 6)))
             .unwrap();
-        let mut first = s.want_full("ap1").unwrap();
-        let mut second = s.want_full("ap1").unwrap();
+        let t0 = Instant::now();
+        let mut first = s.want_full("ap1", t0).unwrap();
+        let mut second = s.want_full("ap1", t0 + Duration::from_secs(1)).unwrap();
         // Asked once for both.
         assert_eq!(
             reg.outbox.try_recv().unwrap(),
@@ -1115,5 +1137,19 @@ mod tests {
         s.apply("ap1", reg.id, AgentMsg::Flows(flows(4, 2, 2)))
             .unwrap();
         assert_eq!(seq(&s), Some(4));
+
+        // The next ask waits out the interval from the last.
+        let at = |secs| t0 + Duration::from_secs(secs);
+        assert_eq!(
+            s.want_full("ap1", at(4)).err(),
+            Some(Full::TooSoon(Duration::from_secs(6)))
+        );
+        assert!(reg.outbox.try_recv().is_err());
+        let _third = s.want_full("ap1", at(10)).unwrap();
+        assert_eq!(
+            reg.outbox.try_recv().unwrap(),
+            CtlMsg::WantFlows { full: true }
+        );
+        assert_eq!(s.want_full("ap9", at(60)).err(), Some(Full::NotConnected));
     }
 }

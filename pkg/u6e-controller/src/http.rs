@@ -12,7 +12,8 @@
 //! those APs reports every 2 s, and its flows every 10 s when asked for.
 //!
 //! `GET /api/flows?ap=&client=` is the latest flows, `GET /api/flows/full?ap=`
-//! asks the AP for every connection it forwards and waits for the answer.
+//! asks the AP for every connection it forwards (at most every 10 s) and
+//! waits for the answer.
 //!
 //! The listener is reached only through the reverse proxy that signs users
 //! in, which names the user in `X-Forwarded-Preferred-Username` and their
@@ -36,7 +37,7 @@ use tokio::time::timeout;
 use u6e_proto::mac;
 
 use crate::actions::{self, Access, Web};
-use crate::state::{Change, Shared, WatchGuard};
+use crate::state::{Change, Full, Shared, WatchGuard};
 use crate::view;
 
 /// How long a new WebSocket may take to say what it watches.
@@ -247,10 +248,26 @@ struct FullQuery {
 }
 
 /// Every connection the AP forwards, from the agent's answer to a request:
-/// in the shape of `/api/flows`, and never kept.
+/// in the shape of `/api/flows`, and never kept. Requests while one is out
+/// share its answer; the AP is asked at most once per `FULL_INTERVAL` (429).
 async fn api_flows_full(Ext(web): Ext<Web>, Query(q): Query<FullQuery>) -> Response {
-    let Some(answer) = web.state.write().want_full(&q.ap) else {
-        return error(StatusCode::NOT_FOUND, "not a connected AP");
+    let asked = web
+        .state
+        .write()
+        .want_full(&q.ap, std::time::Instant::now());
+    let answer = match asked {
+        Ok(answer) => answer,
+        Err(Full::NotConnected) => return error(StatusCode::NOT_FOUND, "not a connected AP"),
+        Err(Full::TooSoon(left)) => {
+            let wait = left.as_secs() + 1;
+            let mut resp = error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "the AP was asked moments ago",
+            );
+            resp.headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from(wait));
+            return resp;
+        }
     };
     match timeout(web.access.timeout, answer).await {
         Ok(Ok(flows)) => {

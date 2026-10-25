@@ -284,6 +284,8 @@ pub struct Flow {
     pub rx_packets: u64,
     pub offloaded: bool,
     pub age_s: u32,
+    /// The client is `src`, the end that opened it; else it is `dst`.
+    pub client_is_src: bool,
 }
 
 /// An operator action for the agent to carry out.

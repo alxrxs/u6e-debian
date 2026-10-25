@@ -227,6 +227,7 @@ fn flows() -> Flows {
         rx_packets: (1 << 36) + 3,
         offloaded: true,
         age_s: 70_009,
+        client_is_src: true,
     };
     let v4 = |last| IpAddr::V4(Ipv4Addr::new(192, 0, 2, last));
     let v6 = |last| IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, last));

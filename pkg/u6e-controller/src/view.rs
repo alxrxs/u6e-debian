@@ -69,7 +69,8 @@ pub fn flows_of(state: &State, f: &Flows, at: SystemTime, client: Option<[u8; 6]
     })
 }
 
-/// One connection; `src` opened it, and tx/rx are the client's.
+/// One connection; `src` opened it, the client is the end
+/// `client_is_src` says, and tx/rx are the client's.
 fn flow(f: &Flow) -> Value {
     json!({
         "proto": f.proto,
@@ -83,6 +84,7 @@ fn flow(f: &Flow) -> Value {
         "rx_packets": f.rx_packets,
         "offloaded": f.offloaded,
         "age": f.age_s,
+        "client_is_src": f.client_is_src,
     })
 }
 

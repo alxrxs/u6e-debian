@@ -8,7 +8,7 @@
 //! that show the address look it up again, and the old name is shown until
 //! the answer comes.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::CStr;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -189,91 +189,18 @@ impl Lookups {
     }
 }
 
-/// Each client's addresses, as the flows of every client of one AP show
-/// them, the ones in most flows first.
-///
-/// A flow has the client at one end without saying which. The client is the
-/// end its flows share, so addresses are taken greedily by the flows they
-/// account for, the opening end winning a tie (a client opens most of its
-/// connections). An address two clients claim (a flow between them) stays
-/// with the one it accounts for more flows of, and the other is worked out
-/// again without it; one still claimed twice is nobody's, as no name beats
-/// a wrong one.
-pub fn addresses(clients: &[([u8; 6], &[Flow])]) -> BTreeMap<[u8; 6], Vec<IpAddr>> {
-    let first: Vec<_> = clients
-        .iter()
-        .map(|(_, flows)| cover(flows, &BTreeSet::new()))
-        .collect();
-    // Per address: the most flows it accounts for, and whose they are.
-    let mut best: BTreeMap<IpAddr, (usize, Option<[u8; 6]>)> = BTreeMap::new();
-    for ((mac, _), addrs) in clients.iter().zip(&first) {
-        for &(ip, n) in addrs {
-            let b = best.entry(ip).or_insert((0, None));
-            if n > b.0 {
-                *b = (n, Some(*mac));
-            } else if n == b.0 {
-                b.1 = None;
-            }
-        }
+/// A client's own addresses as its flows show them (the end each flow says
+/// is the client's), the one in most flows first.
+pub fn addresses(flows: &[Flow]) -> Vec<IpAddr> {
+    let mut seen: BTreeMap<IpAddr, usize> = BTreeMap::new();
+    for f in flows {
+        let own = if f.client_is_src { f.src } else { f.dst };
+        *seen.entry(own).or_default() += 1;
     }
-    let lists: Vec<Vec<IpAddr>> = clients
-        .iter()
-        .zip(first)
-        .map(|((mac, flows), addrs)| {
-            let lost: BTreeSet<IpAddr> = addrs
-                .iter()
-                .map(|(ip, _)| *ip)
-                .filter(|ip| best[ip].1 != Some(*mac))
-                .collect();
-            let addrs = if lost.is_empty() {
-                addrs
-            } else {
-                cover(flows, &lost)
-            };
-            addrs.into_iter().map(|(ip, _)| ip).collect()
-        })
-        .collect();
-    let mut claims: BTreeMap<IpAddr, usize> = BTreeMap::new();
-    for ip in lists.iter().flatten() {
-        *claims.entry(*ip).or_default() += 1;
-    }
-    clients
-        .iter()
-        .zip(lists)
-        .map(|((mac, _), mut addrs)| {
-            addrs.retain(|ip| claims[ip] == 1);
-            (*mac, addrs)
-        })
-        .collect()
-}
-
-/// The addresses, none of `not`, that account for every flow, each with the
-/// number of flows it was taken for.
-fn cover(flows: &[Flow], not: &BTreeSet<IpAddr>) -> Vec<(IpAddr, usize)> {
-    let mut left: Vec<&Flow> = flows.iter().collect();
-    let mut out = Vec::new();
-    loop {
-        // Per address: the flows it is in, and those it opened.
-        let mut score: BTreeMap<IpAddr, (usize, usize)> = BTreeMap::new();
-        for f in &left {
-            if !not.contains(&f.src) {
-                let s = score.entry(f.src).or_default();
-                *s = (s.0 + 1, s.1 + 1);
-            }
-            if f.dst != f.src && !not.contains(&f.dst) {
-                score.entry(f.dst).or_default().0 += 1;
-            }
-        }
-        // Ties beyond that go to the lowest address, so the answer is stable.
-        let Some((ip, (n, _))) = score
-            .into_iter()
-            .max_by(|(a, x), (b, y)| x.cmp(y).then(b.cmp(a)))
-        else {
-            return out;
-        };
-        out.push((ip, n));
-        left.retain(|f| f.src != ip && f.dst != ip);
-    }
+    let mut by_use: Vec<_> = seen.into_iter().collect();
+    // Stable: equal counts keep the lowest address first.
+    by_use.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    by_use.into_iter().map(|(ip, _)| ip).collect()
 }
 
 #[cfg(test)]
@@ -284,7 +211,7 @@ mod tests {
         s.parse().unwrap()
     }
 
-    fn flow(src: &str, dst: &str) -> Flow {
+    fn flow(src: &str, dst: &str, client_is_src: bool) -> Flow {
         Flow {
             proto: 6,
             src: ip(src),
@@ -297,46 +224,26 @@ mod tests {
             rx_packets: 0,
             offloaded: false,
             age_s: 0,
+            client_is_src,
         }
     }
 
-    const A: [u8; 6] = [2, 0, 0, 0, 0, 1];
-    const B: [u8; 6] = [2, 0, 0, 0, 0, 2];
-
     #[test]
-    fn a_clients_addresses_are_the_ends_its_flows_share() {
+    fn a_clients_addresses_are_its_own_ends() {
         let flows = [
-            flow("192.0.2.10", "198.51.100.1"),
-            flow("192.0.2.10", "198.51.100.2"),
-            flow("2001:db8::10", "2001:db8:1::1"),
-            // Opened from outside: the shared end is still the client's.
-            flow("198.51.100.3", "192.0.2.10"),
+            flow("192.0.2.10", "198.51.100.1", true),
+            flow("2001:db8::10", "2001:db8:1::1", true),
+            flow("192.0.2.10", "198.51.100.2", true),
+            // Opened from outside: the client is the far end, never the opener.
+            flow("198.51.100.3", "2001:db8::20", false),
+            flow("198.51.100.3", "2001:db8::20", false),
+            flow("198.51.100.3", "2001:db8::20", false),
         ];
-        let got = addresses(&[(A, &flows[..])]);
-        assert_eq!(got[&A], [ip("192.0.2.10"), ip("2001:db8::10")]);
-        // One flow: the end that opened it.
-        let one = [flow("192.0.2.11", "198.51.100.1")];
-        assert_eq!(addresses(&[(A, &one[..])])[&A], [ip("192.0.2.11")]);
-        assert_eq!(addresses(&[(A, &[][..])])[&A], Vec::<IpAddr>::new());
-    }
-
-    #[test]
-    fn an_address_two_clients_claim_stays_with_the_one_it_explains_more_of() {
-        // A opens three connections, one of them to B; B's only flow is that
-        // one, which B did not open.
-        let a = [
-            flow("192.0.2.10", "198.51.100.1"),
-            flow("192.0.2.10", "198.51.100.2"),
-            flow("192.0.2.10", "192.0.2.20"),
-        ];
-        let b = [flow("192.0.2.10", "192.0.2.20")];
-        let got = addresses(&[(A, &a[..]), (B, &b[..])]);
-        assert_eq!(got[&A], [ip("192.0.2.10")]);
-        assert_eq!(got[&B], [ip("192.0.2.20")]);
-        // A flow between them is all either has: which end is whose cannot
-        // be told, so neither is named.
-        let got = addresses(&[(A, &b[..]), (B, &b[..])]);
-        assert_eq!((got[&A].len(), got[&B].len()), (0, 0));
+        assert_eq!(
+            addresses(&flows),
+            [ip("2001:db8::20"), ip("192.0.2.10"), ip("2001:db8::10")]
+        );
+        assert_eq!(addresses(&[]), Vec::<IpAddr>::new());
     }
 
     #[test]
