@@ -940,6 +940,13 @@ mod tests {
                    neighbor=02:00:00:00:00:0a,0x00005cff,128,149,14,0301ff \
                    pref=1 abridged=1 valid_int=100";
         assert_eq!(r.requests(), [req]);
+        // The DETACH gets no answer, so the steer does not wait for hostapd
+        // to take it: neither may the test.
+        let start = Instant::now();
+        let detached = || r.all_requests().iter().any(|q| q == "wlan5-1 DETACH");
+        while !detached() && start.elapsed() < Duration::from_secs(2) {
+            thread::sleep(Duration::from_millis(5));
+        }
         let acting: Vec<String> = r
             .all_requests()
             .into_iter()
