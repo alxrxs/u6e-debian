@@ -392,7 +392,8 @@ static int __init u6e_pcc_init(void)
 {
 	int ret;
 
-	u6e_pcc_dir = debugfs_create_dir(KBUILD_MODNAME, NULL);
+	/* KBUILD_MODNAME is u6e_pcc; the files are documented as u6e-pcc. */
+	u6e_pcc_dir = debugfs_create_dir("u6e-pcc", NULL);
 	if (IS_ERR(u6e_pcc_dir))
 		return PTR_ERR(u6e_pcc_dir);
 	debugfs_create_file("target", 0600, u6e_pcc_dir, NULL, &u6e_pcc_target_fops);
