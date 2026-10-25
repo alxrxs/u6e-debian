@@ -2,7 +2,8 @@
 //! entries (of the radios that are up) from hostapd, serve them to the other
 //! APs, read theirs, and make each BSS's neighbor list carry the other APs'
 //! BSSs of its SSID, changing hostapd only where something differs. An AP that
-//! stops answering drops out within a round.
+//! stops answering drops out within a round. The BSSs of a round, this AP's
+//! serving ones and the other APs', are the targets a client may be steered to.
 
 pub const ROUND_SECS: u64 = 10;
 
@@ -65,6 +66,50 @@ fn peer_entry(line: &str) -> Option<Entry> {
         bssid: b.into(),
         ssid: s.into(),
         nr: n.into(),
+    })
+}
+
+/// The fixed fields of a neighbor report element (802.11-2024 9.4.2.35),
+/// which name a BSS in a BSS Transition Management Request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Element {
+    pub bssid: [u8; 6],
+    pub bssid_info: u32,
+    pub op_class: u8,
+    pub channel: u8,
+    pub phy_type: u8,
+}
+
+impl Element {
+    /// The element body as SHOW_NEIGHBOR prints it after `nr=`: BSSID, BSSID
+    /// Information (little-endian), Operating Class, Channel Number, PHY Type,
+    /// then optional subelements.
+    pub fn parse(hex: &str) -> Option<Element> {
+        let b: [u8; 13] = mac::unhex(hex.get(..26)?)?;
+        Some(Element {
+            bssid: b[..6].try_into().ok()?,
+            bssid_info: u32::from_le_bytes(b[6..10].try_into().ok()?),
+            op_class: b[10],
+            channel: b[11],
+            phy_type: b[12],
+        })
+    }
+}
+
+/// A BSS a client may be steered to: its SSID in hex, as the reports carry
+/// it, and its element.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Target {
+    pub ssid: String,
+    pub nr: Element,
+}
+
+/// The target of an entry whose element names the entry's own BSSID.
+fn target(e: &Entry) -> Option<Target> {
+    let nr = Element::parse(&e.nr)?;
+    (mac::parse(&e.bssid) == Some(nr.bssid)).then(|| Target {
+        ssid: e.ssid.clone(),
+        nr,
     })
 }
 
@@ -151,8 +196,14 @@ fn fetch(peer: &SocketAddr) -> Vec<Entry> {
     data.lines().filter_map(peer_entry).collect()
 }
 
-/// One round; returns each BSS's number of stations.
-pub fn round(h: &mut Hostapd, own: &Mutex<String>, peers: &[SocketAddr]) -> Vec<(String, u32)> {
+/// One round; returns each BSS's number of stations, and leaves this AP's
+/// serving entries in `own` and the round's steering targets in `targets`.
+pub fn round(
+    h: &mut Hostapd,
+    own: &Mutex<String>,
+    targets: &Mutex<Vec<Target>>,
+    peers: &[SocketAddr],
+) -> Vec<(String, u32)> {
     let ifaces: Vec<String> = fs::read_dir(HOSTAPD)
         .into_iter()
         .flatten()
@@ -161,7 +212,7 @@ pub fn round(h: &mut Hostapd, own: &Mutex<String>, peers: &[SocketAddr]) -> Vec<
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
     let (mut lists, mut mine, mut up) = (Vec::new(), HashSet::new(), String::new());
-    let mut stations = Vec::new();
+    let (mut stations, mut found) = (Vec::new(), Vec::new());
     for iface in ifaces {
         let list = h.request(&iface, "SHOW_NEIGHBOR");
         let status = h.request(&iface, "STATUS");
@@ -171,6 +222,7 @@ pub fn round(h: &mut Hostapd, own: &Mutex<String>, peers: &[SocketAddr]) -> Vec<
         for e in list.lines().filter_map(own_entry) {
             if serving {
                 up += &format!("{} {} {}\n", e.bssid, e.ssid, e.nr);
+                found.extend(target(&e));
             }
             mine.insert(e.bssid);
             ssid.get_or_insert(e.ssid);
@@ -180,6 +232,8 @@ pub fn round(h: &mut Hostapd, own: &Mutex<String>, peers: &[SocketAddr]) -> Vec<
     *own.lock().unwrap() = up;
 
     let theirs: Vec<Entry> = peers.iter().flat_map(fetch).collect();
+    found.extend(theirs.iter().filter_map(target));
+    *targets.lock().unwrap() = found;
     for (iface, list, ssid) in lists {
         if let Some(ssid) = ssid {
             for cmd in changes(&list, &ssid, &mine, &theirs) {
@@ -263,6 +317,29 @@ mod tests {
         );
         assert!(own_entry("bb:bb:bb:bb:bb:01 ssid=4775657374 nr=bb01").is_none());
         assert!(peer_entry("bb:bb:bb:bb:bb:01 4775657374 bb01").is_some());
+    }
+
+    /// An element as hostapd builds it (an AP's SHOW_NEIGHBOR, on a
+    /// documentation BSSID): the fixed fields, BSSID Information little-endian.
+    #[test]
+    fn reads_the_fixed_fields_of_an_element() {
+        const NR: &str = "02000000000aff5c000080950e0603029b00";
+        let e = own_entry(&format!("02:00:00:00:00:0a ssid=73736964 nr={NR} stat")).unwrap();
+        let nr = Element {
+            bssid: [0x02, 0, 0, 0, 0, 0x0a],
+            bssid_info: 0x5cff,
+            op_class: 128,
+            channel: 149,
+            phy_type: 14,
+        };
+        let ssid = "73736964".to_owned();
+        assert_eq!(target(&e), Some(Target { ssid, nr }));
+        // One naming a BSS other than its entry's, and one cut short.
+        assert_eq!(target(&peer("02:00:00:00:00:0b", "73736964", NR)), None);
+        assert_eq!(
+            target(&peer("02:00:00:00:00:0a", "73736964", &NR[..24])),
+            None
+        );
     }
 
     #[test]

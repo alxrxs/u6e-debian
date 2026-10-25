@@ -10,11 +10,13 @@
 //!   u6e-agent --print-flows [--full]
 //!
 //! With the three controller options it also streams telemetry to the
-//! controller (see `link`). `--print-flows` prints the flows the link would
-//! send now, and what reading them cost.
+//! controller and carries out its commands (see `link` and `command`).
+//! `--print-flows` prints the flows the link would send now, and what
+//! reading them cost.
 
 mod clientsock;
 mod collect;
+mod command;
 mod ecm;
 mod events;
 mod kmsg;
@@ -100,8 +102,14 @@ fn args() -> Option<Args> {
 
 /// Starts the telemetry link and the events thread that feeds it. The
 /// agent's other duties do not depend on either, so a failure here is
-/// logged and they carry on.
-fn start_link(l: LinkArgs, collector: &Arc<Mutex<collect::Collector>>) {
+/// logged and they carry on. Commands steer to `targets` and hold their
+/// blocks in `blocks`.
+fn start_link(
+    l: LinkArgs,
+    collector: &Arc<Mutex<collect::Collector>>,
+    targets: &Arc<Mutex<Vec<neighbors::Target>>>,
+    blocks: &Arc<command::Blocks>,
+) {
     let identity = fs::read_to_string(&l.key)
         .map_err(|e| e.to_string())
         .and_then(|pem| Identity::from_pem(&pem).map_err(|e| e.to_string()));
@@ -109,6 +117,21 @@ fn start_link(l: LinkArgs, collector: &Arc<Mutex<collect::Collector>>) {
         Ok(i) => i,
         Err(e) => {
             eprintln!("u6e-agent: {}: {e}; no link to the controller", l.key);
+            return;
+        }
+    };
+    let commands = command::Commands::open(
+        &clientsock::run_dir(),
+        Path::new(neighbors::HOSTAPD),
+        Arc::clone(targets),
+        Arc::clone(blocks),
+    );
+    let mut commands = match commands {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "u6e-agent: hostapd control socket for commands: {e}; no link to the controller"
+            );
             return;
         }
     };
@@ -128,6 +151,7 @@ fn start_link(l: LinkArgs, collector: &Arc<Mutex<collect::Collector>>) {
             cfg,
             move |seq| lock(&collector).snapshot(seq),
             move |seq, stations, full| lock(&flows).flows(seq, stations, full),
+            move |c, last| commands.run(c, last),
             rx,
         )
     });
@@ -219,13 +243,15 @@ fn main() {
         .collect();
 
     let own = Arc::new(Mutex::new(String::new()));
+    let targets = Arc::new(Mutex::new(Vec::new()));
+    let blocks = Arc::new(command::Blocks::default());
     let served = Arc::clone(&own);
     let listen = SocketAddr::new(a.listen, a.port);
     thread::spawn(move || neighbors::serve(listen, served));
     let (gateway, arm) = (a.gateway, a.arm);
     thread::spawn(move || netcheck::run(gateway, arm));
     if let Some(l) = a.link {
-        start_link(l, &collector);
+        start_link(l, &collector, &targets, &blocks);
     }
 
     let stations = Arc::new(Mutex::new(Vec::new()));
@@ -236,8 +262,9 @@ fn main() {
         })
     });
     loop {
-        let counts = neighbors::round(&mut h, &own, &peers);
+        let counts = neighbors::round(&mut h, &own, &targets, &peers);
         *lock(&stations) = counts;
+        command::reassert(&mut h, &blocks, Path::new(neighbors::HOSTAPD));
         thread::sleep(Duration::from_secs(neighbors::ROUND_SECS));
     }
 }

@@ -5,10 +5,11 @@
 //! full key frame now and then), the events as they happen, and its clients'
 //! connections every minute, or at the cadence the controller sets. The
 //! controller sets the tick and that cadence, asks for key frames and flows,
-//! and pings; a silent or broken connection is dropped and dialed again. The
-//! wait before a redial doubles from 1 s to 30 s until a session is useful
-//! (the controller said something in it), so a controller that takes each
-//! session and drops it is not redialed at once.
+//! pings, and sends commands, each carried out against the snapshot sent last
+//! and answered in turn; a silent or broken connection is dropped and dialed
+//! again. The wait before a redial doubles from 1 s to 30 s until a session
+//! is useful (the controller said something in it), so a controller that
+//! takes each session and drops it is not redialed at once.
 //!
 //! One thread owns the connection and waits with `poll` for the socket, an
 //! event or the next tick, so an event leaves at once without a polling loop.
@@ -31,7 +32,7 @@ use std::{fs, mem, thread};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection};
 use u6e_proto::frame::{decode_frame, frame_body, write_frame};
-use u6e_proto::msg::{AgentMsg, CommandResult, CtlMsg, Event, Flows, Hello, Snapshot};
+use u6e_proto::msg::{AgentMsg, Command, CommandResult, CtlMsg, Event, Flows, Hello, Snapshot};
 use u6e_proto::tls::{self, Identity};
 use u6e_proto::{PROTOCOL, delta, version};
 
@@ -96,17 +97,23 @@ pub trait FlowSource: FnMut(u64, &[[u8; 6]], bool) -> Option<Flows> {}
 
 impl<F: FnMut(u64, &[[u8; 6]], bool) -> Option<Flows>> FlowSource for F {}
 
+/// What carries out a command: called with it and the snapshot sent last.
+pub trait CommandRunner: FnMut(&Command, Option<&Snapshot>) -> CommandResult {}
+
+impl<F: FnMut(&Command, Option<&Snapshot>) -> CommandResult> CommandRunner for F {}
+
 /// Runs the link for the life of the process. `snapshot` is called with the
-/// sequence number of each snapshot, and `flows` for each flows message;
-/// both only while connected.
+/// sequence number of each snapshot, `flows` for each flows message and
+/// `command` for each command; all only while connected.
 pub fn run(
     cfg: Config,
     snapshot: impl FnMut(u64) -> Snapshot,
     flows: impl FlowSource,
+    command: impl CommandRunner,
     events: Receiver<Event>,
 ) -> ! {
     let events = Arc::new(Mutex::new(Some(events)));
-    run_with(cfg, snapshot, flows, || Ring::relay(&events))
+    run_with(cfg, snapshot, flows, command, || Ring::relay(&events))
 }
 
 /// The link. `relay` starts the ring the events go through; it is tried again
@@ -116,6 +123,7 @@ fn run_with(
     cfg: Config,
     mut snapshot: impl FnMut(u64) -> Snapshot,
     mut flows: impl FlowSource,
+    mut command: impl CommandRunner,
     mut relay: impl FnMut() -> io::Result<Arc<Ring>>,
 ) -> ! {
     let client = tls::client_config(&cfg.identity, cfg.controller_key);
@@ -137,7 +145,13 @@ fn run_with(
         // A session the controller said nothing in counts as a failed dial.
         let failure = match connect(&cfg.controller, &client) {
             Ok(mut s) => {
-                let Err(e) = s.serve(&cfg, ring.as_deref(), &mut snapshot, &mut flows);
+                let Err(e) = s.serve(
+                    &cfg,
+                    ring.as_deref(),
+                    &mut snapshot,
+                    &mut flows,
+                    &mut command,
+                );
                 if s.heard {
                     eprintln!("u6e-agent: link to {} down: {e}", cfg.controller);
                     backoff = *cfg.backoff.start();
@@ -355,6 +369,7 @@ impl Session {
         ring: Option<&Ring>,
         snapshot: &mut impl FnMut(u64) -> Snapshot,
         flows: &mut impl FlowSource,
+        command: &mut impl CommandRunner,
     ) -> io::Result<Infallible> {
         let mut out = Vec::new();
         write_frame(&mut out, &AgentMsg::Hello(cfg.hello.clone()))?;
@@ -381,9 +396,9 @@ impl Session {
                 out.clear();
             }
             // On the first pass, what came with the version frame.
-            self.process()?;
+            self.process(command)?;
             if self.wait(ring, cfg.silence) {
-                self.receive()?;
+                self.receive(command)?;
             }
             if self.heard && !up {
                 up = true;
@@ -483,10 +498,10 @@ impl Session {
 
     /// Takes in what the readable socket holds and acts on every whole frame
     /// received so far, those that came with the controller's close too.
-    fn receive(&mut self) -> io::Result<()> {
+    fn receive(&mut self, command: &mut impl CommandRunner) -> io::Result<()> {
         self.read_records()?;
         let closed = self.take_plaintext()?;
-        self.process()?;
+        self.process(command)?;
         if closed {
             return Err(ErrorKind::UnexpectedEof.into());
         }
@@ -514,19 +529,19 @@ impl Session {
     }
 
     /// Acts on every whole frame in `inbuf`.
-    fn process(&mut self) -> io::Result<()> {
+    fn process(&mut self, command: &mut impl CommandRunner) -> io::Result<()> {
         let mut used = 0;
         while let Some((msg, n)) = decode_frame::<CtlMsg>(&self.inbuf[used..])? {
             used += n;
             self.last_rx = Instant::now();
             self.heard = true;
-            self.handle(msg)?;
+            self.handle(msg, command)?;
         }
         self.inbuf.drain(..used);
         Ok(())
     }
 
-    fn handle(&mut self, msg: CtlMsg) -> io::Result<()> {
+    fn handle(&mut self, msg: CtlMsg, command: &mut impl CommandRunner) -> io::Result<()> {
         match msg {
             CtlMsg::SetTick { secs } => {
                 self.tick = clamp_tick(secs);
@@ -541,14 +556,8 @@ impl Session {
                 write_frame(&mut out, &AgentMsg::Pong(n))?;
                 self.send(&out)?;
             }
-            // Every command is answered, so the controller never waits out
-            // one this agent does not carry out.
             CtlMsg::Command(c) => {
-                let result = CommandResult {
-                    id: c.id,
-                    ok: false,
-                    detail: "not implemented".into(),
-                };
+                let result = command(&c, self.prev.as_ref());
                 let mut out = Vec::new();
                 write_frame(&mut out, &AgentMsg::Result(result))?;
                 self.send(&out)?;
@@ -675,6 +684,16 @@ mod tests {
             inactive_ms: 0,
             connected_s: 0,
             vlan: 0,
+        }
+    }
+
+    /// The tests' commands: each answered with the seq of the snapshot it
+    /// was given.
+    fn answer(c: &Command, last: Option<&Snapshot>) -> CommandResult {
+        CommandResult {
+            id: c.id,
+            ok: true,
+            detail: format!("after {:?}", last.map(|s| s.seq)),
         }
     }
 
@@ -946,7 +965,7 @@ mod tests {
                     let _ = tick_tx.send((seq, Instant::now()));
                     snapshot(seq)
                 };
-                run_with(cfg, snap, flows, relay)
+                run_with(cfg, snap, flows, answer, relay)
             });
             Agent {
                 events,
@@ -1132,10 +1151,11 @@ mod tests {
         assert!(sent.elapsed() < Duration::from_secs(3));
     }
 
-    /// A command is refused with its id, and on an AP without ECM the flow
-    /// requests are taken without an answer or an end to the session.
+    /// A command is carried out against the snapshot sent last and answered
+    /// in turn; on an AP without ECM the flow requests are taken without an
+    /// answer or an end to the session.
     #[test]
-    fn a_command_is_answered_not_implemented() {
+    fn a_command_is_carried_out_on_the_last_snapshot() {
         let fake = Fake::new();
         let _agent = Agent::spawn(&fake, blank);
         let mut p = fake.accept();
@@ -1147,13 +1167,13 @@ mod tests {
             id: 9,
             kind: CommandKind::Kick { mac },
         }));
-        let refused = CommandResult {
-            id: 9,
-            ok: false,
-            detail: "not implemented".into(),
-        };
-        assert_eq!(p.recv(), AgentMsg::Result(refused));
         p.send(CtlMsg::Ping(2));
+        let done = CommandResult {
+            id: 9,
+            ok: true,
+            detail: "after Some(1)".into(),
+        };
+        assert_eq!(p.recv(), AgentMsg::Result(done));
         assert_eq!(p.recv(), AgentMsg::Pong(2));
     }
 
