@@ -1,5 +1,6 @@
 //! A minimal nl80211 client: generic netlink over one socket, enough to dump
-//! the interfaces, the stations of an interface and the survey of a radio,
+//! the interfaces, the stations of an interface, the survey of a radio, a
+//! radio's channels and capabilities and the regulatory rules it is under,
 //! and a second socket that notices when the interfaces change. Dumps come
 //! back as the kernel's raw bytes and the `parse_*` functions are pure over
 //! them, so recorded replies test the parsing without an AP.
@@ -8,7 +9,9 @@ use std::io;
 use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-use u6e_proto::msg::{RateMode, Station};
+use u6e_proto::msg::{Band, RateMode, Station};
+
+use crate::regdomain::{BandCaps, Channel, RegRule};
 
 const NLM_F_REQUEST: u16 = 1;
 const NLM_F_DUMP: u16 = 0x300;
@@ -29,6 +32,7 @@ const CTRL_ATTR_MCAST_GRP_ID: u16 = 2;
 /// interfaces, APs starting and stopping, and channel switches.
 const WATCHED_GROUPS: [&str; 2] = ["config", "mlme"];
 
+const CMD_GET_WIPHY: u8 = 1;
 const CMD_NEW_WIPHY: u8 = 3;
 const CMD_DEL_WIPHY: u8 = 4;
 const CMD_GET_INTERFACE: u8 = 5;
@@ -38,6 +42,7 @@ const CMD_DEL_INTERFACE: u8 = 8;
 const CMD_START_AP: u8 = 15;
 const CMD_STOP_AP: u8 = 16;
 const CMD_GET_STATION: u8 = 17;
+const CMD_GET_REG: u8 = 31;
 #[cfg(test)]
 const CMD_NEW_STATION: u8 = 19;
 #[cfg(test)]
@@ -51,11 +56,53 @@ const ATTR_IFNAME: u16 = 4;
 const ATTR_IFTYPE: u16 = 5;
 const ATTR_MAC: u16 = 6;
 const ATTR_STA_INFO: u16 = 21;
+const ATTR_WIPHY_BANDS: u16 = 22;
+const ATTR_REG_RULES: u16 = 34;
 const ATTR_WIPHY_FREQ: u16 = 38;
 const ATTR_SSID: u16 = 52;
 const ATTR_SURVEY_INFO: u16 = 84;
 const ATTR_WIPHY_TX_POWER_LEVEL: u16 = 98;
 const ATTR_CHANNEL_WIDTH: u16 = 159;
+const ATTR_CENTER_FREQ1: u16 = 160;
+const ATTR_SPLIT_WIPHY_DUMP: u16 = 174;
+
+/// nl80211's numbers of the bands the radios use.
+const BAND_2GHZ: u16 = 0;
+const BAND_5GHZ: u16 = 1;
+const BAND_6GHZ: u16 = 3;
+const BAND_ATTR_FREQS: u16 = 1;
+const BAND_ATTR_HT_CAPA: u16 = 4;
+const BAND_ATTR_VHT_CAPA: u16 = 8;
+const BAND_ATTR_IFTYPE_DATA: u16 = 9;
+const BAND_IFTYPE_ATTR_IFTYPES: u16 = 1;
+const BAND_IFTYPE_ATTR_HE_CAP_PHY: u16 = 3;
+/// HT capabilities: 40 MHz supported.
+const HT_CAP_40: u16 = 1 << 1;
+/// VHT capabilities: the Supported Channel Width Set (160 MHz when set).
+const VHT_CAP_WIDTHS: u32 = 3 << 2;
+/// HE PHY capabilities, first byte (802.11ax-2021 9.4.2.248.3): 40 MHz in
+/// 2.4 GHz; 40 and 80 MHz in 5 and 6 GHz; 160 MHz in 5 and 6 GHz.
+const HE_PHY_40_24: u8 = 1 << 1;
+const HE_PHY_80: u8 = 1 << 2;
+const HE_PHY_160: u8 = 1 << 3;
+
+const FREQ_ATTR_FREQ: u16 = 1;
+const FREQ_ATTR_DISABLED: u16 = 2;
+const FREQ_ATTR_NO_IR: u16 = 3;
+const FREQ_ATTR_RADAR: u16 = 5;
+const FREQ_ATTR_MAX_TX_POWER: u16 = 6;
+const FREQ_ATTR_DFS_STATE: u16 = 7;
+const FREQ_ATTR_NO_HT40_MINUS: u16 = 9;
+const FREQ_ATTR_NO_HT40_PLUS: u16 = 10;
+const FREQ_ATTR_NO_80MHZ: u16 = 11;
+const FREQ_ATTR_NO_160MHZ: u16 = 12;
+const DFS_AVAILABLE: u32 = 2;
+
+const REG_RULE_FLAGS: u16 = 1;
+const REG_FREQ_RANGE_START: u16 = 2;
+const REG_FREQ_RANGE_END: u16 = 3;
+const REG_FREQ_RANGE_MAX_BW: u16 = 4;
+const REG_POWER_RULE_MAX_EIRP: u16 = 6;
 
 pub const IFTYPE_AP: u32 = 3;
 pub const IFTYPE_AP_VLAN: u32 = 4;
@@ -104,6 +151,8 @@ pub struct Iface {
     pub ssid: String,
     pub freq_mhz: u32,
     pub width_mhz: u16,
+    /// The centre of the whole width.
+    pub center_mhz: u32,
     pub txpower_mbm: i32,
 }
 
@@ -209,6 +258,23 @@ impl Nl80211 {
     /// The raw replies to `GET_SURVEY` of the wiphy of an interface.
     pub fn dump_survey(&mut self, ifindex: u32) -> io::Result<&[u8]> {
         self.dump(CMD_GET_SURVEY, &ifindex_attr(ifindex))
+    }
+
+    /// The raw replies to a split `GET_WIPHY` of one wiphy: its bands, each
+    /// channel in a message of its own.
+    pub fn dump_wiphy(&mut self, wiphy: u32) -> io::Result<&[u8]> {
+        let mut a = Vec::new();
+        put_attr(&mut a, ATTR_WIPHY, &wiphy.to_ne_bytes());
+        put_attr(&mut a, ATTR_SPLIT_WIPHY_DUMP, &[]);
+        self.dump(CMD_GET_WIPHY, &a)
+    }
+
+    /// The raw reply to `GET_REG` for a wiphy: its own regulatory domain, or
+    /// the kernel's when it has none.
+    pub fn get_reg(&mut self, wiphy: u32) -> io::Result<&[u8]> {
+        let mut a = Vec::new();
+        put_attr(&mut a, ATTR_WIPHY, &wiphy.to_ne_bytes());
+        self.transact(self.family, 0, CMD_GET_REG, &a)
     }
 
     pub fn interfaces(&mut self) -> io::Result<Vec<Iface>> {
@@ -500,6 +566,7 @@ pub fn parse_interfaces(raw: &[u8]) -> Vec<Iface> {
                 ssid: String::new(),
                 freq_mhz: 0,
                 width_mhz: 0,
+                center_mhz: 0,
                 txpower_mbm: 0,
             };
             for (ty, d) in a {
@@ -512,6 +579,7 @@ pub fn parse_interfaces(raw: &[u8]) -> Vec<Iface> {
                     ATTR_SSID => i.ssid = String::from_utf8_lossy(d).into_owned(),
                     ATTR_WIPHY_FREQ => i.freq_mhz = u32_of(d),
                     ATTR_CHANNEL_WIDTH => i.width_mhz = width_mhz(u32_of(d)),
+                    ATTR_CENTER_FREQ1 => i.center_mhz = u32_of(d),
                     ATTR_WIPHY_TX_POWER_LEVEL => i.txpower_mbm = i32_of(d),
                     _ => {}
                 }
@@ -653,6 +721,111 @@ pub fn parse_survey(raw: &[u8]) -> Vec<Survey> {
                 }
             }
             Some(s)
+        })
+        .collect()
+}
+
+/// A wiphy's channels and widest channel in `band`, from its split
+/// `GET_WIPHY` dump: the band's capabilities come in one message, each of its
+/// channels in another.
+pub fn parse_band(raw: &[u8], band: Band) -> BandCaps {
+    let ours = match band {
+        Band::B24 => BAND_2GHZ,
+        Band::B5 => BAND_5GHZ,
+        Band::B6 => BAND_6GHZ,
+    };
+    let (mut ht, mut vht, mut he) = (0u16, None::<u32>, 0u8);
+    let mut channels = Vec::new();
+    for rec in records(raw) {
+        for (_, bands) in rec.into_iter().filter(|(ty, _)| *ty == ATTR_WIPHY_BANDS) {
+            for (_, b) in attrs(bands).into_iter().filter(|(ty, _)| *ty == ours) {
+                for (ty, d) in attrs(b) {
+                    match ty {
+                        BAND_ATTR_FREQS => {
+                            channels.extend(attrs(d).into_iter().map(|(_, c)| channel(c)))
+                        }
+                        BAND_ATTR_HT_CAPA => ht = u16_of(d),
+                        BAND_ATTR_VHT_CAPA => vht = Some(u32_of(d)),
+                        BAND_ATTR_IFTYPE_DATA => he |= he_phy_ap(d),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    let max_width_mhz = match band {
+        Band::B24 if ht & HT_CAP_40 != 0 || he & HE_PHY_40_24 != 0 => 40,
+        Band::B24 => 20,
+        _ if he & HE_PHY_160 != 0 || vht.is_some_and(|v| v & VHT_CAP_WIDTHS != 0) => 160,
+        _ if he & HE_PHY_80 != 0 || vht.is_some() => 80,
+        Band::B5 if ht & HT_CAP_40 != 0 => 40,
+        _ => 20,
+    };
+    channels.retain(|c: &Channel| c.freq_mhz != 0);
+    BandCaps {
+        channels,
+        max_width_mhz,
+    }
+}
+
+fn channel(d: &[u8]) -> Channel {
+    let mut c = Channel::default();
+    for (ty, v) in attrs(d) {
+        match ty {
+            FREQ_ATTR_FREQ => c.freq_mhz = u32_of(v),
+            FREQ_ATTR_DISABLED => c.disabled = true,
+            FREQ_ATTR_NO_IR => c.no_ir = true,
+            FREQ_ATTR_RADAR => c.radar = true,
+            FREQ_ATTR_MAX_TX_POWER => c.max_power_mbm = u32_of(v),
+            FREQ_ATTR_DFS_STATE => c.dfs_available = u32_of(v) == DFS_AVAILABLE,
+            FREQ_ATTR_NO_HT40_MINUS => c.no_ht40_minus = true,
+            FREQ_ATTR_NO_HT40_PLUS => c.no_ht40_plus = true,
+            FREQ_ATTR_NO_80MHZ => c.no_80mhz = true,
+            FREQ_ATTR_NO_160MHZ => c.no_160mhz = true,
+            _ => {}
+        }
+    }
+    c
+}
+
+/// The first byte of the HE PHY capabilities an AP interface has, from a
+/// band's per-interface-type data; 0 when none says.
+fn he_phy_ap(d: &[u8]) -> u8 {
+    attrs(d)
+        .into_iter()
+        .filter_map(|(_, entry)| {
+            let a = attrs(entry);
+            let types = a.iter().find(|(ty, _)| *ty == BAND_IFTYPE_ATTR_IFTYPES)?;
+            let ap = attrs(types.1)
+                .iter()
+                .any(|(ty, _)| u32::from(*ty) == IFTYPE_AP);
+            let phy = a
+                .iter()
+                .find(|(ty, _)| *ty == BAND_IFTYPE_ATTR_HE_CAP_PHY)?;
+            ap.then(|| phy.1.first().copied()).flatten()
+        })
+        .fold(0, |acc, b| acc | b)
+}
+
+/// The rules of the regulatory domain in a `GET_REG` reply.
+pub fn parse_reg(raw: &[u8]) -> Vec<RegRule> {
+    records(raw)
+        .flatten()
+        .filter(|(ty, _)| *ty == ATTR_REG_RULES)
+        .flat_map(|(_, rules)| attrs(rules))
+        .map(|(_, rule)| {
+            let mut r = RegRule::default();
+            for (ty, d) in attrs(rule) {
+                match ty {
+                    REG_RULE_FLAGS => r.flags = u32_of(d),
+                    REG_FREQ_RANGE_START => r.start_khz = u32_of(d),
+                    REG_FREQ_RANGE_END => r.end_khz = u32_of(d),
+                    REG_FREQ_RANGE_MAX_BW => r.max_bw_khz = u32_of(d),
+                    REG_POWER_RULE_MAX_EIRP => r.max_eirp_mbm = u32_of(d),
+                    _ => {}
+                }
+            }
+            r
         })
         .collect()
 }
@@ -951,5 +1124,207 @@ mod tests {
         let mut bad_len = STATIONS.to_vec();
         bad_len[..4].copy_from_slice(&u32::MAX.to_ne_bytes());
         assert!(parse_stations(&bad_len).is_empty());
+        assert_eq!(
+            parse_band(&[1, 2, 3], Band::B5),
+            BandCaps {
+                channels: Vec::new(),
+                max_width_mhz: 20
+            }
+        );
+        assert!(parse_reg(&[]).is_empty());
+    }
+
+    #[test]
+    fn interfaces_say_the_centre_of_their_width() {
+        let all = parse_interfaces(INTERFACES);
+        assert_eq!(iface(&all, "wlan5").center_mhz, 5775);
+        assert_eq!(iface(&all, "wlan6").center_mhz, 6345);
+        assert_eq!(iface(&all, "wlan24").center_mhz, 2472);
+    }
+
+    fn nest(ty: u16, parts: &[Vec<u8>]) -> Vec<u8> {
+        let mut a = Vec::new();
+        put_attr(&mut a, ty, &parts.concat());
+        a
+    }
+
+    fn attr(ty: u16, data: &[u8]) -> Vec<u8> {
+        let mut a = Vec::new();
+        put_attr(&mut a, ty, data);
+        a
+    }
+
+    /// One channel's entry, at `idx` of the band's list.
+    fn freq_entry(idx: u16, mhz: u32, flags: &[u16], extra: &[Vec<u8>]) -> Vec<u8> {
+        let mut parts = vec![attr(FREQ_ATTR_FREQ, &mhz.to_ne_bytes())];
+        parts.extend(flags.iter().map(|&f| attr(f, &[])));
+        parts.extend_from_slice(extra);
+        nest(idx, &parts)
+    }
+
+    /// A message of the split dump carrying `band_attrs` of band `band`.
+    fn wiphy_msg(seq: u32, band: u16, band_attrs: &[Vec<u8>]) -> Vec<u8> {
+        let mut a = attr(ATTR_WIPHY, &1u32.to_ne_bytes());
+        a.extend(nest(ATTR_WIPHY_BANDS, &[nest(band, band_attrs)]));
+        request(28, 2, seq, CMD_NEW_WIPHY, &a)
+    }
+
+    /// A split `GET_WIPHY` dump laid out as the kernel's split dump sends it:
+    /// each band's capabilities in a message, then each of its channels in
+    /// one of its own, a 2.4 GHz band first. The 5 GHz band has HT, VHT and,
+    /// for AP interfaces, HE with 160 MHz (`he_phy`); its channels are 36,
+    /// 52 (DFS, no CAC), 100 (DFS, CAC done), 165 (20 MHz only) and 169
+    /// (disabled).
+    fn wiphy_dump(he_phy: u8) -> Vec<u8> {
+        let power = |mbm: u32| attr(FREQ_ATTR_MAX_TX_POWER, &mbm.to_ne_bytes());
+        let dfs = |state: u32| attr(FREQ_ATTR_DFS_STATE, &state.to_ne_bytes());
+        let iftype = |types: &[u16], phy: u8| {
+            let types: Vec<Vec<u8>> = types.iter().map(|&t| attr(t, &[])).collect();
+            nest(
+                0,
+                &[
+                    nest(BAND_IFTYPE_ATTR_IFTYPES, &types),
+                    attr(BAND_IFTYPE_ATTR_HE_CAP_PHY, &[phy, 0x70, 0x0c, 0x80]),
+                ],
+            )
+        };
+        let mut msgs = vec![
+            wiphy_msg(
+                1,
+                BAND_2GHZ,
+                &[attr(BAND_ATTR_HT_CAPA, &0x19efu16.to_ne_bytes())],
+            ),
+            wiphy_msg(
+                1,
+                BAND_2GHZ,
+                &[nest(
+                    BAND_ATTR_FREQS,
+                    &[freq_entry(0, 2412, &[], &[power(2000)])],
+                )],
+            ),
+            wiphy_msg(
+                1,
+                BAND_5GHZ,
+                &[
+                    attr(BAND_ATTR_HT_CAPA, &0x19efu16.to_ne_bytes()),
+                    attr(BAND_ATTR_VHT_CAPA, &0x339b_7930u32.to_ne_bytes()),
+                    nest(
+                        BAND_ATTR_IFTYPE_DATA,
+                        &[
+                            iftype(&[2], 0xff),
+                            iftype(&[u16::try_from(IFTYPE_AP).unwrap()], he_phy),
+                        ],
+                    ),
+                ],
+            ),
+        ];
+        let channels = [
+            freq_entry(0, 5180, &[], &[power(2300)]),
+            freq_entry(
+                1,
+                5260,
+                &[FREQ_ATTR_NO_IR, FREQ_ATTR_RADAR],
+                &[power(2000), dfs(0)],
+            ),
+            freq_entry(
+                2,
+                5500,
+                &[FREQ_ATTR_NO_IR, FREQ_ATTR_RADAR],
+                &[power(2700), dfs(DFS_AVAILABLE)],
+            ),
+            freq_entry(
+                3,
+                5825,
+                &[
+                    FREQ_ATTR_NO_HT40_MINUS,
+                    FREQ_ATTR_NO_HT40_PLUS,
+                    FREQ_ATTR_NO_80MHZ,
+                    FREQ_ATTR_NO_160MHZ,
+                ],
+                &[power(3000)],
+            ),
+            freq_entry(4, 5845, &[FREQ_ATTR_DISABLED], &[]),
+        ];
+        for c in channels {
+            msgs.push(wiphy_msg(1, BAND_5GHZ, &[nest(BAND_ATTR_FREQS, &[c])]));
+        }
+        msgs.push(done(1, 0));
+        msgs.concat()
+    }
+
+    #[test]
+    fn a_split_wiphy_dump_gives_one_bands_channels_and_widest_channel() {
+        let five = parse_band(&wiphy_dump(0x0c), Band::B5);
+        assert_eq!(five.max_width_mhz, 160);
+        let freqs: Vec<u32> = five.channels.iter().map(|c| c.freq_mhz).collect();
+        assert_eq!(freqs, [5180, 5260, 5500, 5825, 5845]);
+        assert_eq!(
+            five.channels[1],
+            Channel {
+                freq_mhz: 5260,
+                no_ir: true,
+                radar: true,
+                max_power_mbm: 2000,
+                ..Channel::default()
+            }
+        );
+        assert!(five.channels[2].dfs_available);
+        let c165 = &five.channels[3];
+        assert!(c165.no_ht40_minus && c165.no_ht40_plus && c165.no_80mhz && c165.no_160mhz);
+        assert!(five.channels[4].disabled);
+        // The non-AP interface type's 0xff says nothing of what an AP gets.
+        assert_eq!(parse_band(&wiphy_dump(0x04), Band::B5).max_width_mhz, 80);
+        let two = parse_band(&wiphy_dump(0x0c), Band::B24);
+        assert_eq!((two.channels.len(), two.max_width_mhz), (1, 40));
+        assert!(parse_band(&wiphy_dump(0x0c), Band::B6).channels.is_empty());
+    }
+
+    #[test]
+    fn a_wiphy_dump_and_a_reg_reply_come_through_the_socket() {
+        let (mut nl, kernel) = fake_kernel();
+        queue(&kernel, &wiphy_dump(0x0c));
+        let caps = parse_band(nl.dump_wiphy(1).unwrap(), Band::B5);
+        assert_eq!(caps.channels.len(), 5);
+
+        let rule = |lo: u32, hi: u32, bw: u32, eirp: u32, flags: u32| {
+            nest(
+                0,
+                &[
+                    attr(REG_RULE_FLAGS, &flags.to_ne_bytes()),
+                    attr(REG_FREQ_RANGE_START, &lo.to_ne_bytes()),
+                    attr(REG_FREQ_RANGE_END, &hi.to_ne_bytes()),
+                    attr(REG_FREQ_RANGE_MAX_BW, &bw.to_ne_bytes()),
+                    attr(REG_POWER_RULE_MAX_EIRP, &eirp.to_ne_bytes()),
+                ],
+            )
+        };
+        let rules = nest(
+            ATTR_REG_RULES,
+            &[
+                rule(5_170_000, 5_250_000, 80_000, 2300, 1 << 11),
+                rule(5_490_000, 5_730_000, 160_000, 2700, 1 << 4),
+            ],
+        );
+        queue(&kernel, &request(28, 0, 2, CMD_GET_REG, &rules));
+        let reg = parse_reg(nl.get_reg(1).unwrap());
+        assert_eq!(
+            reg,
+            [
+                RegRule {
+                    start_khz: 5_170_000,
+                    end_khz: 5_250_000,
+                    max_bw_khz: 80_000,
+                    max_eirp_mbm: 2300,
+                    flags: 1 << 11,
+                },
+                RegRule {
+                    start_khz: 5_490_000,
+                    end_khz: 5_730_000,
+                    max_bw_khz: 160_000,
+                    max_eirp_mbm: 2700,
+                    flags: 1 << 4,
+                },
+            ]
+        );
     }
 }

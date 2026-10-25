@@ -442,6 +442,7 @@ mod tests {
             hostapd: t.path().join("hostapd"),
             kmsg: t.path().join("kmsg"),
             run: t.path().join("run"),
+            wifi: t.path().join("wifi"),
         };
         fs::create_dir_all(&p.hostapd).unwrap();
         fs::create_dir_all(p.sys().join("class/net/wlan6")).unwrap();

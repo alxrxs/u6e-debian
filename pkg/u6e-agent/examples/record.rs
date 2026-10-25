@@ -1,7 +1,7 @@
 //! Records what the collectors parse, as test fixtures: the raw nl80211
-//! replies (interfaces, the stations of every AP interface, the survey of
-//! every radio), each hostapd's STATUS text and a part of ECM's connection
-//! dump, into one directory.
+//! replies (interfaces, the stations of every AP interface, the survey,
+//! channels and regulatory rules of every radio), each hostapd's STATUS text
+//! and a part of ECM's connection dump, into one directory.
 //!
 //!   record <directory>
 //!
@@ -14,6 +14,8 @@
 
 #[path = "../src/nl80211.rs"]
 mod nl80211;
+#[path = "../src/regdomain.rs"]
+mod regdomain;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::unix::net::UnixDatagram;
@@ -29,6 +31,7 @@ const ECM: &str = "/dev/ecm_state";
 /// hardware does not forward.
 const ECM_CONNS: usize = 12;
 const ATTR_MAC: u16 = 6;
+const ATTR_REG_ALPHA2: u16 = 33;
 const ATTR_SSID: u16 = 52;
 const NLA_TYPE_MASK: u16 = 0x3fff;
 
@@ -91,7 +94,7 @@ impl Scrub {
         format!("ssid-{}", (b'a' + index(&mut self.ssids, s) as u8) as char).into_bytes()
     }
 
-    /// A dump with the MAC and SSID of each record replaced, every other
+    /// A dump with the MAC, SSID and country of each record replaced, every other
     /// byte as the kernel sent it.
     fn dump(&mut self, mut raw: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
@@ -112,6 +115,7 @@ impl Scrub {
                 let data = match ty & NLA_TYPE_MASK {
                     ATTR_MAC => self.mac(data).to_vec(),
                     ATTR_SSID => self.ssid(data),
+                    ATTR_REG_ALPHA2 => b"00\0".to_vec(),
                     _ => data.to_vec(),
                 };
                 body.extend_from_slice(&((4 + data.len()) as u16).to_ne_bytes());
@@ -225,6 +229,10 @@ fn run(dir: &Path) -> std::io::Result<()> {
                 radios.push(i.wiphy);
                 let survey = nl.dump_survey(i.ifindex)?;
                 fs::write(dir.join(format!("survey-wiphy{}.bin", i.wiphy)), survey)?;
+                let wiphy = scrub.dump(nl.dump_wiphy(i.wiphy)?);
+                fs::write(dir.join(format!("wiphy{}.bin", i.wiphy)), wiphy)?;
+                let reg = scrub.dump(nl.get_reg(i.wiphy)?);
+                fs::write(dir.join(format!("reg-wiphy{}.bin", i.wiphy)), reg)?;
             }
         }
     }

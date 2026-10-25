@@ -7,8 +7,10 @@
 //! for a large connection table. The
 //! controller sets the tick and that cadence, asks for key frames and flows,
 //! pings, and sends commands, each carried out with the snapshot sent last at
-//! hand and answered in turn, and starts and stops radios' spectrum scans, whose
-//! frames leave as they come (see `spectrum`); a silent or broken connection
+//! hand and answered in turn, starts and stops radios' spectrum scans, whose
+//! frames leave as they come (see `spectrum`), and sends configurations,
+//! applied away from the link and answered once applied, in this session or
+//! the next (see `apply`); a silent or broken connection
 //! is dropped, its scans with it, and dialed again. The wait before a redial
 //! doubles from 1 s to 30 s until a session is useful (the controller said
 //! something in it), so a controller that takes each session and drops it is
@@ -27,7 +29,7 @@ use std::convert::Infallible;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::ops::RangeInclusive;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
@@ -37,8 +39,11 @@ use std::{fs, mem, thread};
 
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection};
-use u6e_proto::frame::{decode_frame, frame_body, write_frame};
-use u6e_proto::msg::{AgentMsg, Command, CommandResult, CtlMsg, Event, Flows, Hello, Snapshot};
+use u6e_proto::frame::{decode_frame, frame_body, write_frame, zeroize};
+use u6e_proto::msg::{
+    AgentMsg, Command, CommandResult, ConfigApplied, CtlMsg, Event, Flows, Hello, SignedConfig,
+    Snapshot,
+};
 use u6e_proto::tls::{self, Identity};
 use u6e_proto::{PROTOCOL, delta, version};
 
@@ -118,18 +123,34 @@ pub trait CommandRunner: FnMut(&Command, Option<&Snapshot>) -> CommandResult {}
 
 impl<F: FnMut(&Command, Option<&Snapshot>) -> CommandResult> CommandRunner for F {}
 
+/// What applies the configurations the controller sends, away from the link:
+/// one can take the better part of a minute (a Wi-Fi restart).
+pub trait ConfigApplier {
+    /// Starts applying `config`, with the snapshot sent last; the answer at
+    /// once when there is one already (a refusal).
+    fn submit(&mut self, config: SignedConfig, last: Option<&Snapshot>) -> Option<ConfigApplied>;
+    /// A descriptor that becomes readable when an apply ends.
+    fn fd(&self) -> RawFd;
+    /// The answers of the applies that ended since the last call.
+    fn take(&mut self) -> Vec<ConfigApplied>;
+}
+
 /// Runs the link for the life of the process. `snapshot` is called with the
-/// sequence number of each snapshot, `flows` for each flows message and
-/// `command` for each command; all only while connected.
+/// sequence number of each snapshot, `flows` for each flows message,
+/// `command` for each command and `applier` for each configuration; all only
+/// while connected.
 pub fn run(
     cfg: Config,
     snapshot: impl FnMut(u64) -> Snapshot,
     flows: impl FlowSource,
     command: impl CommandRunner,
+    applier: impl ConfigApplier,
     events: Receiver<Event>,
 ) -> ! {
     let events = Arc::new(Mutex::new(Some(events)));
-    run_with(cfg, snapshot, flows, command, || Ring::relay(&events))
+    run_with(cfg, snapshot, flows, command, applier, || {
+        Ring::relay(&events)
+    })
 }
 
 /// The link. `relay` starts the ring the events go through; it is tried again
@@ -140,6 +161,7 @@ fn run_with(
     mut snapshot: impl FnMut(u64) -> Snapshot,
     mut flows: impl FlowSource,
     mut command: impl CommandRunner,
+    mut applier: impl ConfigApplier,
     mut relay: impl FnMut() -> io::Result<Arc<Ring>>,
 ) -> ! {
     let client = tls::client_config(&cfg.identity, cfg.controller_key);
@@ -167,6 +189,7 @@ fn run_with(
                     &mut snapshot,
                     &mut flows,
                     &mut command,
+                    &mut applier,
                 );
                 if s.heard {
                     eprintln!("u6e-agent: link to {} down: {e}", cfg.controller);
@@ -407,6 +430,7 @@ impl Session {
         snapshot: &mut impl FnMut(u64) -> Snapshot,
         flows: &mut impl FlowSource,
         command: &mut impl CommandRunner,
+        applier: &mut impl ConfigApplier,
     ) -> io::Result<Infallible> {
         let mut out = Vec::new();
         write_frame(&mut out, &AgentMsg::Hello(cfg.hello.clone()))?;
@@ -423,6 +447,9 @@ impl Session {
             if now >= self.flows_due {
                 self.flows_into(&mut out, now, flows)?;
             }
+            for a in applier.take() {
+                write_frame(&mut out, &AgentMsg::ConfigApplied(a))?;
+            }
             self.spectrum.read(&mut self.spectrum_out);
             if ticked || self.due - now > COALESCE {
                 for ev in ring.map(Ring::take).unwrap_or_default() {
@@ -435,9 +462,9 @@ impl Session {
                 out.clear();
             }
             // On the first pass, what came with the version frame.
-            self.process(command)?;
-            if self.wait(ring, cfg.silence) {
-                self.receive(command)?;
+            self.process(command, applier)?;
+            if self.wait(ring, applier.fd(), cfg.silence) {
+                self.receive(command, applier)?;
             }
             if self.heard && !up {
                 up = true;
@@ -502,9 +529,9 @@ impl Session {
         Ok(())
     }
 
-    /// Waits for the socket (true), an event, a spectrum scan's frame or the
-    /// next deadline (false).
-    fn wait(&self, ring: Option<&Ring>, silence: Duration) -> bool {
+    /// Waits for the socket (true), an event, a spectrum scan's frame, the
+    /// end of an apply (`applied`) or the next deadline (false).
+    fn wait(&self, ring: Option<&Ring>, applied: RawFd, silence: Duration) -> bool {
         let mut deadline = self.due.min(self.flows_due).min(self.last_rx + silence);
         if let Some(d) = self.spectrum.deadline() {
             deadline = deadline.min(d);
@@ -513,7 +540,7 @@ impl Session {
         let ms = i32::try_from(left.as_micros().div_ceil(1000)).unwrap_or(i32::MAX);
         // poll skips a negative fd: without a ring, the socket alone.
         let wake = ring.map_or(-1, |r| r.wake_rx.as_raw_fd());
-        let mut fds: Vec<libc::pollfd> = [self.sock.as_raw_fd(), wake]
+        let mut fds: Vec<libc::pollfd> = [self.sock.as_raw_fd(), wake, applied]
             .into_iter()
             .chain(self.spectrum.fds())
             .map(|fd| libc::pollfd {
@@ -554,10 +581,14 @@ impl Session {
 
     /// Takes in what the readable socket holds and acts on every whole frame
     /// received so far, those that came with the controller's close too.
-    fn receive(&mut self, command: &mut impl CommandRunner) -> io::Result<()> {
+    fn receive(
+        &mut self,
+        command: &mut impl CommandRunner,
+        applier: &mut impl ConfigApplier,
+    ) -> io::Result<()> {
         self.read_records()?;
         let closed = self.take_plaintext()?;
-        self.process(command)?;
+        self.process(command, applier)?;
         if closed {
             return Err(ErrorKind::UnexpectedEof.into());
         }
@@ -585,19 +616,28 @@ impl Session {
     }
 
     /// Acts on every whole frame in `inbuf`.
-    fn process(&mut self, command: &mut impl CommandRunner) -> io::Result<()> {
+    fn process(
+        &mut self,
+        command: &mut impl CommandRunner,
+        applier: &mut impl ConfigApplier,
+    ) -> io::Result<()> {
         let mut used = 0;
         while let Some((msg, n)) = decode_frame::<CtlMsg>(&self.inbuf[used..])? {
             used += n;
             self.last_rx = Instant::now();
             self.heard = true;
-            self.handle(msg, command)?;
+            self.handle(msg, command, applier)?;
         }
-        self.inbuf.drain(..used);
+        consume(&mut self.inbuf, used);
         Ok(())
     }
 
-    fn handle(&mut self, msg: CtlMsg, command: &mut impl CommandRunner) -> io::Result<()> {
+    fn handle(
+        &mut self,
+        msg: CtlMsg,
+        command: &mut impl CommandRunner,
+        applier: &mut impl ConfigApplier,
+    ) -> io::Result<()> {
         match msg {
             CtlMsg::SetTick { secs } => {
                 self.tick = clamp_tick(secs);
@@ -629,11 +669,28 @@ impl Session {
                 let answer = self.spectrum.stop(&radio);
                 self.send_msg(&answer)?;
             }
+            CtlMsg::ApplyConfig(config) => {
+                if let Some(answer) = applier.submit(config, self.prev.as_ref()) {
+                    self.send_msg(&AgentMsg::ConfigApplied(answer))?;
+                }
+            }
             // A newer controller's messages mean nothing to this agent.
             _ => {}
         }
         Ok(())
     }
+}
+
+/// Drops the first `used` bytes of `buf`, the frames acted on, leaving no
+/// copy in its memory of them or of the bytes moved forward over them: a
+/// configuration's frame holds its secrets.
+fn consume(buf: &mut Vec<u8>, used: usize) {
+    let len = buf.len();
+    zeroize(&mut buf[..used]);
+    buf.drain(..used);
+    buf.resize(len, 0);
+    zeroize(&mut buf[len - used..]);
+    buf.truncate(len - used);
 }
 
 /// What this AP tells the controller about itself: its host name and kernel,
@@ -674,6 +731,7 @@ mod tests {
     };
     use u6e_proto::version;
 
+    use crate::apply::Worker;
     use crate::testdir::TestDir;
 
     // A throwaway Ed25519 key made for tests (the same as in u6e-proto's tls
@@ -759,6 +817,18 @@ mod tests {
         CommandResult {
             id: c.id,
             ok: true,
+            detail: format!("after {:?}", last.map(|s| s.seq)),
+        }
+    }
+
+    /// The tests' applies: each answered after 100 ms with the seq of the
+    /// snapshot it was given.
+    fn applied(c: SignedConfig, last: Option<&Snapshot>) -> ConfigApplied {
+        thread::sleep(Duration::from_millis(100));
+        ConfigApplied {
+            sha256: c.sha256,
+            ok: true,
+            radios: Vec::new(),
             detail: format!("after {:?}", last.map(|s| s.seq)),
         }
     }
@@ -1031,7 +1101,8 @@ mod tests {
                     let _ = tick_tx.send((seq, Instant::now()));
                     snapshot(seq)
                 };
-                run_with(cfg, snap, flows, answer, relay)
+                let applier = Worker::new(applied).unwrap();
+                run_with(cfg, snap, flows, answer, applier, relay)
             });
             Agent {
                 events,
@@ -1241,6 +1312,57 @@ mod tests {
         };
         assert_eq!(p.recv(), AgentMsg::Result(done));
         assert_eq!(p.recv(), AgentMsg::Pong(2));
+    }
+
+    /// A configuration is applied away from the link, which goes on (a ping
+    /// is answered meanwhile), and its answer follows when the apply ends; a
+    /// second one while the first runs is refused at once.
+    #[test]
+    fn a_configuration_is_applied_off_the_link_and_answered_when_done() {
+        let fake = Fake::new();
+        let _agent = Agent::spawn(&fake, blank);
+        let mut p = fake.accept();
+        p.start();
+        let apply = |sha256| {
+            CtlMsg::ApplyConfig(SignedConfig {
+                ap: "ap1".into(),
+                seq: 1,
+                sha256,
+                radios: Vec::new(),
+                signature: Vec::new(),
+            })
+        };
+        p.send(apply([1; 32]));
+        p.send(apply([2; 32]));
+        p.send(CtlMsg::Ping(3));
+        let applied = |m| match m {
+            AgentMsg::ConfigApplied(c) => (c.sha256, c.ok, c.detail),
+            other => panic!("expected an answer to a configuration, got {other:?}"),
+        };
+        assert_eq!(
+            applied(p.recv()),
+            (
+                [2; 32],
+                false,
+                "refused: another configuration is being applied".into()
+            )
+        );
+        assert_eq!(p.recv(), AgentMsg::Pong(3));
+        assert_eq!(applied(p.recv()), ([1; 32], true, "after Some(1)".into()));
+    }
+
+    /// The frames acted on leave no copy behind, in the buffer's spare room
+    /// either.
+    #[test]
+    fn frames_acted_on_are_wiped() {
+        let mut buf = Vec::with_capacity(64);
+        buf.extend_from_slice(b"secret frame+next");
+        consume(&mut buf, 13);
+        assert_eq!(buf, b"next");
+        // SAFETY: the bytes were written above; reading them back as u8 is
+        // sound.
+        let spare = unsafe { std::slice::from_raw_parts(buf.as_ptr(), 17) };
+        assert_eq!(&spare[4..], [0; 13]);
     }
 
     #[test]

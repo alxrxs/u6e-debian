@@ -361,7 +361,7 @@ fn associated_for(reply: &str, mac: [u8; 6]) -> Option<u64> {
 /// A request naming `to` as the one candidate, most preferred (its BSS
 /// Transition Candidate Preference subelement, 255), every other BSS excluded
 /// (abridged). No disassociation is imminent: a client that declines stays.
-fn steer_request(mac: [u8; 6], to: &Element) -> String {
+pub fn steer_request(mac: [u8; 6], to: &Element) -> String {
     format!(
         "BSS_TM_REQ {} neighbor={},0x{:08x},{},{},{},0301ff pref=1 abridged=1 \
          valid_int={STEER_TBTT}",

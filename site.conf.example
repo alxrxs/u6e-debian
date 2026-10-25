@@ -45,6 +45,10 @@ BT_POWERED=1
 # agent_key in its block below. CONTROLLER unset: no controller link.
 CONTROLLER=controller.example.net:8443
 CONTROLLER_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+# Optional, with CONTROLLER: the deploy runner's Ed25519 public key (64 hex
+# digits, a plain value). The AP applies the live Wi-Fi configurations the
+# runner signs with it, and nothing else; unset, it applies none.
+RUNNER_KEY=fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210
 
 # Stock firmware SSH: the controller's "Device Authentication" user, and a
 # command printing its password.

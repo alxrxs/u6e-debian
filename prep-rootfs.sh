@@ -263,9 +263,12 @@ peers=$(for a in $U6E_APS; do (U6E_AP=$a; . ./site.conf; echo "${MGMT_ADDR%/*}")
 arm=; [ "${U6E_PERSIST:-0}" = 1 ] && arm=--arm
 # With CONTROLLER set, it also streams the AP's Wi-Fi state to the controller,
 # which it pins by CONTROLLER_KEY; this AP's own key (agent_key) is root's only,
-# and systemd hands the agent a copy (LoadCredential).
+# and systemd hands the agent a copy (LoadCredential). With RUNNER_KEY too, it
+# and its config helper (below) take the live Wi-Fi configurations the deploy
+# runner of that key signs, which the controller only relays.
 link=
 cred=
+runner=
 if [ -n "${CONTROLLER:-}" ]; then
 	[[ ${CONTROLLER_KEY:-} =~ ^[0-9a-fA-F]{64}$ ]] || { echo "CONTROLLER_KEY must be 64 hex digits" >&2; exit 1; }
 	install -d -m0700 $RF/etc/u6e-agent
@@ -273,12 +276,18 @@ if [ -n "${CONTROLLER:-}" ]; then
 	grep -q -- '-----BEGIN PRIVATE KEY-----' $RF/etc/u6e-agent/key.pem || { echo "agent_key: no PKCS#8 private key" >&2; exit 1; }
 	link="--controller $CONTROLLER --key %d/key.pem --controller-key $CONTROLLER_KEY"
 	cred=LoadCredential=key.pem:/etc/u6e-agent/key.pem
+	if [ -n "${RUNNER_KEY:-}" ]; then
+		[[ $RUNNER_KEY =~ ^[0-9a-fA-F]{64}$ ]] || { echo "RUNNER_KEY must be 64 hex digits" >&2; exit 1; }
+		runner="--runner-key $RUNNER_KEY"
+		link="$link $runner"
+	fi
 fi
 # The agent runs as its own user with no capabilities: hostapd gives that
 # user's group its control sockets (ctrl_interface_group, boot/wifi-up.sh),
 # u6e-nss its ECM state device, systemd opens the root-only NSS load file
 # for it, u6e-spectral (below) runs the radios' spectral scans for it on a
-# socket of that group's, and it asks for
+# socket of that group's, its config helper (below) installs Wi-Fi
+# configurations and sets transmit power for it on another, and it asks for
 # u6e-arm/u6e-fallback by a file (below) rather than starting them. Every
 # sandbox setting is at its most restrictive but where a comment says what
 # the agent's work needs instead.
@@ -334,9 +343,9 @@ RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
-# hostapd's control sockets, its own and u6e-spectral's (UNIX), nl80211
-# (NETLINK), the peer exchange, the controller link and the gateway check
-# (INET, INET6).
+# hostapd's control sockets, its own, u6e-spectral's and the config helper's
+# (UNIX), nl80211 (NETLINK), the peer exchange, the controller link and the
+# gateway check (INET, INET6).
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 SystemCallArchitectures=native
 SystemCallErrorNumber=EPERM
@@ -428,6 +437,86 @@ SystemCallArchitectures=native
 SystemCallErrorNumber=EPERM
 SystemCallFilter=@system-service
 SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @privileged @raw-io @reboot @resources @swap memfd_create
+UNIT
+
+# The agent's config helper (u6e-agent --config-helper): the live Wi-Fi
+# configurations the deploy runner signs (RUNNER_KEY), installed in
+# /run/u6e-wifi, root's alone (they hold the secrets; the helper tells the
+# agent how each radio takes a new one, the agent never reads them), then
+# rendered for the running hostapd with the new powers set, or u6e-wifi
+# restarted with them and the previous one put back if the radios do not come
+# up. The agent can do none of it (u6e-wifi's files and systemctl are root's,
+# the power wants CAP_NET_ADMIN). Socket-activated, one helper per
+# connection, on a socket in /run/u6e-wifi-helper, where it also publishes
+# the installed configuration's hash for the agent, both its group's alone;
+# the helper checks every configuration itself, signature and sequence
+# number included. It runs as root for those files and for systemctl, with
+# CAP_NET_ADMIN alone (the render's ip, iw) and writes only u6e-wifi's run
+# directories and its own; every other sandbox setting is at its most
+# restrictive but where a comment says what it needs instead.
+printf 'd /run/u6e-wifi 0700 root root -\nd /run/u6e-wifi-helper 2750 root u6e-agent -\n' \
+	> $RF/usr/lib/tmpfiles.d/u6e-wifi.conf
+cat > $RF/etc/systemd/system/u6e-wifi-config.socket <<'UNIT'
+[Unit]
+Description=U6E Wi-Fi configuration helper socket, for u6e-agent
+
+[Socket]
+ListenStream=/run/u6e-wifi-helper/sock
+SocketUser=root
+SocketGroup=u6e-agent
+SocketMode=0660
+Accept=yes
+
+[Install]
+WantedBy=sockets.target
+UNIT
+ln -sf /etc/systemd/system/u6e-wifi-config.socket $RF/etc/systemd/system/sockets.target.wants/u6e-wifi-config.socket
+cat > $RF/etc/systemd/system/u6e-wifi-config@.service <<UNIT
+[Unit]
+Description=U6E Wi-Fi configuration helper: classifies and installs a configuration for u6e-agent
+
+[Service]
+ExecStart=/usr/local/sbin/u6e-agent --config-helper $runner
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+# A restart and the one putting the previous configuration back.
+RuntimeMaxSec=15min
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=
+NoNewPrivileges=yes
+UMask=0027
+KeyringMode=private
+ProtectSystem=strict
+ReadWritePaths=/run/u6e-wifi /run/u6e-wifi-helper /run/hostapd-u6e
+ProtectHome=yes
+PrivateTmp=yes
+ProtectProc=invisible
+PrivateDevices=yes
+DevicePolicy=closed
+# ip and iw act on the AP's own interfaces; nothing is sent anywhere.
+IPAddressDeny=any
+PrivateIPC=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=strict
+PrivateMounts=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# hostapd's control sockets and systemd's (UNIX), ip and iw (NETLINK).
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+SystemCallFilter=@system-service
+# @privileged stays: sed -i gives its copy the file's owner (fchown), which
+# the capability bounding set already keeps to root's own.
+SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @raw-io @reboot @resources @swap memfd_create
 UNIT
 
 # The boot that brought this image up was one-shot: U-Boot disarmed it before

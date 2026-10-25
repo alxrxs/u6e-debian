@@ -6,21 +6,25 @@
 //! seen once stays in every snapshot, down while its BSSs are gone, so a
 //! hostapd that exits reads as radios down rather than as no radios. The
 //! clients' connections come from ECM (see `ecm`), at the link's cadence.
+//! The installed Wi-Fi configuration's hash is what the config helper
+//! publishes (the configuration itself is root's alone), read again only
+//! when the helper replaced it.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io;
-use std::os::unix::fs::{FileExt, FileTypeExt};
+use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-use u6e_proto::msg::{Band, Bss, Flows, Radio, Snapshot, Station, Temp};
+use u6e_proto::msg::{Bss, Flows, Radio, Snapshot, Station, Temp};
 
 use crate::ecm;
 use crate::kmsg::{self, Kmsg};
 use crate::neighbors::{self, Hostapd};
 use crate::nl80211::{self, Iface, Nl80211, Survey, Watch};
 use crate::rates::RateHold;
+use crate::{regdomain, wificonf};
 
 /// Where the collectors and the events thread look, so tests can point them
 /// at a scratch tree.
@@ -32,6 +36,8 @@ pub struct Paths {
     pub kmsg: PathBuf,
     /// Where this agent binds its client sockets.
     pub run: PathBuf,
+    /// Where the config helper publishes the installed configuration's hash.
+    pub wifi: PathBuf,
 }
 
 impl Default for Paths {
@@ -41,7 +47,30 @@ impl Default for Paths {
             hostapd: crate::neighbors::HOSTAPD.into(),
             kmsg: "/dev/kmsg".into(),
             run: crate::clientsock::run_dir(),
+            wifi: wificonf::STATE.into(),
         }
+    }
+}
+
+/// The published hash of the installed configuration and what its file was
+/// when read: modification time, length and inode, which a publication (a
+/// rename over it) always changes.
+#[derive(Default)]
+struct ConfigHash {
+    file: Option<Option<(SystemTime, u64, u64)>>,
+    hash: Option<[u8; 32]>,
+}
+
+impl ConfigHash {
+    fn get(&mut self, state: &Path) -> Option<[u8; 32]> {
+        let file = fs::metadata(state.join(wificonf::HASH))
+            .ok()
+            .and_then(|m| Some((m.modified().ok()?, m.len(), m.ino())));
+        if self.file != Some(file) {
+            self.hash = wificonf::read_hash(state);
+            self.file = Some(file);
+        }
+        self.hash
     }
 }
 
@@ -186,6 +215,7 @@ pub struct Collector {
     /// Every radio seen since the agent started, by phy, as last seen.
     seen: BTreeMap<String, Radio>,
     rates: RateHold,
+    config: ConfigHash,
 }
 
 impl Collector {
@@ -214,6 +244,7 @@ impl Collector {
             up: HashMap::new(),
             seen: BTreeMap::new(),
             rates: RateHold::default(),
+            config: ConfigHash::default(),
         }
     }
 
@@ -315,7 +346,7 @@ impl Collector {
             radios,
             bsss,
             stations,
-            config_sha256: None,
+            config_sha256: self.config.get(&self.paths.wifi),
         }
     }
 
@@ -514,25 +545,6 @@ fn stations(sys: &Path, order: &[String], per_iface: Vec<(&str, Vec<Station>)>) 
     out
 }
 
-fn band(freq_mhz: u32) -> Band {
-    match freq_mhz {
-        ..3000 => Band::B24,
-        3000..5925 => Band::B5,
-        _ => Band::B6,
-    }
-}
-
-fn channel(freq_mhz: u32) -> u16 {
-    let (f, base) = match band(freq_mhz) {
-        Band::B24 if freq_mhz == 2484 => return 14,
-        Band::B24 => (freq_mhz, 2407),
-        Band::B5 => (freq_mhz, 5000),
-        Band::B6 if freq_mhz == 5935 => return 2,
-        Band::B6 => (freq_mhz, 5950),
-    };
-    (f.saturating_sub(base) / 5) as u16
-}
-
 /// One radio per phy that has a BSS, by phy name. Its channel, width and power
 /// are its first BSS's that is on a channel (hostapd brings them up one by
 /// one); the survey of the channel in use gives the noise and the times, and
@@ -561,8 +573,8 @@ fn radios(
                 .unwrap_or_default();
             Some(Radio {
                 phy: phy.to_owned(),
-                band: band(iface.freq_mhz),
-                channel: channel(iface.freq_mhz),
+                band: regdomain::band_of(iface.freq_mhz),
+                channel: regdomain::channel_of(iface.freq_mhz),
                 width_mhz: iface.width_mhz,
                 txpower_mbm: iface.txpower_mbm,
                 noise_dbm: s.noise_dbm,
@@ -607,6 +619,7 @@ mod tests {
     use crate::testdir::TestDir;
     use std::os::unix::fs::symlink;
     use std::os::unix::net::UnixDatagram;
+    use u6e_proto::msg::Band;
 
     const INTERFACES: &[u8] = include_bytes!("../tests/fixtures/interfaces.bin");
     const STATIONS: &[u8] = include_bytes!("../tests/fixtures/station-wlan5.42.bin");
@@ -947,6 +960,7 @@ mod tests {
             hostapd: t.path().join("hostapd"),
             kmsg: t.path().join("kmsg"),
             run,
+            wifi: t.path().join("wifi"),
         };
         answering_hostapds(&paths.hostapd, &ORDER);
         link_radios(&paths.sys());
@@ -1031,19 +1045,6 @@ mod tests {
         assert!(cache.stale(&order(), true, t0 + s(1)));
         assert!(cache.stale(&order()[1..], false, t0 + s(1)));
         assert!(cache.stale(&order(), false, t0 + s(60)));
-    }
-
-    #[test]
-    fn channels_follow_the_band() {
-        assert_eq!((channel(2412), channel(2472), channel(2484)), (1, 13, 14));
-        assert_eq!((channel(5180), channel(5745)), (36, 149));
-        assert_eq!((channel(5955), channel(6375)), (1, 85));
-        // 6 GHz channel 2 sits below channel 1.
-        assert_eq!((band(5935), channel(5935)), (Band::B6, 2));
-        assert_eq!(
-            (band(2484), band(5180), band(5925), band(7115)),
-            (Band::B24, Band::B5, Band::B6, Band::B6)
-        );
     }
 
     fn radio(phy: &str) -> Radio {
@@ -1169,6 +1170,7 @@ mod tests {
             hostapd: t.path().join("hostapd"),
             kmsg: t.path().join("kmsg"),
             run,
+            wifi: t.path().join("wifi"),
         };
         let mut c = Collector::with_paths(paths.clone());
         let snap = c.snapshot(7);
@@ -1191,6 +1193,17 @@ mod tests {
         assert_eq!(snap.bsss.len(), 1);
         assert_eq!(snap.bsss[0].ifname, "wlan5");
         assert_eq!(c.fw_crashes(), 1);
+        assert_eq!(snap.config_sha256, None);
+
+        // The hash the helper publishes, and each one it publishes after.
+        fs::create_dir_all(&paths.wifi).unwrap();
+        wificonf::write_hash(&paths.wifi, Some([0xab; 32])).unwrap();
+        assert_eq!(c.snapshot(9).config_sha256, Some([0xab; 32]));
+        wificonf::write_hash(&paths.wifi, Some([0xcd; 32])).unwrap();
+        assert_eq!(c.snapshot(10).config_sha256, Some([0xcd; 32]));
+        assert_eq!(c.snapshot(11).config_sha256, Some([0xcd; 32]));
+        wificonf::write_hash(&paths.wifi, None).unwrap();
+        assert_eq!(c.snapshot(12).config_sha256, None);
     }
 
     /// The flows come from the ECM device under the root; without it there
@@ -1204,6 +1217,7 @@ mod tests {
             hostapd: root.join("hostapd"),
             kmsg: root.join("kmsg"),
             run: root.join("run"),
+            wifi: root.join("wifi"),
         });
         let station = [2, 0, 0, 0, 0, 8];
         assert_eq!(c.flows(1, &[station], false), None);

@@ -7,5 +7,10 @@ publish = false
 
 [dependencies]
 libc = "0.2"
+serde = { version = "1.0.229", features = ["derive"] }
 u6e-proto = { path = "../u6e-proto" }
 rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std"] }
+
+[dev-dependencies]
+# The tests sign configurations as the deploy runner does.
+aws-lc-rs = { version = "1.18", default-features = false, features = ["alloc", "aws-lc-sys"] }

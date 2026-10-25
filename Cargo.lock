@@ -1004,8 +1004,10 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 name = "u6e-agent"
 version = "1.0.0"
 dependencies = [
+ "aws-lc-rs",
  "libc",
  "rustls",
+ "serde",
  "u6e-proto",
 ]
 
