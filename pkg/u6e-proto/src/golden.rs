@@ -336,6 +336,14 @@ fn samples() -> Samples {
         ("RolloutDone", rollout(RolloutOutcome::Done)),
         ("RolloutRolledBack", rollout(RolloutOutcome::RolledBack)),
         ("RolloutFailed", rollout(RolloutOutcome::Failed)),
+        (
+            "RolloutAsk",
+            RunnerMsg::RolloutAsk {
+                ap: "ap1".into(),
+                image_id: "u6e-ap1-20261025".into(),
+                user: "root".into(),
+            },
+        ),
     ];
     let runner_ctl = vec![
         ("RunnerPing", RunnerCtlMsg::Ping(1 << 50)),
@@ -360,6 +368,7 @@ fn samples() -> Samples {
                 id,
                 ap: "ap1".into(),
                 image_id: "u6e-ap1-20261025".into(),
+                previous: "u6e-ap1-20261024".into(),
                 user: "admin".into(),
             }),
         ),

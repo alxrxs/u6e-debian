@@ -518,6 +518,14 @@ pub enum RunnerMsg {
     RolloutLog { id: u64, line: String },
     /// How a rollout ended: the last word on it.
     RolloutResult(RolloutResult),
+    /// A local caller of the runner asks for a rollout: the controller makes
+    /// it a [`RunnerCtlMsg::Rollout`] of its own, which it gates and shows as
+    /// it does an admin's.
+    RolloutAsk {
+        ap: String,
+        image_id: String,
+        user: String,
+    },
 }
 
 /// Everything the controller sends the deploy runner.
@@ -536,7 +544,8 @@ pub enum RunnerCtlMsg {
     /// The AP reconnected with an installed configuration other than the
     /// one it last acknowledged (`acked`): sign the runner's last
     /// configuration for it again, under a new sequence number (the old one
-    /// is a replay to the AP), and send it.
+    /// is a replay to the AP), and send it. `ap` is the name configurations
+    /// are signed for (the AP's host name).
     Repush {
         ap: String,
         acked: Option<[u8; 32]>,
@@ -544,8 +553,11 @@ pub enum RunnerCtlMsg {
     },
     /// Roll an image out to an AP, as an admin asked; the runner may refuse.
     Rollout(RolloutRequest),
-    /// A rollout's health gate: whether the AP came back as the gate
-    /// requires, in its time. Unhealthy, the runner rolls the AP back.
+    /// A rollout's health gate as the controller sees the AP: healthy once
+    /// it is back with the image, every radio up and clients returning;
+    /// unhealthy when it cannot get there. The runner waits its gate time
+    /// after staging for healthy, and rolls the AP back on unhealthy or when
+    /// the time runs out.
     RolloutGate {
         id: u64,
         healthy: bool,
@@ -569,7 +581,11 @@ pub struct RolloutRequest {
     pub ap: String,
     /// The kept build to stage, as the image names itself.
     pub image_id: String,
-    /// The admin who asked, for the runner's audit.
+    /// The image the AP runs now, as its agent reported it: what a failed
+    /// health gate rolls it back to. Empty when the controller does not know,
+    /// and the runner then refuses.
+    pub previous: String,
+    /// Who asked, for the runner's audit.
     pub user: String,
 }
 
