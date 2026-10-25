@@ -1,7 +1,8 @@
 //! The AP's state as a `Snapshot`: nl80211 for the interfaces, stations and
 //! survey, hostapd for whether a radio is up, sysfs and procfs for the rest.
 //! A source that is missing or odd reads as zeros and empty lists; collecting
-//! never fails.
+//! never fails. Station rates go through `rates`, which keeps a client's
+//! HT/VHT/HE rate over the legacy samples between its data frames.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -15,6 +16,7 @@ use u6e_proto::msg::{Band, Bss, Radio, Snapshot, Station, Temp};
 use crate::kmsg::{self, Kmsg};
 use crate::neighbors::{self, Hostapd};
 use crate::nl80211::{self, Iface, Nl80211, Survey, Watch};
+use crate::rates::RateHold;
 
 /// Where the collectors and the events thread look, so tests can point them
 /// at a scratch tree.
@@ -167,6 +169,7 @@ pub struct Collector {
     crashes: u64,
     /// Whether each BSS's radio was up at the last answer.
     up: HashMap<String, bool>,
+    rates: RateHold,
 }
 
 impl Collector {
@@ -186,6 +189,7 @@ impl Collector {
             paths,
             crashes,
             up: HashMap::new(),
+            rates: RateHold::default(),
         }
     }
 
@@ -249,7 +253,8 @@ impl Collector {
                 (i.name.as_str(), stas.unwrap_or_default())
             })
             .collect();
-        let stations = stations(&sys, &order, per_iface);
+        let mut stations = stations(&sys, &order, per_iface);
+        self.rates.apply(&mut stations, Instant::now());
         let (run, dir) = (&self.paths.run, &self.paths.hostapd);
         let mut hostapd = self.hostapd.get(|| Hostapd::bind(run, "collect", dir));
         let radios = radios(

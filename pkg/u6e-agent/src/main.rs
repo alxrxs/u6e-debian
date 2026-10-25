@@ -18,6 +18,7 @@ mod link;
 mod neighbors;
 mod netcheck;
 mod nl80211;
+mod rates;
 mod stats;
 #[cfg(test)]
 mod testdir;
