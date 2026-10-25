@@ -7,6 +7,8 @@
 
 pub mod delta;
 pub mod frame;
+#[cfg(test)]
+mod golden;
 pub mod msg;
 #[cfg(feature = "tls")]
 pub mod tls;

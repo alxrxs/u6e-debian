@@ -10,7 +10,8 @@
 //! their Hello; any first frame not of this form is theirs, protocol 0.
 
 /// The protocol of the messages of [`crate::msg`] and their delta coding;
-/// bumped with every change an end built before it could not decode.
+/// bumped with every change an end built before it could not decode. The
+/// golden test (`golden.rs`) fails on a change of their encoding without one.
 pub const PROTOCOL: u16 = 1;
 
 /// The protocol of a peer whose first frame is no version frame: the link as
