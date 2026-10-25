@@ -56,7 +56,7 @@ sudo FORCE=1 ./deploy.sh ap1      # boot ap1 again even though it already runs t
 7. `pkg/netlogd/build.sh`: builds Debian's `systemd-netlogd`, which forwards the log, with a fix for its journal file rotation.
 8. `mkrootfs.sh`: creates the Debian root filesystem.
 9. `pkg/u6e-agent` (a member of the cargo workspace in `Cargo.toml`): builds the access point's resident agent (Rust, one static binary): the neighbor report exchange between access points, the management network check, the state line in the log, the collectors that read the access point's Wi-Fi state (nl80211, hostapd, sysfs, the kernel log) into snapshots and events, and, when given a controller (`--controller`, `--key`, `--controller-key`), the link that streams them to it over post-quantum TLS with pinned keys. It runs as its own user `u6e-agent`, with no capabilities and in a tight systemd sandbox: hostapd gives that user's group its control sockets, systemd opens the root-only files it reads (the NSS load in debugfs, its private key), and it asks for `u6e-arm`/`u6e-fallback` through files their path units watch, as it may start no unit itself.
-10. For each access point whose running image was built from other inputs (this repository except `pkg/u6e-controller`, `$BLOBS`, `site.conf` or the source trees): `prep-rootfs.sh` builds its image, unless the image built last for that access point (recorded in `stamps/built-<ap>`) has these inputs and is still in `images/` (`ap-image.sh` makes this choice); `boot/stage.sh` boots that image, and `deploy.sh` waits until all three radios are up. An access point already running the current build is left alone; `FORCE=1` boots it anyway, with the image already built for the current inputs if there is one (delete `stamps/built-<ap>` to build a fresh one). With `BOOT=0` each image is built and kept but not booted, so the access points keep running until a later run boots that same image.
+10. For each access point whose running image was built from other inputs (the parts of this repository that go into an image, which `ap-image.sh` lists, with only the agent's dependencies of `Cargo.lock`; `$BLOBS`, `site.conf` or the source trees): `prep-rootfs.sh` builds its image, unless the image built last for that access point (recorded in `stamps/built-<ap>`) has these inputs and is still in `images/` (`ap-image.sh` makes this choice); `boot/stage.sh` boots that image, and `deploy.sh` waits until all three radios are up. An access point already running the current build is left alone; `FORCE=1` boots it anyway, with the image already built for the current inputs if there is one (delete `stamps/built-<ap>` to build a fresh one). With `BOOT=0` each image is built and kept but not booted, so the access points keep running until a later run boots that same image.
 
 Every image is kept in `images/` with a `MANIFEST` (versions and checksums), so an earlier build can be booted again without rebuilding. The image itself carries its `images/` name and the same versions in `/etc/u6e-image`.
 
@@ -119,7 +119,7 @@ Wi-Fi starts by itself on every boot (`u6e-wifi.service`), with nothing else on 
 |---|---|
 | `deploy.sh` | Builds and boots everything, step by step |
 | `rust-toolchain.toml`, `toolchain.env` | The pinned build toolchain: Rust, and zig with cargo-zigbuild |
-| `ap-image.sh` | Chooses the image `deploy.sh` boots on an access point: the one already built for the current inputs, or a new one |
+| `ap-image.sh` | The key of what this repository puts into an image, and the choice of the image `deploy.sh` boots on an access point: the one already built for the current inputs, or a new one |
 | `trees.sh`, `export.sh` | Create the source trees from the patch series, and export commits back to patches |
 | `kernel/`, `backports/` | Upstream release address and our patches |
 | `config-u6e.sh` | Kernel configuration |
@@ -148,7 +148,7 @@ Wi-Fi starts by itself on every boot (`u6e-wifi.service`), with nothing else on 
 - `test/bip-verify.py <pcap> <BSSID> <key>` checks the beacon protection signature of every beacon in a capture.
 - `U6E_AP=<ap> test/oce-retry.sh <interface> [<count>]` counts how many times a radio retries unanswered management frames (`mgmtsend.c` is its helper).
 
-`test/ap-image.sh` needs no access point: it checks offline, with a stub `prep-rootfs.sh`, which image `ap-image.sh` picks (an image built with `BOOT=0` is the one booted next; changed inputs or a deleted image mean a new build; `FORCE=1` reuses the kept image; a failed build stops `deploy.sh` and records nothing).
+`test/ap-image.sh` needs no access point: it checks offline, with a stub `prep-rootfs.sh`, which image `ap-image.sh` picks (an image built with `BOOT=0` is the one booted next; changed inputs or a deleted image mean a new build; `FORCE=1` reuses the kept image; a failed build stops `deploy.sh` and records nothing), and, over commits to a scratch clone, that only a change to what goes into an image changes its key (a README, test, controller or controller-only dependency change does not; an agent source, agent dependency or `prep-rootfs.sh` change does).
 
 ## Licence
 
