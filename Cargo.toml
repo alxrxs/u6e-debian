@@ -1,5 +1,5 @@
 [workspace]
-members = ["pkg/u6e-proto", "pkg/u6e-agent", "pkg/u6e-spectral", "pkg/u6e-controller"]
+members = ["pkg/u6e-proto", "pkg/u6e-agent", "pkg/u6e-spectral", "pkg/u6e-controller", "pkg/u6e-deploy"]
 resolver = "3"
 
 [profile.release]

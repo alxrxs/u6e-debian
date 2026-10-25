@@ -1027,6 +1027,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "u6e-deploy"
+version = "1.0.0"
+dependencies = [
+ "aws-lc-rs",
+ "libc",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "toml",
+ "u6e-controller",
+ "u6e-proto",
+]
+
+[[package]]
 name = "u6e-proto"
 version = "1.0.0"
 dependencies = [
