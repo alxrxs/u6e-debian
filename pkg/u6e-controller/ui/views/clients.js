@@ -1,5 +1,6 @@
 // Clients: every associated client, sortable and filterable, with its signal
-// over the session as a sparkline.
+// over the session as a sparkline; and the blocked ones no AP lets on, each a
+// link to its page, where it can be unblocked.
 
 import { h, BANDS, bits, duration, mbps, palette, pct, phy, quality } from '../util.js';
 import { sparkline } from '../charts.js';
@@ -83,7 +84,10 @@ export default {
       h('div', { class: 'grow' }, search),
       h('div', { class: 'seg', role: 'group', 'aria-label': 'Band' }, bandButtons.map(([, b]) => b)),
       apSelect);
-    root.append(h('div', { class: 'head' }, h('h1', {}, 'Clients'), sub), tools, table, empty);
+    const offList = h('ul', { class: 'panel off-list' });
+    const off = h('section', {}, h('h2', { class: 'section-title' }, 'Blocked'), offList);
+    root.append(h('div', { class: 'head' }, h('h1', {}, 'Clients'), sub), tools, table, empty, off);
+    let offDrawn = '';
 
     const view = {
       update() {
@@ -106,6 +110,15 @@ export default {
           return (x < y ? -1 : x > y ? 1 : ma < mb ? -1 : 1) * sort.dir;
         });
         sub.textContent = !store.keyed ? '' : rows.length === all.length ? `${all.length} associated` : `${rows.length} of ${all.length} shown`;
+
+        const kept = (store.state.blocked || []).filter((m) => !(m in store.state.clients));
+        off.hidden = !kept.length;
+        if (kept.join() !== offDrawn) {
+          offDrawn = kept.join();
+          offList.replaceChildren(...kept.map((m) => h('li', {},
+            h('a', { class: 'mono', href: `#/client/${m}` }, m),
+            h('span', { class: 'muted' }, 'kept off every access point'))));
+        }
 
         const anyUp = Object.values(store.state.aps).some((a) => a.up);
         table.hidden = !rows.length;

@@ -67,17 +67,6 @@ function targets(store, c) {
   return out.sort((a, b) => a.ap.localeCompare(b.ap) || Number(a.band) - Number(b.band));
 }
 
-/** Whether the client is blocked: as its AP says while it is associated,
- * else as the latest block or unblock of it left it. */
-function isBlocked(store, mac, c) {
-  if (c) return !!c.blocked;
-  for (let i = store.events.length - 1; i >= 0; i--) {
-    const e = store.events[i];
-    if (e.kind === 'action' && e.mac === mac && (e.action === 'block' || e.action === 'unblock')) return e.action === 'block';
-  }
-  return store.ui.blocked?.get(mac) ?? false;
-}
-
 /** A modal question: resolves to what `pick` makes of the dialog (true
  * without one), or null when cancelled. `choices`, given the confirm button,
  * builds what there is to pick from. */
@@ -244,9 +233,6 @@ export default {
       view.update();
       const res = await store.act(mac, action, body);
       busy = '';
-      if (res.status >= 200 && res.status < 300 && (action === 'block' || action === 'unblock')) {
-        (store.ui.blocked ||= new Map()).set(mac, action === 'block');
-      }
       const [tone, text] = outcome(action, res, who, target);
       result.dataset.tone = tone;
       result.replaceChildren(icon(tone === 'ok' ? ICONS.unblock : 'M12 3a9 9 0 1 0 0 18a9 9 0 0 0 0-18M12 8v5M12 16.5v.01'),
@@ -259,7 +245,8 @@ export default {
     }
 
     function updateHead(c) {
-      const blocked = isBlocked(store, mac, c);
+      // The policy's list holds the clients no AP lets on, too.
+      const blocked = (store.state.blocked || []).includes(mac);
       name = c?.name || clientFlows(store, mac)?.cf.name || name;
       title.textContent = name || mac;
       title.className = name ? '' : 'mono';

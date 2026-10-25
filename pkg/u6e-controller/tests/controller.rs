@@ -1564,6 +1564,45 @@ fn policy_survives_restart() {
     assert!(e.to_string().contains("policy.json"), "{e}");
 }
 
+/// The clients blocked are listed whether an AP holds them or not, so one
+/// kept off every AP can still be unblocked; an associated one says so too.
+#[test]
+fn blocked_clients_listed() {
+    let r = controller(Timing::default());
+    let mut a = ap_with_client(&r, KEY_AP1, "ap1", &[]);
+    let mut ui = Ui::subscribe(r.c.http, json!("*"));
+    let key = ui.recv();
+    assert_eq!(key["key"]["blocked"], json!([]));
+    assert_eq!(key["key"]["clients"]["02:00:00:00:00:01"]["blocked"], false);
+    assert_eq!(a.expect(), CtlMsg::SetTick { secs: TICK_WATCHED });
+    let mut block = |mac: [u8; 6]| {
+        let (addr, path) = (r.c.http, format!("/api/clients/{}/block", mac::format(mac)));
+        let t = thread::spawn(move || post(addr, &path, &format!("{SAME_SITE}{ADMIN}"), ""));
+        let id = a.expect_command(CommandKind::Block { mac });
+        a.reply(id, true, "OK");
+        assert_eq!(t.join().unwrap().0, 200);
+    };
+    let blocked_patch = |ui: &mut Ui| loop {
+        let m = ui.recv();
+        if m["patch"].get("blocked").is_some() {
+            return m["patch"].clone();
+        }
+    };
+
+    // One no AP holds: listed, and nothing else changes.
+    block([0x02, 0, 0, 0, 0, 0x09]);
+    let patch = blocked_patch(&mut ui);
+    assert_eq!(patch, json!({"blocked": ["02:00:00:00:00:09"]}));
+    // One the AP still holds: listed, and its own entry says so.
+    block(MAC);
+    let patch = blocked_patch(&mut ui);
+    let both = json!(["02:00:00:00:00:01", "02:00:00:00:00:09"]);
+    assert_eq!(patch["blocked"], both);
+    assert_eq!(patch["clients"]["02:00:00:00:00:01"]["blocked"], true);
+    let clients = json_get(r.c.http, "/api/clients");
+    assert_eq!(clients["02:00:00:00:00:01"]["blocked"], true);
+}
+
 #[test]
 fn steer_routed_to_the_clients_ap() {
     let r = controller(Timing::default());

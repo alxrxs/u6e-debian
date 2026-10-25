@@ -388,8 +388,9 @@ async fn live(mut ws: WebSocket, state: Shared, user: Option<String>) {
             Ok(Change::Up(ap) | Change::Down(ap) | Change::Snapshot(ap)) => (wanted(&ap), None),
             Ok(Change::Flows(ap)) => (flows && wanted(&ap), None),
             Ok(Change::Names) => (true, None),
+            // A block or an unblock changes the list of clients blocked.
             Ok(Change::Action(a)) if a.ap.as_deref().is_none_or(wanted) => {
-                (false, Some(json!({ "events": [view::action(&a)] })))
+                (true, Some(json!({ "events": [view::action(&a)] })))
             }
             Ok(Change::Event(..) | Change::Action(_)) => (false, None),
             // Too slow to keep up: the state is whole again with the next

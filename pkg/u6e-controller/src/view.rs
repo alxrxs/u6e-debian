@@ -4,7 +4,9 @@
 //! and retry ratios are worked out here from the counters of the AP's last two
 //! snapshots, and rounded so that a steady value is not resent. A client is
 //! named (`name`) when the reverse DNS of an address its flows show has a
-//! name; the UI shows its MAC otherwise.
+//! name; the UI shows its MAC otherwise. The clients the policy blocks are
+//! listed whole (`blocked`), associated or not, so that one kept off every AP
+//! can still be found and unblocked; an associated client says it too.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -15,17 +17,23 @@ use u6e_proto::msg::{Band, Event, EventKind, Flow, Flows, Radio, RateMode, Snaps
 
 use crate::state::{Action, Ap, ClientView, State};
 
-/// The APs and clients of the APs `wanted` says yes to, as one object, with
-/// their flows when `flows`.
+/// The APs and clients of the APs `wanted` says yes to, and the clients
+/// blocked, as one object, with their flows when `flows`.
 pub fn view(state: &State, wanted: impl Fn(&str) -> bool, flows: bool) -> Value {
     let mut v = json!({
         "aps": aps(state, &wanted),
         "clients": clients(state, &wanted),
+        "blocked": blocked(state),
     });
     if flows {
         v["flows"] = self::flows(state, &wanted, None);
     }
     v
+}
+
+/// Every client the policy blocks, by MAC, in order.
+pub fn blocked(state: &State) -> Value {
+    state.blocked.iter().map(|m| mac::format(*m)).collect()
 }
 
 /// The latest flows of every wanted AP that has sent some, by AP; of one
@@ -374,6 +382,7 @@ fn client_view(state: &State, c: &ClientView) -> Value {
         "idle": st.inactive_ms / 1000,
         "rx_bytes": st.rx_bytes,
         "tx_bytes": st.tx_bytes,
+        "blocked": state.blocked.contains(&st.mac),
     });
     if let Some(b) = band {
         o["band"] = b.into();
