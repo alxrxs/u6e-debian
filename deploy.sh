@@ -99,8 +99,10 @@ if [ $# = 0 ]; then
 	set -- "${aps[@]}"
 fi
 # Everything an AP's image is built from: this tree, the blobs, the site and
-# the two source trees.
-image=$(head_of .)/$(head_of "$BLOBS")/$(sha256sum < site.conf | cut -c1-16)/$(head_of linux-7.2.8)/$(head_of backports-7.2)
+# the two source trees. The tree is hashed without pkg/u6e-controller, which no
+# image carries, so a commit that touches only the controller reboots no AP.
+image_tree() { git -c safe.directory='*' ls-tree -r HEAD | grep -v $'\tpkg/u6e-controller/' | sha256sum | cut -c1-16; }
+image=$(image_tree)/$(head_of "$BLOBS")/$(sha256sum < site.conf | cut -c1-16)/$(head_of linux-7.2.8)/$(head_of backports-7.2)
 for ap in "$@"; do
 	export U6E_AP=$ap
 	if [ "${FORCE:-0}" != 1 ] && [ "$(cat "stamps/ap-$ap" 2>/dev/null)" = "$image" ]; then
