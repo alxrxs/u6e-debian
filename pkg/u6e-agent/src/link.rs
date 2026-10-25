@@ -6,13 +6,17 @@
 //! connections every minute, or at the cadence the controller sets. The
 //! controller sets the tick and that cadence, asks for key frames and flows,
 //! pings, and sends commands, each carried out against the snapshot sent last
-//! and answered in turn; a silent or broken connection is dropped and dialed
-//! again. The wait before a redial doubles from 1 s to 30 s until a session
-//! is useful (the controller said something in it), so a controller that
-//! takes each session and drops it is not redialed at once.
+//! and answered in turn, and starts and stops radios' spectrum scans, whose
+//! frames leave as they come (see `spectrum`); a silent or broken connection
+//! is dropped, its scans with it, and dialed again. The wait before a redial
+//! doubles from 1 s to 30 s until a session is useful (the controller said
+//! something in it), so a controller that takes each session and drops it is
+//! not redialed at once.
 //!
 //! One thread owns the connection and waits with `poll` for the socket, an
-//! event or the next tick, so an event leaves at once without a polling loop.
+//! event, a spectrum frame or the next tick, so an event or a frame leaves at
+//! once without a polling loop; one due within 50 ms of the tick rides in its
+//! record.
 //! Received bytes are decrypted into a buffer and cut into frames only when
 //! whole, so no read can stop mid-frame. A second thread moves events into a
 //! ring of the newest 256 whether or not the link is up.
@@ -24,6 +28,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::ops::RangeInclusive;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -35,6 +40,8 @@ use u6e_proto::frame::{decode_frame, frame_body, write_frame};
 use u6e_proto::msg::{AgentMsg, Command, CommandResult, CtlMsg, Event, Flows, Hello, Snapshot};
 use u6e_proto::tls::{self, Identity};
 use u6e_proto::{PROTOCOL, delta, version};
+
+use crate::spectrum::{self, Spectrum};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Longest the handshake or the controller's version frame may take, or a
@@ -70,6 +77,9 @@ pub struct Config {
     /// The wait before a redial: the start after a useful session, doubled
     /// after each dial that brought none, up to the end.
     pub backoff: RangeInclusive<Duration>,
+    /// The spectrum helper's socket, and how long a scan may run.
+    pub spectrum: PathBuf,
+    pub spectrum_limit: Duration,
 }
 
 impl Config {
@@ -86,6 +96,8 @@ impl Config {
             hello,
             silence: SILENCE,
             backoff: BACKOFF_MIN..=BACKOFF_MAX,
+            spectrum: spectrum::SOCKET.into(),
+            spectrum_limit: spectrum::LIMIT,
         }
     }
 }
@@ -143,7 +155,7 @@ fn run_with(
             }
         }
         // A session the controller said nothing in counts as a failed dial.
-        let failure = match connect(&cfg.controller, &client) {
+        let failure = match connect(&cfg, &client) {
             Ok(mut s) => {
                 let Err(e) = s.serve(
                     &cfg,
@@ -235,7 +247,8 @@ impl Ring {
 
 /// Opens the TCP connection, completes the TLS handshake and agrees on the
 /// protocol.
-fn connect(controller: &str, client: &Arc<ClientConfig>) -> io::Result<Session> {
+fn connect(cfg: &Config, client: &Arc<ClientConfig>) -> io::Result<Session> {
+    let controller = cfg.controller.as_str();
     let mut err = io::Error::new(ErrorKind::NotFound, "no address");
     let mut found = None;
     for addr in controller.to_socket_addrs()? {
@@ -259,7 +272,8 @@ fn connect(controller: &str, client: &Arc<ClientConfig>) -> io::Result<Session> 
     while conn.is_handshaking() {
         conn.complete_io(&mut sock)?;
     }
-    let mut s = Session::new(conn, sock);
+    let spectrum = Spectrum::new(&cfg.spectrum, cfg.spectrum_limit);
+    let mut s = Session::new(conn, sock, spectrum);
     s.agree()?;
     Ok(s)
 }
@@ -304,10 +318,15 @@ struct Session {
     flow_seq: u64,
     /// The controller has sent a message: the session is a useful one.
     heard: bool,
+    /// The spectrum scans the controller asked for; they end with the
+    /// session.
+    spectrum: Spectrum,
+    /// What the scans sent, waiting for the next record.
+    spectrum_out: Vec<u8>,
 }
 
 impl Session {
-    fn new(conn: ClientConnection, sock: TcpStream) -> Self {
+    fn new(conn: ClientConnection, sock: TcpStream, spectrum: Spectrum) -> Self {
         let now = Instant::now();
         Session {
             conn,
@@ -327,6 +346,8 @@ impl Session {
             want_full: false,
             flow_seq: 0,
             heard: false,
+            spectrum,
+            spectrum_out: Vec::new(),
         }
     }
 
@@ -386,10 +407,12 @@ impl Session {
             if now >= self.flows_due {
                 self.flows_into(&mut out, now, flows)?;
             }
+            self.spectrum.read(&mut self.spectrum_out);
             if ticked || self.due - now > COALESCE {
                 for ev in ring.map(Ring::take).unwrap_or_default() {
                     write_frame(&mut out, &AgentMsg::Event(ev))?;
                 }
+                out.append(&mut self.spectrum_out);
             }
             if !out.is_empty() {
                 self.send(&out)?;
@@ -461,20 +484,28 @@ impl Session {
         Ok(())
     }
 
-    /// Waits for the socket (true), an event or the next deadline (false).
+    /// Waits for the socket (true), an event, a spectrum scan's frame or the
+    /// next deadline (false).
     fn wait(&self, ring: Option<&Ring>, silence: Duration) -> bool {
-        let deadline = self.due.min(self.flows_due).min(self.last_rx + silence);
+        let mut deadline = self.due.min(self.flows_due).min(self.last_rx + silence);
+        if let Some(d) = self.spectrum.deadline() {
+            deadline = deadline.min(d);
+        }
         let left = deadline.saturating_duration_since(Instant::now());
         let ms = i32::try_from(left.as_micros().div_ceil(1000)).unwrap_or(i32::MAX);
         // poll skips a negative fd: without a ring, the socket alone.
         let wake = ring.map_or(-1, |r| r.wake_rx.as_raw_fd());
-        let mut fds = [self.sock.as_raw_fd(), wake].map(|fd| libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        });
-        // SAFETY: `fds` is a valid array of two pollfds for the call.
-        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, ms) };
+        let mut fds: Vec<libc::pollfd> = [self.sock.as_raw_fd(), wake]
+            .into_iter()
+            .chain(self.spectrum.fds())
+            .map(|fd| libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        // SAFETY: `fds` is a valid array of pollfds of that length.
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
         n > 0 && fds[0].revents != 0
     }
 
@@ -487,6 +518,13 @@ impl Session {
             self.flush()?;
         }
         Ok(())
+    }
+
+    /// Sends one message now, in a record of its own.
+    fn send_msg(&mut self, msg: &AgentMsg) -> io::Result<()> {
+        let mut out = Vec::new();
+        write_frame(&mut out, msg)?;
+        self.send(&out)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -551,16 +589,10 @@ impl Session {
                 self.want_key = true;
                 self.due = Instant::now();
             }
-            CtlMsg::Ping(n) => {
-                let mut out = Vec::new();
-                write_frame(&mut out, &AgentMsg::Pong(n))?;
-                self.send(&out)?;
-            }
+            CtlMsg::Ping(n) => self.send_msg(&AgentMsg::Pong(n))?,
             CtlMsg::Command(c) => {
                 let result = command(&c, self.prev.as_ref());
-                let mut out = Vec::new();
-                write_frame(&mut out, &AgentMsg::Result(result))?;
-                self.send(&out)?;
+                self.send_msg(&AgentMsg::Result(result))?;
             }
             CtlMsg::WantFlows { full } => {
                 self.want_full |= full;
@@ -569,6 +601,15 @@ impl Session {
             CtlMsg::FlowCadence { secs } => {
                 self.flow_every = clamp_flows(secs);
                 self.flows_due = self.last_flows + self.flow_every;
+            }
+            CtlMsg::SpectrumStart { radio } => {
+                if let Some(answer) = self.spectrum.start(&radio) {
+                    self.send_msg(&answer)?;
+                }
+            }
+            CtlMsg::SpectrumStop { radio } => {
+                let answer = self.spectrum.stop(&radio);
+                self.send_msg(&answer)?;
             }
             // A newer controller's messages mean nothing to this agent.
             _ => {}
@@ -607,9 +648,15 @@ mod tests {
     use std::sync::RwLock;
     use std::sync::mpsc::{self, SyncSender, sync_channel};
 
+    use std::os::unix::net::UnixListener;
+
     use rustls::{ServerConfig, ServerConnection};
-    use u6e_proto::msg::{Bss, Command, CommandKind, EventKind, RateMode, Station, Temp};
+    use u6e_proto::msg::{
+        Bss, Command, CommandKind, EventKind, RateMode, SpectrumFrame, Station, Temp,
+    };
     use u6e_proto::version;
+
+    use crate::testdir::TestDir;
 
     // A throwaway Ed25519 key made for tests (the same as in u6e-proto's tls
     // tests); it protects nothing.
@@ -1459,6 +1506,295 @@ mod tests {
             p.ends();
         });
         assert_backs_off(&at, &QUICK);
+    }
+
+    /// The spectrum helper's end: each connection, once it has asked.
+    struct Helper {
+        dir: TestDir,
+        conns: mpsc::Receiver<Scan>,
+    }
+
+    /// One connection to the helper: the scan of one radio.
+    struct Scan {
+        sock: UnixStream,
+        request: String,
+    }
+
+    impl Helper {
+        fn new() -> Self {
+            let dir = TestDir::new();
+            let listener = UnixListener::bind(dir.path().join("sock")).unwrap();
+            let (tx, conns) = mpsc::channel();
+            thread::spawn(move || {
+                for sock in listener.incoming() {
+                    let mut sock = sock.unwrap();
+                    let mut request = Vec::new();
+                    let mut b = [0];
+                    while sock.read(&mut b).unwrap_or(0) == 1 && b[0] != b'\n' {
+                        request.push(b[0]);
+                    }
+                    let request = String::from_utf8(request).unwrap();
+                    if tx.send(Scan { sock, request }).is_err() {
+                        return;
+                    }
+                }
+            });
+            Helper { dir, conns }
+        }
+
+        fn socket(&self) -> PathBuf {
+            self.dir.path().join("sock")
+        }
+
+        fn next(&self) -> Scan {
+            self.conns
+                .recv_timeout(WAIT)
+                .expect("no scan asked of the helper")
+        }
+
+        /// An agent of `fake` whose scans go to this helper and last `limit`.
+        fn agent(&self, fake: &Fake, limit: Duration) -> Agent {
+            let socket = self.socket();
+            let tweak = |c: &mut Config| {
+                c.spectrum = socket;
+                c.spectrum_limit = limit;
+            };
+            Agent::spawn_with(fake, 0, tweak, blank)
+        }
+    }
+
+    impl Scan {
+        fn send(&mut self, msg: &AgentMsg) {
+            write_frame(&mut self.sock, msg).unwrap();
+        }
+
+        /// Whether the agent closes the connection within `wait`.
+        fn closed_within(&mut self, wait: Duration) -> bool {
+            self.sock.set_read_timeout(Some(wait)).unwrap();
+            matches!(self.sock.read(&mut [0; 64]), Ok(0))
+        }
+    }
+
+    fn spectrum_state(radio: &str, running: bool, reason: &str) -> AgentMsg {
+        AgentMsg::SpectrumState {
+            radio: radio.into(),
+            running,
+            reason: reason.into(),
+        }
+    }
+
+    fn spectrum_frame(radio: &str, bins: usize) -> SpectrumFrame {
+        SpectrumFrame {
+            radio: radio.into(),
+            at_ms: 1 << 41,
+            center_mhz: 5775,
+            width_mhz: 80,
+            first_mhz_x10: 57352,
+            step_khz: 313,
+            bins: vec![-100; bins],
+            noise_dbm: -96,
+        }
+    }
+
+    /// A scan asked by the controller: the helper's answer and frames come
+    /// through as they are sent, well inside the 15 s tick, and a stop
+    /// closes the helper's connection, which stops the scan.
+    #[test]
+    fn a_spectrum_scan_is_forwarded_and_stopped() {
+        let (fake, helper) = (Fake::new(), Helper::new());
+        let _agent = helper.agent(&fake, spectrum::LIMIT);
+        let mut p = fake.accept();
+        p.start();
+        p.send(CtlMsg::SpectrumStart {
+            radio: "radio5".into(),
+        });
+        let mut scan = helper.next();
+        assert_eq!(scan.request, "start radio5");
+        let started = spectrum_state("radio5", true, "started");
+        scan.send(&started);
+        assert_eq!(p.recv(), started);
+        let sent = Instant::now();
+        let frame = AgentMsg::Spectrum(spectrum_frame("radio5", 256));
+        scan.send(&frame);
+        assert_eq!(p.recv(), frame);
+        assert!(
+            sent.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            sent.elapsed()
+        );
+        p.send(CtlMsg::SpectrumStart {
+            radio: "radio5".into(),
+        });
+        assert_eq!(p.recv(), spectrum_state("radio5", true, "running"));
+        p.send(CtlMsg::SpectrumStop {
+            radio: "radio5".into(),
+        });
+        assert_eq!(p.recv(), spectrum_state("radio5", false, "stopped"));
+        assert!(scan.closed_within(WAIT));
+    }
+
+    /// Review focus 2: the controller goes mid-scan, by closing the session
+    /// or by falling silent, and the agent stops the scan itself.
+    #[test]
+    fn link_loss_stops_scan() {
+        let (fake, helper) = (Fake::new(), Helper::new());
+        let _agent = helper.agent(&fake, spectrum::LIMIT);
+        let mut p = fake.accept();
+        p.start();
+        p.send(CtlMsg::SpectrumStart {
+            radio: "radio6".into(),
+        });
+        let mut scan = helper.next();
+        drop(p);
+        let gone = Instant::now();
+        assert!(scan.closed_within(WAIT));
+        assert!(
+            gone.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            gone.elapsed()
+        );
+
+        let (fake, helper) = (Fake::new(), Helper::new());
+        let socket = helper.socket();
+        let _agent = Agent::spawn_with(
+            &fake,
+            0,
+            |c| {
+                c.spectrum = socket;
+                c.silence = Duration::from_secs(1);
+            },
+            blank,
+        );
+        let mut p = fake.accept();
+        p.start();
+        p.send(CtlMsg::SpectrumStart {
+            radio: "radio6".into(),
+        });
+        let mut scan = helper.next();
+        let silent = Instant::now();
+        assert!(scan.closed_within(WAIT));
+        let after = silent.elapsed();
+        assert!(after < Duration::from_secs(3), "{after:?}");
+        drop(p);
+    }
+
+    /// A scan ends at its limit by itself, the controller told why.
+    #[test]
+    fn a_scan_ends_at_its_limit() {
+        let (fake, helper) = (Fake::new(), Helper::new());
+        let _agent = helper.agent(&fake, Duration::from_secs(1));
+        let mut p = fake.accept();
+        p.start();
+        let asked = Instant::now();
+        p.send(CtlMsg::SpectrumStart {
+            radio: "radio24".into(),
+        });
+        let mut scan = helper.next();
+        assert_eq!(
+            p.recv(),
+            spectrum_state("radio24", false, "stopped after 1 s, the limit")
+        );
+        let took = asked.elapsed();
+        assert!((0.9..3.0).contains(&took.as_secs_f64()), "{took:?}");
+        assert!(scan.closed_within(WAIT));
+    }
+
+    /// Whatever the helper sends, at most 10 frames a second leave per
+    /// radio, none over 600 B, and none of another radio.
+    #[test]
+    fn frames_are_held_to_the_budget() {
+        let (fake, helper) = (Fake::new(), Helper::new());
+        let _agent = helper.agent(&fake, spectrum::LIMIT);
+        let mut p = fake.accept();
+        p.start();
+        p.send(CtlMsg::SpectrumStart {
+            radio: "radio5".into(),
+        });
+        let mut scan = helper.next();
+        scan.send(&AgentMsg::Spectrum(spectrum_frame("radio5", 600)));
+        for _ in 0..30 {
+            scan.send(&AgentMsg::Spectrum(spectrum_frame("radio5", 256)));
+        }
+        // A ping after the burst: everything forwarded is before its pong.
+        thread::sleep(Duration::from_millis(300));
+        p.send(CtlMsg::Ping(5));
+        let mut frames = 0;
+        loop {
+            match p.recv() {
+                AgentMsg::Spectrum(f) => {
+                    assert_eq!(f.bins.len(), 256);
+                    frames += 1;
+                }
+                AgentMsg::Pong(5) => break,
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(frames, spectrum::FRAMES_PER_S);
+        scan.send(&AgentMsg::Spectrum(spectrum_frame("radio6", 256)));
+        assert_eq!(
+            p.recv(),
+            spectrum_state(
+                "radio5",
+                false,
+                "stopped: the spectrum helper sent another radio's"
+            )
+        );
+        assert!(scan.closed_within(WAIT));
+    }
+
+    /// Only a stable radio name reaches the helper, so the controller cannot
+    /// make the agent send it a line of its own; without a helper the scan
+    /// does not start; the helper's refusal ends the scan.
+    #[test]
+    fn a_scan_that_cannot_run_is_answered() {
+        let (fake, helper) = (Fake::new(), Helper::new());
+        let _agent = helper.agent(&fake, spectrum::LIMIT);
+        let mut p = fake.accept();
+        p.start();
+        p.send(CtlMsg::SpectrumStart {
+            radio: "radio5\nstart radio6".into(),
+        });
+        assert_eq!(
+            p.recv(),
+            spectrum_state("", false, "refused: no such radio")
+        );
+        p.send(CtlMsg::SpectrumStart {
+            radio: "radio6".into(),
+        });
+        let mut scan = helper.next();
+        assert_eq!(scan.request, "start radio6");
+        let refused = spectrum_state("", false, "refused: another client scans it");
+        scan.send(&refused);
+        assert_eq!(
+            p.recv(),
+            spectrum_state("radio6", false, "refused: another client scans it")
+        );
+        assert!(scan.closed_within(WAIT));
+        assert!(
+            helper.conns.try_recv().is_err(),
+            "a line of the controller's own"
+        );
+
+        let fake = Fake::new();
+        let _agent = Agent::spawn_with(
+            &fake,
+            0,
+            |c| c.spectrum = PathBuf::from("/nonexistent/sock"),
+            blank,
+        );
+        let mut p = fake.accept();
+        p.start();
+        p.send(CtlMsg::SpectrumStart {
+            radio: "radio5".into(),
+        });
+        match p.recv() {
+            AgentMsg::SpectrumState {
+                radio,
+                running: false,
+                reason,
+            } => assert!(radio == "radio5" && reason.starts_with("no spectrum helper")),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

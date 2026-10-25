@@ -16,8 +16,9 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
-/// The radios a scan may be asked of, by stable name.
-pub const RADIOS: [&str; 3] = ["radio24", "radio5", "radio6"];
+/// The stable names are the only radios; a request naming anything else (a
+/// path among them) is no request.
+pub use u6e_proto::msg::{RADIOS, radio};
 
 /// Where the radios' debugfs directories are.
 pub const DEBUGFS: &str = "/sys/kernel/debug/ieee80211";
@@ -27,12 +28,6 @@ pub const DEBUGFS: &str = "/sys/kernel/debug/ieee80211";
 pub const FFT_BINS: u32 = 512;
 /// Samples per trigger, one trigger per frame: 80 samples a second.
 pub const COUNT: u32 = 8;
-
-/// The stable name `name` is one of, as the static it is; nothing else is a
-/// radio, so no request can name a path.
-pub fn radio(name: &str) -> Option<&'static str> {
-    RADIOS.iter().copied().find(|r| *r == name)
-}
 
 /// A radio whose scan runs: disabled when dropped.
 pub struct Scan {
@@ -176,6 +171,7 @@ pub mod tests {
             "radio7",
             "../radio5",
             "radio5/",
+            "radio5\nstart radio6",
             "phy0",
             "RADIO5",
         ] {

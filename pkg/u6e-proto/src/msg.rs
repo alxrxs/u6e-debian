@@ -360,6 +360,15 @@ pub struct CommandResult {
     pub detail: String,
 }
 
+/// The radios' stable names, as their wiphys are named on the AP: the only
+/// radios a spectrum scan may be asked of.
+pub const RADIOS: [&str; 3] = ["radio24", "radio5", "radio6"];
+
+/// `name` as the one of [`RADIOS`] it is; nothing else names a radio.
+pub fn radio(name: &str) -> Option<&'static str> {
+    RADIOS.iter().copied().find(|r| *r == name)
+}
+
 /// One spectrum of a radio's own channel: the power in each FFT bin, the
 /// highest over the samples since the frame before.
 ///

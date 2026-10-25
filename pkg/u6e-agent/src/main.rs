@@ -10,7 +10,8 @@
 //!   u6e-agent --print-flows [--full]
 //!
 //! With the three controller options it also streams telemetry to the
-//! controller and carries out its commands (see `link` and `command`).
+//! controller, carries out its commands and forwards the spectrum scans it
+//! asks for, which u6e-spectral runs (see `link`, `command` and `spectrum`).
 //! `--print-flows` prints the flows the link would send now, and what
 //! reading them cost.
 
@@ -26,6 +27,7 @@ mod netcheck;
 mod nl80211;
 mod passed;
 mod rates;
+mod spectrum;
 mod stats;
 #[cfg(test)]
 mod testdir;
