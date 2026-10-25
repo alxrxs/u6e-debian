@@ -1,5 +1,6 @@
 // Devices: each AP with what it runs and how it is doing, and its radios with
-// channel, power, noise, clients and how busy the air is.
+// channel, power, noise, clients and how busy the air is; a radio's name
+// leads to its spectrum.
 
 import { h, ago, bandName, duration, palette, pct } from '../util.js';
 import { sparkline, stack } from '../charts.js';
@@ -40,7 +41,7 @@ function radioPanel(store, name, phy, r, tempC) {
   return h('article', { class: `radio${r.up ? '' : ' down'}`, 'data-band': r.band },
     h('div', { class: 'radio-top' },
       h('span', { class: 'band' }, bandName(r.band)),
-      h('span', { class: 'phy' }, phy)),
+      h('a', { class: 'phy', href: `#/spectrum/${name}/${phy}`, title: `The spectrum ${phy} hears` }, phy)),
     h('div', { class: 'chan', title: `Channel ${r.channel}, ${r.width} MHz wide` },
       h('span', { class: 'muted' }, 'Channel'), h('b', {}, String(r.channel)), h('span', {}, `${r.width} MHz`)),
     r.up ? null : h('p', { class: 'note' }, 'Radio down: no clients can join it.'),

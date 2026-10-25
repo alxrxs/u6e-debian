@@ -334,6 +334,7 @@ details.manifest pre {
 .radio-top { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
 .radio-top .band { font-size: 15px; color: var(--band); }
 .radio-top .phy { color: var(--ink-3); font-size: 12px; }
+.radio-top a.phy { color: var(--accent); }
 
 .chan { display: flex; align-items: baseline; gap: 10px; margin: 6px 0 12px; }
 .chan b { font-size: 30px; font-weight: 650; line-height: 1; letter-spacing: -0.02em; }
@@ -558,6 +559,39 @@ table.conns { font-size: 12.5px; }
 .flow-sum .off b { text-align: left; }
 .client-flows .table-wrap { padding: 0 8px; }
 
+/* Spectrum */
+
+.rf { --band: var(--accent); overflow: hidden; }
+.rf[data-band="2.4"] { --band: var(--b24); }
+.rf[data-band="5"] { --band: var(--b5); }
+.rf[data-band="6"] { --band: var(--b6); }
+.rf-top { display: flex; align-items: center; gap: 10px 16px; flex-wrap: wrap; padding: 16px 20px 0; }
+.rf-title { display: flex; align-items: baseline; gap: 4px 12px; flex-wrap: wrap; min-width: 0; }
+.rf-title h2 { font-size: 20px; }
+.rf-chan { color: var(--ink-2); font-weight: 550; }
+.rf-top .btn { margin-left: auto; }
+.rf-top .btn svg { width: 12px; height: 12px; color: currentColor; }
+.rf-top .btn svg path { fill: currentColor; }
+
+.rf-status { position: relative; display: flex; gap: 8px; align-items: flex-start; margin: 12px 20px 0; padding: 9px 12px 10px; border-radius: 8px; background: var(--sunken); color: var(--ink-2); font-size: 13px; overflow: hidden; }
+.rf-status svg { width: 14px; height: 14px; flex: none; margin-top: 2px; }
+.rf-status b { font-weight: 600; white-space: nowrap; }
+.rf-status[data-tone="ok"] { color: var(--ink); background: color-mix(in srgb, var(--ok) 9%, var(--surface)); }
+/* How much of the scan's 10 minutes is gone, along the bottom edge. */
+.rf-status[data-tone="ok"]::after { content: ""; position: absolute; left: 0; bottom: 0; width: var(--done, 0); height: 3px; background: var(--ok); }
+.rf-status[data-tone="bad"] { color: var(--bad); background: color-mix(in srgb, var(--bad) 8%, var(--surface)); }
+.rf-status[data-tone="wait"] span::after { content: ""; display: inline-block; width: 6px; height: 6px; margin-left: 8px; border-radius: 50%; background: var(--accent); animation: pulse 0.8s ease-in-out infinite alternate; }
+
+.rf-body { padding: 4px 20px 16px; }
+.rf-plot-head { display: flex; align-items: center; gap: 4px 14px; flex-wrap: wrap; margin: 14px 0 4px; }
+.rf-plot-head .btn { margin-left: auto; height: 26px; padding: 0 8px; font-size: 12px; }
+.sw-now { background: var(--band); }
+.legend i.sw-hold { width: 14px; height: 0; border-radius: 0; border-top: 1.5px solid var(--ink-3); vertical-align: 3px; }
+.rf-spectrum { display: block; width: 100%; height: 240px; }
+.rf-waterfall { display: block; width: 100%; height: 320px; }
+.rf-key { display: inline-flex; align-items: center; gap: 8px; margin-left: auto; color: var(--ink-3); font-size: 12px; }
+.rf-scale { width: 150px; height: 10px; border-radius: 2px; }
+
 /* Events */
 
 .feed { list-style: none; margin: 0; padding: 0; }
@@ -578,7 +612,7 @@ table.conns { font-size: 12.5px; }
 .more { display: block; margin: 12px auto 0; padding: 7px 14px; border: 1px solid var(--rule); border-radius: 8px; background: var(--surface); color: var(--ink-2); font: inherit; font-size: 13px; cursor: pointer; }
 
 @media (prefers-reduced-motion: reduce) {
-  .feed li.fresh, .btn[aria-busy] svg, .full[aria-busy] h3::after { animation: none; }
+  .feed li.fresh, .btn[aria-busy] svg, .full[aria-busy] h3::after, .rf-status span::after { animation: none; }
   .expand svg { transition: none; }
 }
 
@@ -588,7 +622,7 @@ table.conns { font-size: 12.5px; }
   .bar { gap: 10px; padding: 0 12px; height: auto; min-height: 52px; flex-wrap: wrap; }
   .brand span { display: none; }
   .tabs { order: 3; width: calc(100% + 24px); height: 40px; margin: 0 -12px; padding: 0 4px; border-top: 1px solid var(--rule-2); }
-  .tabs a { flex: 1; justify-content: center; padding: 0 6px; }
+  .tabs a { flex: 1; justify-content: center; padding: 0 4px; font-size: 13px; }
   .session { gap: 10px; }
   .user { max-width: 12ch; }
   .banner { padding: 9px 16px; }
@@ -634,4 +668,11 @@ table.conns { font-size: 12.5px; }
   .conns tr { gap: 2px 10px; }
   .conns td[data-label]::before { content: attr(data-label) " "; color: var(--ink-3); }
   .client-flows .table-wrap { padding: 0; }
+  .rf-top { padding: 14px 14px 0; }
+  .rf-top .btn { margin-left: 0; width: 100%; justify-content: center; }
+  .rf-status { margin: 12px 14px 0; }
+  .rf-body { padding: 0 14px 14px; }
+  .rf-spectrum { height: 200px; }
+  .rf-waterfall { height: 260px; }
+  .rf-scale { width: 90px; }
 }

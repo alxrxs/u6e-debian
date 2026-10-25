@@ -3,7 +3,9 @@
 // happen; the views render from that, and the samples taken here every two
 // seconds draw the charts of each client's session. While a view shows flows
 // the socket asks for them too, which makes the APs send them every 10 s;
-// the client actions are POSTs, answered with their result.
+// the client actions are POSTs, answered with their result. The socket also
+// watches the one radio whose spectrum is shown, if any: its scan's state
+// comes as JSON, its frames as binary messages straight to the view.
 
 import { icon } from './util.js';
 import devices from './views/devices.js';
@@ -11,6 +13,7 @@ import clients from './views/clients.js';
 import client from './views/client.js';
 import events from './views/events.js';
 import flows from './views/flows.js';
+import spectrum, { decodeFrame } from './views/spectrum.js';
 
 /** Samples kept per client and radio: an hour at one per tick. */
 const HISTORY = 1800;
@@ -47,13 +50,17 @@ const store = {
   flowsKeyed: false,
   /** What the views remember across visits: sort, filters, open details. */
   ui: {},
+  /** The radio whose scan the socket watches (`<ap>/<radio>`, or null), its
+   * state as the controller last told it, and who takes its frames. */
+  spectrum: { key: null, state: null, onFrame: null },
   /** Fetches the events held before this page opened, once. */
   loadHistory,
   act,
   fullFlows,
+  watchSpectrum,
 };
 
-const views = { devices, clients, client, flows, events };
+const views = { devices, clients, client, flows, events, spectrum };
 let current = null;
 let currentName = '';
 
@@ -198,14 +205,37 @@ function watchFlows(want) {
   if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ flows: want }));
 }
 
+/** Watches the scan of `key` (`<ap>/<radio>`), which starts it if it is not
+ * running, or none (null); the controller stops a scan nobody watches. */
+function watchSpectrum(key) {
+  const s = store.spectrum;
+  if (key === null && s.key === null) return;
+  s.key = key;
+  s.state = null;
+  if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ spectrum: key }));
+}
+
 let backoff = 1;
 
 function connect() {
   const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
+  ws.binaryType = 'arraybuffer';
   socket = ws;
-  ws.onopen = () => ws.send(JSON.stringify({ subscribe: '*', flows: withFlows }));
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ subscribe: '*', flows: withFlows }));
+    // A scan watched when the socket dropped is watched again, unless it
+    // had stopped: a new socket never starts one by itself.
+    const s = store.spectrum;
+    if (s.key && !s.state?.stopped && !s.state?.error) ws.send(JSON.stringify({ spectrum: s.key }));
+  };
   ws.onmessage = (e) => {
+    if (e.data instanceof ArrayBuffer) {
+      const f = decodeFrame(e.data);
+      if (f && f.key === store.spectrum.key) store.spectrum.onFrame?.(f);
+      return;
+    }
     const m = JSON.parse(e.data);
+    if (m.spectrum && m.spectrum.key === store.spectrum.key) store.spectrum.state = m.spectrum;
     if (m.key) {
       store.state = m.key;
       store.keyed = true;
@@ -280,6 +310,8 @@ function show() {
   const [name, arg] = route();
   currentName = name;
   const root = document.getElementById('view');
+  // A view that holds something open (the spectrum's scan) lets it go.
+  current?.unmount?.();
   root.replaceChildren();
   current = views[name].mount(root, store, arg);
   watchFlows(!!views[name].flows);
@@ -324,7 +356,7 @@ function render() {
       ? `Live updates stopped: the controller cannot be reached. Trying again in ${s} s; the figures shown are the last received.`
       : `The controller cannot be reached. Trying again in ${s} s.`;
   }
-  const title = { devices: 'Devices', clients: 'Clients', client: 'Client', flows: 'Flows', events: 'Events' }[currentName];
+  const title = { devices: 'Devices', clients: 'Clients', client: 'Client', flows: 'Flows', spectrum: 'Spectrum', events: 'Events' }[currentName];
   document.title = `${title} – Wi-Fi`;
   current?.update();
 }
