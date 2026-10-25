@@ -10,6 +10,9 @@
 //! later, a blocked one stays away until it is unblocked, a steered one moves
 //! to its target, and the thermostat (`02:00:00:00:00:06`) never answers a
 //! kick, for the timeout. Each client's addresses have a DNS name, but one's.
+//! A radio asked to scan sends ten spectra a second until it is told to stop
+//! or goes down (`spectrum`: Wi-Fi bursts, a narrowband sender on 5 GHz, a
+//! microwave oven and Bluetooth on 2.4 GHz, a quiet 6 GHz channel).
 //! The web listener adds what the sign-in proxy in front of a controller
 //! would: a user, a member of the admin group unless `--viewer` is given.
 //!
@@ -20,6 +23,7 @@
 mod flows;
 #[path = "../../tests/common/keys.rs"]
 mod keys;
+mod spectrum;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -33,7 +37,7 @@ use axum::middleware;
 use keys::{KEY_AP1, KEY_AP2, KEY_CONTROLLER};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::time::{interval, sleep, sleep_until};
+use tokio::time::{MissedTickBehavior, interval, sleep, sleep_until};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::ServerName;
 use u6e_controller::actions::{Access, GROUPS_HEADER, USER_HEADER};
@@ -44,7 +48,7 @@ use u6e_controller::names::Resolve;
 use u6e_proto::frame::{decode_frame, frame_body, write_frame};
 use u6e_proto::msg::{
     AgentMsg, Band, Bss, CommandKind, CommandResult, CtlMsg, Event, EventKind, Flows, Hello, Radio,
-    RateMode, Snapshot, Station, Temp,
+    RateMode, Snapshot, SpectrumFrame, Station, Temp,
 };
 use u6e_proto::tls::{self, Identity};
 use u6e_proto::{PROTOCOL, delta, mac, version};
@@ -263,7 +267,7 @@ impl World {
                     "image:     20261024-213000-5f0c2a1-9e1d3b7-ap1\nkernel:    5f0c2a1 kernel: thermal and spectral\nbackports: 9e1d3b7 ath11k: radio hwmon\ndebian-ap: 58e88f8 prep-rootfs: image identity\nhostapd:   2:2.10-21",
                     "6.12.57-u6e",
                     3 * 86_400 + 4_310,
-                    [(6, 20), (36, 80), (37, 160)],
+                    [(11, 20), (36, 80), (37, 160)],
                     true,
                 ),
                 ap(
@@ -591,6 +595,32 @@ impl World {
         }
     }
 
+    /// The next spectrum of the AP's radio of that name, or why it cannot
+    /// scan: it has none, or it is down.
+    fn spectrum(&mut self, ap: usize, radio: &str) -> Result<SpectrumFrame, &'static str> {
+        self.advance();
+        let i = RADIOS
+            .iter()
+            .position(|r| *r == radio)
+            .ok_or("no such radio")?;
+        let r = self.aps[ap].radios[i].clone();
+        if !r.up {
+            return Err("the radio is down");
+        }
+        let clients = self
+            .clients
+            .iter()
+            .filter(|c| c.at.is_some_and(|(a, b)| a == ap && BSSS[b].2 == i));
+        let busy = FOREIGN_BUSY[i] / 200.0 + 0.04 * clients.count() as f64;
+        let at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        let t = self.t;
+        Ok(spectrum::frame(radio, &r, busy, t, at_ms, &mut || {
+            self.noise()
+        }))
+    }
+
     /// Whether the AP's link is down by the script.
     fn away(&mut self, ap: usize) -> bool {
         self.advance();
@@ -781,6 +811,10 @@ async fn agent(addr: SocketAddr, ap: usize, pem: &str, world: Arc<Mutex<World>>)
     let mut cadence = Duration::from_secs(60);
     let mut next_flows = next;
     let mut events = interval(Duration::from_millis(250));
+    // The radios scanning, and the tenth of a second their frames come at.
+    let mut scans = BTreeSet::new();
+    let mut frames = interval(Duration::from_millis(100));
+    frames.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let (mut seq, mut last, mut want_key) = (0, None::<Snapshot>, true);
     let mut flows_seq = 0;
     let flows = |seq: &mut u64, full| {
@@ -818,6 +852,32 @@ async fn agent(addr: SocketAddr, ap: usize, pem: &str, world: Arc<Mutex<World>>)
                         send(&mut wr, &AgentMsg::Result(r)).await?;
                     }
                 }
+                CtlMsg::SpectrumStart { radio } => {
+                    let can = world
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .spectrum(ap, &radio)
+                        .map(|_| "started");
+                    if can.is_ok() {
+                        scans.insert(radio.clone());
+                    }
+                    let (running, reason) = (can.is_ok(), can.unwrap_or_else(|why| why).into());
+                    let state = AgentMsg::SpectrumState {
+                        radio,
+                        running,
+                        reason,
+                    };
+                    send(&mut wr, &state).await?;
+                }
+                CtlMsg::SpectrumStop { radio } => {
+                    scans.remove(&radio);
+                    let state = AgentMsg::SpectrumState {
+                        radio,
+                        running: false,
+                        reason: "stopped".into(),
+                    };
+                    send(&mut wr, &state).await?;
+                }
                 _ => {}
             }
         }
@@ -848,6 +908,26 @@ async fn agent(addr: SocketAddr, ap: usize, pem: &str, world: Arc<Mutex<World>>)
                 };
                 for ev in due {
                     send(&mut wr, &AgentMsg::Event(ev)).await?;
+                }
+            }
+            _ = frames.tick(), if !scans.is_empty() => {
+                let mut stopped = Vec::new();
+                for radio in &scans {
+                    let frame = world.lock().unwrap_or_else(|e| e.into_inner()).spectrum(ap, radio);
+                    match frame {
+                        Ok(f) => send(&mut wr, &AgentMsg::Spectrum(f)).await?,
+                        // A radio that went down ends its scan, as the helper would.
+                        Err(why) => stopped.push((radio.clone(), why)),
+                    }
+                }
+                for (radio, why) in stopped {
+                    scans.remove(&radio);
+                    let state = AgentMsg::SpectrumState {
+                        radio,
+                        running: false,
+                        reason: why.into(),
+                    };
+                    send(&mut wr, &state).await?;
                 }
             }
             n = read(&mut rd, &mut chunk) => buf.extend_from_slice(&chunk[..n?]),
