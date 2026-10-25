@@ -3,7 +3,7 @@
 //! result) on ports of its own, and speaks the link to it with u6e-proto
 //! alone: a blocking rustls client, the framing and the messages.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::hash::{DefaultHasher, Hasher};
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
@@ -935,6 +935,85 @@ fn assets_served_with_cache_headers() {
         let (head, _) = http_request(r.c.http, missing, "");
         assert!(head.starts_with("http/1.1 404"), "{missing}: {head}");
     }
+}
+
+/// The quoted import specifiers of a module (`from './x.js'`).
+fn imports(module: &str) -> Vec<String> {
+    let after = module.split("from '").skip(1);
+    after
+        .map(|s| s.split('\'').next().unwrap().to_owned())
+        .collect()
+}
+
+/// `spec` relative to the directory `dir` of the module importing it.
+fn resolve(dir: &str, spec: &str) -> String {
+    let mut parts: Vec<&str> = dir.split('/').collect();
+    for p in spec.split('/') {
+        match p {
+            "." => {}
+            ".." => {
+                parts.pop();
+            }
+            p => parts.push(p),
+        }
+    }
+    parts.join("/")
+}
+
+/// Every file under `dir`, by its path from `root`.
+fn files_under(root: &Path, dir: &Path, out: &mut BTreeSet<String>) {
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            files_under(root, &path, out);
+        } else {
+            let rel = path.strip_prefix(root).unwrap();
+            out.insert(rel.to_str().unwrap().replace('\\', "/"));
+        }
+    }
+}
+
+/// Every file of the UI is served, reached as a browser reaches it: from the
+/// page's links, then from each module's imports; and none is left out, so a
+/// file added to `ui/` but not to the embedded list fails here.
+#[test]
+fn every_ui_file_is_served() {
+    let r = controller(Timing::default());
+    let (_, page) = http_request(r.c.http, "/", "");
+    let links = page
+        .split(['"', '\''])
+        .filter(|s| s.starts_with("/assets/"));
+    let mut todo: Vec<String> = links.map(str::to_owned).collect();
+    assert!(!todo.is_empty(), "{page}");
+    let mut served = BTreeSet::new();
+    while let Some(path) = todo.pop() {
+        if !served.insert(path.clone()) {
+            continue;
+        }
+        let (head, body) = http_request(r.c.http, &path, "");
+        assert!(head.starts_with("http/1.1 200"), "{path}: {head}");
+        if path.ends_with(".js") {
+            let dir = &path[..path.rfind('/').unwrap()];
+            todo.extend(imports(&body).iter().map(|s| resolve(dir, s)));
+        }
+    }
+    let version = page
+        .split("/assets/")
+        .nth(1)
+        .unwrap()
+        .split('/')
+        .next()
+        .unwrap();
+    let prefix = format!("/assets/{version}/");
+    let served: BTreeSet<String> = served
+        .iter()
+        .map(|p| p.strip_prefix(&prefix).unwrap_or(p).to_owned())
+        .collect();
+    let ui = Path::new(env!("CARGO_MANIFEST_DIR")).join("ui");
+    let mut on_disk = BTreeSet::new();
+    files_under(&ui, &ui, &mut on_disk);
+    on_disk.remove("index.html");
+    assert_eq!(served, on_disk);
 }
 
 /// A WebSocket client of the web listener.
