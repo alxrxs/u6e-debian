@@ -26,6 +26,16 @@ pub enum AgentMsg {
     Flows(Flows),
     /// The outcome of a [`CtlMsg::Command`].
     Result(CommandResult),
+    /// One spectrum of a radio scanning since [`CtlMsg::SpectrumStart`].
+    Spectrum(SpectrumFrame),
+    /// Whether a radio's spectrum scan runs, and why it started or ended: the
+    /// answer to [`CtlMsg::SpectrumStart`] and [`CtlMsg::SpectrumStop`], and
+    /// what the agent sends when it ends a scan itself.
+    SpectrumState {
+        radio: String,
+        running: bool,
+        reason: String,
+    },
 }
 
 /// Everything the controller sends.
@@ -52,6 +62,15 @@ pub enum CtlMsg {
     },
     /// An operator action, answered by an [`AgentMsg::Result`] of its id.
     Command(Command),
+    /// Scan the spectrum of the radio of this stable name (`radio24`,
+    /// `radio5`, `radio6`) on its own channel and stream it, until
+    /// [`CtlMsg::SpectrumStop`], the end of the session or the agent's limit.
+    SpectrumStart {
+        radio: String,
+    },
+    SpectrumStop {
+        radio: String,
+    },
 }
 
 /// What the AP is running, sent once per connection.
@@ -339,4 +358,27 @@ pub struct CommandResult {
     pub ok: bool,
     /// hostapd's answer, or why the command was refused.
     pub detail: String,
+}
+
+/// One spectrum of a radio's own channel: the power in each FFT bin, the
+/// highest over the samples since the frame before.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpectrumFrame {
+    pub radio: String,
+    /// Milliseconds since the Unix epoch, as [`Event::at_ms`].
+    pub at_ms: u64,
+    /// The scanned segment: its centre and width.
+    pub center_mhz: u16,
+    pub width_mhz: u16,
+    /// The centre of the first bin, in tenths of a MHz.
+    pub first_mhz_x10: u32,
+    /// From one bin's centre to the next, rounded to the kHz; exactly
+    /// `width_mhz` / `bins.len()`.
+    pub step_khz: u32,
+    /// dBm per bin, lowest frequency first.
+    pub bins: Vec<i8>,
+    /// The noise floor the samples report.
+    pub noise_dbm: i8,
 }

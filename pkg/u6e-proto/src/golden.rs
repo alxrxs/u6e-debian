@@ -23,7 +23,7 @@ use crate::mac::hex;
 use crate::msg::{
     AgentMsg, Band, Bss, ClientFlows, Command, CommandKind, CommandResult, CtlMsg, Event,
     EventKind, FieldDelta, Flow, Flows, Hello, Radio, RateMode, RecDelta, Snapshot, SnapshotDelta,
-    Station, Temp,
+    SpectrumFrame, Station, Temp,
 };
 
 const HOW: &str = "bump u6e_proto::PROTOCOL (pkg/u6e-proto/src/version.rs) and write the \
@@ -187,6 +187,27 @@ fn samples() -> (Named<AgentMsg>, Named<CtlMsg>) {
             detail: "OK".into(),
         }),
     ));
+    agent.push((
+        "Spectrum",
+        AgentMsg::Spectrum(SpectrumFrame {
+            radio: "radio5".into(),
+            at_ms: 1 << 41,
+            center_mhz: 60_003,
+            width_mhz: 320,
+            first_mhz_x10: 70_012,
+            step_khz: 70_013,
+            bins: vec![-128, -95, 0, 127],
+            noise_dbm: -96,
+        }),
+    ));
+    agent.push((
+        "SpectrumState",
+        AgentMsg::SpectrumState {
+            radio: "radio5".into(),
+            running: true,
+            reason: "started".into(),
+        },
+    ));
     let mut ctl = vec![
         ("SetTick", CtlMsg::SetTick { secs: 300 }),
         ("WantKey", CtlMsg::WantKey),
@@ -210,6 +231,9 @@ fn samples() -> (Named<AgentMsg>, Named<CtlMsg>) {
     for (name, kind) in commands {
         ctl.push((name, CtlMsg::Command(Command { id: 1 << 42, kind })));
     }
+    let radio = || "radio5".to_owned();
+    ctl.push(("SpectrumStart", CtlMsg::SpectrumStart { radio: radio() }));
+    ctl.push(("SpectrumStop", CtlMsg::SpectrumStop { radio: radio() }));
     (agent, ctl)
 }
 
