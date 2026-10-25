@@ -5,8 +5,8 @@
 //! full key frame now and then), the events as they happen, and its clients'
 //! connections every minute, or at the cadence the controller sets. The
 //! controller sets the tick and that cadence, asks for key frames and flows,
-//! pings, and sends commands, each carried out against the snapshot sent last
-//! and answered in turn, and starts and stops radios' spectrum scans, whose
+//! pings, and sends commands, each carried out with the snapshot sent last at
+//! hand and answered in turn, and starts and stops radios' spectrum scans, whose
 //! frames leave as they come (see `spectrum`); a silent or broken connection
 //! is dropped, its scans with it, and dialed again. The wait before a redial
 //! doubles from 1 s to 30 s until a session is useful (the controller said

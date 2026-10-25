@@ -1,9 +1,11 @@
 //! The operator's commands, carried out through hostapd's control sockets:
 //! kick (deauthenticate), block and unblock (every BSS's deny ACL) and steer
 //! (an 802.11v BSS Transition Management Request). All a command names is
-//! checked before hostapd is asked anything: the address must be a station's,
-//! the station must be on this AP in the link's latest snapshot, and a steer
-//! target must be a BSS of the latest 802.11k round, of the station's SSID.
+//! checked before hostapd is told to do anything: the address must be a
+//! station's, the station must be associated with a BSS of this AP as
+//! hostapd has it at that moment (a snapshot can be a tick old, and a client
+//! that changed bands since is no longer where it says), and a steer target
+//! must be a BSS of the latest 802.11k round, of the station's SSID.
 //! Blocks live in RAM: on each connection the controller sends the whole set
 //! (`SyncBlocks`), which every BSS's deny ACL is made to hold exactly, and
 //! they go back onto a BSS whose hostapd started again without them.
@@ -14,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use u6e_proto::mac;
-use u6e_proto::msg::{Bss, Command, CommandKind, CommandResult, Snapshot};
+use u6e_proto::msg::{Command, CommandKind, CommandResult, Snapshot};
 
 use crate::collect;
 use crate::neighbors::{Element, Hostapd, Target};
@@ -63,8 +65,9 @@ impl Commands {
         })
     }
 
-    /// Carries out `c` on the stations of `last`, the snapshot the link sent
-    /// last.
+    /// Carries out `c` where hostapd has its station now. `last`, the
+    /// snapshot the link sent last, names the BSSs' BSSIDs for a steer, and
+    /// the stations a sync looks for.
     pub fn run(&mut self, c: &Command, last: Option<&Snapshot>) -> CommandResult {
         let (ok, detail) = match self.carry_out(&c.kind, last) {
             Ok(d) => (true, d),
@@ -81,19 +84,23 @@ impl Commands {
         match *kind {
             CommandKind::Kick { mac } => {
                 let mac = station(mac)?;
-                let bss = bss_of(last, mac).ok_or(NOT_HERE)?;
-                self.kick(&bss.ifname, mac)
+                let iface = self.current_bss(mac)?;
+                self.kick(&iface, mac)
             }
             CommandKind::Block { mac } => {
                 let mac = station(mac)?;
+                // Looked up first: a deny ACL entry makes hostapd drop the
+                // station, after which it is on no BSS to kick it from.
+                let on = self.current_bss(mac);
                 // Held through the change, so a reassertion never interleaves.
                 let blocks = Arc::clone(&self.blocks);
                 let mut held = crate::lock(&blocks);
                 held.insert(mac);
                 let acl = self.on_every_bss(&format!("DENY_ACL ADD_MAC {}", mac::format(mac)));
-                let kick = match bss_of(last, mac) {
-                    Some(bss) => self.kick(&bss.ifname, mac),
-                    None => Ok(NOT_HERE.into()),
+                let kick = match on {
+                    Ok(iface) => self.kick(&iface, mac),
+                    Err(e) if e == NOT_HERE => Ok(e),
+                    Err(e) => Err(e),
                 };
                 let label = |d| format!("kick: {d}");
                 both(acl, kick.map(label).map_err(label))
@@ -111,7 +118,10 @@ impl Commands {
                 let targets = crate::lock(&self.targets).clone();
                 let find = |bssid| targets.iter().find(|t| t.nr.bssid == bssid);
                 let target = find(target_bssid).ok_or("unknown target")?;
-                let bss = bss_of(last, mac).ok_or(NOT_HERE)?;
+                let iface = self.current_bss(mac)?;
+                let bss = last
+                    .and_then(|s| s.bsss.iter().find(|b| b.ifname == iface))
+                    .ok_or_else(|| format!("{iface}: not in the last snapshot"))?;
                 if bss.bssid == target_bssid {
                     return Err("already on the target".into());
                 }
@@ -125,8 +135,8 @@ impl Commands {
 
     /// Makes the blocks exactly `macs`. Each BSS's deny ACL gets those it
     /// lacks and loses those it holds beyond them: hostapd's own list, so a
-    /// block an earlier agent left there goes too. A client of `macs` still on
-    /// the AP is kicked.
+    /// block an earlier agent left there goes too. A client of `macs` the
+    /// last snapshot has on the AP is kicked where hostapd has it now.
     fn sync(&mut self, macs: &[[u8; 6]], last: Option<&Snapshot>) -> Outcome {
         if macs.len() > SYNC_MAX {
             return Err(format!("more than {SYNC_MAX} blocks"));
@@ -135,6 +145,11 @@ impl Commands {
             station(m)?;
         }
         let want: BTreeSet<[u8; 6]> = macs.iter().copied().collect();
+        let on: Vec<([u8; 6], String)> = want
+            .iter()
+            .filter(|&&m| listed(last, m))
+            .filter_map(|&m| Some((m, self.current_bss(m).ok()?)))
+            .collect();
         let blocks = Arc::clone(&self.blocks);
         let mut held = crate::lock(&blocks);
         held.clone_from(&want);
@@ -144,10 +159,37 @@ impl Commands {
             .reduce(both)
             .unwrap_or_else(|| Err("no BSS".into()));
         let label = |d| format!("kick: {d}");
-        want.iter()
-            .filter_map(|&m| Some((bss_of(last, m)?, m)))
-            .map(|(bss, m)| self.kick(&bss.ifname, m).map(label).map_err(label))
+        on.iter()
+            .map(|(m, iface)| self.kick(iface, *m).map(label).map_err(label))
             .fold(acl, both)
+    }
+
+    /// The BSS `mac` is associated with now, by hostapd's `STA`: of the BSSs
+    /// that list it as associated, the one it joined last (an entry lingers
+    /// on the old BSS for a moment after a roam). Not here when every BSS
+    /// answered and none has it, the silent ones' failures otherwise.
+    fn current_bss(&mut self, mac: [u8; 6]) -> Result<String, String> {
+        let cmd = format!("STA {}", mac::format(mac));
+        let mut newest: Option<(u64, String)> = None;
+        let mut silent = Vec::new();
+        for iface in collect::bss_order(&self.dir) {
+            match self.request(&iface, &cmd) {
+                Ok(reply) => {
+                    let Some(age) = associated_for(&reply, mac) else {
+                        continue;
+                    };
+                    if newest.as_ref().is_none_or(|(a, _)| age < *a) {
+                        newest = Some((age, iface));
+                    }
+                }
+                Err(e) => silent.push(e),
+            }
+        }
+        match newest {
+            Some((_, iface)) => Ok(iface),
+            None if silent.is_empty() => Err(NOT_HERE.into()),
+            None => Err(silent.join("; ")),
+        }
     }
 
     /// One BSS's deny ACL made to hold exactly `want`.
@@ -246,11 +288,30 @@ fn station(m: [u8; 6]) -> Result<[u8; 6], String> {
     }
 }
 
-/// The BSS `mac` is a station of in `last`.
-fn bss_of(last: Option<&Snapshot>, mac: [u8; 6]) -> Option<&Bss> {
-    let s = last?;
-    let sta = s.stations.iter().find(|st| st.mac == mac)?;
-    s.bsss.get(usize::from(sta.bss))
+/// Whether `last` has `mac` among its stations.
+fn listed(last: Option<&Snapshot>, mac: [u8; 6]) -> bool {
+    last.is_some_and(|s| s.stations.iter().any(|st| st.mac == mac))
+}
+
+/// How long `mac` has been connected, in seconds, by hostapd's answer to
+/// `STA <mac>`: its address, then `flags=[AUTH][ASSOC]...` and, among the
+/// rest, `connected_time=`. `None` unless that answer is about `mac` and it
+/// is associated ("FAIL" for a station hostapd does not know).
+fn associated_for(reply: &str, mac: [u8; 6]) -> Option<u64> {
+    let mut lines = reply.lines();
+    if lines.next().and_then(mac::parse) != Some(mac) {
+        return None;
+    }
+    let mut assoc = false;
+    let mut age = u64::MAX;
+    for l in lines {
+        if let Some(flags) = l.strip_prefix("flags=") {
+            assoc = flags.contains("[ASSOC]");
+        } else if let Some(t) = l.strip_prefix("connected_time=") {
+            age = t.parse().unwrap_or(u64::MAX);
+        }
+    }
+    assoc.then_some(age)
 }
 
 /// A request naming `to` as the one candidate, most preferred (its BSS
@@ -286,7 +347,7 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use u6e_proto::msg::{RateMode, Station};
+    use u6e_proto::msg::{Bss, RateMode, Station};
 
     use crate::testdir::TestDir;
 
@@ -307,14 +368,36 @@ mod tests {
         Some("OK\n".into())
     }
 
-    /// hostapds at `BSSS` answering with `reply`, the requests they got, and
+    /// A station hostapd has on a BSS: the BSS, its address, its flags and
+    /// its `connected_time`.
+    type Entry = (&'static str, [u8; 6], &'static str, u64);
+
+    const ASSOC: &str = "[AUTH][ASSOC][AUTHORIZED]";
+
+    /// hostapds at `BSSS` answering with `reply` (`STA` from the stations in
+    /// `on`, unless `reply` keeps the BSS silent), the requests they got, and
     /// commands for them.
     struct Rig {
         t: TestDir,
         log: Arc<Mutex<Vec<String>>>,
+        on: Arc<Mutex<Vec<Entry>>>,
         targets: Arc<Mutex<Vec<Target>>>,
         blocks: Arc<Blocks>,
         cmds: Commands,
+    }
+
+    /// hostapd's answer to `STA <mac>` on `iface`, in its layout.
+    fn sta_reply(on: &[Entry], iface: &str, req: &str) -> String {
+        let mac = req.strip_prefix("STA ").and_then(mac::parse);
+        on.iter().find(|e| e.0 == iface && Some(e.1) == mac).map_or(
+            "FAIL\n".into(),
+            |&(_, m, flags, age)| {
+                format!(
+                    "{}\nflags={flags}\naid=1\ncapability=0x0\nconnected_time={age}\n",
+                    mac::format(m)
+                )
+            },
+        )
     }
 
     impl Rig {
@@ -323,15 +406,21 @@ mod tests {
             let dir = t.path().join("hostapd");
             fs::create_dir_all(&dir).unwrap();
             let log = Arc::new(Mutex::new(Vec::new()));
+            // `STA` on wlan5-1, as the snapshot has it.
+            let on = Arc::new(Mutex::new(vec![("wlan5-1", STA, ASSOC, 60)]));
             for iface in BSSS {
                 let server = UnixDatagram::bind(dir.join(iface)).unwrap();
-                let log = Arc::clone(&log);
+                let (log, on) = (Arc::clone(&log), Arc::clone(&on));
                 thread::spawn(move || {
                     let mut buf = [0; 4096];
                     while let Ok((n, from)) = server.recv_from(&mut buf) {
                         let req = String::from_utf8_lossy(&buf[..n]).into_owned();
                         log.lock().unwrap().push(format!("{iface} {req}"));
-                        if let (Some(r), Some(p)) = (reply(iface, &req), from.as_pathname()) {
+                        let r = reply(iface, &req).map(|r| match req.starts_with("STA ") {
+                            true => sta_reply(&on.lock().unwrap(), iface, &req),
+                            false => r,
+                        });
+                        if let (Some(r), Some(p)) = (r, from.as_pathname()) {
                             let _ = server.send_to(r.as_bytes(), p);
                         }
                     }
@@ -339,8 +428,10 @@ mod tests {
             }
             let targets = Arc::new(Mutex::new(vec![
                 target(SSID, NR),
-                // The station's own BSS, and a BSS of another SSID.
+                // The station's own BSS, its 2.4 GHz one, and a BSS of
+                // another SSID.
                 target(SSID, "020000000012ff5c000080950e0603029b00"),
+                target(SSID, "020000000010ff5c000080950e0603029b00"),
                 target("6f74686572", "02000000000bff5c000080950e0603029b00"),
             ]));
             let blocks = Arc::new(Blocks::default());
@@ -354,6 +445,7 @@ mod tests {
             Rig {
                 t,
                 log,
+                on,
                 targets,
                 blocks,
                 cmds,
@@ -364,8 +456,21 @@ mod tests {
             self.cmds.run(&Command { id: 7, kind }, Some(&snapshot()))
         }
 
+        /// The requests that act, the `STA` lookups left out.
         fn requests(&self) -> Vec<String> {
+            self.all_requests()
+                .into_iter()
+                .filter(|r| !r.contains(" STA "))
+                .collect()
+        }
+
+        fn all_requests(&self) -> Vec<String> {
             self.log.lock().unwrap().clone()
+        }
+
+        /// What hostapd has of the station now, whatever the snapshot says.
+        fn station_on(&self, entries: &[Entry]) {
+            *self.on.lock().unwrap() = entries.to_vec();
         }
     }
 
@@ -488,6 +593,7 @@ mod tests {
         let mac = [0x02, 0xff, 0x0a, 0xa0, 0x7f, 0x80];
         let mut snap = snapshot();
         snap.stations = vec![station(mac, 2)];
+        r.station_on(&[("wlan5-1", mac, ASSOC, 1)]);
         let kick = Command {
             id: 1,
             kind: CommandKind::Kick { mac },
@@ -521,33 +627,41 @@ mod tests {
         assert!(r.requests().is_empty());
     }
 
+    /// Not here is hostapd's word: a station of the snapshot that has left
+    /// since, or is only authenticated, is refused after the lookups alone.
     #[test]
     fn a_station_not_here_is_refused_before_any_request() {
         let mut r = Rig::new(ok);
-        let mac = [0x02, 0, 0, 0, 0, 0x99];
-        for kind in [
-            CommandKind::Kick { mac },
-            CommandKind::Steer {
-                mac,
-                target_bssid: TARGET,
-            },
-        ] {
+        let kinds = |mac| {
+            [
+                CommandKind::Kick { mac },
+                CommandKind::Steer {
+                    mac,
+                    target_bssid: TARGET,
+                },
+            ]
+        };
+        let away = [0x02, 0, 0, 0, 0, 0x99];
+        for kind in kinds(away) {
             let res = r.run(kind);
             assert_eq!(
                 (res.ok, res.detail.as_str()),
                 (false, "not associated here")
             );
         }
-        let kick = Command {
-            id: 1,
-            kind: CommandKind::Kick { mac: STA },
-        };
-        let res = r.cmds.run(&kick, None);
-        assert_eq!(
-            (res.ok, res.detail.as_str()),
-            (false, "not associated here")
-        );
+        for on in [&[][..], &[("wlan5-1", STA, "[AUTH]", 1)]] {
+            r.station_on(on);
+            for kind in kinds(STA) {
+                let res = r.run(kind);
+                assert_eq!(
+                    (res.ok, res.detail.as_str()),
+                    (false, "not associated here")
+                );
+            }
+        }
         assert!(r.requests().is_empty());
+        // Each lookup asked every BSS.
+        assert_eq!(r.all_requests().len(), 6 * BSSS.len());
     }
 
     #[test]
@@ -564,6 +678,53 @@ mod tests {
             r.requests(),
             ["wlan5-1 DEAUTHENTICATE 02:00:00:00:00:01 reason=3"]
         );
+    }
+
+    /// The station changed bands since the snapshot, which still has it on
+    /// wlan5-1: the kick goes where hostapd has it now. Without a snapshot
+    /// as well.
+    #[test]
+    fn kick_follows_a_station_that_moved_since_the_snapshot() {
+        let mut r = Rig::new(ok);
+        r.station_on(&[("wlan24", STA, ASSOC, 2)]);
+        let res = r.run(CommandKind::Kick { mac: STA });
+        assert_eq!((res.ok, res.detail.as_str()), (true, "wlan24: OK"));
+        let kick = Command {
+            id: 1,
+            kind: CommandKind::Kick { mac: STA },
+        };
+        assert!(r.cmds.run(&kick, None).ok);
+        assert_eq!(
+            r.requests(),
+            ["wlan24 DEAUTHENTICATE 02:00:00:00:00:01 reason=3"; 2]
+        );
+    }
+
+    /// Moments after a roam the old BSS can still list the station: the one
+    /// it joined last is where it is.
+    #[test]
+    fn of_two_associations_the_newest_counts() {
+        let mut r = Rig::new(ok);
+        r.station_on(&[("wlan24", STA, ASSOC, 0), ("wlan5-1", STA, ASSOC, 300)]);
+        let res = r.run(CommandKind::Kick { mac: STA });
+        assert_eq!((res.ok, res.detail.as_str()), (true, "wlan24: OK"));
+        r.station_on(&[("wlan24", STA, ASSOC, 300), ("wlan6", STA, ASSOC, 1)]);
+        let res = r.run(CommandKind::Kick { mac: STA });
+        assert_eq!((res.ok, res.detail.as_str()), (true, "wlan6: OK"));
+    }
+
+    #[test]
+    fn hostapds_sta_answer_is_read_for_its_station_only() {
+        let sta = "02:00:00:00:00:01\nflags=[AUTH][ASSOC][AUTHORIZED][WMM][HE]\naid=3\n\
+                   rx_packets=10\nconnected_time=42\nsupported_rates=0c 12\n";
+        assert_eq!(associated_for(sta, STA), Some(42));
+        assert_eq!(associated_for(sta, [0x02, 0, 0, 0, 0, 0x02]), None);
+        assert_eq!(associated_for("FAIL\n", STA), None);
+        assert_eq!(associated_for("", STA), None);
+        let no_time = "02:00:00:00:00:01\nflags=[AUTH][ASSOC]\n";
+        assert_eq!(associated_for(no_time, STA), Some(u64::MAX));
+        let auth_only = "02:00:00:00:00:01\nflags=[AUTH]\nconnected_time=1\n";
+        assert_eq!(associated_for(auth_only, STA), None);
     }
 
     #[test]
@@ -625,6 +786,36 @@ mod tests {
               neighbor=02:00:00:00:00:0a,0x00005cff,128,149,14,0301ff \
               pref=1 abridged=1 disassoc_imminent=1 disassoc_timer=100 valid_int=100"]
         );
+    }
+
+    /// The snapshot has the station on wlan5-1, but it changed bands since:
+    /// the request goes to wlan24, and wlan5-1 is a target like any other.
+    #[test]
+    fn steer_follows_a_station_that_moved_since_the_snapshot() {
+        let mut r = Rig::new(ok);
+        r.station_on(&[("wlan24", STA, ASSOC, 2)]);
+        let res = r.run(CommandKind::Steer {
+            mac: STA,
+            target_bssid: [0x02, 0, 0, 0, 0, 0x12],
+        });
+        assert_eq!((res.ok, res.detail.as_str()), (true, "wlan24: OK"));
+        let reqs = r.requests();
+        assert_eq!(reqs.len(), 1);
+        assert!(
+            reqs[0].starts_with("wlan24 BSS_TM_REQ 02:00:00:00:00:01 neighbor=02:00:00:00:00:12,"),
+            "{reqs:?}"
+        );
+        // Moved onto the target itself: nothing to ask.
+        r.station_on(&[("wlan5-1", STA, ASSOC, 0)]);
+        let res = r.run(CommandKind::Steer {
+            mac: STA,
+            target_bssid: [0x02, 0, 0, 0, 0, 0x12],
+        });
+        assert_eq!(
+            (res.ok, res.detail.as_str()),
+            (false, "already on the target")
+        );
+        assert_eq!(r.requests().len(), 1);
     }
 
     #[test]
