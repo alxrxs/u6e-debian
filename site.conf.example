@@ -39,6 +39,13 @@ U6E_PERSIST=0
 # 1: bluetoothd powers the Bluetooth controller at boot. 0: it stays off until
 # powered by hand (bluetoothctl power on).
 BT_POWERED=1
+# Experimental, off unless set (README.md, Experimental). NSS_SHAPERS: MB of
+# host RAM the NSS firmware takes for its shapers at boot, for good; unset,
+# none. U6E_PCC=1: load u6e-pcc and create its mirror device mirror.0;
+# registering it keeps every DNS connection on the CPU, and it stays loaded
+# until the next boot.
+#NSS_SHAPERS=4
+#U6E_PCC=1
 # Optional: the Wi-Fi controller u6e-agent streams the AP's Wi-Fi state to
 # (host:port), and the controller's Ed25519 public key (64 hex digits), which
 # the agent pins: a plain value, not a secret. Each AP's own private key is

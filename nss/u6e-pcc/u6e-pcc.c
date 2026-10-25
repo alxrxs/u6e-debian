@@ -12,8 +12,8 @@
  * Every other connection is permitted, as with no registrant; with no
  * target the callback costs one comparison.
  *
- * Use (the image loads it after ecm and qca-nss-mirror, once the mirror
- * instance exists; all files root only):
+ * Use (with U6E_PCC=1 in site.conf the image loads it after ecm and
+ * qca-nss-mirror, once the mirror instance exists; all files root only):
  *	echo create > /proc/sys/dev/nss/mirror/config	(makes mirror.0)
  *	modprobe u6e-pcc [mirror=mirror.0]
  *	echo 128 > /sys/kernel/debug/u6e-pcc/snaplen	(64-65535; default 128)

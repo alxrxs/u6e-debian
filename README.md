@@ -22,7 +22,8 @@ The only thing ever written to the SPI flash (the small chip holding the boot lo
   - optionally, the controller `u6e-agent` streams to: its address and its public key (plain values), with each access point's own private key read by a shell function in that access point's block;
   - one block per access point (hostname, address, LED colour, Wi-Fi colours, and optionally its SSH host key, read by a shell function), and the test client for `test/`;
   - optionally, `AP_KNOWN_HOSTS`: the known_hosts file the boot tooling checks the access points' host keys against (see [Booting](#booting));
-  - `U6E_PERSIST` (see [Booting](#booting)) and `BLOBS`, the location of the proprietary files below.
+  - `U6E_PERSIST` (see [Booting](#booting)) and `BLOBS`, the location of the proprietary files below;
+  - optionally, the experimental `NSS_SHAPERS` and `U6E_PCC`, off unless set (see [What the access point does](#what-the-access-point-does)).
 - `$BLOBS`: a separate private repository with the proprietary files the build reads from it. They are not redistributable, so they are not included here:
 
 | Path under `$BLOBS/` | What it is |
@@ -115,6 +116,12 @@ Wi-Fi starts by itself on every boot (`u6e-wifi.service`), with nothing else on 
 - Bluetooth (LE and Classic) works with BlueZ under the stock firmware's address, the board's base MAC + 4: the controller stays unconfigured until `u6e-btaddr` gives it that address at boot. With `BT_POWERED=0` in `site.conf` it stays off until powered by hand (`bluetoothctl power on`). Never unload `btqcomipc` on a running access point: the SoC hangs until the watchdog resets it.
 - `tc` can shape traffic on the NSS processor.
 
+**Experimental (off unless set in `site.conf`)**
+
+These are under test and change what an image does, so an image built without them does none of this:
+- `NSS_SHAPERS=<MB>` gives the NSS firmware that many MB of host RAM for its shapers at boot (`qca-nss-drv qos_mem_size`), kept until the next boot, beyond its own pool of one interface shaper and about 410 classes, which refuses a second shaper tree. An access point has about 220 MB of RAM available, so each MB is taken from that. Unset, the firmware gets no host RAM for its shapers.
+- `U6E_PCC=1` has `u6e-nss` create the NSS mirror device `mirror.0` and load `u6e-pcc` (`nss/u6e-pcc/`), our module that has ECM accelerate one client's TCP and UDP connections with an NSS mirror rule, so the NSS core copies their packets to `mirror.0` while they stay offloaded; nothing sets a client yet. Loading it costs every access point something, whether a client is set or not: while it is registered ECM keeps every DNS (port 53) connection on the CPU, registering drops every connection from the hardware once, and it cannot be unloaded, as ECM holds it until the next boot. Unset, the module is in the image but nothing loads it, and no mirror device is created.
+
 ## Repository layout
 
 | Path | Contents |
@@ -125,7 +132,7 @@ Wi-Fi starts by itself on every boot (`u6e-wifi.service`), with nothing else on 
 | `trees.sh`, `export.sh` | Create the source trees from the patch series, and export commits back to patches |
 | `kernel/`, `backports/` | Upstream release address and our patches |
 | `config-u6e.sh` | Kernel configuration |
-| `nss/` | Builds the NSS drivers, the Wi-Fi stack and the NSS firmware download, with the patches for each, and `u6e-pcc` (`nss/u6e-pcc/`), our module that has ECM accelerate one client's TCP and UDP connections with an NSS mirror rule, so the NSS core copies their packets to a mirror device while they stay offloaded (`u6e-nss` creates that device, `mirror.0`, and loads the module at boot; nothing sets a target yet). The image gives the NSS firmware 4 MB of host RAM for its shapers (`qca-nss-drv qos_mem_size`), beyond the one interface shaper and about 410 classes its own pool holds |
+| `nss/` | Builds the NSS drivers, the Wi-Fi stack and the NSS firmware download, with the patches for each, and `u6e-pcc` (`nss/u6e-pcc/`), our module that has ECM accelerate one client's TCP and UDP connections with an NSS mirror rule, so the NSS core copies their packets to a mirror device while they stay offloaded (in every image, loaded only with `U6E_PCC=1`, see [Experimental](#what-the-access-point-does)) |
 | `fw/` | Builds the board data files; includes `ath11k-bdencoder` |
 | `pkg/hostapd/` | hostapd build with our 29 patches |
 | `pkg/iproute2-nss/` | `iproute2` with NSS support in `tc` |

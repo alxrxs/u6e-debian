@@ -686,9 +686,15 @@ rm -rf modstage
 # The firmware computes the TX checksums (12.2 honours the host's flags),
 # so the glue keeps checksum offload and TSO on lan. The firmware's shapers
 # come from a pool that holds one interface shaper and about 410 classes on
-# its own; qos_mem_size gives it that many MB of host RAM more, for good.
+# its own; NSS_SHAPERS (site.conf, experimental) gives it that many MB of
+# host RAM more, for good, through qos_mem_size. Unset, it gets none.
+shapers=
+if [ -n "${NSS_SHAPERS:-}" ]; then
+	[[ $NSS_SHAPERS =~ ^[1-9][0-9]*$ ]] || { echo "NSS_SHAPERS must be a whole number of MB, 1 or more" >&2; exit 1; }
+	shapers="options qca-nss-drv qos_mem_size=$NSS_SHAPERS"
+fi
 printf '%s\n' 'options ath11k nss_offload=1 frame_mode=2' 'options qca-dwmac-nss ifname=lan fw_if=1 fw_csum=1' \
-	'options qca-nss-drv qos_mem_size=4' 'blacklist ath11k_ahb' 'blacklist ath11k_pci' > $RF/etc/modprobe.d/u6e-nss.conf
+	${shapers:+"$shapers"} 'blacklist ath11k_ahb' 'blacklist ath11k_pci' > $RF/etc/modprobe.d/u6e-nss.conf
 # The OpenWrt wireless stack makes no default interface (a station vif
 # taken through NSS offload hangs the NSS core); add each radio's as an AP.
 # First the radio's wiphy is named after its band, by the device it sits on:
@@ -804,6 +810,12 @@ if [ -n "$major" ] && mknod -m 0440 /dev/ecm_state c "$major" 0; then
 else
 	echo "u6e-nss: no ECM state device" >&2
 fi
+NSS
+# U6E_PCC=1 (site.conf, experimental): u6e-nss also loads u6e-pcc, which
+# keeps every DNS connection on the CPU and stays until reboot; otherwise
+# the module ships but nothing loads it.
+if [ "${U6E_PCC:-0}" = 1 ]; then
+	cat >> $RF/usr/local/sbin/u6e-nss <<'PCC'
 # One client's capture (nss/u6e-pcc): the mirror instance mirror.0, then
 # ECM's PCC registrant; registering defuncts every connection, cheap at boot.
 if echo create > /proc/sys/dev/nss/mirror/config && [ -d /sys/class/net/mirror.0 ]; then
@@ -811,8 +823,9 @@ if echo create > /proc/sys/dev/nss/mirror/config && [ -d /sys/class/net/mirror.0
 else
 	echo "u6e-nss: no mirror instance mirror.0" >&2
 fi
-modprobe qca-nss-netlink
-NSS
+PCC
+fi
+echo 'modprobe qca-nss-netlink' >> $RF/usr/local/sbin/u6e-nss
 sed -i "s/@MGMT_IF@/$MGMT_IF/g; s/@CLIENT_IF@/$CLIENT_IF/g" $RF/usr/local/sbin/u6e-nss
 chmod 0755 $RF/usr/local/sbin/u6e-nss
 cat > $RF/etc/systemd/system/u6e-nss.service <<'UNIT'
