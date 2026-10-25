@@ -111,6 +111,9 @@ impl Resolve for Names {
     }
 }
 
+/// Frames an AP sends a client each second however idle it is (keepalives,
+/// null data), which its retry ratio is counted over too.
+const IDLE_FRAMES: f64 = 10.0;
 /// The client that never answers a kick.
 const SILENT: u8 = 6;
 /// How long a kicked or unblocked client takes to come back, and a steered
@@ -432,11 +435,14 @@ impl World {
             let up_b = up / 8.0 * dt;
             c.tx_bytes += down_b;
             c.rx_bytes += up_b;
-            c.tx_packets += down_b / 1200.0;
+            let sent = c.tx_packets.floor();
+            c.tx_packets += down_b / 1200.0 + IDLE_FRAMES * dt;
             c.rx_packets += up_b / 900.0;
             let snr = signal - f64::from(NOISE[radio]);
             let retry = (0.02 + (32.0 - snr) * 0.012).clamp(0.01, 0.35);
-            c.tx_retries += down_b / 1200.0 * retry;
+            // Retries of the frames sent whole, as the counters a station
+            // reports have it, so the ratio stays within the frames sent.
+            c.tx_retries += (c.tx_packets.floor() - sent) * retry;
             let tx_us = down * dt / tx_mbps;
             let rx_us = up * dt / rx_mbps;
             c.tx_airtime_us += tx_us;
