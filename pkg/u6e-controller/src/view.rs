@@ -281,8 +281,7 @@ fn ap_view(ap: &Ap) -> Value {
     let mut o = Map::new();
     o.insert("up".into(), ap.is_up().into());
     if let Some(h) = &ap.hello {
-        let image = h.manifest.lines().find_map(|l| l.strip_prefix("image:"));
-        o.insert("image".into(), image.unwrap_or_default().trim().into());
+        o.insert("image".into(), h.image().into());
         o.insert("manifest".into(), h.manifest.clone().into());
         o.insert("kernel".into(), h.kernel.clone().into());
         o.insert("hostapd".into(), h.hostapd.clone().into());

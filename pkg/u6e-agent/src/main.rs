@@ -153,7 +153,7 @@ fn start_link(
             Arc::clone(targets),
             l.runner_key,
             hello.ap.clone(),
-            wificonf::image_floor(&hello.manifest),
+            hello.built_ms(),
         );
         apply::Worker::new(move |c, last: Option<&_>| a.run(c, last))
     });
@@ -214,7 +214,8 @@ fn config_helper() -> ! {
         process::exit(1);
     }
     let hello = link::local_hello();
-    let server = helper::Server::new(runner, hello.ap, wificonf::image_floor(&hello.manifest));
+    let floor = hello.built_ms();
+    let server = helper::Server::new(runner, hello.ap, floor);
     if let Err(e) = server.serve(&mut conn) {
         eprintln!("u6e-agent: config helper: {e}");
         process::exit(1);

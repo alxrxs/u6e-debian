@@ -10,7 +10,7 @@
 //!
 //! It takes only configurations the deploy runner signed for this AP, newer
 //! than the last it installed (the sequence number survives the agent, until
-//! the next boot) and than the image itself (`wificonf::image_floor`, which
+//! the next boot) and than the image's build time (`Hello::built_ms`, which
 //! survives the boot), whatever the agent checked: a compromised controller
 //! or agent cannot install one of its own, nor replay an old one. systemd starts one helper per
 //! connection on a socket only the agent's group may open (`u6e-agent

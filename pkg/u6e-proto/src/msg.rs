@@ -81,7 +81,9 @@ pub enum CtlMsg {
     ApplyConfig(SignedConfig),
 }
 
-/// What the AP is running, sent once per connection.
+/// What the AP is running, sent once per connection. `manifest` is the
+/// image's `/etc/u6e-image`: `key: value` lines, among them `image:` and
+/// `built_ms:`.
 ///
 /// On the wire: a change to it bumps [`crate::PROTOCOL`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -91,6 +93,30 @@ pub struct Hello {
     pub kernel: String,
     pub hostapd: String,
     pub agent: String,
+}
+
+impl Hello {
+    /// The image's name: where its build keeps it, and what a rollout names.
+    pub fn image(&self) -> &str {
+        self.manifest_line("image")
+    }
+
+    /// The image's build time in milliseconds since the Unix epoch; 0 for an
+    /// image from before the manifest said. No configuration the deploy
+    /// runner signed before it (its sequence number is its signing time)
+    /// applies on the image.
+    pub fn built_ms(&self) -> u64 {
+        self.manifest_line("built_ms").parse().unwrap_or(0)
+    }
+
+    /// The value of the manifest's `<key>:` line; empty without one.
+    fn manifest_line(&self, key: &str) -> &str {
+        let line = self
+            .manifest
+            .lines()
+            .find_map(|l| l.strip_prefix(key)?.strip_prefix(':'));
+        line.unwrap_or_default().trim()
+    }
 }
 
 /// The state of the AP at one tick.
@@ -608,4 +634,33 @@ pub enum RolloutOutcome {
     RolledBack,
     /// Neither the image nor the way back could be staged.
     Failed,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hello(manifest: &str) -> Hello {
+        Hello {
+            ap: "ap1".into(),
+            manifest: manifest.into(),
+            kernel: String::new(),
+            hostapd: String::new(),
+            agent: String::new(),
+        }
+    }
+
+    #[test]
+    fn the_manifest_names_the_image_and_its_build_time() {
+        let h = hello(
+            "image:     20261025-120000-abc-def-ap1\nbuilt_ms:  1792929600000\nkernel:    x\n",
+        );
+        assert_eq!(h.image(), "20261025-120000-abc-def-ap1");
+        assert_eq!(h.built_ms(), 1_792_929_600_000);
+        // From before the build time was written; and nonsense.
+        let old = hello("image: old\nkernel: x\n");
+        assert_eq!((old.image(), old.built_ms()), ("old", 0));
+        let bad = hello("images: x\nbuilt_ms: soon\n");
+        assert_eq!((bad.image(), bad.built_ms()), ("", 0));
+    }
 }
