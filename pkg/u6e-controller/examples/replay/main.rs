@@ -51,6 +51,8 @@ use u6e_proto::{PROTOCOL, delta, mac, version};
 
 /// The script's length; it starts over after.
 const CYCLE: f64 = 120.0;
+/// The radios by index, named after their band as the image names them.
+const RADIOS: [&str; 3] = ["radio24", "radio5", "radio6"];
 const NOISE: [i8; 3] = [-92, -95, -96];
 /// Airtime other networks and interference take on each band, in percent.
 const FOREIGN_BUSY: [f64; 3] = [24.0, 5.0, 0.8];
@@ -223,7 +225,7 @@ fn radios(channels: [(u16, u16); 3]) -> Vec<Radio> {
     let power = [2000, 2300, 1900];
     (0..3)
         .map(|i| Radio {
-            phy: format!("phy{i}"),
+            phy: RADIOS[i].into(),
             band: bands[i],
             channel: channels[i].0,
             width_mhz: channels[i].1,
@@ -365,7 +367,7 @@ impl World {
             }
             Act::RadioDown(ap, radio) => {
                 self.aps[ap].radios[radio].up = false;
-                let phy = format!("phy{radio}");
+                let phy = RADIOS[radio].into();
                 self.event(ap, EventKind::RadioDown { phy });
                 let gone: Vec<_> = (0..self.clients.len())
                     .filter(|&i| {
@@ -383,7 +385,7 @@ impl World {
             }
             Act::RadioUp(ap, radio) => {
                 self.aps[ap].radios[radio].up = true;
-                let phy = format!("phy{radio}");
+                let phy = RADIOS[radio].into();
                 self.event(ap, EventKind::RadioUp { phy });
             }
         }
@@ -612,7 +614,7 @@ impl World {
             ("gephy-thermal", 46.0 + (t / 70.0).sin()),
         ];
         if a.radio_temps {
-            temps.extend([("phy0", 54.0), ("phy1", 63.5), ("phy2", 61.0)]);
+            temps.extend([(RADIOS[0], 54.0), (RADIOS[1], 63.5), (RADIOS[2], 61.0)]);
         }
         let mut stations: Vec<Station> = self
             .clients
@@ -644,7 +646,7 @@ impl World {
                     ifname: ifname.into(),
                     bssid: bssid(ap, i),
                     ssid: ssid.into(),
-                    phy: format!("phy{radio}"),
+                    phy: RADIOS[radio].into(),
                     vlan,
                 })
                 .collect(),
