@@ -1,0 +1,168 @@
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Subject: [PATCH] ecm_classifier_dscp: tag a bridged flow without conntrack by its tc class
+
+An access point that bridges its clients without br_netfilter has no
+conntrack for their packets, so the DSCP classifier, the only one that
+sets a QoS tag, leaves every such connection at its first packet and the
+NSS rule carries no tag. An NSS shaper (nsshtb) classifies offloaded
+packets by that tag alone, so it cannot shape a client's offloaded flows.
+
+Without conntrack, a connection whose first packet the classifier sees
+carries a tc class as its priority (a non-zero major, TC_H_MAJ, as set by
+an ingress "flower ... action skbedit priority 1:10") now opts in. Each
+direction's tag is the priority of a packet travelling that way when it
+names a class, else 0: flow_qos_tag from the packets of the side ECM saw
+first (the connection's source), return_qos_tag from the other side's.
+TCP is accelerated once both directions have been seen; other protocols
+follow accel_delay_pkts as the conntrack path does (at 0 the direction
+seen is tagged at once, the other when its first packet reaches the
+classifier, or from the first when the rule is not unidirectional). The
+tag is fixed when the rule is made, so a changed class takes effect once
+the connection is decelerated (defunct_by_mac) and accelerated again.
+
+Every other connection is left exactly as before: a connection without
+conntrack whose first packet names no class is not the classifier's (it
+is unassigned and its rule has no QoS tag), and connections with
+conntrack take the unchanged path. The priorities the receive paths
+write (mac80211's 802.1d TID, the NSS descriptor's 8-bit priority, a VLAN
+ingress map) have no major and never opt in. Since the first packet
+decides, a flow is tagged whichever side speaks first only when both
+directions carry a class: a direction without a limit carries its
+shaper's default class. No IGS tag is set, and igs_enabled is untouched.
+---
+--- a/ecm_classifier_dscp.c
++++ b/ecm_classifier_dscp.c
+@@ -84,6 +84,7 @@
+ 	uint32_t ci_serial;					/* RO: Serial of the connection */
+ 	struct ecm_classifier_process_response process_response;/* Last process response computed */
+ 	bool packet_seen[ECM_CONN_DIR_MAX];			/* Per-direction packet seen flag */
++	bool tc_tagged;						/* Opted in by a tc class, no ct */
+ 	int refs;						/* Integer to trap we never go negative */
+ #if (DEBUG_LEVEL > 0)
+ 	uint16_t magic;
+@@ -224,6 +225,89 @@
+ }
+ 
+ /*
++ * ecm_classifier_dscp_tc_tag()
++ *	Record the QoS tag of one direction of a connection without conntrack:
++ *	the packet's priority when it names a tc class (a non-zero major,
++ *	e.g. set by "tc ... action skbedit priority 1:10"), else 0. The 802.1d
++ *	user priorities (0-7) the Wi-Fi and NSS receive paths write are no class.
++ */
++static void ecm_classifier_dscp_tc_tag(struct ecm_classifier_dscp_instance *cdscpi,
++				       ecm_tracker_sender_type_t sender, struct sk_buff *skb)
++{
++	uint32_t tag = TC_H_MAJ(skb->priority) ? skb->priority : 0;
++
++	if (sender == ECM_TRACKER_SENDER_TYPE_SRC) {
++		cdscpi->process_response.flow_qos_tag = tag;
++		cdscpi->packet_seen[ECM_CONN_DIR_FLOW] = true;
++	} else {
++		cdscpi->process_response.return_qos_tag = tag;
++		cdscpi->packet_seen[ECM_CONN_DIR_RETURN] = true;
++	}
++}
++
++/*
++ * ecm_classifier_dscp_process_no_ct()
++ *	Tag a connection that has no conntrack (a bridged flow without
++ *	br_netfilter) from its packets' tc classes, gated as the conntrack
++ *	path gates its fallback: TCP waits for both directions, other
++ *	protocols follow accel_delay_pkts. Called with ecm_classifier_dscp_lock held.
++ */
++static void ecm_classifier_dscp_process_no_ct(struct ecm_classifier_dscp_instance *cdscpi,
++					      ecm_tracker_sender_type_t sender,
++					      struct sk_buff *skb, int protocol,
++					      uint64_t slow_pkts, bool unidir_accel_en)
++{
++	struct ecm_classifier_process_response *pr = &cdscpi->process_response;
++
++	cdscpi->tc_tagged = true;
++	pr->relevance = ECM_CLASSIFIER_RELEVANCE_YES;
++	pr->became_relevant = ecm_db_time_get();
++	pr->process_actions |= ECM_CLASSIFIER_PROCESS_ACTION_ACCEL_MODE;
++	pr->accel_mode = ECM_CLASSIFIER_ACCELERATION_MODE_ACCEL;
++
++	if (protocol == IPPROTO_TCP) {
++		if (!ecm_classifier_dscp_is_bidi_packet_seen(cdscpi)) {
++			ecm_classifier_dscp_tc_tag(cdscpi, sender, skb);
++		}
++		if (!ecm_classifier_dscp_is_bidi_packet_seen(cdscpi)) {
++			pr->accel_mode = ECM_CLASSIFIER_ACCELERATION_MODE_NO;
++			return;
++		}
++		pr->process_actions |= ECM_CLASSIFIER_PROCESS_ACTION_QOS_TAG;
++		return;
++	}
++
++	if (ecm_classifier_accel_delay_pkts) {
++		if (!ecm_classifier_dscp_is_bidi_packet_seen(cdscpi)) {
++			ecm_classifier_dscp_tc_tag(cdscpi, sender, skb);
++		}
++		if (ecm_classifier_dscp_is_bidi_packet_seen(cdscpi)) {
++			pr->process_actions |= ECM_CLASSIFIER_PROCESS_ACTION_QOS_TAG;
++			return;
++		}
++		if (ecm_classifier_accel_delay_pkts == 1 ||
++		    slow_pkts < ecm_classifier_accel_delay_pkts) {
++			pr->accel_mode = ECM_CLASSIFIER_ACCELERATION_MODE_NO;
++			return;
++		}
++	}
++
++	/*
++	 * One direction seen (or no delay): its tag, and for a bidirectional
++	 * rule the same tag for the other direction while that has none.
++	 */
++	ecm_classifier_dscp_tc_tag(cdscpi, sender, skb);
++	if (!unidir_accel_en) {
++		if (sender == ECM_TRACKER_SENDER_TYPE_SRC && !pr->return_qos_tag) {
++			pr->return_qos_tag = pr->flow_qos_tag;
++		} else if (sender == ECM_TRACKER_SENDER_TYPE_DEST && !pr->flow_qos_tag) {
++			pr->flow_qos_tag = pr->return_qos_tag;
++		}
++	}
++	pr->process_actions |= ECM_CLASSIFIER_PROCESS_ACTION_QOS_TAG;
++}
++
++/*
+  * ecm_classifier_dscp_update()
+  *	Called from the frontend files to update the classifier instance.
+  */
+@@ -282,6 +366,7 @@
+ 	struct nf_ct_dscpremark_ext *dscpcte;
+ 	bool dscp_marked = false;
+ 	uint64_t slow_pkts;
++	bool unidir_accel_en;
+ 
+ 	cdscpi = (struct ecm_classifier_dscp_instance *)aci;
+ 	DEBUG_CHECK_MAGIC(cdscpi, ECM_CLASSIFIER_DSCP_INSTANCE_MAGIC, "%px: magic failed\n", cdscpi);
+@@ -335,6 +420,7 @@
+ 	slow_pkts = ecm_front_end_get_slow_packet_count(feci);
+ 	ecm_front_end_connection_deref(feci);
+ 	protocol = ecm_db_connection_protocol_get(ci);
++	unidir_accel_en = ci->unidir_accel_en;
+ 	ecm_db_connection_deref(ci);
+ 	if (ECM_FRONT_END_ACCELERATION_NOT_POSSIBLE(accel_mode)) {
+ 		spin_lock_bh(&ecm_classifier_dscp_lock);
+@@ -347,8 +433,18 @@
+ 	 */
+ 	ct = nf_ct_get(skb, &ctinfo);
+ 	if (!ct) {
+-		DEBUG_WARN("%px: no conntrack found\n", cdscpi);
+ 		spin_lock_bh(&ecm_classifier_dscp_lock);
++
++		/*
++		 * Without conntrack, a connection whose first packet here names
++		 * a tc class opts in; any other is not ours, as before.
++		 */
++		if (cdscpi->tc_tagged || TC_H_MAJ(skb->priority)) {
++			ecm_classifier_dscp_process_no_ct(cdscpi, sender, skb, protocol,
++							  slow_pkts, unidir_accel_en);
++			goto dscp_classifier_out;
++		}
++		DEBUG_WARN("%px: no conntrack found\n", cdscpi);
+ 		cdscpi->process_response.relevance = ECM_CLASSIFIER_RELEVANCE_NO;
+ 		goto dscp_classifier_out;
+ 	}
