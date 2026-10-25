@@ -1327,6 +1327,7 @@ mod tests {
             CtlMsg::ApplyConfig(SignedConfig {
                 ap: "ap1".into(),
                 seq: 1,
+                not_after: 2,
                 sha256,
                 radios: Vec::new(),
                 signature: Vec::new(),

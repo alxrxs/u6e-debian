@@ -2408,6 +2408,7 @@ fn signed(ap: &str, seq: u64, dtim: u8) -> SignedConfig {
     SignedConfig {
         ap: ap.into(),
         seq,
+        not_after: seq + 1,
         sha256: config_sha256(&radios),
         radios,
         signature: vec![0; 64],

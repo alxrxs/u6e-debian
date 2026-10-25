@@ -15,6 +15,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use u6e_proto::config::config_sha256;
@@ -38,6 +39,9 @@ const CTRL_INTERFACE: &str = "/run/hostapd";
 const CTRL_GROUP: &str = "u6e-agent";
 /// The only directory a configuration may name files in: u6e-wifi's.
 const FILES: &str = "/run/hostapd-u6e/";
+/// Where systemd-timesyncd marks the clock synchronized: until it is, the
+/// clock may still be at the image's build date (the AP has no RTC).
+const SYNCHRONIZED: &str = "/run/systemd/timesync/synchronized";
 const TEXT_MAX: usize = 64 << 10;
 
 /// BSS settings hostapd reads from its configuration at each use, so a `SET`
@@ -418,6 +422,17 @@ pub fn read_seq(dir: &Path) -> u64 {
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0)
+}
+
+/// The time in milliseconds since the Unix epoch, which a signed
+/// configuration's validity is judged by; `None` while the clock is not
+/// synchronized.
+pub fn now_ms() -> Option<u64> {
+    if !Path::new(SYNCHRONIZED).exists() {
+        return None;
+    }
+    let since = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
+    u64::try_from(since.as_millis()).ok()
 }
 
 pub fn write_seq(dir: &Path, seq: u64) -> io::Result<()> {

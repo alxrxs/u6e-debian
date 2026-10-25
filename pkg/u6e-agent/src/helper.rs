@@ -11,11 +11,13 @@
 //! It takes only configurations the deploy runner signed for this AP, newer
 //! than the last it installed (the sequence number survives the agent, until
 //! the next boot) and than the image's build time (`Hello::built_ms`, which
-//! survives the boot), whatever the agent checked: a compromised controller
-//! or agent cannot install one of its own, nor replay an old one. systemd starts one helper per
-//! connection on a socket only the agent's group may open (`u6e-agent
-//! --config-helper`; see prep-rootfs.sh for the units); a connection carries
-//! one request and its reply, the configuration's bytes wiped after.
+//! survives the boot), and still valid by its synchronized clock (each is
+//! signed for ten minutes), whatever the agent checked: a compromised
+//! controller or agent cannot install one of its own, nor replay an old one.
+//! systemd starts one helper per connection on a socket only the agent's
+//! group may open (`u6e-agent --config-helper`; see prep-rootfs.sh for the
+//! units); a connection carries one request and its reply, the
+//! configuration's bytes wiped after.
 
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -128,6 +130,9 @@ pub struct Server {
     pub ap: String,
     /// The image's build time: no sequence number at or below it applies.
     pub floor: u64,
+    /// The time a configuration's validity is judged by
+    /// ([`wificonf::now_ms`]).
+    pub now: fn() -> Option<u64>,
 }
 
 impl Server {
@@ -146,6 +151,7 @@ impl Server {
             runner,
             ap,
             floor,
+            now: wificonf::now_ms,
         }
     }
 
@@ -198,6 +204,9 @@ impl Server {
         config::verify(&runner, &self.ap, c)?;
         let last = wificonf::read_seq(&self.dir);
         if let Some(why) = config::replayed(c.seq, last, "the last installed", self.floor) {
+            return Err(why);
+        }
+        if let Some(why) = config::expired(c, (self.now)()) {
             return Err(why);
         }
         for r in &c.radios {
@@ -483,6 +492,7 @@ pub mod tests {
             runner: Some(runner_public()),
             ap: "ap1".into(),
             floor: 0,
+            now: || Some(0),
         };
         (s, log)
     }
@@ -779,6 +789,22 @@ pub mod tests {
         let why = "replayed: sequence 999 is not past 1000, this image's build time";
         assert_eq!(r.install(signed(999, fixture()), false), Err(why.into()));
         assert_eq!(r.installed(), new());
+    }
+
+    /// The helper judges validity by its own clock too: an expired
+    /// configuration, or any while the clock is not synchronized, is not
+    /// installed.
+    #[test]
+    fn an_expired_configuration_is_refused_and_none_without_a_clock() {
+        let mut r = Rig::new();
+        let new = || with5(&edit(WLAN5, "dtim_period=3", "dtim_period=1"), 23);
+        r.server.now = || Some(u64::MAX);
+        let why = "expired: valid until 600060, now 18446744073709551615";
+        assert_eq!(r.install(signed(60, new()), false), Err(why.into()));
+        r.server.now = || None;
+        let why = "the clock is not synchronized, so no configuration applies";
+        assert_eq!(r.install(signed(60, new()), false), Err(why.into()));
+        assert_eq!(r.installed(), fixture());
     }
 
     /// The agent's end, against a helper on a socket.

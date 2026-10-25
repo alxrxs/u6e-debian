@@ -5,16 +5,17 @@
 //!
 //! Nothing is installed before the whole request passes: the runner's
 //! signature over it, for this AP, with a sequence number past the last one
-//! applied and the image's build time (no replay, not even after a reboot),
-//! its SHA-256, each radio's file, and any new channel
-//! or power one the radio may take now (nl80211's channels and rules; never
-//! a DFS channel that needs a CAC first). The installed configuration is the
-//! root helper's alone (it holds the secrets), so the helper says how each
-//! radio takes the new one (`wificonf::class`): nothing; BSS settings hostapd
-//! rereads at each use, which the agent `SET`s on their BSS before rebuilding
-//! its beacons; the channel or width, a channel switch announcement; the
-//! power alone, which the helper sets; anything else, a restart of u6e-wifi
-//! by the helper, after every client is asked to move to the other AP.
+//! applied and the image's build time and within its validity by a
+//! synchronized clock (no replay, not even after a reboot), its SHA-256, each
+//! radio's file, and any new channel or power one the radio may take now
+//! (nl80211's channels and rules; never a DFS channel that needs a CAC
+//! first). The installed configuration is the root helper's alone (it holds
+//! the secrets), so the helper says how each radio takes the new one
+//! (`wificonf::class`): nothing; BSS settings hostapd rereads at each use,
+//! which the agent `SET`s on their BSS before rebuilding its beacons; the
+//! channel or width, a channel switch announcement; the power alone, which
+//! the helper sets; anything else, a restart of u6e-wifi by the helper, after
+//! every client is asked to move to the other AP.
 //! hostapd's own reloads would not do: RELOAD re-reads no file and
 //! deauthenticates every station of the radio; RELOAD_CONFIG re-reads it but
 //! deauthenticates the stations of every BSS without an unchanged
@@ -187,6 +188,9 @@ pub struct Apply {
     last_seq: u64,
     /// The image's build time: no sequence number at or below it applies.
     floor: u64,
+    /// The time a configuration's validity is judged by
+    /// ([`wificonf::now_ms`]).
+    now: fn() -> Option<u64>,
     steer_grace: Duration,
     switch_wait: Duration,
 }
@@ -210,6 +214,7 @@ impl Apply {
             ap,
             last_seq: 0,
             floor,
+            now: wificonf::now_ms,
             steer_grace: STEER_GRACE,
             switch_wait: SWITCH_WAIT,
         }
@@ -247,6 +252,9 @@ impl Apply {
         config::verify(&runner, &self.ap, c)?;
         let (last, floor) = (self.last_seq, self.floor);
         if let Some(why) = config::replayed(c.seq, last, "the last applied", floor) {
+            return Err(why);
+        }
+        if let Some(why) = config::expired(c, (self.now)()) {
             return Err(why);
         }
         let bands: Vec<Band> = c.radios.iter().map(|r| r.radio).collect();
@@ -707,6 +715,7 @@ mod tests {
                 runner: Some(runner_public()),
                 ap: "ap1".into(),
                 floor: 0,
+                now: || Some(0),
             };
             let sock = t.path().join("sock");
             let listener = UnixListener::bind(&sock).unwrap();
@@ -734,6 +743,7 @@ mod tests {
                 ap: "ap1".into(),
                 last_seq: 0,
                 floor: 0,
+                now: || Some(0),
                 steer_grace: Duration::ZERO,
                 switch_wait: Duration::from_secs(2),
             };
@@ -900,6 +910,25 @@ mod tests {
         );
         assert!(newer.requests().is_empty());
         assert_eq!(newer.helper(), String::new());
+
+        // Past its validity, or with a clock not yet synchronized: refused
+        // before the helper, which would refuse it too.
+        for (now, why) in [
+            (
+                (|| Some(u64::MAX)) as fn() -> Option<u64>,
+                "refused: expired: valid until 600060, now 18446744073709551615",
+            ),
+            (
+                || None,
+                "refused: the clock is not synchronized, so no configuration applies",
+            ),
+        ] {
+            let mut late = Rig::new();
+            late.apply.now = now;
+            assert_eq!(late.run(signed(60, new())).detail, why);
+            assert!(late.requests().is_empty());
+            assert_eq!(late.helper(), String::new());
+        }
 
         let mut keyless = Rig::new();
         keyless.apply.runner = None;

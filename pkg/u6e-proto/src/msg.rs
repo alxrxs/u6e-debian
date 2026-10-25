@@ -466,16 +466,20 @@ impl Drop for RadioConfig {
 }
 
 /// A whole configuration of one AP, as the deploy runner signed it: Ed25519
-/// over [`crate::config::payload`] (the protocol, `ap`, `seq` and `sha256`),
-/// by the key the AP's image pins. `seq` grows with every configuration the
-/// runner signs for the AP, so an old one cannot be replayed.
+/// over [`crate::config::payload`] (the protocol, `ap`, `seq`, `not_after`
+/// and `sha256`), by the key the AP's image pins. `seq` grows with every
+/// configuration the runner signs for the AP and `not_after` ends its
+/// validity soon after, so an old one cannot be replayed.
 ///
 /// On the wire: a change to it bumps [`crate::PROTOCOL`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedConfig {
     /// The AP it is for, by its host name.
     pub ap: String,
+    /// The runner's signing time, in milliseconds since the Unix epoch.
     pub seq: u64,
+    /// The last moment, in the same milliseconds, at which it may apply.
+    pub not_after: u64,
     /// [`crate::config::config_sha256`] of `radios`.
     pub sha256: [u8; 32],
     /// Every radio of the AP, once each, in band order.

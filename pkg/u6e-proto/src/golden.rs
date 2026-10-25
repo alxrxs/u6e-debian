@@ -137,6 +137,7 @@ fn signed_config() -> SignedConfig {
     SignedConfig {
         ap: "ap1".into(),
         seq: (1 << 42) + 2,
+        not_after: (1 << 42) + 3,
         sha256: [0x82; 32],
         radios: radio_configs(),
         signature: (0..64).map(|i| 0x80 + i).collect(),
@@ -435,7 +436,7 @@ fn render() -> String {
     let s = samples();
     let sha256 = config_sha256(&radio_configs());
     let hash = format!("ConfigSha256 {}\n", hex(&sha256));
-    let signed = payload(PROTOCOL, "ap1", (1 << 42) + 2, &sha256);
+    let signed = payload(PROTOCOL, "ap1", (1 << 42) + 2, (1 << 42) + 3, &sha256);
     let signed = format!("SignedPayload {}\n", hex(&signed));
     lines(&s.agent)
         .chain(lines(&s.ctl))
