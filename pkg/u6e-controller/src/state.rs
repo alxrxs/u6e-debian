@@ -7,7 +7,8 @@
 //!
 //! The state also sets each AP's tick and flow cadence. While a UI client
 //! watches an AP it reports every 2 s, otherwise at the 15 s scrape interval;
-//! while one watches its flows they come every 10 s, otherwise every minute.
+//! while one watches its flows they come every 10 s (an AP stretches that
+//! for a large connection table, up to the minute), otherwise every minute.
 //! The session follows per-AP channels holding what the watchers want. The
 //! scans of the APs' radios are kept here too, watched as `spectrum` says.
 

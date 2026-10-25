@@ -3,7 +3,8 @@
 //! a controller of another protocol is not spoken to. The agent then says who
 //! it is, sends a snapshot every tick (a delta against the previous one, a
 //! full key frame now and then), the events as they happen, and its clients'
-//! connections every minute, or at the cadence the controller sets. The
+//! connections every minute, or at the cadence the controller sets, stretched
+//! for a large connection table. The
 //! controller sets the tick and that cadence, asks for key frames and flows,
 //! pings, and sends commands, each carried out with the snapshot sent last at
 //! hand and answered in turn, and starts and stops radios' spectrum scans, whose
@@ -58,6 +59,9 @@ const FLOWS_DEFAULT: Duration = Duration::from_secs(60);
 /// Each read of ECM's table costs CPU in proportion to the connections in
 /// it: no faster than this.
 const FLOWS_MIN: Duration = Duration::from_secs(10);
+/// Connections of ECM's table read per second at most, on average: each
+/// costs ~0.07 ms, so the reads stay near 0.2 % of a core at any table size.
+const FLOWS_CONNS_PER_S: u64 = 30;
 /// An event this close to the next tick waits and rides in its record.
 const COALESCE: Duration = Duration::from_millis(50);
 /// The controller pings every 15 s; this long without a word is a dead session.
@@ -103,11 +107,11 @@ impl Config {
 }
 
 /// What reads the flows: called with the seq of the message, the stations
-/// of the last snapshot and whether every connection is wanted; `None` when
-/// there are none to send.
-pub trait FlowSource: FnMut(u64, &[[u8; 6]], bool) -> Option<Flows> {}
+/// of the last snapshot and whether every connection is wanted; the flows
+/// and the connections read for them, `None` when there are none to send.
+pub trait FlowSource: FnMut(u64, &[[u8; 6]], bool) -> Option<(Flows, usize)> {}
 
-impl<F: FnMut(u64, &[[u8; 6]], bool) -> Option<Flows>> FlowSource for F {}
+impl<F: FnMut(u64, &[[u8; 6]], bool) -> Option<(Flows, usize)>> FlowSource for F {}
 
 /// What carries out a command: called with it and the snapshot sent last.
 pub trait CommandRunner: FnMut(&Command, Option<&Snapshot>) -> CommandResult {}
@@ -289,6 +293,14 @@ fn clamp_flows(secs: u16) -> Duration {
     Duration::from_secs(u64::from(secs)).clamp(FLOWS_MIN, FLOWS_DEFAULT)
 }
 
+/// The wait after a read of `conns` connections: the controller's
+/// `cadence`, or a second per [`FLOWS_CONNS_PER_S`] of them when that is
+/// longer, up to [`FLOWS_DEFAULT`].
+fn flows_every(cadence: Duration, conns: usize) -> Duration {
+    let scaled = Duration::from_millis((conns as u64 * 1000).div_ceil(FLOWS_CONNS_PER_S));
+    cadence.max(scaled.min(FLOWS_DEFAULT))
+}
+
 /// Whether this tick sends a key frame whatever the snapshot; otherwise it
 /// does only when no delta can carry the change.
 fn key_due(want_key: bool, since_key: Duration) -> bool {
@@ -310,9 +322,12 @@ struct Session {
     /// The last snapshot sent: the base of the next delta.
     prev: Option<Snapshot>,
     seq: u64,
+    /// The controller's cadence for the flows.
     flow_every: Duration,
     flows_due: Instant,
     last_flows: Instant,
+    /// The connections the last read of the flows held.
+    flow_conns: usize,
     /// The next flows carry every connection.
     want_full: bool,
     flow_seq: u64,
@@ -343,6 +358,7 @@ impl Session {
             flow_every: FLOWS_DEFAULT,
             flows_due: now,
             last_flows: now,
+            flow_conns: 0,
             want_full: false,
             flow_seq: 0,
             heard: false,
@@ -474,13 +490,15 @@ impl Session {
             .iter()
             .flat_map(|s| s.stations.iter().map(|st| st.mac))
             .collect();
-        if let Some(f) = flows(self.flow_seq + 1, &stations, self.want_full) {
+        self.flow_conns = 0;
+        if let Some((f, conns)) = flows(self.flow_seq + 1, &stations, self.want_full) {
             write_frame(out, &AgentMsg::Flows(f))?;
             self.flow_seq += 1;
+            self.flow_conns = conns;
         }
         self.want_full = false;
         self.last_flows = now;
-        self.flows_due = now + self.flow_every;
+        self.flows_due = now + flows_every(self.flow_every, self.flow_conns);
         Ok(())
     }
 
@@ -600,7 +618,7 @@ impl Session {
             }
             CtlMsg::FlowCadence { secs } => {
                 self.flow_every = clamp_flows(secs);
-                self.flows_due = self.last_flows + self.flow_every;
+                self.flows_due = self.last_flows + flows_every(self.flow_every, self.flow_conns);
             }
             CtlMsg::SpectrumStart { radio } => {
                 if let Some(answer) = self.spectrum.start(&radio) {
@@ -1232,6 +1250,33 @@ mod tests {
         assert_eq!(clamp_flows(u16::MAX), FLOWS_DEFAULT);
     }
 
+    /// The controller's cadence holds up to 30 connections a second; a
+    /// larger table waits longer, never past the idle minute.
+    #[test]
+    fn flows_wait_longer_for_a_large_table() {
+        let s = Duration::from_secs;
+        let watched = s(10);
+        for (conns, wait) in [
+            (0, s(10)),
+            (300, s(10)),
+            (450, s(15)),
+            (1006, Duration::from_millis(33_534)),
+            (1800, s(60)),
+            (4096, s(60)),
+        ] {
+            assert_eq!(flows_every(watched, conns), wait, "{conns}");
+        }
+        // Unwatched: the minute, whatever the table.
+        for conns in [0, 1006, 4096] {
+            assert_eq!(flows_every(s(60), conns), s(60), "{conns}");
+        }
+        // The read's cost per second stays within the budget.
+        for conns in [10, 300, 301, 1006, 1799] {
+            let rate = conns as f64 / flows_every(watched, conns).as_secs_f64();
+            assert!(rate <= FLOWS_CONNS_PER_S as f64 + 1e-9, "{conns}: {rate}");
+        }
+    }
+
     /// Flows that say which call made them: its seq, stations and `full`.
     struct FlowCalls {
         rx: mpsc::Receiver<(u64, Vec<[u8; 6]>, bool, Instant)>,
@@ -1239,14 +1284,22 @@ mod tests {
 
     impl FlowCalls {
         fn source() -> (Self, impl FlowSource + Send + 'static) {
+            Self::of_table(0)
+        }
+
+        /// Flows read from a table of `conns` connections.
+        fn of_table(conns: usize) -> (Self, impl FlowSource + Send + 'static) {
             let (tx, rx) = mpsc::channel();
             let flows = move |seq, stations: &[[u8; 6]], full| {
                 let _ = tx.send((seq, stations.to_vec(), full, Instant::now()));
-                Some(Flows {
-                    seq,
-                    complete: full,
-                    clients: Vec::new(),
-                })
+                Some((
+                    Flows {
+                        seq,
+                        complete: full,
+                        clients: Vec::new(),
+                    },
+                    conns,
+                ))
             };
             (FlowCalls { rx }, flows)
         }
@@ -1288,6 +1341,25 @@ mod tests {
         let (_, _, _, second) = calls.next();
         let gap = secs(first, second);
         assert!((9.9..12.0).contains(&gap), "{gap}");
+    }
+
+    /// A table of 390 connections is read every 13 s, not at the 10 s the
+    /// controller asked for.
+    #[test]
+    fn a_large_table_stretches_the_cadence() {
+        let fake = Fake::new();
+        let (calls, flows) = FlowCalls::of_table(390);
+        let _agent = Agent::spawn_flows(&fake, with_station, flows);
+        let mut p = fake.accept();
+        assert!(matches!(p.recv(), AgentMsg::Hello(_)));
+        assert!(matches!(p.recv(), AgentMsg::Key(_)));
+        expect_flows(&mut p, 1, false);
+        let (_, _, _, first) = calls.next();
+        p.send(CtlMsg::FlowCadence { secs: 10 });
+        expect_flows(&mut p, 2, false);
+        let (_, _, _, second) = calls.next();
+        let gap = secs(first, second);
+        assert!((12.9..14.5).contains(&gap), "{gap}");
     }
 
     /// A request is answered at once, every connection when it asks for

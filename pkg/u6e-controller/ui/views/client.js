@@ -306,7 +306,7 @@ export default {
         flowSub.replaceChildren();
         flowBox.replaceChildren(h('div', { class: 'panel empty' }, h('p', {},
           !store.flowsKeyed ? 'Loading its connections.'
-            : 'It has no connection open, or its AP has not reported its connections yet: every AP does every 10 seconds while this page is open.')));
+            : 'It has no connection open, or its AP has not reported its connections yet: every AP does every 10 seconds while this page is open, one with many connections less often.')));
         return;
       }
       const { cf } = x;

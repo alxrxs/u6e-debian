@@ -283,8 +283,8 @@ export default {
         drawn = stamp;
         if (!shown.length) {
           const [title, text] = !store.keyed ? store.waiting()
-            : !store.flowsKeyed ? ['Loading the flows', 'Each AP sends its clients’ connections every 10 seconds while this page shows them.']
-              : Object.values(store.state.aps).some((a) => a.up) ? ['No flows yet', 'Each connected AP sends its clients’ connections within 10 seconds.']
+            : !store.flowsKeyed ? ['Loading the flows', 'Each AP sends its clients’ connections every 10 seconds while this page shows them, one with many connections less often.']
+              : Object.values(store.state.aps).some((a) => a.up) ? ['No flows yet', 'Each connected AP sends its clients’ connections within 10 seconds, one with many connections within a minute.']
                 : ['No access point is connected', 'Flows are listed once an AP’s agent reports them.'];
           list.replaceChildren(h('div', { class: 'panel empty' }, h('strong', {}, title), h('p', {}, text)));
           return;

@@ -9,8 +9,9 @@
 //! or `{"subscribe":"*"}`, with `"flows":true` for their clients' flows too);
 //! it then gets their state as one JSON `key`, a JSON merge `patch` of what
 //! changed after each update, and their new `events`. While it is open each of
-//! those APs reports every 2 s, and its flows every 10 s while the socket asks
-//! for them, which it can change at any time with `{"flows":true|false}`.
+//! those APs reports every 2 s, and its flows every 10 s (less often for a
+//! large connection table) while the socket asks for them, which it can
+//! change at any time with `{"flows":true|false}`.
 //!
 //! `{"spectrum":"<ap>/<radio>"}` on an open socket watches that radio's scan,
 //! starting it if it is not running, and `{"spectrum":null}` stops watching;

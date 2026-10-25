@@ -2,7 +2,8 @@
 // (a key, then merge patches of what changed) and their events as they
 // happen; the views render from that, and the samples taken here every two
 // seconds draw the charts of each client's session. While a view shows flows
-// the socket asks for them too, which makes the APs send them every 10 s;
+// the socket asks for them too, which makes the APs send them every 10 s
+// (one with a large connection table less often);
 // the client actions are POSTs, answered with their result. The socket also
 // watches the one radio whose spectrum is shown, if any: its scan's state
 // comes as JSON, its frames as binary messages straight to the view.

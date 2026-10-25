@@ -319,12 +319,13 @@ impl Collector {
     }
 
     /// The connections of `stations`, as [`ecm::EcmTable::flows`] sums
-    /// them; `None` while ECM cannot be read.
-    pub fn flows(&mut self, seq: u64, stations: &[[u8; 6]], full: bool) -> Option<Flows> {
+    /// them, and how many connections the table read held; `None` while ECM
+    /// cannot be read.
+    pub fn flows(&mut self, seq: u64, stations: &[[u8; 6]], full: bool) -> Option<(Flows, usize)> {
         match ecm::read(&self.paths.root.join(ecm::DEVICE), ecm::CAP) {
             Ok(t) => {
                 self.ecm.ok();
-                Some(t.flows(seq, stations, full))
+                Some((t.flows(seq, stations, full), t.conns.len()))
             }
             Err(e) => {
                 self.ecm.report(&e);
@@ -1209,7 +1210,8 @@ mod tests {
         fs::create_dir_all(device.parent().unwrap()).unwrap();
         let dump = include_str!("../tests/fixtures/ecm-state.txt");
         fs::write(device, dump).unwrap();
-        let f = c.flows(2, &[station], false).unwrap();
+        let (f, table) = c.flows(2, &[station], false).unwrap();
         assert_eq!((f.seq, f.clients.len(), f.clients[0].conns), (2, 1, 3));
+        assert_eq!(table, 13);
     }
 }
