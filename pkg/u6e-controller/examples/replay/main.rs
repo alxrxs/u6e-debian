@@ -10,7 +10,7 @@
 //! later, a blocked one stays away until it is unblocked, a steered one moves
 //! to its target, and the thermostat (`02:00:00:00:00:06`) never answers a
 //! kick, for the timeout. Each client's addresses have a DNS name, but one's.
-//! A radio asked to scan sends ten spectra a second until it is told to stop
+//! A radio asked to scan sends eight spectra a second until it is told to stop
 //! or goes down (`spectrum`: Wi-Fi bursts, a narrowband sender on 5 GHz, a
 //! microwave oven and Bluetooth on 2.4 GHz, a quiet 6 GHz channel).
 //! The web listener adds what the sign-in proxy in front of a controller
@@ -811,9 +811,9 @@ async fn agent(addr: SocketAddr, ap: usize, pem: &str, world: Arc<Mutex<World>>)
     let mut cadence = Duration::from_secs(60);
     let mut next_flows = next;
     let mut events = interval(Duration::from_millis(250));
-    // The radios scanning, and the tenth of a second their frames come at.
+    // The radios scanning, and the eighth of a second their frames come at.
     let mut scans = BTreeSet::new();
-    let mut frames = interval(Duration::from_millis(100));
+    let mut frames = interval(Duration::from_millis(125));
     frames.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let (mut seq, mut last, mut want_key) = (0, None::<Snapshot>, true);
     let mut flows_seq = 0;

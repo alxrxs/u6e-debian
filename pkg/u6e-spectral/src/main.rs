@@ -1,6 +1,6 @@
 //! The AP's spectrum helper: it runs a radio's spectral scan for the agent,
 //! which cannot (the scan's debugfs and relay files are root's), decodes the
-//! samples into dBm per bin and hands the agent at most 10 frames a second
+//! samples into dBm per bin and hands the agent at most 8 frames a second
 //! per radio. It does that and nothing else, as root without capabilities in
 //! a sandbox that shows it only those files (see prep-rootfs.sh for the
 //! units).

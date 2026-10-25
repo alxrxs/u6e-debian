@@ -48,7 +48,7 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Limits {
-            linger: Duration::from_secs(5),
+            linger: Duration::from_secs(4),
             limit: Duration::from_secs(600),
         }
     }

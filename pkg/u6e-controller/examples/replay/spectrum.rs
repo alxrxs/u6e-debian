@@ -1,6 +1,6 @@
 //! The spectra the simulated radios' scans show, as the AP's spectral helper
-//! sends them: ten frames a second, each the highest power per bin over its
-//! tenth of a second, 3.2 bins per MHz of the radio's channel. Every channel
+//! sends them: eight frames a second, each the highest power per bin over
+//! its eighth of a second, 3.2 bins per MHz of the radio's channel. Every channel
 //! has its noise floor and the Wi-Fi bursts of its clients and neighbours; the
 //! 6 GHz one is quiet but for them. Beside them, on the 5 GHz channels a
 //! narrowband sender (a video link, say) comes and goes, drifting a little;
@@ -91,7 +91,7 @@ pub fn frame(
         Band::B24 => {
             if t % 60.0 < 30.0 {
                 // The magnetron's hump moves with its load, and its mains
-                // cycle smears it over the tenth of a second.
+                // cycle smears it over the eighth of a second.
                 let at = 2457.0 + 6.0 * (t * 0.9).sin() + rng();
                 let level = -44.0 + 3.0 * rng();
                 add(&mut power, &move |f: f64| {

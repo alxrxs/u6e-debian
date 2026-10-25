@@ -26,8 +26,9 @@ use crate::hold::Hold;
 use crate::radio::{self, Scan};
 use crate::sample::Decoder;
 
-/// One frame per radio per period: at most 10 a second.
-pub const PERIOD: Duration = Duration::from_millis(100);
+/// One frame per radio per period: at most 8 a second, each a trigger of
+/// the scan, which is what the scan costs the kernel.
+pub const PERIOD: Duration = Duration::from_millis(125);
 /// Requests a client may make at once; then one per [`REFILL`].
 pub const BURST: u32 = 5;
 const REFILL: Duration = Duration::from_secs(1);
@@ -549,10 +550,10 @@ mod tests {
         );
     }
 
-    /// A sample every 5 ms for 2 s: folded into at most 10 frames a second,
+    /// A sample every 5 ms for 2 s: folded into at most 8 frames a second,
     /// each within 600 B.
     #[test]
-    fn frames_come_at_most_ten_a_second_each_within_600_bytes() {
+    fn frames_come_at_most_eight_a_second_each_within_600_bytes() {
         let h = Helper::new();
         let mut c = h.connect();
         ask(&mut c, "start radio6");
@@ -575,7 +576,7 @@ mod tests {
                 buf.drain(..n);
             }
         }
-        assert!((15..=21).contains(&frames), "{frames} frames in 2 s");
+        assert!((12..=17).contains(&frames), "{frames} frames in 2 s");
     }
 
     /// Review focus 5: no request but start or stop of a stable radio name

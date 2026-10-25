@@ -10,9 +10,10 @@ import { h, icon, bandName, palette } from '../util.js';
 const ADMIN_GROUP = 'wifi-admins';
 /** The radios that scan, by the names the image gives them, and their bands. */
 const RADIOS = [['radio24', '2.4'], ['radio5', '5'], ['radio6', '6']];
-/** The waterfall: a row each tenth of a second, a minute of them. */
-const ROW_MS = 100;
-const ROWS = 600;
+/** The waterfall: a row each eighth of a second, a frame's period, a minute
+ * of them. */
+const ROW_MS = 125;
+const ROWS = 480;
 /** The power scale of the chart and the colours, dBm. */
 const LOW = -100;
 const HIGH = -30;
@@ -112,7 +113,7 @@ function freqTicks(lo, hi, px) {
 }
 
 /**
- * The last minute of a radio's frames, a row each tenth of a second: kept as
+ * The last minute of a radio's frames, a row each eighth of a second: kept as
  * dBm so that a change of theme repaints it, and drawn into an image a row at
  * a time (the rows already there move down one, the new one is put on top).
  * A gap is a row of -128 dBm, far below any radio's noise floor.
@@ -449,8 +450,8 @@ export default {
       view.update();
     });
 
-    // A row each tenth of a second while the scan runs: the latest frame,
-    // unless it is too old to stand for this tenth, then a gap.
+    // A row each eighth of a second while the scan runs: the latest frame,
+    // unless it is too old to stand for this eighth, then a gap.
     const rows = setInterval(() => {
       if (!scanning()) return;
       wf.push(frame && Date.now() - seen < 300 ? frame.bins : null);
@@ -517,7 +518,7 @@ export default {
       if (s?.scanning) {
         if (!s.running) return ['wait', `Waiting for ${ui.ap} to start the scan…`];
         const left = s.since + s.limit * 1000 - Date.now();
-        return ['ok', `Scanning. It stops in ${clock(left)}, after ${minutes} minutes, or 5 s after the last page watching it closes.`];
+        return ['ok', `Scanning. It stops in ${clock(left)}, after ${minutes} minutes, or 4 s after the last page watching it closes.`];
       }
       if (asked) return ['wait', `Asking ${ui.ap} to scan…`];
       switch (s?.stopped) {

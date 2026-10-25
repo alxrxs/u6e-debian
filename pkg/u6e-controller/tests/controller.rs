@@ -2142,13 +2142,14 @@ fn a_scan_needs_an_admin_on_the_uis_page() {
     assert_eq!(a.expect_scan(), scan_start("radio5"));
 }
 
-/// Review focus 1: the scan stops 5 s after its last watcher closes the page,
-/// and 5 s after one whose network went was last heard from.
+/// Review focus 1: the scan stops 4 s after its last watcher closes the page,
+/// and 4 s after one whose network went was last heard from, so the radio's
+/// scan is off within 5 s.
 #[test]
 fn scan_stops_when_last_watcher_leaves() {
     let r = controller(Timing::default());
     let mut a = ap_with_client(&r, KEY_AP1, "ap1", &[]);
-    let linger = Duration::from_secs(5);
+    let linger = Duration::from_secs(4);
     let scanning = || {
         let s = r.c.state.read();
         let scan = s.ap("ap1").and_then(|a| a.scans.get("radio5"));

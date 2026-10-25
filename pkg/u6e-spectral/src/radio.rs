@@ -26,7 +26,7 @@ pub const DEBUGFS: &str = "/sys/kernel/debug/ieee80211";
 /// The FFT size: 512 points, of which the in-band 256 are reported, 285 B
 /// a frame on the wire.
 pub const FFT_BINS: u32 = 512;
-/// Samples per trigger, one trigger per frame: 80 samples a second.
+/// Samples per trigger, one trigger per frame: 64 samples a second.
 pub const COUNT: u32 = 8;
 
 /// A radio whose scan runs: disabled when dropped.
