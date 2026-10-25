@@ -2,8 +2,9 @@
 //! and the deploy runner's Ed25519 signature over it, which the AP checks
 //! against the runner's key its image pins. The controller relays
 //! configurations but holds no key that signs one, so it cannot make an AP
-//! run one the runner did not render. Whether a configuration's sequence
-//! number is newer than the last one applied is the AP's to judge.
+//! run one the runner did not render. The sequence number is the runner's
+//! signing time in milliseconds: the AP takes one past both the last it
+//! applied and its image's build time ([`replayed`]).
 
 use aws_lc_rs::digest::{SHA256, digest};
 use aws_lc_rs::signature::{ED25519, Ed25519KeyPair, UnparsedPublicKey};
@@ -59,6 +60,20 @@ pub fn verify(runner: &[u8; 32], ap: &str, c: &SignedConfig) -> Result<(), Strin
     UnparsedPublicKey::new(&ED25519, runner)
         .verify(&payload(PROTOCOL, &c.ap, c.seq, &c.sha256), &c.signature)
         .map_err(|_| "not signed by the deploy runner".into())
+}
+
+/// Why sequence number `seq` may not apply when `last` (named `what`) was
+/// the last one and `floor` the image's build time (`Hello::built_ms`): a
+/// replay unless past both. A reboot forgets the last one applied, not the
+/// image's build time, so no configuration signed before the image was built
+/// ever applies on it.
+pub fn replayed(seq: u64, last: u64, what: &str, floor: u64) -> Option<String> {
+    let (bound, what) = if last >= floor {
+        (last, what)
+    } else {
+        (floor, "this image's build time")
+    };
+    (seq <= bound).then(|| format!("replayed: sequence {seq} is not past {bound}, {what}"))
 }
 
 #[cfg(test)]
@@ -159,6 +174,21 @@ mod tests {
             .as_ref()
             .to_vec();
         assert!(verify(&public(&runner), "ap1", &c).is_err());
+    }
+
+    #[test]
+    fn past_the_last_and_the_images_build_time() {
+        let last = "the last installed";
+        assert_eq!(replayed(11, 10, last, 5), None);
+        assert_eq!(
+            replayed(10, 10, last, 5).as_deref(),
+            Some("replayed: sequence 10 is not past 10, the last installed")
+        );
+        assert_eq!(
+            replayed(8, 0, last, 9).as_deref(),
+            Some("replayed: sequence 8 is not past 9, this image's build time")
+        );
+        assert_eq!(replayed(1, 0, last, 0), None);
     }
 
     #[test]

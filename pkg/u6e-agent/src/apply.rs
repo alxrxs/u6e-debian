@@ -246,7 +246,7 @@ impl Apply {
             .ok_or("no deploy runner key in this image: live configuration is off")?;
         config::verify(&runner, &self.ap, c)?;
         let (last, floor) = (self.last_seq, self.floor);
-        if let Some(why) = wificonf::replayed(c.seq, last, "the last applied", floor) {
+        if let Some(why) = config::replayed(c.seq, last, "the last applied", floor) {
             return Err(why);
         }
         let bands: Vec<Band> = c.radios.iter().map(|r| r.radio).collect();

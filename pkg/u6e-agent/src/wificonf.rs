@@ -412,23 +412,6 @@ pub fn installed_hash(dir: &Path) -> Option<[u8; 32]> {
         .map(|r| config_sha256(&r))
 }
 
-/// The image's identity, as prep-rootfs.sh writes it.
-pub const IMAGE: &str = "/etc/u6e-image";
-
-/// Why sequence number `seq` may not apply when `last` (named `what`) was
-/// the last one and `floor` the image's build time (`Hello::built_ms`): a
-/// replay unless past both. The runner numbers its configurations by the
-/// time it signs them, so none signed before the image was built applies on
-/// it, though a reboot forgets the last one applied.
-pub fn replayed(seq: u64, last: u64, what: &str, floor: u64) -> Option<String> {
-    let (bound, what) = if last >= floor {
-        (last, what)
-    } else {
-        (floor, "this image's build time")
-    };
-    (seq <= bound).then(|| format!("replayed: sequence {seq} is not past {bound}, {what}"))
-}
-
 /// The last sequence number installed; 0 before any since boot.
 pub fn read_seq(dir: &Path) -> u64 {
     fs::read_to_string(dir.join(SEQ))
@@ -889,21 +872,6 @@ pub mod tests {
         drop(stage(t.path(), &old).unwrap());
         assert_eq!(read(t.path()).unwrap(), new);
         assert!(!t.path().join(".wlan5.conf.new").exists());
-    }
-
-    #[test]
-    fn past_the_last_and_the_images_build_time() {
-        let last = "the last installed";
-        assert_eq!(replayed(11, 10, last, 5), None);
-        assert_eq!(
-            replayed(10, 10, last, 5).as_deref(),
-            Some("replayed: sequence 10 is not past 10, the last installed")
-        );
-        assert_eq!(
-            replayed(8, 0, last, 9).as_deref(),
-            Some("replayed: sequence 8 is not past 9, this image's build time")
-        );
-        assert_eq!(replayed(1, 0, last, 0), None);
     }
 
     /// The sequence number and the published hash, and who may read them.

@@ -197,7 +197,7 @@ impl Server {
             .ok_or("no deploy runner key in this image: live configuration is off")?;
         config::verify(&runner, &self.ap, c)?;
         let last = wificonf::read_seq(&self.dir);
-        if let Some(why) = wificonf::replayed(c.seq, last, "the last installed", self.floor) {
+        if let Some(why) = config::replayed(c.seq, last, "the last installed", self.floor) {
             return Err(why);
         }
         for r in &c.radios {
