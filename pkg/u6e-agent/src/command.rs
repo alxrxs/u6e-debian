@@ -5,28 +5,34 @@
 //! station's, the station must be associated with a BSS of this AP as
 //! hostapd has it at that moment (a snapshot can be a tick old, and a client
 //! that changed bands since is no longer where it says), and a steer target
-//! must be a BSS of the latest 802.11k round, of the station's SSID.
+//! must be a BSS of the latest 802.11k round, of the station's SSID. A steer
+//! asks politely (the client may decline and stays where it is) and reports
+//! the client's answer.
 //! Blocks live in RAM: on each connection the controller sends the whole set
 //! (`SyncBlocks`), which every BSS's deny ACL is made to hold exactly, and
 //! they go back onto a BSS whose hostapd started again without them.
 
 use std::collections::BTreeSet;
 use std::io::{self, ErrorKind};
+use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use u6e_proto::mac;
 use u6e_proto::msg::{Command, CommandKind, CommandResult, Snapshot};
 
-use crate::collect;
-use crate::neighbors::{Element, Hostapd, Target};
+use crate::clientsock::ClientSocket;
+use crate::neighbors::{ANSWER_WAIT, Element, Hostapd, Target};
+use crate::{collect, events};
 
-/// TBTTs a steered client has before hostapd disassociates it, and for which
-/// the candidate list stays valid: ~10 s at the default beacon interval, time
-/// for a few scans and a reassociation, short enough that a client ignoring
-/// the request is moved anyway. hostapd's default validity, 1 TBTT, expires
-/// before a client's scan ends.
+/// TBTTs for which a steer's candidate list stays valid: ~10 s at the
+/// default beacon interval, time for a few scans and a reassociation.
+/// hostapd's default validity, 1 TBTT, expires before a client's scan ends.
 const STEER_TBTT: u16 = 100;
+/// How long a steer waits for the client's BSS Transition Management
+/// Response; the controller waits 5 s for the whole command.
+const BTM_WAIT: Duration = Duration::from_secs(3);
 /// "Deauthenticated because sending STA is leaving": the client may come back.
 const KICK_REASON: u16 = 3;
 const DETAIL_MAX: usize = 200;
@@ -39,6 +45,8 @@ pub type Blocks = Mutex<BTreeSet<[u8; 6]>>;
 
 pub struct Commands {
     hostapd: Hostapd,
+    /// Where the client sockets are bound.
+    run: PathBuf,
     /// hostapd's control socket directory: one socket per BSS.
     dir: PathBuf,
     targets: Arc<Mutex<Vec<Target>>>,
@@ -59,6 +67,7 @@ impl Commands {
     ) -> io::Result<Self> {
         Ok(Commands {
             hostapd: Hostapd::bind(run, "command", dir)?,
+            run: run.to_owned(),
             dir: dir.to_owned(),
             targets,
             blocks,
@@ -128,9 +137,44 @@ impl Commands {
                 if find(bss.bssid).map(|t| &t.ssid) != Some(&target.ssid) {
                     return Err("the target serves another SSID".into());
                 }
-                self.ask(&bss.ifname, &steer_request(mac, &target.nr))
+                self.steer(&bss.ifname, mac, &target.nr)
             }
         }
+    }
+
+    /// Asks `mac` on `iface` to move to `to`, and waits up to [`BTM_WAIT`]
+    /// for its answer: a decline fails the steer with the client's reason.
+    fn steer(&mut self, iface: &str, mac: [u8; 6], to: &Element) -> Outcome {
+        // Attached before the request, so its answer cannot come first.
+        let events = self.attach(iface);
+        let sent = self.ask(iface, &steer_request(mac, to))?;
+        let Some(events) = events else {
+            return Ok(format!("{sent}, the client's answer not watched"));
+        };
+        let answer = btm_answer(&events, mac, BTM_WAIT);
+        let _ = events.send(b"DETACH");
+        match answer {
+            Some(0) => Ok(format!("{iface}: accepted")),
+            Some(code) => Err(format!("{iface}: {}", declined(code))),
+            None => Ok(format!(
+                "{sent}, no answer from the client in {} s",
+                BTM_WAIT.as_secs()
+            )),
+        }
+    }
+
+    /// A socket attached to `iface`'s events; `None` when hostapd does not
+    /// confirm in time.
+    fn attach(&self, iface: &str) -> Option<ClientSocket> {
+        let sock = ClientSocket::bind(&self.run, "btm").ok()?;
+        sock.connect(self.dir.join(iface)).ok()?;
+        // A hostapd that stops reading would block a send for good.
+        sock.set_write_timeout(Some(ANSWER_WAIT)).ok()?;
+        sock.set_read_timeout(Some(ANSWER_WAIT)).ok()?;
+        sock.send(b"ATTACH").ok()?;
+        let mut buf = [0; 64];
+        let n = sock.recv(&mut buf).ok()?;
+        buf[..n].starts_with(b"OK").then_some(sock)
     }
 
     /// Makes the blocks exactly `macs`. Each BSS's deny ACL gets those it
@@ -316,11 +360,11 @@ fn associated_for(reply: &str, mac: [u8; 6]) -> Option<u64> {
 
 /// A request naming `to` as the one candidate, most preferred (its BSS
 /// Transition Candidate Preference subelement, 255), every other BSS excluded
-/// (abridged), with disassociation after [`STEER_TBTT`].
+/// (abridged). No disassociation is imminent: a client that declines stays.
 fn steer_request(mac: [u8; 6], to: &Element) -> String {
     format!(
         "BSS_TM_REQ {} neighbor={},0x{:08x},{},{},{},0301ff pref=1 abridged=1 \
-         disassoc_imminent=1 disassoc_timer={STEER_TBTT} valid_int={STEER_TBTT}",
+         valid_int={STEER_TBTT}",
         mac::format(mac),
         mac::format(to.bssid),
         to.bssid_info,
@@ -328,6 +372,53 @@ fn steer_request(mac: [u8; 6], to: &Element) -> String {
         to.channel,
         to.phy_type,
     )
+}
+
+/// The status of `mac`'s BSS Transition Management Response, from the
+/// events `sock` gets within `wait`.
+fn btm_answer(sock: &UnixDatagram, mac: [u8; 6], wait: Duration) -> Option<u8> {
+    let end = Instant::now() + wait;
+    let mut buf = [0; 4096];
+    loop {
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        sock.set_read_timeout(Some(left)).ok()?;
+        let n = sock.recv(&mut buf).ok()?;
+        if let Some(code) = btm_status(&String::from_utf8_lossy(&buf[..n]), mac) {
+            return Some(code);
+        }
+    }
+}
+
+/// The status code of hostapd's `BSS-TM-RESP <mac> status_code=<n> ...`
+/// event, if `msg` is that event about `mac`.
+fn btm_status(msg: &str, mac: [u8; 6]) -> Option<u8> {
+    let mut f = events::unprefixed(msg).split_whitespace();
+    if f.next()? != "BSS-TM-RESP" || mac::parse(f.next()?)? != mac {
+        return None;
+    }
+    f.find_map(|kv| kv.strip_prefix("status_code="))?
+        .parse()
+        .ok()
+}
+
+/// Why a client declined, by its status code (IEEE 802.11-2020, table
+/// 9-428).
+fn declined(code: u8) -> String {
+    let why = match code {
+        1 => "unspecified reason",
+        2 => "too few beacons received",
+        3 => "insufficient capacity",
+        4 => "BSS termination undesired",
+        5 => "BSS termination delay requested",
+        6 => "it proposed its own candidates",
+        7 => "no suitable candidates",
+        8 => "leaving the ESS",
+        _ => return format!("declined: status {code}"),
+    };
+    format!("declined: {why}")
 }
 
 /// Both parts' details; a success only when both are.
@@ -368,6 +459,27 @@ mod tests {
         Some("OK\n".into())
     }
 
+    /// The events a fake hostapd sends its attached clients after it
+    /// answered a request.
+    type Events = fn(&str) -> Vec<String>;
+
+    /// A client that answers each steer request by accepting it.
+    fn accepts(req: &str) -> Vec<String> {
+        btm_response(
+            req,
+            "status_code=0 bss_termination_delay=0 target_bssid=02:00:00:00:00:0a",
+        )
+    }
+
+    /// hostapd's event for the answer to `req`, if it is a steer request.
+    fn btm_response(req: &str, rest: &str) -> Vec<String> {
+        req.strip_prefix("BSS_TM_REQ ")
+            .and_then(|r| r.split(' ').next())
+            .map(|sta| format!("<3>BSS-TM-RESP {sta} {rest}"))
+            .into_iter()
+            .collect()
+    }
+
     /// A station hostapd has on a BSS: the BSS, its address, its flags and
     /// its `connected_time`.
     type Entry = (&'static str, [u8; 6], &'static str, u64);
@@ -375,8 +487,8 @@ mod tests {
     const ASSOC: &str = "[AUTH][ASSOC][AUTHORIZED]";
 
     /// hostapds at `BSSS` answering with `reply` (`STA` from the stations in
-    /// `on`, unless `reply` keeps the BSS silent), the requests they got, and
-    /// commands for them.
+    /// `on`, unless `reply` keeps the BSS silent) and sending their attached
+    /// clients `events`, the requests they got, and commands for them.
     struct Rig {
         t: TestDir,
         log: Arc<Mutex<Vec<String>>>,
@@ -402,6 +514,10 @@ mod tests {
 
     impl Rig {
         fn new(reply: Reply) -> Self {
+            Self::with_events(reply, accepts)
+        }
+
+        fn with_events(reply: Reply, events: Events) -> Self {
             let t = TestDir::new();
             let dir = t.path().join("hostapd");
             fs::create_dir_all(&dir).unwrap();
@@ -413,6 +529,7 @@ mod tests {
                 let (log, on) = (Arc::clone(&log), Arc::clone(&on));
                 thread::spawn(move || {
                     let mut buf = [0; 4096];
+                    let mut attached = Vec::new();
                     while let Ok((n, from)) = server.recv_from(&mut buf) {
                         let req = String::from_utf8_lossy(&buf[..n]).into_owned();
                         log.lock().unwrap().push(format!("{iface} {req}"));
@@ -420,8 +537,19 @@ mod tests {
                             true => sta_reply(&on.lock().unwrap(), iface, &req),
                             false => r,
                         });
-                        if let (Some(r), Some(p)) = (r, from.as_pathname()) {
-                            let _ = server.send_to(r.as_bytes(), p);
+                        let (Some(r), Some(from)) = (r, from.as_pathname()) else {
+                            continue;
+                        };
+                        match req.as_str() {
+                            "ATTACH" => attached.push(from.to_owned()),
+                            "DETACH" => attached.retain(|p| p != from),
+                            _ => {}
+                        }
+                        let _ = server.send_to(r.as_bytes(), from);
+                        for ev in events(&req) {
+                            for p in &attached {
+                                let _ = server.send_to(ev.as_bytes(), p);
+                            }
                         }
                     }
                 });
@@ -456,11 +584,15 @@ mod tests {
             self.cmds.run(&Command { id: 7, kind }, Some(&snapshot()))
         }
 
-        /// The requests that act, the `STA` lookups left out.
+        /// The requests that act, the `STA` lookups and the attachments
+        /// for events left out.
         fn requests(&self) -> Vec<String> {
             self.all_requests()
                 .into_iter()
-                .filter(|r| !r.contains(" STA "))
+                .filter(|r| {
+                    let req = r.split_once(' ').map_or("", |(_, req)| req);
+                    !req.starts_with("STA ") && req != "ATTACH" && req != "DETACH"
+                })
                 .collect()
         }
 
@@ -773,19 +905,101 @@ mod tests {
     }
 
     #[test]
+    /// A polite request: no disassociation imminent. The events are watched
+    /// from before it until the client's answer.
     fn steer_request_is_built_from_the_targets_element() {
         let mut r = Rig::new(ok);
         let res = r.run(CommandKind::Steer {
             mac: STA,
             target_bssid: TARGET,
         });
-        assert_eq!((res.ok, res.detail.as_str()), (true, "wlan5-1: OK"));
+        assert_eq!((res.ok, res.detail.as_str()), (true, "wlan5-1: accepted"));
+        let req = "wlan5-1 BSS_TM_REQ 02:00:00:00:00:01 \
+                   neighbor=02:00:00:00:00:0a,0x00005cff,128,149,14,0301ff \
+                   pref=1 abridged=1 valid_int=100";
+        assert_eq!(r.requests(), [req]);
+        let acting: Vec<String> = r
+            .all_requests()
+            .into_iter()
+            .filter(|q| !q.contains(" STA "))
+            .collect();
+        assert_eq!(acting, ["wlan5-1 ATTACH", req, "wlan5-1 DETACH"]);
+    }
+
+    /// A client that declines fails the steer with its reason; another
+    /// station's answer is not taken for its own.
+    #[test]
+    fn a_declined_steer_fails_with_the_clients_reason() {
+        fn declines(req: &str) -> Vec<String> {
+            let other = "<3>BSS-TM-RESP 02:00:00:00:00:02 status_code=0 bss_termination_delay=0";
+            let mut evs = vec![
+                other.to_owned(),
+                "<3>AP-STA-CONNECTED 02:00:00:00:00:03".into(),
+            ];
+            evs.extend(btm_response(req, "status_code=7 bss_termination_delay=0"));
+            evs
+        }
+        let mut r = Rig::with_events(ok, declines);
+        let res = r.run(CommandKind::Steer {
+            mac: STA,
+            target_bssid: TARGET,
+        });
         assert_eq!(
-            r.requests(),
-            ["wlan5-1 BSS_TM_REQ 02:00:00:00:00:01 \
-              neighbor=02:00:00:00:00:0a,0x00005cff,128,149,14,0301ff \
-              pref=1 abridged=1 disassoc_imminent=1 disassoc_timer=100 valid_int=100"]
+            (res.ok, res.detail.as_str()),
+            (false, "wlan5-1: declined: no suitable candidates")
         );
+    }
+
+    /// No answer in time leaves the request sent: the client may still act.
+    #[test]
+    fn a_steer_without_an_answer_says_so_in_time() {
+        let mut r = Rig::with_events(ok, |_| Vec::new());
+        let start = Instant::now();
+        let res = r.run(CommandKind::Steer {
+            mac: STA,
+            target_bssid: TARGET,
+        });
+        assert_eq!(
+            (res.ok, res.detail.as_str()),
+            (true, "wlan5-1: OK, no answer from the client in 3 s")
+        );
+        let took = start.elapsed();
+        assert!(
+            (BTM_WAIT..BTM_WAIT + Duration::from_secs(1)).contains(&took),
+            "{took:?}"
+        );
+        // A hostapd that refuses the attachment: the request goes all the same.
+        let mut r = Rig::new(|_, req| Some(if req == "ATTACH" { "FAIL\n" } else { "OK\n" }.into()));
+        let res = r.run(CommandKind::Steer {
+            mac: STA,
+            target_bssid: TARGET,
+        });
+        assert_eq!(
+            (res.ok, res.detail.as_str()),
+            (true, "wlan5-1: OK, the client's answer not watched")
+        );
+    }
+
+    #[test]
+    fn a_btm_response_is_read_for_its_station() {
+        let ev = "<3>BSS-TM-RESP 02:00:00:00:00:01 status_code=7 bss_termination_delay=0";
+        assert_eq!(btm_status(ev, STA), Some(7));
+        assert_eq!(btm_status(&ev[3..], STA), Some(7));
+        assert_eq!(btm_status(ev, [0x02, 0, 0, 0, 0, 0x02]), None);
+        let accept = "<3>BSS-TM-RESP 02:00:00:00:00:01 status_code=0 bss_termination_delay=0 \
+                      target_bssid=02:00:00:00:00:0a";
+        assert_eq!(btm_status(accept, STA), Some(0));
+        for other in [
+            "<3>AP-STA-CONNECTED 02:00:00:00:00:01",
+            "<3>BSS-TM-RESP 02:00:00:00:00:01",
+            "<3>BSS-TM-RESP 02:00:00:00:00:01 status_code=x",
+            "",
+        ] {
+            assert_eq!(btm_status(other, STA), None, "{other:?}");
+        }
+        assert_eq!(declined(7), "declined: no suitable candidates");
+        assert_eq!(declined(1), "declined: unspecified reason");
+        assert_eq!(declined(42), "declined: status 42");
     }
 
     /// The snapshot has the station on wlan5-1, but it changed bands since:
@@ -798,7 +1012,7 @@ mod tests {
             mac: STA,
             target_bssid: [0x02, 0, 0, 0, 0, 0x12],
         });
-        assert_eq!((res.ok, res.detail.as_str()), (true, "wlan24: OK"));
+        assert_eq!((res.ok, res.detail.as_str()), (true, "wlan24: accepted"));
         let reqs = r.requests();
         assert_eq!(reqs.len(), 1);
         assert!(

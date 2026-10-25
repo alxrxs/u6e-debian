@@ -121,6 +121,8 @@ function outcome(action, res, who, target) {
   const why = (detail) => {
     if (/not associated/i.test(detail)) return `${who} was no longer on ${ap} when the command arrived.`;
     if (action === 'steer' && /unknown|neighbo|not in/i.test(detail)) return `${ap} does not know that BSS (its AP or radio may have gone down). Pick another.`;
+    const declined = action === 'steer' && /declined: (.*)$/.exec(detail);
+    if (declined) return `${who} declined to move (${declined[1]}) and stays on ${ap}.`;
     return detail;
   };
   switch (res.status) {

@@ -206,15 +206,17 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-/// The event a hostapd message reports, "<3>NAME [MAC ...]" (the priority
-/// prefix stripped); none for what is not one of ours. `phy` names the phy of
-/// the BSS, for the events about the radio.
-fn parse(msg: &str, bss: u16, phy: impl FnOnce() -> String) -> Option<EventKind> {
-    let msg = msg
-        .strip_prefix('<')
+/// A hostapd event message, "<3>NAME [MAC ...]", without its priority.
+pub fn unprefixed(msg: &str) -> &str {
+    msg.strip_prefix('<')
         .and_then(|m| m.split_once('>'))
-        .map_or(msg, |(_, m)| m);
-    let mut f = msg.split_whitespace();
+        .map_or(msg, |(_, m)| m)
+}
+
+/// The event a hostapd message reports; none for what is not one of ours.
+/// `phy` names the phy of the BSS, for the events about the radio.
+fn parse(msg: &str, bss: u16, phy: impl FnOnce() -> String) -> Option<EventKind> {
+    let mut f = unprefixed(msg).split_whitespace();
     let name = f.next()?;
     let station = |f: &mut std::str::SplitWhitespace| mac::parse(f.next()?);
     Some(match name {

@@ -25,7 +25,7 @@ pub const HOSTAPD: &str = "/run/hostapd";
 const ROUND: Duration = Duration::from_secs(ROUND_SECS);
 const TIMEOUT: Duration = Duration::from_secs(3);
 /// How long hostapd has to answer a control request.
-const ANSWER_WAIT: Duration = Duration::from_secs(1);
+pub const ANSWER_WAIT: Duration = Duration::from_secs(1);
 
 /// A neighbor report entry: BSSID, and SSID and element in hex.
 struct Entry {
