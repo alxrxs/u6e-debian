@@ -804,12 +804,12 @@ if [ -n "$major" ] && mknod -m 0440 /dev/ecm_state c "$major" 0; then
 else
 	echo "u6e-nss: no ECM state device" >&2
 fi
-# One client's capture (nss/u6e-pcc): the mirror instance nssmirror0, then
+# One client's capture (nss/u6e-pcc): the mirror instance mirror.0, then
 # ECM's PCC registrant; registering defuncts every connection, cheap at boot.
-if echo create > /proc/sys/dev/nss/mirror/config && [ -d /sys/class/net/nssmirror0 ]; then
+if echo create > /proc/sys/dev/nss/mirror/config && [ -d /sys/class/net/mirror.0 ]; then
 	modprobe u6e-pcc || echo "u6e-nss: u6e-pcc did not load" >&2
 else
-	echo "u6e-nss: no mirror instance nssmirror0" >&2
+	echo "u6e-nss: no mirror instance mirror.0" >&2
 fi
 modprobe qca-nss-netlink
 NSS

@@ -125,7 +125,7 @@ Wi-Fi starts by itself on every boot (`u6e-wifi.service`), with nothing else on 
 | `trees.sh`, `export.sh` | Create the source trees from the patch series, and export commits back to patches |
 | `kernel/`, `backports/` | Upstream release address and our patches |
 | `config-u6e.sh` | Kernel configuration |
-| `nss/` | Builds the NSS drivers, the Wi-Fi stack and the NSS firmware download, with the patches for each, and `u6e-pcc` (`nss/u6e-pcc/`), our module that has ECM accelerate one client's TCP and UDP connections with an NSS mirror rule, so the NSS core copies their packets to a mirror device while they stay offloaded (`u6e-nss` creates that device, `nssmirror0`, and loads the module at boot; nothing sets a target yet). The image gives the NSS firmware 4 MB of host RAM for its shapers (`qca-nss-drv qos_mem_size`), beyond the one interface shaper and about 410 classes its own pool holds |
+| `nss/` | Builds the NSS drivers, the Wi-Fi stack and the NSS firmware download, with the patches for each, and `u6e-pcc` (`nss/u6e-pcc/`), our module that has ECM accelerate one client's TCP and UDP connections with an NSS mirror rule, so the NSS core copies their packets to a mirror device while they stay offloaded (`u6e-nss` creates that device, `mirror.0`, and loads the module at boot; nothing sets a target yet). The image gives the NSS firmware 4 MB of host RAM for its shapers (`qca-nss-drv qos_mem_size`), beyond the one interface shaper and about 410 classes its own pool holds |
 | `fw/` | Builds the board data files; includes `ath11k-bdencoder` |
 | `pkg/hostapd/` | hostapd build with our 29 patches |
 | `pkg/iproute2-nss/` | `iproute2` with NSS support in `tc` |

@@ -14,8 +14,8 @@
  *
  * Use (the image loads it after ecm and qca-nss-mirror, once the mirror
  * instance exists; all files root only):
- *	echo create > /proc/sys/dev/nss/mirror/config	(makes nssmirror0)
- *	modprobe u6e-pcc [mirror=nssmirror0]
+ *	echo create > /proc/sys/dev/nss/mirror/config	(makes mirror.0)
+ *	modprobe u6e-pcc [mirror=mirror.0]
  *	echo 128 > /sys/kernel/debug/u6e-pcc/snaplen	(64-65535; default 128)
  *	echo 02:00:00:00:00:01 > /sys/kernel/debug/u6e-pcc/target
  *	echo none > /sys/kernel/debug/u6e-pcc/target
@@ -50,7 +50,7 @@
 
 #define U6E_PCC_SNAPLEN_MIN 64
 
-static char *mirror = "nssmirror0";
+static char *mirror = "mirror.0";
 module_param(mirror, charp, 0444);
 MODULE_PARM_DESC(mirror, "NSS mirror netdev the target's flows are copied to");
 
