@@ -119,7 +119,7 @@ Wi-Fi starts by itself on every boot (`u6e-wifi.service`), with nothing else on 
 | `pkg/iproute2-nss/` | `iproute2` with NSS support in `tc` |
 | `pkg/netlogd/` | `systemd-netlogd` (the log forwarder) without a spurious error at each journal file rotation |
 | `pkg/u6e-proto/` | The wire protocol between the agent and the controller: messages, delta coding, framing, and the TLS 1.3 configuration (X25519MLKEM768, pinned Ed25519 raw public keys, no session resumption) (Rust) |
-| `pkg/u6e-controller/` | The Wi-Fi controller: the agents' sessions over the pinned-key TLS link, the live state of every access point, Prometheus metrics, and the web UI embedded in the binary (`ui/`: devices, clients, a client's session, events), kept live over a WebSocket (Rust, hand-written JavaScript and CSS) |
+| `pkg/u6e-controller/` | The Wi-Fi controller: the agents' sessions over the pinned-key TLS link, the live state of every access point, Prometheus metrics, and the web UI embedded in the binary (`ui/`: devices, clients, a client's session, events), kept live over a WebSocket; `cargo run -p u6e-controller --example replay` serves it fed by two simulated access points (Rust, hand-written JavaScript and CSS) |
 | `pkg/u6e-agent/` | The access point's resident agent: neighbor reports across access points, management network check, state line, Wi-Fi state collectors and events, the telemetry link to the controller (Rust) |
 | `mkrootfs.sh` | Creates the Debian root filesystem |
 | `prep-rootfs.sh` | Adds the kernel, firmware and configuration, and produces one image per access point |
