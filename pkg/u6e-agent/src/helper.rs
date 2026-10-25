@@ -10,8 +10,9 @@
 //!
 //! It takes only configurations the deploy runner signed for this AP, newer
 //! than the last it installed (the sequence number survives the agent, until
-//! the next boot), whatever the agent checked: a compromised controller or
-//! agent cannot install one of its own. systemd starts one helper per
+//! the next boot) and than the image itself (`wificonf::image_floor`, which
+//! survives the boot), whatever the agent checked: a compromised controller
+//! or agent cannot install one of its own, nor replay an old one. systemd starts one helper per
 //! connection on a socket only the agent's group may open (`u6e-agent
 //! --config-helper`; see prep-rootfs.sh for the units); a connection carries
 //! one request and its reply, the configuration's bytes wiped after.
@@ -125,11 +126,13 @@ pub struct Server {
     pub runner: Option<[u8; 32]>,
     /// This AP's name, which a configuration must be signed for.
     pub ap: String,
+    /// The image's build time: no sequence number at or below it applies.
+    pub floor: u64,
 }
 
 impl Server {
     /// The AP's helper.
-    pub fn new(runner: Option<[u8; 32]>, ap: String) -> Self {
+    pub fn new(runner: Option<[u8; 32]>, ap: String, floor: u64) -> Self {
         Server {
             dir: wificonf::DIR.into(),
             state: wificonf::STATE.into(),
@@ -142,6 +145,7 @@ impl Server {
             up_wait: Duration::from_secs(30),
             runner,
             ap,
+            floor,
         }
     }
 
@@ -193,11 +197,8 @@ impl Server {
             .ok_or("no deploy runner key in this image: live configuration is off")?;
         config::verify(&runner, &self.ap, c)?;
         let last = wificonf::read_seq(&self.dir);
-        if c.seq <= last {
-            return Err(format!(
-                "replayed: sequence {} is not past {last}, the last installed",
-                c.seq
-            ));
+        if let Some(why) = wificonf::replayed(c.seq, last, "the last installed", self.floor) {
+            return Err(why);
         }
         for r in &c.radios {
             let name = wificonf::iface(r.radio);
@@ -481,6 +482,7 @@ pub mod tests {
             up_wait: Duration::from_secs(2),
             runner: Some(runner_public()),
             ap: "ap1".into(),
+            floor: 0,
         };
         (s, log)
     }
@@ -757,6 +759,26 @@ pub mod tests {
         );
         assert_eq!((r.installed(), r.log()), before);
         assert_eq!(wificonf::read_seq(&r.server.dir), 10);
+    }
+
+    /// A reboot forgets the last sequence number (it lives in /run), but not
+    /// the image's build time: a configuration signed before the image was
+    /// built is refused on it, before the first install and after a reboot.
+    #[test]
+    fn a_configuration_older_than_the_image_is_refused_across_a_reboot() {
+        let mut r = Rig::new();
+        r.server.floor = 1_000;
+        let new = || with5(&edit(WLAN5, "dtim_period=3", "dtim_period=1"), 23);
+        let why = "replayed: sequence 1000 is not past 1000, this image's build time";
+        assert_eq!(r.install(signed(1_000, new()), false), Err(why.into()));
+        assert!(r.install(signed(1_001, new()), false).is_ok());
+        assert_eq!(wificonf::read_seq(&r.server.dir), 1_001);
+        // The reboot: /run is gone, the image is the same.
+        fs::remove_file(r.server.dir.join("seq")).unwrap();
+        assert_eq!(wificonf::read_seq(&r.server.dir), 0);
+        let why = "replayed: sequence 999 is not past 1000, this image's build time";
+        assert_eq!(r.install(signed(999, fixture()), false), Err(why.into()));
+        assert_eq!(r.installed(), new());
     }
 
     /// The agent's end, against a helper on a socket.

@@ -153,6 +153,7 @@ fn start_link(
             Arc::clone(targets),
             l.runner_key,
             hello.ap.clone(),
+            wificonf::image_floor(&hello.manifest),
         );
         apply::Worker::new(move |c, last: Option<&_>| a.run(c, last))
     });
@@ -212,7 +213,8 @@ fn config_helper() -> ! {
         eprintln!("u6e-agent: config helper: a peer outside the agent's group");
         process::exit(1);
     }
-    let server = helper::Server::new(runner, link::local_hello().ap);
+    let hello = link::local_hello();
+    let server = helper::Server::new(runner, hello.ap, wificonf::image_floor(&hello.manifest));
     if let Err(e) = server.serve(&mut conn) {
         eprintln!("u6e-agent: config helper: {e}");
         process::exit(1);
@@ -285,7 +287,7 @@ fn main() {
         config_helper();
     }
     if env::args().nth(1).as_deref() == Some("--publish-config-hash") {
-        helper::Server::new(None, String::new()).publish();
+        helper::Server::new(None, String::new(), 0).publish();
         return;
     }
     let nss_load = passed::take(collect::NSS_LOAD_NAME);

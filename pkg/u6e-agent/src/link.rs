@@ -697,7 +697,7 @@ fn consume(buf: &mut Vec<u8>, used: usize) {
 /// this agent's version, and the image identity `/etc/u6e-image` records.
 pub fn local_hello() -> Hello {
     let read = |p| fs::read_to_string(p).unwrap_or_default().trim().to_owned();
-    let image = read("/etc/u6e-image");
+    let image = read(crate::wificonf::IMAGE);
     Hello {
         ap: read("/proc/sys/kernel/hostname"),
         hostapd: hostapd_version(&image),

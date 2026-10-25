@@ -5,7 +5,8 @@
 //!
 //! Nothing is installed before the whole request passes: the runner's
 //! signature over it, for this AP, with a sequence number past the last one
-//! applied (no replay), its SHA-256, each radio's file, and any new channel
+//! applied and the image's build time (no replay, not even after a reboot),
+//! its SHA-256, each radio's file, and any new channel
 //! or power one the radio may take now (nl80211's channels and rules; never
 //! a DFS channel that needs a CAC first). The installed configuration is the
 //! root helper's alone (it holds the secrets), so the helper says how each
@@ -184,6 +185,8 @@ pub struct Apply {
     /// The last sequence number sent to the helper, whose own record (which
     /// outlasts the agent) is the one that counts.
     last_seq: u64,
+    /// The image's build time: no sequence number at or below it applies.
+    floor: u64,
     steer_grace: Duration,
     switch_wait: Duration,
 }
@@ -196,6 +199,7 @@ impl Apply {
         targets: Arc<Mutex<Vec<Target>>>,
         runner: Option<[u8; 32]>,
         ap: String,
+        floor: u64,
     ) -> Self {
         Apply {
             hostapd,
@@ -205,6 +209,7 @@ impl Apply {
             runner,
             ap,
             last_seq: 0,
+            floor,
             steer_grace: STEER_GRACE,
             switch_wait: SWITCH_WAIT,
         }
@@ -240,11 +245,9 @@ impl Apply {
             .runner
             .ok_or("no deploy runner key in this image: live configuration is off")?;
         config::verify(&runner, &self.ap, c)?;
-        if c.seq <= self.last_seq {
-            return Err(format!(
-                "replayed: sequence {} is not past {}, the last applied",
-                c.seq, self.last_seq
-            ));
+        let (last, floor) = (self.last_seq, self.floor);
+        if let Some(why) = wificonf::replayed(c.seq, last, "the last applied", floor) {
+            return Err(why);
         }
         let bands: Vec<Band> = c.radios.iter().map(|r| r.radio).collect();
         if bands.is_empty() || !bands.windows(2).all(|w| (w[0] as u8) < (w[1] as u8)) {
@@ -703,6 +706,7 @@ mod tests {
                 up_wait: Duration::from_secs(2),
                 runner: Some(runner_public()),
                 ap: "ap1".into(),
+                floor: 0,
             };
             let sock = t.path().join("sock");
             let listener = UnixListener::bind(&sock).unwrap();
@@ -729,6 +733,7 @@ mod tests {
                 runner: Some(runner_public()),
                 ap: "ap1".into(),
                 last_seq: 0,
+                floor: 0,
                 steer_grace: Duration::ZERO,
                 switch_wait: Duration::from_secs(2),
             };
@@ -883,6 +888,18 @@ mod tests {
             "refused: replayed: sequence 3 is not past 5, the last installed"
         );
         assert_eq!(r.installed(), new());
+
+        // An agent of an image built after the configuration was signed, as
+        // after a reboot into a newer image: refused before the helper.
+        let mut newer = Rig::new();
+        newer.apply.floor = 100;
+        let done = newer.run(signed(50, new()));
+        assert_eq!(
+            done.detail,
+            "refused: replayed: sequence 50 is not past 100, this image's build time"
+        );
+        assert!(newer.requests().is_empty());
+        assert_eq!(newer.helper(), String::new());
 
         let mut keyless = Rig::new();
         keyless.apply.runner = None;

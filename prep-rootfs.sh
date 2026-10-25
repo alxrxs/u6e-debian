@@ -845,16 +845,20 @@ UNIT
 ln -sf /etc/systemd/system/u6e-nss.service $RF/etc/systemd/system/multi-user.target.wants/u6e-nss.service
 
 # The image's identity: images/<time>-<kernel>-<backports>-<AP>/ is where it
-# is kept, /etc/u6e-image carries that name and its versions (u6e-agent reports
-# them to the controller), and MANIFEST adds the checksums.
+# is kept, /etc/u6e-image carries that name, its build time in milliseconds
+# and its versions (u6e-agent reports them to the controller), and MANIFEST
+# adds the checksums. The build time is the floor of the live configurations'
+# sequence numbers (the deploy runner's signing times): one signed before the
+# image was built never applies on it, not even after a reboot.
 g() { git -c safe.directory='*' -C "$1" log -1 --format='%h %s'; }
-A=images/$(date +%Y%m%d-%H%M%S)-$(git -c safe.directory='*' -C $K rev-parse --short HEAD)-$(git -c safe.directory='*' -C backports-7.2 rev-parse --short HEAD)
+built_ms=$(date +%s%3N)
+A=images/$(date -d "@${built_ms%???}" +%Y%m%d-%H%M%S)-$(git -c safe.directory='*' -C $K rev-parse --short HEAD)-$(git -c safe.directory='*' -C backports-7.2 rev-parse --short HEAD)
 A=$A-${U6E_AP:-default}
 versions="kernel:    $(g $K)
 backports: $(g backports-7.2)
 debian-ap: $(g .)
 hostapd:   $(dpkg-query --admindir=$RF/var/lib/dpkg -W -f '${Version}' hostapd)"
-printf 'image:     %s\n%s\n' "${A#images/}" "$versions" > $RF/etc/u6e-image
+printf 'image:     %s\nbuilt_ms:  %s\n%s\n' "${A#images/}" "$built_ms" "$versions" > $RF/etc/u6e-image
 
 # Pack: a reproducible zstd initrd (fixed mtimes, renumbered inodes) with the
 # paths this script rewrites last, so go8.sh's chunk compare only rewrites the
