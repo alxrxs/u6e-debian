@@ -11,7 +11,8 @@
 //! took the slow path): an ended connection is decelerated, yet it keeps its
 //! totals until conntrack lets it go, minutes later. A full record (mask 1,
 //! where both are in the front end's block, e.g. `nss_v4.ported.accel_mode`)
-//! parses too, without its age.
+//! parses too, without its age. A record without the count (an ECM without
+//! that part of 902) is classified by its mode alone, and counted.
 //!
 //! Each open of the device starts a new dump, which walks ECM's list by
 //! reference, so a connection added or removed meanwhile is either whole in
@@ -75,6 +76,9 @@ pub struct EcmTable {
     /// False when the dump held more than the cap, broke off, or had a
     /// record it could not read.
     pub complete: bool,
+    /// Connections whose record has no slow path packet count, classified
+    /// by their mode alone.
+    pub without_slow_path: usize,
 }
 
 /// Reads a dump from the device at `path`, at most `cap` connections of it.
@@ -89,6 +93,7 @@ pub fn parse(r: impl Read, cap: usize) -> EcmTable {
     let mut t = EcmTable {
         conns: Vec::new(),
         complete: true,
+        without_slow_path: 0,
     };
     let mut cur: Option<Pending> = None;
     let end = lines(r, |line| {
@@ -236,7 +241,10 @@ impl Pending {
 
     fn finish(self) -> Option<Conn> {
         let packets = self.from_packets? + self.to_packets?;
-        let offloaded = self.accel_mode? == ACCEL || self.slow_path_packets? * 2 < packets;
+        let offloaded = self.accel_mode? == ACCEL
+            || self
+                .slow_path_packets
+                .is_some_and(|slow| slow * 2 < packets);
         Some(Conn {
             proto: self.proto?,
             src: self.src?,
@@ -259,8 +267,12 @@ impl EcmTable {
     /// The connection `p` read, or, when it misses a field, the mark that
     /// one is left out.
     fn add(&mut self, p: Pending) {
+        let without_slow_path = p.slow_path_packets.is_none();
         match p.finish() {
-            Some(c) => self.conns.push(c),
+            Some(c) => {
+                self.conns.push(c);
+                self.without_slow_path += usize::from(without_slow_path);
+            }
             None => self.complete = false,
         }
     }
@@ -444,6 +456,7 @@ mod tests {
             }
         );
         assert_eq!(t.conns.iter().filter(|c| c.offloaded).count(), 12);
+        assert_eq!(t.without_slow_path, 0);
     }
 
     /// Any split of the reads gives the same table.
@@ -485,6 +498,7 @@ mod tests {
         let got: Vec<_> = t.conns.iter().map(|c| (c.sport, c.offloaded)).collect();
         assert_eq!(got, [(33350, true), (42482, true)]);
         assert_eq!(t.conns[1].from_bytes, 3_317_265_521);
+        assert_eq!(t.without_slow_path, 0);
     }
 
     /// A decelerated connection is offloaded while fewer than half of its
@@ -500,6 +514,27 @@ mod tests {
         // 7 packets in all.
         assert!(decel(3));
         assert!(!decel(4));
+    }
+
+    /// A brief record of an ECM without the slow path packet count (its
+    /// 13 lines) parses, classified by its mode alone, and is counted.
+    #[test]
+    fn a_record_without_a_slow_path_count_is_classified_by_its_mode() {
+        let old = |mode: u8| {
+            record(7, m(1), m(9), [100, 900])
+                .replace("accel_mode=2", &format!("accel_mode={mode}"))
+                .lines()
+                .filter(|l| !l.contains("slow_path_packets"))
+                .map(|l| format!("{l}\n"))
+                .collect::<String>()
+        };
+        let accelerated = parse(old(2).as_bytes(), CAP);
+        assert!(accelerated.complete);
+        assert_eq!(accelerated.without_slow_path, 1);
+        assert!(accelerated.conns[0].offloaded);
+        let decelerated = parse(old(0).as_bytes(), CAP);
+        assert!(decelerated.complete);
+        assert!(!decelerated.conns[0].offloaded);
     }
 
     #[test]

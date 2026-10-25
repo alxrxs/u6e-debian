@@ -268,9 +268,10 @@ fn print_flows(nss_load: Option<fs::File>, full: bool) {
     let _ = write_frame(&mut frame, &AgentMsg::Flows(flows.clone()));
     println!("{flows:#?}");
     eprintln!(
-        "{} connections (complete: {}), {} of {} stations with some: {:.1} ms CPU, {:.1} ms wall, {} B framed",
+        "{} connections (complete: {}, {} without slow path counts), {} of {} stations with some: {:.1} ms CPU, {:.1} ms wall, {} B framed",
         table.conns.len(),
         table.complete,
+        table.without_slow_path,
         flows.clients.len(),
         stations.len(),
         used.as_secs_f64() * 1e3,
