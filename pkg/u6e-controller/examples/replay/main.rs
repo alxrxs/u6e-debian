@@ -3,33 +3,48 @@
 //! over the real link with the tests' throwaway keys. Each AP has three
 //! radios; ten clients move about in a two-minute script that repeats (joins
 //! and leaves, roams between the APs, an EAP failure, a 6 GHz radio going
-//! down and up, one AP's link dropping for a while), their signals, rates and
-//! traffic drifting all the while.
-//! The agents keep to the tick the controller sets, as real ones do.
+//! down and up, one AP's link dropping for a while), their signals, rates,
+//! traffic and connections drifting all the while.
+//! The agents keep to the tick and flow cadence the controller sets, as real
+//! ones do, and carry out its commands: a kicked client rejoins a few seconds
+//! later, a blocked one stays away until it is unblocked, a steered one moves
+//! to its target, and the thermostat (`02:00:00:00:00:06`) never answers a
+//! kick, for the timeout. Each client's addresses have a DNS name, but one's.
+//! The web listener adds what the sign-in proxy in front of a controller
+//! would: a user, a member of the admin group unless `--viewer` is given.
 //!
-//!   cargo run -p u6e-controller --example replay [-- <web address>]
+//!   cargo run -p u6e-controller --example replay [-- [<web address>] [--viewer]]
 //!
 //! The web address defaults to 127.0.0.1:8080.
 
-#[path = "../tests/common/keys.rs"]
+mod flows;
+#[path = "../../tests/common/keys.rs"]
 mod keys;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use axum::extract::Request;
+use axum::http::HeaderValue;
+use axum::middleware;
 use keys::{KEY_AP1, KEY_AP2, KEY_CONTROLLER};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{interval, sleep, sleep_until};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::ServerName;
+use u6e_controller::actions::{Access, GROUPS_HEADER, USER_HEADER};
 use u6e_controller::agents::Timing;
 use u6e_controller::config::Config;
+use u6e_controller::http;
+use u6e_controller::names::Resolve;
 use u6e_proto::frame::{decode_frame, frame_body, write_frame};
 use u6e_proto::msg::{
-    AgentMsg, Band, Bss, CtlMsg, Event, EventKind, Hello, Radio, RateMode, Snapshot, Station, Temp,
+    AgentMsg, Band, Bss, CommandKind, CommandResult, CtlMsg, Event, EventKind, Flows, Hello, Radio,
+    RateMode, Snapshot, Station, Temp,
 };
 use u6e_proto::tls::{self, Identity};
 use u6e_proto::{PROTOCOL, delta, mac, version};
@@ -65,6 +80,44 @@ const BSSS: [(&str, &str, usize, u16); 4] = [
 /// The SSID that authenticates with EAP.
 const EAP_SSID: &str = "ssid-a";
 
+/// Each client's DNS name and the connections it usually keeps open, by the
+/// last byte of its MAC (from 1); one has no name.
+const PROFILES: [(Option<&str>, u32); 10] = [
+    (Some("pixel-8.home.arpa"), 42),
+    (Some("macbook-air.home.arpa"), 64),
+    (Some("iphone-15.home.arpa"), 31),
+    (Some("living-room-tv.home.arpa"), 18),
+    (Some("galaxy-tab.home.arpa"), 26),
+    (Some("thermostat.home.arpa"), 5),
+    (Some("printer.home.arpa"), 7),
+    (Some("workstation-with-a-rather-long-name.home.arpa"), 80),
+    (Some("doorbell.home.arpa"), 9),
+    (None, 22),
+];
+/// The reverse DNS of the clients' addresses (`flows`): their profiles' names.
+struct Names;
+
+impl Resolve for Names {
+    fn reverse(&self, ip: IpAddr) -> Option<String> {
+        let last = match ip {
+            IpAddr::V4(v4) if v4.octets()[..3] == [192, 0, 2] => v4.octets()[3].checked_sub(10)?,
+            IpAddr::V6(v6) if v6.segments()[..3] == [0x2001, 0xdb8, 0x10] => {
+                u8::try_from(v6.segments()[7]).ok()?
+            }
+            _ => return None,
+        };
+        let (name, _) = PROFILES.get(usize::from(last).checked_sub(1)?)?;
+        name.map(str::to_owned)
+    }
+}
+
+/// The client that never answers a kick.
+const SILENT: u8 = 6;
+/// How long a kicked or unblocked client takes to come back, and a steered
+/// one to move.
+const REJOIN_S: f64 = 6.0;
+const STEER_S: f64 = 3.0;
+
 /// One simulated client: where it is, how it is heard, and its counters.
 struct Client {
     last: u8,
@@ -89,6 +142,7 @@ struct Client {
 }
 
 /// What the script does at a moment of its cycle.
+#[derive(Clone, Copy)]
 enum Act {
     Join(u8, usize, usize, f64),
     Leave(u8),
@@ -125,6 +179,12 @@ struct World {
     step: usize,
     aps: [ApSim; 2],
     clients: Vec<Client>,
+    /// The clients blocked, by MAC: they join nowhere.
+    blocked: BTreeSet<[u8; 6]>,
+    /// Where each client a block put off was, to go back to when unblocked.
+    homes: BTreeMap<[u8; 6], (usize, usize)>,
+    /// Joins the commands have set off, at seconds since the start.
+    later: Vec<(f64, Act)>,
     rng: u64,
 }
 
@@ -222,6 +282,9 @@ impl World {
                 client(9, RateMode::Ht, 1, 30e3, Some((0, 0, -66.0))),
                 client(10, RateMode::He, 2, 2e6, None),
             ],
+            blocked: BTreeSet::new(),
+            homes: BTreeMap::new(),
+            later: Vec::new(),
             rng: 0x9e37_79b9_7f4a_7c15,
         };
         for i in 0..w.clients.len() {
@@ -272,6 +335,9 @@ impl World {
         match *act {
             Act::Join(last, ap, bss, signal) => {
                 let Some(i) = find(self, last) else { return };
+                if self.blocked.contains(&World::mac(last)) {
+                    return;
+                }
                 self.leave(i);
                 let c = &mut self.clients[i];
                 // A new association: the station's counters start over.
@@ -331,6 +397,11 @@ impl World {
                 self.step = 0;
                 self.cycle += CYCLE;
             }
+        }
+        let (due, later) = self.later.drain(..).partition(|(at, _)| *at <= now);
+        self.later = later;
+        for (_, act) in due {
+            self.act(&act);
         }
         let dt = now - self.t;
         self.t = now;
@@ -399,6 +470,119 @@ impl World {
         }
     }
 
+    /// The flows of the AP's clients: each one's largest connections, or
+    /// every one when `full`.
+    fn flows(&mut self, ap: usize, seq: u64, full: bool) -> Flows {
+        self.advance();
+        let t = self.t;
+        let clients = self
+            .clients
+            .iter()
+            .filter(|c| c.at.is_some_and(|(x, _)| x == ap))
+            .map(|c| {
+                let traffic = flows::Traffic {
+                    mac: World::mac(c.last),
+                    last: c.last,
+                    conns: PROFILES[usize::from(c.last) - 1].1,
+                    down: c.tx_bytes,
+                    up: c.rx_bytes,
+                    connected_s: t - c.since,
+                    t,
+                };
+                flows::client(&traffic, if full { usize::MAX } else { flows::TOP })
+            })
+            .collect();
+        Flows {
+            seq,
+            complete: true,
+            clients,
+        }
+    }
+
+    /// Carries out a command on the AP as its hostapd would: its result, or
+    /// `None` for one the AP never answers.
+    fn command(&mut self, ap: usize, kind: &CommandKind) -> Option<(bool, String)> {
+        self.advance();
+        let mac = match kind {
+            CommandKind::Kick { mac }
+            | CommandKind::Block { mac }
+            | CommandKind::Unblock { mac }
+            | CommandKind::Steer { mac, .. } => *mac,
+            // The list the AP's deny lists are made to hold: whoever is on
+            // it and here goes.
+            CommandKind::SyncBlocks { macs } => {
+                self.blocked = macs.iter().copied().collect();
+                let gone: Vec<usize> = (0..self.clients.len())
+                    .filter(|&i| {
+                        let c = &self.clients[i];
+                        c.at.is_some_and(|(a, _)| a == ap)
+                            && self.blocked.contains(&World::mac(c.last))
+                    })
+                    .collect();
+                for i in gone {
+                    self.leave(i);
+                }
+                return Some((true, "OK".into()));
+            }
+        };
+        let i = self.clients.iter().position(|c| World::mac(c.last) == mac);
+        let here = i.and_then(|i| {
+            let at = self.clients[i].at.filter(|(a, _)| *a == ap)?;
+            Some((i, at.1))
+        });
+        let ok = Some((true, "OK".to_owned()));
+        match *kind {
+            CommandKind::Block { .. } => {
+                self.blocked.insert(mac);
+                if let Some((i, bss)) = here {
+                    self.homes.insert(mac, (ap, bss));
+                    self.leave(i);
+                }
+                ok
+            }
+            CommandKind::Unblock { .. } => {
+                // A client a block put off goes back to where it was.
+                self.blocked.remove(&mac);
+                if let (Some((a, b)), Some(i)) = (self.homes.remove(&mac), i) {
+                    let c = &self.clients[i];
+                    self.later
+                        .push((self.t + REJOIN_S, Act::Join(c.last, a, b, c.base)));
+                }
+                ok
+            }
+            CommandKind::SyncBlocks { .. } => unreachable!("answered above"),
+            _ if here.is_none() => Some((false, "not associated here".into())),
+            CommandKind::Kick { .. } if mac[5] == SILENT => None,
+            CommandKind::Kick { .. } => {
+                let (i, bss) = here?;
+                let c = &self.clients[i];
+                let join = Act::Join(c.last, ap, bss, c.base);
+                self.later.push((self.t + REJOIN_S, join));
+                self.leave(i);
+                ok
+            }
+            CommandKind::Steer { target_bssid, .. } => {
+                let (i, _) = here?;
+                // Only a BSS on a radio that is up is in the neighbor reports.
+                let target = (0..self.aps.len()).find_map(|a| {
+                    let b = (0..BSSS.len()).find(|&b| bssid(a, b) == target_bssid)?;
+                    let up = self.t >= self.aps[a].away_until && self.aps[a].radios[BSSS[b].2].up;
+                    up.then_some((a, b))
+                });
+                let Some((a, b)) = target else {
+                    return Some((
+                        false,
+                        "unknown target BSS: not in the neighbor reports".into(),
+                    ));
+                };
+                let c = &self.clients[i];
+                let join = Act::Join(c.last, a, b, c.base + 3.0);
+                self.later.push((self.t + STEER_S, join));
+                ok
+            }
+        }
+    }
+
     /// Whether the AP's link is down by the script.
     fn away(&mut self, ap: usize) -> bool {
         self.advance();
@@ -452,7 +636,7 @@ impl World {
                 .enumerate()
                 .map(|(i, &(ifname, ssid, radio, vlan))| Bss {
                     ifname: ifname.into(),
-                    bssid: [0x02, 0, 0, 0x0a, ap as u8 + 1, i as u8],
+                    bssid: bssid(ap, i),
                     ssid: ssid.into(),
                     phy: format!("phy{radio}"),
                     vlan,
@@ -461,6 +645,10 @@ impl World {
             stations,
         }
     }
+}
+
+fn bssid(ap: usize, bss: usize) -> [u8; 6] {
+    [0x02, 0, 0, 0x0a, ap as u8 + 1, bss as u8]
 }
 
 /// The rate a client is heard at: Mbit/s, MCS and mode, from its signal on
@@ -582,8 +770,16 @@ async fn agent(addr: SocketAddr, ap: usize, pem: &str, world: Arc<Mutex<World>>)
 
     let mut tick = Duration::from_secs(15);
     let mut next = tokio::time::Instant::now();
+    let mut cadence = Duration::from_secs(60);
+    let mut next_flows = next;
     let mut events = interval(Duration::from_millis(250));
     let (mut seq, mut last, mut want_key) = (0, None::<Snapshot>, true);
+    let mut flows_seq = 0;
+    let flows = |seq: &mut u64, full| {
+        *seq += 1;
+        let mut w = world.lock().unwrap_or_else(|e| e.into_inner());
+        AgentMsg::Flows(w.flows(ap, *seq, full))
+    };
     loop {
         // What came with the version frame too.
         while let Some((msg, used)) = decode_frame::<CtlMsg>(&buf)? {
@@ -595,6 +791,25 @@ async fn agent(addr: SocketAddr, ap: usize, pem: &str, world: Arc<Mutex<World>>)
                 }
                 CtlMsg::WantKey => want_key = true,
                 CtlMsg::Ping(n) => send(&mut wr, &AgentMsg::Pong(n)).await?,
+                CtlMsg::FlowCadence { secs } => {
+                    cadence = Duration::from_secs(secs.into());
+                    next_flows = tokio::time::Instant::now();
+                }
+                CtlMsg::WantFlows { full } => send(&mut wr, &flows(&mut flows_seq, full)).await?,
+                CtlMsg::Command(cmd) => {
+                    let done = world
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .command(ap, &cmd.kind);
+                    if let Some((ok, detail)) = done {
+                        let r = CommandResult {
+                            id: cmd.id,
+                            ok,
+                            detail,
+                        };
+                        send(&mut wr, &AgentMsg::Result(r)).await?;
+                    }
+                }
                 _ => {}
             }
         }
@@ -612,6 +827,10 @@ async fn agent(addr: SocketAddr, ap: usize, pem: &str, world: Arc<Mutex<World>>)
                 send(&mut wr, &msg.unwrap_or_else(|| AgentMsg::Key(snap.clone()))).await?;
                 (last, want_key) = (Some(snap), false);
                 next += tick;
+            }
+            () = sleep_until(next_flows) => {
+                send(&mut wr, &flows(&mut flows_seq, false)).await?;
+                next_flows += cadence;
             }
             _ = events.tick() => {
                 let due = {
@@ -637,14 +856,19 @@ async fn read<R: AsyncRead + Unpin>(r: &mut R, chunk: &mut [u8]) -> io::Result<u
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> io::Result<()> {
-    let web = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "127.0.0.1:8080".into());
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let admin = !args.iter().any(|a| a == "--viewer");
+    let web = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .map_or("127.0.0.1:8080", String::as_str);
     let public = |pem| Identity::from_pem(pem).map(|i| mac::hex(&i.public_key()));
     // The actions' decisions, kept for the next replay like a controller's.
     let policy = std::env::temp_dir().join("u6e-replay-policy.json");
+    // The controller's own web listener goes unused: the one below is its
+    // router behind what the sign-in proxy adds.
     let config = format!(
-        "listen_agents = \"127.0.0.1:0\"\nlisten_http = \"{web}\"\nlisten_metrics = \"127.0.0.1:0\"\n\
+        "listen_agents = \"127.0.0.1:0\"\nlisten_http = \"127.0.0.1:0\"\nlisten_metrics = \"127.0.0.1:0\"\n\
          public_origin = \"http://{web}\"\npolicy_path = \"{}\"\n\
          [aps.ap1]\npublic_key = \"{}\"\n[aps.ap2]\npublic_key = \"{}\"\n",
         policy.display(),
@@ -653,10 +877,33 @@ async fn main() -> io::Result<()> {
     );
     let config = Config::parse(&config).map_err(io::Error::other)?;
     let identity = Identity::from_pem(KEY_CONTROLLER).map_err(io::Error::other)?;
-    let resolver = Arc::new(u6e_controller::names::System);
-    let c = u6e_controller::start(&config, &identity, Timing::default(), resolver).await?;
-    eprintln!("replay: the UI is on http://{}/", c.http);
-
+    let timing = Timing::default();
+    let c = u6e_controller::start(&config, &identity, timing, Arc::new(Names)).await?;
+    let user = HeaderValue::from_static(if admin { "operator" } else { "viewer" });
+    let groups = HeaderValue::from_str(&config.admin_group).map_err(io::Error::other)?;
+    let signed_in = move |mut req: Request| {
+        let h = req.headers_mut();
+        h.insert(USER_HEADER, user.clone());
+        if admin {
+            h.insert(GROUPS_HEADER, groups.clone());
+        } else {
+            h.remove(GROUPS_HEADER);
+        }
+        async move { req }
+    };
+    let web_router = http::router(c.state.clone(), Access::new(&config, timing.command))
+        .layer(middleware::map_request(signed_in));
+    let listener = tokio::net::TcpListener::bind(web).await?;
+    eprintln!(
+        "replay: the UI is on http://{}/, its user {}",
+        listener.local_addr()?,
+        if admin { "an admin" } else { "not an admin" }
+    );
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, web_router).await {
+            eprintln!("replay: web listener: {e}");
+        }
+    });
     let world = Arc::new(Mutex::new(World::new()));
     for (ap, pem) in [KEY_AP1, KEY_AP2].into_iter().enumerate() {
         let world = Arc::clone(&world);
