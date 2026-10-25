@@ -3,11 +3,14 @@
 //! result) on ports of its own, and speaks the link to it with u6e-proto
 //! alone: a blocking rustls client, the framing and the messages.
 
+use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hasher};
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{fs, path::PathBuf};
@@ -20,13 +23,14 @@ use tungstenite::client::IntoClientRequest;
 use tungstenite::{HandshakeError, Message};
 use u6e_controller::agents::Timing;
 use u6e_controller::config::Config;
-use u6e_controller::state::{TICK_IDLE, TICK_WATCHED};
+use u6e_controller::names::Resolve;
+use u6e_controller::state::{FLOWS_IDLE, FLOWS_WATCHED, TICK_IDLE, TICK_WATCHED};
 use u6e_controller::{Controller, start};
 use u6e_proto::PROTOCOL;
 use u6e_proto::frame::{decode_frame, frame_body, write_frame};
 use u6e_proto::msg::{
-    AgentMsg, Band, Bss, CtlMsg, Event, EventKind, FieldDelta, Hello, Radio, RateMode, Snapshot,
-    SnapshotDelta, Station, Temp,
+    AgentMsg, Band, Bss, ClientFlows, CommandKind, CommandResult, CtlMsg, Event, EventKind,
+    FieldDelta, Flow, Flows, Hello, Radio, RateMode, Snapshot, SnapshotDelta, Station, Temp,
 };
 use u6e_proto::tls::{self, Identity};
 use u6e_proto::{mac, version};
@@ -48,13 +52,23 @@ fn identity(pem: &str) -> Identity {
     Identity::from_pem(pem).unwrap()
 }
 
+/// The origin the UI is served at, in the tests' configurations.
+const ORIGIN: &str = "https://wifi.example.org";
+/// The headers of the UI's own page asking for an action.
+const SAME_SITE: &str = "Content-Type: application/json\r\nOrigin: https://wifi.example.org\r\n";
+/// The headers the sign-in proxy sets for an admin.
+const ADMIN: &str =
+    "X-Auth-Request-Groups: staff,wifi-admins\r\nX-Forwarded-Preferred-Username: alice\r\n";
+
 /// A configuration on loopback ports of the system's choosing, admitting
-/// `ap1` and, with `ap2`, `ap2`.
-fn config_text(key: &str, ap2: bool) -> String {
+/// `ap1` and, with `ap2`, `ap2`, its policy in `dir`.
+fn config_text(key: &str, ap2: bool, dir: &Path) -> String {
     let mut text = format!(
         "listen_agents = \"127.0.0.1:0\"\nlisten_http = \"127.0.0.1:0\"\n\
          listen_metrics = \"127.0.0.1:0\"\nkey = \"{key}\"\n\
+         public_origin = \"{ORIGIN}\"\npolicy_path = \"{}\"\n\
          [aps.ap1]\npublic_key = \"{}\"\n",
+        dir.join("policy.json").display(),
         mac::hex(&identity(KEY_AP1).public_key())
     );
     if ap2 {
@@ -64,13 +78,37 @@ fn config_text(key: &str, ap2: bool) -> String {
     text
 }
 
-/// A controller in this process, alive as long as the runtime.
+/// A resolver of the names it is given, which counts what it is asked.
+#[derive(Default)]
+struct FakeDns {
+    names: Mutex<HashMap<IpAddr, String>>,
+    asked: Mutex<Vec<IpAddr>>,
+}
+
+impl Resolve for FakeDns {
+    fn reverse(&self, ip: IpAddr) -> Option<String> {
+        self.asked.lock().unwrap().push(ip);
+        self.names.lock().unwrap().get(&ip).cloned()
+    }
+}
+
+/// A controller in this process, alive as long as the runtime, its policy
+/// in a directory of its own unless it was given one.
 struct Running {
     c: Controller,
+    dns: Arc<FakeDns>,
     _rt: Runtime,
+    _dir: Option<TempDir>,
 }
 
 fn controller(timing: Timing) -> Running {
+    let dir = TempDir::new("controller");
+    let mut r = controller_in(timing, &dir.0);
+    r._dir = Some(dir);
+    r
+}
+
+fn controller_in(timing: Timing, dir: &Path) -> Running {
     // Two workers are plenty, and a worker per core in every test of eight
     // test processes at once runs into the threads a cgroup allows.
     let rt = Builder::new_multi_thread()
@@ -78,11 +116,18 @@ fn controller(timing: Timing) -> Running {
         .enable_all()
         .build()
         .unwrap();
-    let config = Config::parse(&config_text("unused.pem", true)).unwrap();
+    let config = Config::parse(&config_text("unused.pem", true, dir)).unwrap();
+    let dns = Arc::new(FakeDns::default());
+    let resolver: Arc<dyn Resolve> = dns.clone();
     let c = rt
-        .block_on(start(&config, &identity(KEY_CONTROLLER), timing))
+        .block_on(start(&config, &identity(KEY_CONTROLLER), timing, resolver))
         .unwrap();
-    Running { c, _rt: rt }
+    Running {
+        c,
+        dns,
+        _rt: rt,
+        _dir: None,
+    }
 }
 
 /// Polls `cond` until it holds.
@@ -99,6 +144,8 @@ struct Agent {
     conn: ClientConnection,
     sock: TcpStream,
     buf: Vec<u8>,
+    /// The blocks each sync the controller sent set, answered.
+    syncs: Vec<Vec<[u8; 6]>>,
 }
 
 impl Agent {
@@ -117,6 +164,7 @@ impl Agent {
             conn,
             sock,
             buf: Vec::new(),
+            syncs: Vec::new(),
         })
     }
 
@@ -197,7 +245,8 @@ impl Agent {
         }
     }
 
-    /// The next message other than a ping, which is answered.
+    /// The next message other than a ping or a sync of the blocks, which
+    /// are answered (the sync's list kept in `syncs`).
     fn expect(&mut self) -> CtlMsg {
         let start = Instant::now();
         loop {
@@ -205,9 +254,50 @@ impl Agent {
             assert!(start.elapsed() < WAIT, "no message from the controller");
             match self.recv().unwrap() {
                 CtlMsg::Ping(n) => self.send(&AgentMsg::Pong(n)).unwrap(),
+                CtlMsg::Command(c) => match c.kind {
+                    CommandKind::SyncBlocks { macs } => {
+                        self.syncs.push(macs);
+                        self.reply(c.id, true, "synced");
+                    }
+                    kind => return CtlMsg::Command(u6e_proto::msg::Command { id: c.id, kind }),
+                },
                 msg => return msg,
             }
         }
+    }
+
+    /// The blocks of the next sync of the blocks.
+    fn expect_sync(&mut self) -> Vec<[u8; 6]> {
+        if !self.syncs.is_empty() {
+            return self.syncs.remove(0);
+        }
+        loop {
+            match self.recv().unwrap() {
+                CtlMsg::Ping(n) => self.send(&AgentMsg::Pong(n)).unwrap(),
+                CtlMsg::Command(u6e_proto::msg::Command {
+                    id,
+                    kind: CommandKind::SyncBlocks { macs },
+                }) => {
+                    self.reply(id, true, "synced");
+                    return macs;
+                }
+                other => panic!("{other:?} before the sync of the blocks"),
+            }
+        }
+    }
+
+    /// The next command, which must be `kind`; its id.
+    fn expect_command(&mut self, kind: CommandKind) -> u64 {
+        match self.expect() {
+            CtlMsg::Command(c) if c.kind == kind => c.id,
+            other => panic!("{other:?}, not {kind:?}"),
+        }
+    }
+
+    fn reply(&mut self, id: u64, ok: bool, detail: &str) {
+        let detail = detail.into();
+        self.send(&AgentMsg::Result(CommandResult { id, ok, detail }))
+            .unwrap();
     }
 }
 
@@ -432,7 +522,7 @@ fn spawn_binary(dir: &TempDir) -> Binary {
     let key = dir.0.join("key.pem");
     fs::write(&key, KEY_CONTROLLER).unwrap();
     let config = dir.0.join("config.toml");
-    fs::write(&config, config_text(key.to_str().unwrap(), false)).unwrap();
+    fs::write(&config, config_text(key.to_str().unwrap(), false, &dir.0)).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_u6e-controller"))
         .arg("--config")
         .arg(&config)
@@ -544,6 +634,7 @@ fn second_connection_replaces_first() {
         .send(&AgentMsg::Key(snapshot(1, Vec::new(), Vec::new())))
         .unwrap();
     wait_for("first key frame", || seq_of(&r, "ap1") == Some(1));
+    assert!(first.expect_sync().is_empty());
 
     let mut second = Agent::hello(r.c.agents, KEY_AP1, "ap1");
     // The first connection is closed, whatever it still sends.
@@ -567,6 +658,7 @@ fn silent_agent_dropped() {
     let timing = Timing {
         ping: Duration::from_millis(200),
         silence: Duration::from_millis(1500),
+        ..Timing::default()
     };
     let r = controller(timing);
     let up = |ap: &str| r.c.state.read().ap(ap).unwrap().is_up();
@@ -1135,4 +1227,568 @@ fn an_agent_of_another_protocol_is_turned_away() {
     while let Ok(msg) = old.recv() {
         assert!(matches!(msg, CtlMsg::Ping(_)), "{msg:?}");
     }
+}
+
+/// A request over HTTP/1.1: the status line and headers (lowercased), and
+/// the body.
+fn http_send(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &str,
+    body: &str,
+) -> (String, String) {
+    let mut sock = TcpStream::connect(addr).unwrap();
+    sock.set_read_timeout(Some(WAIT)).unwrap();
+    write!(
+        sock,
+        "{method} {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n{headers}\
+         Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut resp = String::new();
+    sock.read_to_string(&mut resp).unwrap();
+    let (head, body) = resp.split_once("\r\n\r\n").unwrap();
+    (head.to_lowercase(), body.to_owned())
+}
+
+/// The status and JSON body of an action.
+fn post(addr: SocketAddr, path: &str, headers: &str, body: &str) -> (u16, Value) {
+    let (head, body) = http_send(addr, "POST", path, headers, body);
+    let status = head[9..12].parse().unwrap();
+    (status, serde_json::from_str(&body).unwrap())
+}
+
+const CLIENT: &str = "/api/clients/02:00:00:00:00:01";
+
+/// An AP of `name` up with `MAC` on its one BSS, its blocks synced (and
+/// checked to be `blocked`).
+fn ap_with_client(r: &Running, pem: &str, name: &str, blocked: &[[u8; 6]]) -> Agent {
+    let mut a = Agent::hello(r.c.agents, pem, name);
+    let s = snapshot(1, vec![bss("wlan5", "Guest")], vec![station(MAC, 0, -54)]);
+    a.send(&AgentMsg::Key(s)).unwrap();
+    assert_eq!(a.expect_sync(), blocked);
+    a
+}
+
+/// The lines of the metrics that start with `prefix`.
+fn metrics_of(r: &Running, prefix: &str) -> Vec<String> {
+    let body = http_get(r.c.metrics, "/metrics");
+    let lines = body.lines().filter(|l| l.starts_with(prefix));
+    lines.map(str::to_owned).collect()
+}
+
+#[test]
+fn actions_refuse_cross_site() {
+    let r = controller(Timing::default());
+    let mut a = ap_with_client(&r, KEY_AP1, "ap1", &[]);
+    let kick = format!("{CLIENT}/kick");
+    let origin = "Origin: https://wifi.example.org\r\n";
+    let json = "Content-Type: application/json\r\n";
+    for headers in [
+        // A form or a plain-text body: what another site's page can send
+        // without asking first.
+        format!("{origin}Content-Type: text/plain\r\n"),
+        format!("{origin}Content-Type: application/x-www-form-urlencoded\r\n"),
+        origin.to_owned(),
+        // Another site, or one that hides where it is.
+        format!("{json}Origin: https://elsewhere.example\r\n"),
+        format!("{json}Origin: null\r\n"),
+        json.to_owned(),
+    ] {
+        let (status, body) = post(r.c.http, &kick, &format!("{headers}{ADMIN}"), "{}");
+        assert_eq!(
+            (status, body),
+            (403, json!({"error": "cross-site"})),
+            "{headers}"
+        );
+    }
+    // Refused before the group is looked at.
+    let (status, body) = post(r.c.http, &kick, "", "{}");
+    assert_eq!((status, body), (403, json!({"error": "cross-site"})));
+
+    // Nothing reached the AP: the next command is the one allowed.
+    let t = thread::spawn(move || post(r.c.http, &kick, &format!("{SAME_SITE}{ADMIN}"), "{}"));
+    let id = a.expect_command(CommandKind::Kick { mac: MAC });
+    a.reply(id, true, "wlan5: OK");
+    assert_eq!(t.join().unwrap().0, 200);
+    assert_eq!(r.c.state.read().actions.len(), 1);
+}
+
+#[test]
+fn actions_require_wifi_admins() {
+    let r = controller(Timing::default());
+    let mut a = ap_with_client(&r, KEY_AP1, "ap1", &[]);
+    let kick = format!("{CLIENT}/kick");
+    let user = "X-Forwarded-Preferred-Username: bob\r\n";
+    for groups in [
+        // No groups at all: the proxy sends no header.
+        "",
+        "X-Auth-Request-Groups: staff,wifi-admins-old\r\n",
+        "X-Auth-Request-Groups: \r\n",
+        // Another proxy's spelling is never read.
+        "X-Forwarded-Groups: wifi-admins\r\n",
+    ] {
+        let (status, body) = post(r.c.http, &kick, &format!("{SAME_SITE}{user}{groups}"), "{}");
+        assert_eq!(
+            (status, body),
+            (403, json!({"error": "not an admin"})),
+            "{groups}"
+        );
+    }
+    for path in ["block", "unblock", "steer"] {
+        let p = format!("{CLIENT}/{path}");
+        let (status, _) = post(
+            r.c.http,
+            &p,
+            SAME_SITE,
+            "{\"target_bssid\":\"02:00:00:00:10:02\"}",
+        );
+        assert_eq!(status, 403, "{path}");
+    }
+    assert!(r.c.state.read().blocked.is_empty());
+    assert!(r.c.state.read().actions.is_empty());
+    let me = |headers: &str| {
+        let (_, body) = http_send(r.c.http, "GET", "/api/me", headers, "");
+        serde_json::from_str::<Value>(&body).unwrap()
+    };
+    assert_eq!(me(user), json!({"user": "bob", "admin": false}));
+    assert_eq!(me(ADMIN), json!({"user": "alice", "admin": true}));
+    assert_eq!(me(""), json!({"user": null, "admin": false}));
+
+    // An admin's kick reaches the AP the client is on, and is an event.
+    let t = thread::spawn(move || post(r.c.http, &kick, &format!("{SAME_SITE}{ADMIN}"), "{}"));
+    let id = a.expect_command(CommandKind::Kick { mac: MAC });
+    a.reply(id, true, "wlan5: OK");
+    let (status, body) = t.join().unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(
+        body,
+        json!({"ap": "ap1", "ok": true, "detail": "wlan5: OK"})
+    );
+    let events = json_get(r.c.http, "/api/events?ap=ap1");
+    let ev = events.as_array().unwrap().last().unwrap().clone();
+    let at = ev["at"].clone();
+    assert!(at.is_u64(), "{ev}");
+    assert_eq!(
+        ev,
+        json!({"at": at, "kind": "action", "action": "kick", "user": "alice",
+            "mac": "02:00:00:00:00:01", "ap": "ap1", "ok": true, "detail": "wlan5: OK"})
+    );
+    assert_eq!(
+        metrics_of(&r, "wifi_actions_total{action=\"kick\""),
+        [
+            "wifi_actions_total{action=\"kick\",result=\"ok\"} 1",
+            "wifi_actions_total{action=\"kick\",result=\"failed\"} 0",
+            "wifi_actions_total{action=\"kick\",result=\"timeout\"} 0",
+        ]
+    );
+
+    // A client on no AP is refused, and that is an event too.
+    let (status, body) = post(
+        r.c.http,
+        "/api/clients/02:00:00:00:00:99/kick",
+        &format!("{SAME_SITE}{ADMIN}"),
+        "{}",
+    );
+    assert_eq!((status, body), (404, json!({"error": "not associated"})));
+    let (status, _) = post(
+        r.c.http,
+        "/api/clients/nope/kick",
+        &format!("{SAME_SITE}{ADMIN}"),
+        "",
+    );
+    assert_eq!(status, 400);
+}
+
+/// Review focus 1: a client blocked, and another unblocked, while its AP is
+/// away is blocked (and let on) when the AP comes back, by the one sync that
+/// makes the AP's blocks the policy's.
+#[test]
+fn block_resent_on_reconnect() {
+    let r = controller(Timing::default());
+    let admin = format!("{SAME_SITE}{ADMIN}");
+    let other = [0x02, 0, 0, 0, 0, 0x02];
+    let mut a = ap_with_client(&r, KEY_AP1, "ap1", &[]);
+    // Blocked while ap1 is up: sent to it at once.
+    let t = {
+        let admin = admin.clone();
+        thread::spawn(move || post(r.c.http, "/api/clients/02:00:00:00:00:02/block", &admin, ""))
+    };
+    let id = a.expect_command(CommandKind::Block { mac: other });
+    a.reply(id, true, "wlan5: OK; kick: not associated here");
+    assert_eq!(t.join().unwrap().0, 200);
+    drop(a);
+    wait_for("ap1 down", || !r.c.state.read().ap("ap1").unwrap().is_up());
+
+    // Blocked and unblocked while no AP is connected: saved all the same.
+    let (status, body) = post(r.c.http, &format!("{CLIENT}/block"), &admin, "");
+    assert_eq!(status, 200);
+    assert_eq!(
+        body,
+        json!({"ok": true, "results": [{"ok": true, "detail": "saved; no AP is connected"}]})
+    );
+    let (status, _) = post(
+        r.c.http,
+        "/api/clients/02:00:00:00:00:02/unblock",
+        &admin,
+        "",
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        metrics_of(&r, "wifi_blocked_clients"),
+        ["wifi_blocked_clients 1"]
+    );
+
+    // Back: the AP's blocks are made exactly the policy's, which lets
+    // `other` on there too; again on every connection.
+    let a = ap_with_client(&r, KEY_AP1, "ap1", &[MAC]);
+    drop(a);
+    let _a = ap_with_client(&r, KEY_AP1, "ap1", &[MAC]);
+    // ap2 dials in for the first time: the same.
+    let _b = ap_with_client(&r, KEY_AP2, "ap2", &[MAC]);
+}
+
+/// The policy is saved before an AP hears of it, and is what the next
+/// controller starts with.
+#[test]
+fn policy_survives_restart() {
+    let dir = TempDir::new("restart");
+    let admin = format!("{SAME_SITE}{ADMIN}");
+    {
+        let r = controller_in(Timing::default(), &dir.0);
+        let (status, _) = post(r.c.http, &format!("{CLIENT}/block"), &admin, "");
+        assert_eq!(status, 200);
+        let text = fs::read_to_string(dir.0.join("policy.json")).unwrap();
+        let saved: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(saved, json!({"blocked": ["02:00:00:00:00:01"]}));
+    }
+    let r = controller_in(Timing::default(), &dir.0);
+    assert_eq!(r.c.state.read().blocked.len(), 1);
+    let _a = ap_with_client(&r, KEY_AP1, "ap1", &[MAC]);
+
+    // A policy file that does not parse stops the controller from starting
+    // rather than letting every blocked client back on.
+    drop(r);
+    fs::write(dir.0.join("policy.json"), "{\"blocked\": [\"02:00\"]}").unwrap();
+    let rt = Builder::new_current_thread().enable_all().build().unwrap();
+    let config = Config::parse(&config_text("unused.pem", true, &dir.0)).unwrap();
+    let resolver: Arc<dyn Resolve> = Arc::new(FakeDns::default());
+    let started = rt.block_on(start(
+        &config,
+        &identity(KEY_CONTROLLER),
+        Timing::default(),
+        resolver,
+    ));
+    let e = started.err().expect("started on a bad policy");
+    assert!(e.to_string().contains("policy.json"), "{e}");
+}
+
+#[test]
+fn steer_routed_to_the_clients_ap() {
+    let r = controller(Timing::default());
+    let admin = format!("{SAME_SITE}{ADMIN}");
+    // ap1 carries another client, ap2 the one steered.
+    let mut one = Agent::hello(r.c.agents, KEY_AP1, "ap1");
+    let other = [0x02, 0, 0, 0, 0, 0x02];
+    let s = snapshot(1, vec![bss("wlan5", "Guest")], vec![station(other, 0, -50)]);
+    one.send(&AgentMsg::Key(s)).unwrap();
+    assert!(one.expect_sync().is_empty());
+    let mut two = ap_with_client(&r, KEY_AP2, "ap2", &[]);
+
+    let target = [0x02, 0, 0, 0, 0x10, 0x09];
+    let body = "{\"target_bssid\": \"02:00:00:00:10:09\"}";
+    let t = {
+        let admin = admin.clone();
+        thread::spawn(move || post(r.c.http, &format!("{CLIENT}/steer"), &admin, body))
+    };
+    let id = two.expect_command(CommandKind::Steer {
+        mac: MAC,
+        target_bssid: target,
+    });
+    two.reply(id, false, "unknown target");
+    let (status, body) = t.join().unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(
+        body,
+        json!({"ap": "ap2", "ok": false, "detail": "unknown target"})
+    );
+    assert_eq!(
+        metrics_of(&r, "wifi_actions_total{action=\"steer\",result=\"failed\"}"),
+        ["wifi_actions_total{action=\"steer\",result=\"failed\"} 1"]
+    );
+
+    // ap1 heard nothing of it: its next command is its own client's.
+    let t = {
+        let admin = admin.clone();
+        thread::spawn(move || post(r.c.http, "/api/clients/02:00:00:00:00:02/kick", &admin, ""))
+    };
+    let id = one.expect_command(CommandKind::Kick { mac: other });
+    one.reply(id, true, "wlan5: OK");
+    assert_eq!(t.join().unwrap().0, 200);
+
+    for bad in [
+        "",
+        "{}",
+        "{\"target_bssid\": \"nope\"}",
+        "{\"target_bssid\": \"02:00:00:00:10:09\", \"x\": 1}",
+    ] {
+        let (status, _) = post(r.c.http, &format!("{CLIENT}/steer"), &admin, bad);
+        assert_eq!(status, 400, "{bad}");
+    }
+}
+
+#[test]
+fn an_unanswered_command_times_out() {
+    let timing = Timing {
+        command: Duration::from_millis(300),
+        ..Timing::default()
+    };
+    let r = controller(timing);
+    let mut a = ap_with_client(&r, KEY_AP1, "ap1", &[]);
+    let admin = format!("{SAME_SITE}{ADMIN}");
+    let t = thread::spawn(move || post(r.c.http, &format!("{CLIENT}/kick"), &admin, ""));
+    let id = a.expect_command(CommandKind::Kick { mac: MAC });
+    let (status, body) = t.join().unwrap();
+    assert_eq!(status, 504);
+    assert_eq!(
+        body,
+        json!({"ap": "ap1", "ok": false, "detail": "no answer from the AP in 300ms"})
+    );
+    // Too late: dropped, and the session goes on.
+    a.reply(id, true, "wlan5: OK");
+    let s = r.c.state.read();
+    let last = s.actions.back().unwrap();
+    assert_eq!((last.action, last.ok), ("kick", false));
+    drop(s);
+    assert_eq!(
+        metrics_of(&r, "wifi_actions_total{action=\"kick\",result=\"timeout\"}"),
+        ["wifi_actions_total{action=\"kick\",result=\"timeout\"} 1"]
+    );
+    a.send(&AgentMsg::Pong(0)).unwrap();
+    assert!(r.c.state.read().ap("ap1").unwrap().is_up());
+}
+
+fn flow(src: &str, dst: &str, bytes: u64, offloaded: bool) -> Flow {
+    Flow {
+        proto: 6,
+        src: src.parse().unwrap(),
+        sport: 50_000,
+        dst: dst.parse().unwrap(),
+        dport: 443,
+        tx_bytes: bytes,
+        rx_bytes: bytes * 10,
+        tx_packets: 10,
+        rx_packets: 20,
+        offloaded,
+        age_s: 30,
+    }
+}
+
+fn flows(seq: u64, top: Vec<Flow>, conns: u32) -> Flows {
+    let sum = |f: fn(&Flow) -> u64| top.iter().map(f).sum();
+    Flows {
+        seq,
+        complete: true,
+        clients: vec![ClientFlows {
+            mac: MAC,
+            conns,
+            offloaded: top.iter().filter(|f| f.offloaded).count() as u32,
+            tx_bytes: sum(|f| f.tx_bytes),
+            rx_bytes: sum(|f| f.rx_bytes),
+            tx_packets: sum(|f| f.tx_packets),
+            rx_packets: sum(|f| f.rx_packets),
+            top,
+        }],
+    }
+}
+
+#[test]
+fn flows_api_shape() {
+    let r = controller(Timing::default());
+    let mut a = ap_with_client(&r, KEY_AP1, "ap1", &[]);
+    let top = vec![
+        flow("192.0.2.10", "198.51.100.1", 1000, true),
+        flow("2001:db8::10", "2001:db8:1::1", 10, false),
+    ];
+    a.send(&AgentMsg::Flows(flows(1, top, 9))).unwrap();
+    wait_for("the flows", || {
+        r.c.state.read().ap("ap1").unwrap().flows.is_some()
+    });
+
+    let got = json_get(r.c.http, "/api/flows");
+    let at = got["ap1"]["at"].clone();
+    assert!(at.is_u64(), "{got}");
+    let client = json!({
+        "conns": 9, "offloaded": 1, "tx_bytes": 1010, "rx_bytes": 10100,
+        "tx_packets": 20, "rx_packets": 40,
+        "top": [
+            {"proto": 6, "src": "192.0.2.10", "sport": 50000, "dst": "198.51.100.1",
+             "dport": 443, "tx_bytes": 1000, "rx_bytes": 10000, "tx_packets": 10,
+             "rx_packets": 20, "offloaded": true, "age": 30},
+            {"proto": 6, "src": "2001:db8::10", "sport": 50000, "dst": "2001:db8:1::1",
+             "dport": 443, "tx_bytes": 10, "rx_bytes": 100, "tx_packets": 10,
+             "rx_packets": 20, "offloaded": false, "age": 30},
+        ],
+    });
+    let want = json!({"ap1": {"at": at, "seq": 1, "complete": true,
+        "clients": {"02:00:00:00:00:01": client}}});
+    assert_eq!(got, want);
+    assert_eq!(
+        json_get(r.c.http, "/api/flows?ap=ap1&client=02:00:00:00:00:01"),
+        want
+    );
+    assert_eq!(
+        json_get(r.c.http, "/api/flows?client=02:00:00:00:00:99")["ap1"]["clients"],
+        json!({})
+    );
+    assert_eq!(json_get(r.c.http, "/api/flows?ap=ap2"), json!({}));
+    let (head, _) = http_request(r.c.http, "/api/flows?client=nope", "");
+    assert!(head.starts_with("http/1.1 400"), "{head}");
+    let labels = "{ap=\"ap1\",ssid=\"Guest\",mac=\"02:00:00:00:00:01\"}";
+    assert_eq!(
+        metrics_of(&r, "wifi_client_conns{"),
+        [format!("wifi_client_conns{labels} 9")]
+    );
+    assert_eq!(
+        metrics_of(&r, "wifi_client_offloaded_conns{"),
+        [format!("wifi_client_offloaded_conns{labels} 1")]
+    );
+
+    // The whole table answers its request only, and is not kept.
+    let t = thread::spawn(move || http_send(r.c.http, "GET", "/api/flows/full?ap=ap1", "", ""));
+    assert_eq!(a.expect(), CtlMsg::WantFlows { full: true });
+    let every: Vec<Flow> = (1..=9)
+        .map(|i| flow("192.0.2.10", &format!("198.51.100.{i}"), i, false))
+        .collect();
+    a.send(&AgentMsg::Flows(flows(2, every, 9))).unwrap();
+    let (head, body) = t.join().unwrap();
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    let full: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(full["ap1"]["seq"], 2);
+    assert_eq!(
+        full["ap1"]["clients"]["02:00:00:00:00:01"]["top"]
+            .as_array()
+            .unwrap()
+            .len(),
+        9
+    );
+    assert_eq!(json_get(r.c.http, "/api/flows")["ap1"]["seq"], 1);
+    let (head, _) = http_send(r.c.http, "GET", "/api/flows/full?ap=ap2", "", "");
+    assert!(head.starts_with("http/1.1 404"), "{head}");
+}
+
+#[test]
+fn a_full_table_not_answered_in_time_is_a_504() {
+    let timing = Timing {
+        command: Duration::from_millis(300),
+        ..Timing::default()
+    };
+    let r = controller(timing);
+    let mut a = ap_with_client(&r, KEY_AP1, "ap1", &[]);
+    let (head, _) = http_send(r.c.http, "GET", "/api/flows/full?ap=ap1", "", "");
+    assert!(head.starts_with("http/1.1 504"), "{head}");
+    assert_eq!(a.expect(), CtlMsg::WantFlows { full: true });
+    // The request that gave up does not keep the next one from asking.
+    let t = thread::spawn(move || http_send(r.c.http, "GET", "/api/flows/full?ap=ap1", "", ""));
+    assert_eq!(a.expect(), CtlMsg::WantFlows { full: true });
+    a.send(&AgentMsg::Flows(flows(
+        1,
+        vec![flow("192.0.2.10", "198.51.100.1", 1, true)],
+        1,
+    )))
+    .unwrap();
+    assert!(t.join().unwrap().0.starts_with("http/1.1 200"));
+}
+
+#[test]
+fn cadence_follows_watchers() {
+    let r = controller(Timing::default());
+    let mut a = ap_with_client(&r, KEY_AP1, "ap1", &[]);
+    // Watching the APs alone sets the tick, not the flows' cadence.
+    let mut plain = Ui::subscribe(r.c.http, json!(["ap1"]));
+    assert!(plain.recv()["key"].get("flows").is_none());
+    assert_eq!(a.expect(), CtlMsg::SetTick { secs: TICK_WATCHED });
+    let mut ui = Ui::open(r.c.http, &[]).unwrap();
+    ui.send(&json!({"subscribe": ["ap1"], "flows": true}));
+    assert_eq!(ui.recv()["key"]["flows"], json!({}));
+    assert_eq!(
+        a.expect(),
+        CtlMsg::FlowCadence {
+            secs: FLOWS_WATCHED
+        }
+    );
+    assert_eq!(r.c.state.read().flow_watchers("ap1"), 1);
+
+    // Flows reach the watching socket.
+    let top = vec![flow("192.0.2.10", "198.51.100.1", 5, true)];
+    a.send(&AgentMsg::Flows(flows(1, top, 1))).unwrap();
+    let patch = ui.recv();
+    assert_eq!(patch["patch"]["flows"]["ap1"]["seq"], 1, "{patch}");
+
+    // An AP that connects while watched hears it at once.
+    drop(a);
+    let mut a = Agent::hello(r.c.agents, KEY_AP1, "ap1");
+    assert_eq!(a.expect(), CtlMsg::SetTick { secs: TICK_WATCHED });
+    assert_eq!(
+        a.expect(),
+        CtlMsg::FlowCadence {
+            secs: FLOWS_WATCHED
+        }
+    );
+    drop(ui);
+    assert_eq!(a.expect(), CtlMsg::FlowCadence { secs: FLOWS_IDLE });
+    drop(plain);
+    assert_eq!(a.expect(), CtlMsg::SetTick { secs: TICK_IDLE });
+}
+
+#[test]
+fn names_resolved_from_the_flows_addresses() {
+    let r = controller(Timing::default());
+    let mut a = ap_with_client(&r, KEY_AP1, "ap1", &[]);
+    let (v4, v6) = (
+        "192.0.2.10".parse().unwrap(),
+        "2001:db8::10".parse().unwrap(),
+    );
+    r.dns
+        .names
+        .lock()
+        .unwrap()
+        .insert(v6, "tablet.lan.example".into());
+    let mut ui = Ui::subscribe(r.c.http, json!("*"));
+    assert!(
+        ui.recv()["key"]["clients"]["02:00:00:00:00:01"]
+            .get("name")
+            .is_none()
+    );
+    let top = vec![
+        flow("192.0.2.10", "198.51.100.1", 1000, true),
+        flow("192.0.2.10", "198.51.100.2", 100, true),
+        flow("2001:db8::10", "2001:db8:1::1", 10, false),
+    ];
+    for seq in 1..=3 {
+        a.send(&AgentMsg::Flows(flows(seq, top.clone(), 3)))
+            .unwrap();
+    }
+    // The v4 address has no name; the v6 one's is the client's.
+    loop {
+        let msg = ui.recv();
+        if let Some(name) = msg["patch"]["clients"]["02:00:00:00:00:01"].get("name") {
+            assert_eq!(name, "tablet.lan.example");
+            break;
+        }
+    }
+    let c = &json_get(r.c.http, "/api/clients")["02:00:00:00:00:01"];
+    assert_eq!(c["name"], "tablet.lan.example");
+    let f = json_get(r.c.http, "/api/flows");
+    assert_eq!(
+        f["ap1"]["clients"]["02:00:00:00:00:01"]["name"],
+        "tablet.lan.example"
+    );
+    // Each address once, however many flows showed it.
+    wait_for("both lookups", || r.dns.asked.lock().unwrap().len() >= 2);
+    let mut asked = r.dns.asked.lock().unwrap().clone();
+    asked.sort();
+    assert_eq!(asked, [v4, v6]);
 }

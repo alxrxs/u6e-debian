@@ -1,6 +1,7 @@
 //! `/metrics` in the Prometheus text exposition format, rendered from the live
 //! state at each scrape. Client series exist only for associated clients, so
-//! their number follows the clients on the air, not every MAC ever seen.
+//! their number follows the clients on the air, not every MAC ever seen; the
+//! connection counts only for those of an AP that has sent its flows.
 
 use std::collections::BTreeSet;
 use std::fmt::Write;
@@ -17,6 +18,10 @@ use u6e_proto::msg::{Radio, Snapshot, Station};
 
 use crate::state::{Ap, Shared, State};
 use crate::view::band;
+
+/// The operator's actions and their results, every pair always exported.
+const ACTIONS: [&str; 4] = ["kick", "block", "unblock", "steer"];
+const RESULTS: [&str; 3] = ["ok", "failed", "timeout"];
 
 const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
@@ -325,6 +330,56 @@ pub fn render(state: &State) -> String {
                 ("mac", mac.as_str()),
             ];
             m.sample(&labels, value(&c.station));
+        }
+    }
+    let conns = [
+        (
+            "wifi_client_conns",
+            "Connections of the client the AP forwards.",
+            false,
+        ),
+        (
+            "wifi_client_offloaded_conns",
+            "Connections of the client the AP's network processor forwards, past its CPU.",
+            true,
+        ),
+    ];
+    for (name, help, offloaded) in conns {
+        m.family(name, GAUGE, help);
+        for c in &clients {
+            let Some((flows, _)) = state.ap(&c.ap).and_then(|a| a.flows.as_ref()) else {
+                continue;
+            };
+            let of = flows.clients.iter().find(|f| f.mac == c.station.mac);
+            let n = of.map_or(0, |f| if offloaded { f.offloaded } else { f.conns });
+            let mac = mac::format(c.station.mac);
+            let labels = [
+                ("ap", c.ap.as_str()),
+                ("ssid", c.ssid.as_str()),
+                ("mac", mac.as_str()),
+            ];
+            m.sample(&labels, f64::from(n));
+        }
+    }
+
+    m.family(
+        "wifi_blocked_clients",
+        GAUGE,
+        "Clients the operator blocked on every AP.",
+    );
+    m.sample(&[], state.blocked.len() as f64);
+    m.family(
+        "wifi_actions_total",
+        COUNTER,
+        "Operator actions on clients, by result (timeout: an AP did not answer in time).",
+    );
+    for action in ACTIONS {
+        for result in RESULTS {
+            let n = state.action_counts.get(&(action, result)).copied();
+            m.sample(
+                &[("action", action), ("result", result)],
+                n.unwrap_or(0) as f64,
+            );
         }
     }
     m.out

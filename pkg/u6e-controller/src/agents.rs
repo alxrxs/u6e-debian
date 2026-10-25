@@ -2,8 +2,11 @@
 //! keys of configured APs; each end then states its protocol in the version
 //! frame, and an agent of another protocol is turned away, recorded in the
 //! state for the metrics and the UI. The session then takes the agent's Hello,
-//! applies its key frames, deltas and events to the state, pings it, and sets
-//! its tick from the AP's watchers.
+//! applies its key frames, deltas, events, flows and command results to the
+//! state, pings it, sets its tick and flow cadence from the AP's watchers, and
+//! passes on what the state queues for it (commands, requests for flows).
+//! After the first key frame of every connection it gives the AP the
+//! policy's blocks, all of them, since the AP keeps them in RAM only.
 //!
 //! Received bytes collect in a buffer and are cut into frames only when whole,
 //! so a read cancelled by another branch of the session's `select!` never
@@ -29,17 +32,20 @@ use u6e_proto::msg::{AgentMsg, CtlMsg, Hello};
 use u6e_proto::tls::{self, AllowedKeys};
 use u6e_proto::{PROTOCOL, version};
 
-use crate::state::{Registration, Shared, TICK_WATCHED};
+use crate::names::Lookups;
+use crate::state::{FLOWS_WATCHED, Registration, Shared, TICK_WATCHED};
 
 /// Longest a handshake, or a write to a stalled agent, may take.
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How often the session pings, and how long it waits for any word from the
-/// agent before dropping it; the agent keeps the same 60 s on its side.
+/// How often the session pings, how long it waits for any word from the
+/// agent before dropping it (the agent keeps the same 60 s on its side), and
+/// how long an operator waits for a command's result.
 #[derive(Debug, Clone, Copy)]
 pub struct Timing {
     pub ping: Duration,
     pub silence: Duration,
+    pub command: Duration,
 }
 
 impl Default for Timing {
@@ -47,6 +53,7 @@ impl Default for Timing {
         Timing {
             ping: Duration::from_secs(15),
             silence: Duration::from_secs(60),
+            command: Duration::from_secs(5),
         }
     }
 }
@@ -58,6 +65,7 @@ pub async fn serve(
     allowed: AllowedKeys,
     state: Shared,
     timing: Timing,
+    lookups: Lookups,
 ) {
     let acceptor = TlsAcceptor::from(tls);
     loop {
@@ -71,6 +79,7 @@ pub async fn serve(
                     allowed,
                     state.clone(),
                     timing,
+                    lookups.clone(),
                 ));
             }
             Err(e) => {
@@ -90,6 +99,7 @@ async fn connection(
     allowed: AllowedKeys,
     state: Shared,
     timing: Timing,
+    lookups: Lookups,
 ) {
     // Each tick is one small record; Nagle would hold the answers back.
     let _ = sock.set_nodelay(true);
@@ -121,8 +131,10 @@ async fn connection(
         last_rx: Instant::now(),
         timing,
         state,
+        lookups,
         id: 0,
         awaiting_key: false,
+        synced: false,
         pings: 0,
     };
     let r = match s.agree().await {
@@ -150,10 +162,13 @@ struct Session {
     last_rx: Instant,
     timing: Timing,
     state: Shared,
+    lookups: Lookups,
     /// The state's id of this session, once it has said Hello.
     id: u64,
     /// A key frame was asked for and has not come yet.
     awaiting_key: bool,
+    /// The policy's blocks were given to the AP, after its first key frame.
+    synced: bool,
     pings: u64,
 }
 
@@ -194,6 +209,10 @@ impl Session {
         if *reg.tick.borrow_and_update() == TICK_WATCHED {
             self.send(&CtlMsg::SetTick { secs: TICK_WATCHED }).await?;
         }
+        if *reg.cadence.borrow_and_update() == FLOWS_WATCHED {
+            let secs = FLOWS_WATCHED;
+            self.send(&CtlMsg::FlowCadence { secs }).await?;
+        }
         // Frames that came in the Hello's record.
         self.process().await?;
 
@@ -216,6 +235,13 @@ impl Session {
                     let secs = *reg.tick.borrow_and_update();
                     self.send(&CtlMsg::SetTick { secs }).await?;
                 }
+                r = reg.cadence.changed() => {
+                    r.map_err(io::Error::other)?;
+                    let secs = *reg.cadence.borrow_and_update();
+                    self.send(&CtlMsg::FlowCadence { secs }).await?;
+                }
+                // The state holds the sender while this session is the AP's.
+                Some(msg) = reg.outbox.recv() => self.send(&msg).await?,
                 _ = &mut reg.stop => {
                     return Err(io::Error::other("replaced by a newer connection"));
                 }
@@ -274,17 +300,29 @@ impl Session {
     }
 
     /// Applies every whole frame received so far; a delta that does not fit,
-    /// or a key frame that is not valid, asks once for a key frame.
+    /// or a key frame that is not valid, asks once for a key frame. The first
+    /// key frame applied is followed by the policy's blocks, and flows by
+    /// lookups of the names of the addresses they show.
     async fn process(&mut self) -> io::Result<()> {
         let mut used = 0;
         let mut want_key = false;
+        let mut sync = None;
+        let mut flows = false;
         while let Some((msg, n)) = decode_frame::<AgentMsg>(&self.inbuf[used..])? {
             used += n;
             self.last_rx = Instant::now();
-            if matches!(msg, AgentMsg::Key(_)) {
+            let key = matches!(msg, AgentMsg::Key(_));
+            if key {
                 self.awaiting_key = false;
             }
-            let gap = self.state.write().apply(&self.name, self.id, msg).is_err();
+            flows |= matches!(msg, AgentMsg::Flows(_));
+            let mut state = self.state.write();
+            let gap = state.apply(&self.name, self.id, msg).is_err();
+            if key && !gap && !self.synced {
+                self.synced = true;
+                sync = state.sync_blocks(&self.name, self.id);
+            }
+            drop(state);
             if gap && !self.awaiting_key {
                 self.awaiting_key = true;
                 want_key = true;
@@ -294,7 +332,25 @@ impl Session {
         if want_key {
             self.send(&CtlMsg::WantKey).await?;
         }
+        if let Some(msg) = &sync {
+            self.send(msg).await?;
+        }
+        if flows {
+            self.look_up_names();
+        }
         Ok(())
+    }
+
+    /// Looks up the names now due, each in a task of its own.
+    fn look_up_names(&self) {
+        let due = self.state.write().names_due(std::time::Instant::now());
+        for ip in due {
+            let (state, lookups) = (self.state.clone(), self.lookups.clone());
+            tokio::spawn(async move {
+                let name = lookups.reverse(ip).await;
+                state.write().named(ip, name, std::time::Instant::now());
+            });
+        }
     }
 
     async fn send(&mut self, msg: &CtlMsg) -> io::Result<()> {

@@ -1,16 +1,22 @@
 //! The web listener (`listen_http`): the web UI, embedded in the binary, its
-//! JSON API, and the WebSocket that keeps it live.
+//! JSON API, the operator's actions (`actions`), and the WebSocket that keeps
+//! the UI live.
 //!
 //! The UI's files are served under `/assets/<version>/`, the version a hash of
 //! them all, so they can be cached for good and a new binary still reaches
 //! every browser at once; the page itself is revalidated on each load. The
 //! WebSocket's first message names the APs it watches (`{"subscribe":["ap1"]}`
-//! or `{"subscribe":"*"}`); it then gets their state as one JSON `key`, a JSON
-//! merge `patch` of what changed after each update, and their new `events`.
-//! While it is open each of those APs reports every 2 s.
+//! or `{"subscribe":"*"}`, with `"flows":true` for their clients' flows too);
+//! it then gets their state as one JSON `key`, a JSON merge `patch` of what
+//! changed after each update, and their new `events`. While it is open each of
+//! those APs reports every 2 s, and its flows every 10 s when asked for.
+//!
+//! `GET /api/flows?ap=&client=` is the latest flows, `GET /api/flows/full?ap=`
+//! asks the AP for every connection it forwards and waits for the answer.
 //!
 //! The listener is reached only through the reverse proxy that signs users
-//! in, which names the user in `X-Forwarded-Preferred-Username`.
+//! in, which names the user in `X-Forwarded-Preferred-Username` and their
+//! groups in `X-Auth-Request-Groups`.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
@@ -22,12 +28,14 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State as Ext};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::time::timeout;
+use u6e_proto::mac;
 
+use crate::actions::{self, Access, Web};
 use crate::state::{Change, Shared, WatchGuard};
 use crate::view;
 
@@ -35,7 +43,6 @@ use crate::view;
 const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// A subscription is a list of AP names; nothing a client sends is larger.
 const MAX_MESSAGE: usize = 4096;
-const USER_HEADER: &str = "x-forwarded-preferred-username";
 
 const HTML: &str = "text/html; charset=utf-8";
 const CSS: &str = "text/css; charset=utf-8";
@@ -111,15 +118,22 @@ static UI: LazyLock<Ui> = LazyLock::new(|| {
 });
 
 /// The web listener's routes.
-pub fn router(state: Shared) -> Router {
+pub fn router(state: Shared, access: Access) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/assets/{*path}", get(asset))
         .route("/api/aps", get(api_aps))
         .route("/api/clients", get(api_clients))
         .route("/api/events", get(api_events))
+        .route("/api/flows", get(api_flows))
+        .route("/api/flows/full", get(api_flows_full))
+        .route("/api/me", get(actions::me))
+        .route("/api/clients/{mac}/kick", post(actions::kick))
+        .route("/api/clients/{mac}/block", post(actions::block))
+        .route("/api/clients/{mac}/unblock", post(actions::unblock))
+        .route("/api/clients/{mac}/steer", post(actions::steer))
         .route("/ws", get(ws))
-        .with_state(state)
+        .with_state(Web { state, access })
 }
 
 /// `body` as `kind`, or 304 when the client holds `etag` already.
@@ -180,7 +194,7 @@ async fn asset(Path(path): Path<String>, req: HeaderMap) -> Response {
     }
 }
 
-fn json_response(v: &Value) -> Response {
+pub(crate) fn json_response(v: &Value) -> Response {
     let headers = [
         (header::CONTENT_TYPE, "application/json"),
         (header::CACHE_CONTROL, "no-store"),
@@ -206,6 +220,49 @@ async fn api_events(Ext(state): Ext<Shared>, Query(q): Query<EventsQuery>) -> Re
     json_response(&Value::Array(events))
 }
 
+#[derive(Deserialize)]
+struct FlowsQuery {
+    ap: Option<String>,
+    client: Option<String>,
+}
+
+/// An API error: `{"error": why}`.
+pub(crate) fn error(status: StatusCode, why: &str) -> Response {
+    (status, json_response(&json!({ "error": why }))).into_response()
+}
+
+async fn api_flows(Ext(state): Ext<Shared>, Query(q): Query<FlowsQuery>) -> Response {
+    let client = match q.client.as_deref().map(mac::parse) {
+        None => None,
+        Some(Some(m)) => Some(m),
+        Some(None) => return error(StatusCode::BAD_REQUEST, "not a MAC"),
+    };
+    let wanted = |ap: &str| q.ap.as_deref().is_none_or(|a| a == ap);
+    json_response(&view::flows(&state.read(), wanted, client))
+}
+
+#[derive(Deserialize)]
+struct FullQuery {
+    ap: String,
+}
+
+/// Every connection the AP forwards, from the agent's answer to a request:
+/// in the shape of `/api/flows`, and never kept.
+async fn api_flows_full(Ext(web): Ext<Web>, Query(q): Query<FullQuery>) -> Response {
+    let Some(answer) = web.state.write().want_full(&q.ap) else {
+        return error(StatusCode::NOT_FOUND, "not a connected AP");
+    };
+    match timeout(web.access.timeout, answer).await {
+        Ok(Ok(flows)) => {
+            let state = web.state.read();
+            let one = view::flows_of(&state, &flows, std::time::SystemTime::now(), None);
+            json_response(&json!({ q.ap: one }))
+        }
+        Ok(Err(_)) => error(StatusCode::BAD_GATEWAY, "the AP went away"),
+        Err(_) => error(StatusCode::GATEWAY_TIMEOUT, "no answer from the AP"),
+    }
+}
+
 /// Whether a browser's request comes from a page of this site: another site's
 /// page could otherwise read the state with the user's sign-in.
 fn same_origin(req: &HeaderMap) -> bool {
@@ -225,10 +282,7 @@ async fn ws(Ext(state): Ext<Shared>, req: HeaderMap, upgrade: WebSocketUpgrade) 
     if !same_origin(&req) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let user = req
-        .get(USER_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
+    let user = actions::user(&req);
     upgrade
         .max_message_size(MAX_MESSAGE)
         .on_upgrade(move |socket| live(socket, state, user))
@@ -237,6 +291,9 @@ async fn ws(Ext(state): Ext<Shared>, req: HeaderMap, upgrade: WebSocketUpgrade) 
 #[derive(Deserialize)]
 struct Subscribe {
     subscribe: Aps,
+    /// The APs' clients' flows too.
+    #[serde(default)]
+    flows: bool,
 }
 
 #[derive(Deserialize)]
@@ -247,8 +304,9 @@ enum Aps {
     All(String),
 }
 
-/// The configured APs the socket's first message asks for.
-async fn subscription(ws: &mut WebSocket, state: &Shared) -> Option<Vec<String>> {
+/// The configured APs the socket's first message asks for, and whether
+/// their flows too.
+async fn subscription(ws: &mut WebSocket, state: &Shared) -> Option<(Vec<String>, bool)> {
     let msg = timeout(SUBSCRIBE_TIMEOUT, ws.recv()).await.ok()??.ok()?;
     let Message::Text(text) = msg else {
         return None;
@@ -256,11 +314,12 @@ async fn subscription(ws: &mut WebSocket, state: &Shared) -> Option<Vec<String>>
     let sub: Subscribe = serde_json::from_str(&text).ok()?;
     let state = state.read();
     let names = state.aps().map(|(n, _)| n.to_owned());
-    Some(match sub.subscribe {
+    let aps = match sub.subscribe {
         Aps::All(all) if all == "*" => names.collect(),
         Aps::All(_) => return None,
         Aps::Named(wanted) => names.filter(|n| wanted.contains(n)).collect(),
-    })
+    };
+    Some((aps, sub.flows))
 }
 
 async fn send(ws: &mut WebSocket, msg: &Value) -> Result<(), axum::Error> {
@@ -269,15 +328,24 @@ async fn send(ws: &mut WebSocket, msg: &Value) -> Result<(), axum::Error> {
 
 /// Serves one WebSocket until either end closes it.
 async fn live(mut ws: WebSocket, state: Shared, user: Option<String>) {
-    let Some(names) = subscription(&mut ws, &state).await else {
+    let Some((names, flows)) = subscription(&mut ws, &state).await else {
         return;
     };
     let wanted = |ap: &str| names.iter().any(|n| n == ap);
-    // Held until the socket ends: the watchers are what set the 2 s tick.
-    let _watching: Vec<WatchGuard> = names.iter().filter_map(|n| state.watch(n)).collect();
+    // Held until the socket ends: the watchers are what set the 2 s tick and
+    // the 10 s flow cadence.
+    let flow_watchers = names
+        .iter()
+        .filter(|_| flows)
+        .filter_map(|n| state.watch_flows(n));
+    let _watching: Vec<WatchGuard> = names
+        .iter()
+        .filter_map(|n| state.watch(n))
+        .chain(flow_watchers)
+        .collect();
     // Subscribed first, so nothing between the key and the first patch is lost.
     let mut changes = state.read().subscribe();
-    let mut sent = view::view(&state.read(), wanted);
+    let mut sent = view::view(&state.read(), wanted, flows);
     if send(&mut ws, &json!({ "key": sent, "user": user }))
         .await
         .is_err()
@@ -300,7 +368,12 @@ async fn live(mut ws: WebSocket, state: Shared, user: Option<String>) {
                 (true, ev.map(|e| json!({ "events": [e] })))
             }
             Ok(Change::Up(ap) | Change::Down(ap) | Change::Snapshot(ap)) => (wanted(&ap), None),
-            Ok(Change::Event(..)) => (false, None),
+            Ok(Change::Flows(ap)) => (flows && wanted(&ap), None),
+            Ok(Change::Names) => (true, None),
+            Ok(Change::Action(a)) if a.ap.as_deref().is_none_or(wanted) => {
+                (false, Some(json!({ "events": [view::action(&a)] })))
+            }
+            Ok(Change::Event(..) | Change::Action(_)) => (false, None),
             // Too slow to keep up: the state is whole again with the next
             // patch, the events missed are told of.
             Err(RecvError::Lagged(_)) => (true, Some(json!({ "lost": true }))),
@@ -314,7 +387,7 @@ async fn live(mut ws: WebSocket, state: Shared, user: Option<String>) {
         if !relevant {
             continue;
         }
-        let next = view::view(&state.read(), wanted);
+        let next = view::view(&state.read(), wanted, flows);
         if let Some(patch) = view::diff(&sent, &next) {
             if send(&mut ws, &json!({ "patch": patch })).await.is_err() {
                 return;

@@ -641,15 +641,20 @@ async fn main() -> io::Result<()> {
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:8080".into());
     let public = |pem| Identity::from_pem(pem).map(|i| mac::hex(&i.public_key()));
+    // The actions' decisions, kept for the next replay like a controller's.
+    let policy = std::env::temp_dir().join("u6e-replay-policy.json");
     let config = format!(
         "listen_agents = \"127.0.0.1:0\"\nlisten_http = \"{web}\"\nlisten_metrics = \"127.0.0.1:0\"\n\
+         public_origin = \"http://{web}\"\npolicy_path = \"{}\"\n\
          [aps.ap1]\npublic_key = \"{}\"\n[aps.ap2]\npublic_key = \"{}\"\n",
+        policy.display(),
         public(KEY_AP1).map_err(io::Error::other)?,
         public(KEY_AP2).map_err(io::Error::other)?,
     );
     let config = Config::parse(&config).map_err(io::Error::other)?;
     let identity = Identity::from_pem(KEY_CONTROLLER).map_err(io::Error::other)?;
-    let c = u6e_controller::start(&config, &identity, Timing::default()).await?;
+    let resolver = Arc::new(u6e_controller::names::System);
+    let c = u6e_controller::start(&config, &identity, Timing::default(), resolver).await?;
     eprintln!("replay: the UI is on http://{}/", c.http);
 
     let world = Arc::new(Mutex::new(World::new()));

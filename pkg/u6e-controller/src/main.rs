@@ -7,9 +7,11 @@ use std::fs;
 use std::future;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use u6e_controller::agents::Timing;
 use u6e_controller::config::Config;
+use u6e_controller::names::System;
 use u6e_proto::tls::Identity;
 
 const DEFAULT_CONFIG: &str = "/etc/wifi-controller/config.toml";
@@ -57,7 +59,7 @@ fn main() -> ExitCode {
         }
     };
     runtime.block_on(async {
-        match u6e_controller::start(&config, &identity, Timing::default()).await {
+        match u6e_controller::start(&config, &identity, Timing::default(), Arc::new(System)).await {
             Ok(c) => {
                 eprintln!(
                     "u6e-controller: agents on {}, http on {}, metrics on {}, {} APs configured, \
@@ -71,7 +73,7 @@ fn main() -> ExitCode {
                 future::pending::<ExitCode>().await
             }
             Err(e) => {
-                eprintln!("u6e-controller: listen: {e}");
+                eprintln!("u6e-controller: {e}");
                 ExitCode::FAILURE
             }
         }

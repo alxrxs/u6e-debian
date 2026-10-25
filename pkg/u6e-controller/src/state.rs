@@ -1,29 +1,51 @@
 //! The live view of the APs: per AP what it runs, its latest snapshot rebuilt
-//! from key frames and deltas, and its recent events. Everything is in RAM; an
-//! AP sends it all again when it reconnects.
+//! from key frames and deltas, its clients' latest flows, and its recent
+//! events. All of that is in RAM; an AP sends it all again when it
+//! reconnects. Beside it are the operator's side: the clients blocked (kept
+//! on disk by `policy`), the commands waiting for their results, the actions
+//! taken, and the names of the clients' addresses.
 //!
-//! The state also sets each AP's tick. While a UI client watches an AP it
-//! reports every 2 s, otherwise at the 15 s scrape interval: the session
-//! follows a per-AP channel holding the tick the watchers want.
+//! The state also sets each AP's tick and flow cadence. While a UI client
+//! watches an AP it reports every 2 s, otherwise at the 15 s scrape interval;
+//! while one watches its flows they come every 10 s, otherwise every minute.
+//! The session follows per-AP channels holding what the watchers want.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
-use tokio::sync::{broadcast, oneshot, watch};
-use u6e_proto::PROTOCOL;
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use u6e_proto::delta::{self, Gap};
-use u6e_proto::msg::{AgentMsg, Event, EventKind, Hello, Snapshot, Station};
+use u6e_proto::msg::{
+    AgentMsg, Command, CommandKind, CommandResult, CtlMsg, Event, EventKind, Flows, Hello,
+    Snapshot, Station,
+};
+use u6e_proto::{PROTOCOL, mac};
+
+use crate::names::{self, Names};
+use crate::policy::Blocked;
 
 /// Events kept per AP, newest last.
 pub const EVENTS_CAP: usize = 1000;
+/// Operator actions kept, newest last.
+pub const ACTIONS_CAP: usize = 1000;
 /// The tick of an AP someone is watching.
 pub const TICK_WATCHED: u16 = 2;
 /// The tick of an unwatched AP: the scrape interval, which is also the
 /// agent's tick until it is told one.
 pub const TICK_IDLE: u16 = 15;
+/// The flow cadence of an AP whose flows someone is watching.
+pub const FLOWS_WATCHED: u16 = 10;
+/// The flow cadence otherwise, which is the agent's until it is told one.
+pub const FLOWS_IDLE: u16 = 60;
+/// How long a client's addresses are remembered after its flows last showed
+/// them, so that a client quiet for a while keeps its name.
+const ADDRESSES_KEPT: Duration = Duration::from_secs(3600);
 const CHANGES_CAP: usize = 256;
+/// Messages queued for a session; a session that far behind is stalled.
+const OUTBOX_CAP: usize = 64;
 
 /// What changed, for the UI to fetch.
 #[derive(Debug, Clone, PartialEq)]
@@ -32,6 +54,55 @@ pub enum Change {
     Down(String),
     Snapshot(String),
     Event(String, Event),
+    Flows(String),
+    /// A client's name came or changed.
+    Names,
+    Action(Action),
+}
+
+/// One operator action on one AP (or on none, when no AP was connected to
+/// carry a block out), with what came of it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Action {
+    pub at: SystemTime,
+    /// The signed-in user, as the proxy named them.
+    pub user: Option<String>,
+    pub action: &'static str,
+    pub mac: [u8; 6],
+    pub ap: Option<String>,
+    pub ok: bool,
+    pub detail: String,
+}
+
+/// The name of a command's kind, as the API and the metrics spell it.
+pub fn action_name(kind: &CommandKind) -> &'static str {
+    match kind {
+        CommandKind::Kick { .. } => "kick",
+        CommandKind::Block { .. } => "block",
+        CommandKind::Unblock { .. } => "unblock",
+        CommandKind::Steer { .. } => "steer",
+        CommandKind::SyncBlocks { .. } => "sync",
+    }
+}
+
+/// Who waits for a command's result.
+pub enum Waiter {
+    /// An operator's request.
+    Reply(oneshot::Sender<CommandResult>),
+    /// Nobody: the policy's blocks given to an AP that reconnected, whose
+    /// failure is only logged.
+    Resent,
+}
+
+struct Pending {
+    ap: String,
+    waiter: Waiter,
+}
+
+/// A client's addresses as its flows last showed them.
+struct Addresses {
+    ips: Vec<IpAddr>,
+    at: SystemTime,
 }
 
 /// One configured AP.
@@ -53,9 +124,15 @@ pub struct Ap {
     pub events: VecDeque<Event>,
     /// Firmware crashes per phy since the controller started.
     pub crashes: BTreeMap<String, u64>,
+    /// Its clients' latest flows and when they came, only while connected.
+    pub flows: Option<(Flows, SystemTime)>,
     rx_bytes: Arc<AtomicU64>,
     watchers: usize,
     tick: watch::Sender<u16>,
+    flow_watchers: usize,
+    cadence: watch::Sender<u16>,
+    /// Requests for the whole table, answered by the next flows that hold it.
+    full: Vec<oneshot::Sender<Flows>>,
     session: Option<Live>,
 }
 
@@ -63,6 +140,7 @@ pub struct Ap {
 struct Live {
     id: u64,
     _stop: oneshot::Sender<()>,
+    outbox: mpsc::Sender<CtlMsg>,
 }
 
 impl Ap {
@@ -77,9 +155,13 @@ impl Ap {
             last_seen: None,
             events: VecDeque::new(),
             crashes: BTreeMap::new(),
+            flows: None,
             rx_bytes: Arc::new(AtomicU64::new(0)),
             watchers: 0,
             tick: watch::Sender::new(TICK_IDLE),
+            flow_watchers: 0,
+            cadence: watch::Sender::new(FLOWS_IDLE),
+            full: Vec::new(),
             session: None,
         }
     }
@@ -120,7 +202,42 @@ impl Ap {
         self.snapshot_at = None;
         self.previous = None;
         self.connected_since = None;
+        self.flows = None;
+        self.full.clear();
     }
+
+    /// One more watcher (`more`) or one fewer, of the AP or its flows.
+    fn watched(&mut self, flows: bool, more: bool) {
+        let (count, channel, watched, idle) = if flows {
+            (
+                &mut self.flow_watchers,
+                &self.cadence,
+                FLOWS_WATCHED,
+                FLOWS_IDLE,
+            )
+        } else {
+            (&mut self.watchers, &self.tick, TICK_WATCHED, TICK_IDLE)
+        };
+        if more {
+            *count += 1;
+            if *count == 1 {
+                channel.send_replace(watched);
+            }
+        } else {
+            *count -= 1;
+            if *count == 0 {
+                channel.send_replace(idle);
+            }
+        }
+    }
+}
+
+/// Whether `f` lists every connection it counts, as an answer to a request
+/// for the whole table does.
+fn lists_everything(f: &Flows) -> bool {
+    f.clients
+        .iter()
+        .all(|c| c.top.len() as u64 == u64::from(c.conns))
 }
 
 /// A client as the UI and the metrics see it: once, on the AP that heard it last.
@@ -140,6 +257,10 @@ pub struct Registration {
     pub id: u64,
     /// The tick the AP should report at.
     pub tick: watch::Receiver<u16>,
+    /// The flow cadence the AP should keep.
+    pub cadence: watch::Receiver<u16>,
+    /// What else to send the agent: commands and requests for the flows.
+    pub outbox: mpsc::Receiver<CtlMsg>,
     /// Resolves when a newer connection of the same AP takes over.
     pub stop: oneshot::Receiver<()>,
     /// The AP's received-bytes counter.
@@ -151,6 +272,16 @@ pub struct State {
     aps: BTreeMap<String, Ap>,
     next_id: u64,
     changes: broadcast::Sender<Change>,
+    /// The clients blocked, as saved in the policy file.
+    pub blocked: Blocked,
+    next_command: u64,
+    pending: HashMap<u64, Pending>,
+    /// Operator actions, newest last.
+    pub actions: VecDeque<Action>,
+    /// Operator requests by action and result, for the metrics.
+    pub action_counts: BTreeMap<(&'static str, &'static str), u64>,
+    names: Names,
+    addresses: HashMap<[u8; 6], Addresses>,
 }
 
 impl State {
@@ -159,7 +290,19 @@ impl State {
             aps: names.into_iter().map(|n| (n, Ap::new())).collect(),
             next_id: 0,
             changes: broadcast::Sender::new(CHANGES_CAP),
+            blocked: Blocked::new(),
+            next_command: 0,
+            pending: HashMap::new(),
+            actions: VecDeque::new(),
+            action_counts: BTreeMap::new(),
+            names: Names::default(),
+            addresses: HashMap::new(),
         }
+    }
+
+    /// The state with the clients a saved policy blocks.
+    pub fn with_blocked(self, blocked: Blocked) -> Self {
+        State { blocked, ..self }
     }
 
     /// Every configured AP by name, connected or not.
@@ -179,6 +322,10 @@ impl State {
         self.aps.get(ap).map_or(0, |a| a.watchers)
     }
 
+    pub fn flow_watchers(&self, ap: &str) -> usize {
+        self.aps.get(ap).map_or(0, |a| a.flow_watchers)
+    }
+
     fn notify(&self, change: Change) {
         // No receiver is not an error: nobody has the UI open.
         let _ = self.changes.send(change);
@@ -191,7 +338,12 @@ impl State {
         self.next_id += 1;
         let id = self.next_id;
         let (stop_tx, stop) = oneshot::channel();
-        entry.session = Some(Live { id, _stop: stop_tx });
+        let (outbox_tx, outbox) = mpsc::channel(OUTBOX_CAP);
+        entry.session = Some(Live {
+            id,
+            _stop: stop_tx,
+            outbox: outbox_tx,
+        });
         // Each connection numbers its snapshots from 1 again, so a delta must
         // never meet the previous connection's snapshot.
         entry.reset_session();
@@ -203,9 +355,13 @@ impl State {
         let reg = Registration {
             id,
             tick: entry.tick.subscribe(),
+            cadence: entry.cadence.subscribe(),
+            outbox,
             stop,
             rx_bytes: Arc::clone(&entry.rx_bytes),
         };
+        // The previous connection's commands went with it.
+        self.drop_pending(ap);
         self.notify(Change::Up(ap.to_owned()));
         Some(reg)
     }
@@ -226,6 +382,7 @@ impl State {
         entry.hello = None;
         entry.session = None;
         entry.reset_session();
+        self.drop_pending(ap);
         self.notify(Change::Down(ap.to_owned()));
         true
     }
@@ -237,7 +394,13 @@ impl State {
         };
         entry.session = None;
         entry.reset_session();
+        self.drop_pending(ap);
         self.notify(Change::Down(ap.to_owned()));
+    }
+
+    /// Forgets the commands sent to `ap`: their waiters hear it went away.
+    fn drop_pending(&mut self, ap: &str) {
+        self.pending.retain(|_, p| p.ap != ap);
     }
 
     /// The AP, while session `id` is the one serving it.
@@ -282,14 +445,174 @@ impl State {
                 entry.push_event(ev.clone());
                 Some(Change::Event(ap.to_owned(), ev))
             }
-            // A Pong only proves the agent is alive; flows and command results
-            // are not kept.
+            AgentMsg::Flows(f) => {
+                entry.full.retain(|w| !w.is_closed());
+                // The whole table goes to those who asked for it; the UI's
+                // view keeps to the summaries.
+                if !entry.full.is_empty() && lists_everything(&f) {
+                    for w in entry.full.drain(..) {
+                        let _ = w.send(f.clone());
+                    }
+                    None
+                } else {
+                    entry.flows = Some((f, now));
+                    self.learn_addresses(ap, now);
+                    Some(Change::Flows(ap.to_owned()))
+                }
+            }
+            AgentMsg::Result(r) => {
+                self.result(ap, r);
+                None
+            }
+            // A Pong only proves the agent is alive.
             _ => None,
         };
         if let Some(c) = change {
             self.notify(c);
         }
         Ok(())
+    }
+
+    /// Hands a command's result to whoever waits for it. A result of another
+    /// AP's command, or of one given up on, is dropped.
+    fn result(&mut self, ap: &str, r: CommandResult) {
+        if self.pending.get(&r.id).is_none_or(|p| p.ap != ap) {
+            return;
+        }
+        let Some(Pending { waiter, .. }) = self.pending.remove(&r.id) else {
+            return;
+        };
+        match waiter {
+            Waiter::Reply(tx) => {
+                let _ = tx.send(r);
+            }
+            Waiter::Resent if r.ok => {}
+            Waiter::Resent => {
+                eprintln!(
+                    "u6e-controller: {ap}: the policy's blocks failed: {}",
+                    r.detail
+                );
+            }
+        }
+    }
+
+    /// Queues `kind` for the session serving `ap`, its result for `waiter`;
+    /// the command's id, or `None` when no session serves the AP or it is
+    /// too far behind to take one.
+    pub fn command(&mut self, ap: &str, kind: CommandKind, waiter: Waiter) -> Option<u64> {
+        let live = self.aps.get(ap)?.session.as_ref()?;
+        let id = self.next_command + 1;
+        let msg = CtlMsg::Command(Command { id, kind });
+        live.outbox.try_send(msg).ok()?;
+        self.next_command = id;
+        let ap = ap.to_owned();
+        self.pending.insert(id, Pending { ap, waiter });
+        Some(id)
+    }
+
+    /// Forgets command `id`, whose waiter gave up on it.
+    pub fn forget(&mut self, id: u64) {
+        self.pending.remove(&id);
+    }
+
+    /// The command that makes a reconnected AP's blocks the policy's, for
+    /// its session `id` to send: all of them at once, so that a client
+    /// unblocked while the AP could not be told is let on there too.
+    pub fn sync_blocks(&mut self, ap: &str, id: u64) -> Option<CtlMsg> {
+        self.live(ap, id)?;
+        self.next_command += 1;
+        let macs = self.blocked.iter().copied().collect();
+        let cmd = Command {
+            id: self.next_command,
+            kind: CommandKind::SyncBlocks { macs },
+        };
+        let pending = Pending {
+            ap: ap.to_owned(),
+            waiter: Waiter::Resent,
+        };
+        self.pending.insert(cmd.id, pending);
+        Some(CtlMsg::Command(cmd))
+    }
+
+    /// The APs a session serves.
+    pub fn connected(&self) -> Vec<String> {
+        let up = self.aps.iter().filter(|(_, a)| a.is_up());
+        up.map(|(n, _)| n.clone()).collect()
+    }
+
+    /// A request for the whole flow table of `ap`, answered by the agent's
+    /// next table that lists every connection; the agent is asked when no
+    /// request is out already. `None` when no session serves the AP.
+    pub fn want_full(&mut self, ap: &str) -> Option<oneshot::Receiver<Flows>> {
+        let entry = self.aps.get_mut(ap)?;
+        let live = entry.session.as_ref()?;
+        entry.full.retain(|w| !w.is_closed());
+        if entry.full.is_empty() {
+            live.outbox
+                .try_send(CtlMsg::WantFlows { full: true })
+                .ok()?;
+        }
+        let (tx, rx) = oneshot::channel();
+        entry.full.push(tx);
+        Some(rx)
+    }
+
+    /// Records an operator action, for the events and the journal.
+    pub fn record(&mut self, action: Action) {
+        let on = action.ap.as_deref().map(|ap| format!(" on {ap}"));
+        eprintln!(
+            "u6e-controller: {} {} {}{}: {}: {}",
+            action.user.as_deref().unwrap_or("(no user)"),
+            action.action,
+            mac::format(action.mac),
+            on.unwrap_or_default(),
+            if action.ok { "ok" } else { "failed" },
+            action.detail
+        );
+        if self.actions.len() == ACTIONS_CAP {
+            self.actions.pop_front();
+        }
+        self.actions.push_back(action.clone());
+        self.notify(Change::Action(action));
+    }
+
+    /// Takes the addresses the flows of `ap` show its clients at.
+    fn learn_addresses(&mut self, ap: &str, now: SystemTime) {
+        let Some((flows, _)) = self.aps.get(ap).and_then(|a| a.flows.as_ref()) else {
+            return;
+        };
+        let clients: Vec<_> = flows
+            .clients
+            .iter()
+            .map(|c| (c.mac, c.top.as_slice()))
+            .collect();
+        for (mac, ips) in names::addresses(&clients) {
+            if !ips.is_empty() {
+                self.addresses.insert(mac, Addresses { ips, at: now });
+            }
+        }
+        let kept = |a: &Addresses| now.duration_since(a.at).is_ok_and(|d| d < ADDRESSES_KEPT);
+        self.addresses.retain(|_, a| kept(a));
+    }
+
+    /// The addresses of the clients to look up now, marked as in flight.
+    pub fn names_due(&mut self, now: Instant) -> Vec<IpAddr> {
+        self.names.prune(now);
+        let wanted = self.addresses.values().flat_map(|a| a.ips.iter().copied());
+        self.names.due(wanted, now)
+    }
+
+    /// Takes the answer of a lookup of `ip`.
+    pub fn named(&mut self, ip: IpAddr, name: Option<String>, now: Instant) {
+        if self.names.answer(ip, name, now) {
+            self.notify(Change::Names);
+        }
+    }
+
+    /// The client's name: that of the first of its addresses that has one.
+    pub fn name_of(&self, mac: &[u8; 6]) -> Option<&str> {
+        let ips = &self.addresses.get(mac)?.ips;
+        ips.iter().find_map(|ip| self.names.get(ip))
     }
 
     /// Every associated client, sorted by MAC. A MAC in two snapshots (a roam
@@ -345,33 +668,39 @@ impl Shared {
     /// Counts a watcher of `ap` until the guard is dropped; the first one
     /// moves the AP to the 2 s tick, the last one to leave moves it back.
     pub fn watch(&self, ap: &str) -> Option<WatchGuard> {
+        self.watching(ap, false)
+    }
+
+    /// Counts a watcher of the flows of `ap` likewise: the first one moves
+    /// the AP to the 10 s flow cadence, the last one back to the minute.
+    pub fn watch_flows(&self, ap: &str) -> Option<WatchGuard> {
+        self.watching(ap, true)
+    }
+
+    fn watching(&self, ap: &str, flows: bool) -> Option<WatchGuard> {
         let mut state = self.write();
         let entry = state.aps.get_mut(ap)?;
-        entry.watchers += 1;
-        if entry.watchers == 1 {
-            entry.tick.send_replace(TICK_WATCHED);
-        }
+        entry.watched(flows, true);
         Some(WatchGuard {
             shared: self.clone(),
             ap: ap.to_owned(),
+            flows,
         })
     }
 }
 
-/// One watcher of an AP; see [`Shared::watch`].
+/// One watcher of an AP or its flows; see [`Shared::watch`].
 pub struct WatchGuard {
     shared: Shared,
     ap: String,
+    flows: bool,
 }
 
 impl Drop for WatchGuard {
     fn drop(&mut self) {
         let mut state = self.shared.write();
         if let Some(entry) = state.aps.get_mut(&self.ap) {
-            entry.watchers -= 1;
-            if entry.watchers == 0 {
-                entry.tick.send_replace(TICK_IDLE);
-            }
+            entry.watched(self.flows, false);
         }
     }
 }
@@ -642,5 +971,149 @@ mod tests {
         assert_eq!(*tick.borrow_and_update(), TICK_IDLE);
         assert_eq!(shared.read().watchers("ap1"), 0);
         assert!(shared.watch("ap9").is_none());
+    }
+
+    #[test]
+    fn flow_watchers_drive_the_cadence_alone() {
+        let shared = Shared::new(state(&["ap1"]));
+        let reg = shared.write().connect("ap1", hello("ap1")).unwrap();
+        let (mut cadence, mut tick) = (reg.cadence, reg.tick);
+        assert_eq!(*cadence.borrow(), FLOWS_IDLE);
+        let ap = shared.watch("ap1").unwrap();
+        assert!(!cadence.has_changed().unwrap());
+        let flows = shared.watch_flows("ap1").unwrap();
+        assert_eq!(*cadence.borrow_and_update(), FLOWS_WATCHED);
+        assert_eq!(*tick.borrow_and_update(), TICK_WATCHED);
+        drop(flows);
+        assert_eq!(*cadence.borrow_and_update(), FLOWS_IDLE);
+        assert!(!tick.has_changed().unwrap());
+        drop(ap);
+        assert_eq!(*tick.borrow_and_update(), TICK_IDLE);
+    }
+
+    fn result(id: u64) -> AgentMsg {
+        AgentMsg::Result(CommandResult {
+            id,
+            ok: true,
+            detail: "OK".into(),
+        })
+    }
+
+    #[test]
+    fn a_result_reaches_its_own_waiter_only() {
+        let mut s = state(&["ap1", "ap2"]);
+        let mut one = s.connect("ap1", hello("ap1")).unwrap();
+        let two = s.connect("ap2", hello("ap2")).unwrap().id;
+        let mac = [2, 0, 0, 0, 0, 1];
+        let (tx, mut rx) = oneshot::channel();
+        let id = s
+            .command("ap1", CommandKind::Kick { mac }, Waiter::Reply(tx))
+            .unwrap();
+        let sent = one.outbox.try_recv().unwrap();
+        let kind = CommandKind::Kick { mac };
+        assert_eq!(sent, CtlMsg::Command(Command { id, kind }));
+        // Another AP cannot answer it.
+        s.apply("ap2", two, result(id)).unwrap();
+        assert!(rx.try_recv().is_err());
+        s.apply("ap1", one.id, result(id)).unwrap();
+        assert_eq!(rx.try_recv().unwrap().detail, "OK");
+        // A command to an AP that goes away is answered by its going.
+        let (tx, mut rx) = oneshot::channel();
+        s.command("ap1", CommandKind::Kick { mac }, Waiter::Reply(tx))
+            .unwrap();
+        s.disconnect("ap1", one.id);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+        let (tx, _rx) = oneshot::channel();
+        assert_eq!(
+            s.command("ap1", CommandKind::Kick { mac }, Waiter::Reply(tx)),
+            None
+        );
+    }
+
+    #[test]
+    fn the_sync_holds_the_policy_and_goes_to_the_session_only() {
+        let mut s = state(&["ap1"]);
+        let old = s.connect("ap1", hello("ap1")).unwrap().id;
+        let new = s.connect("ap1", hello("ap1")).unwrap().id;
+        s.blocked.insert([2, 0, 0, 0, 0, 2]);
+        s.blocked.insert([2, 0, 0, 0, 0, 1]);
+        assert_eq!(s.sync_blocks("ap1", old), None);
+        let Some(CtlMsg::Command(c)) = s.sync_blocks("ap1", new) else {
+            panic!("no sync");
+        };
+        let macs = vec![[2, 0, 0, 0, 0, 1], [2, 0, 0, 0, 0, 2]];
+        assert_eq!(c.kind, CommandKind::SyncBlocks { macs });
+        // Its result is taken without a waiter.
+        s.apply("ap1", new, result(c.id)).unwrap();
+        assert!(s.pending.is_empty());
+    }
+
+    fn flows(seq: u64, conns: u32, listed: usize) -> Flows {
+        let flow = u6e_proto::msg::Flow {
+            proto: 6,
+            src: "192.0.2.10".parse().unwrap(),
+            sport: 1,
+            dst: "198.51.100.1".parse().unwrap(),
+            dport: 2,
+            tx_bytes: 0,
+            rx_bytes: 0,
+            tx_packets: 0,
+            rx_packets: 0,
+            offloaded: false,
+            age_s: 0,
+        };
+        Flows {
+            seq,
+            complete: true,
+            clients: vec![u6e_proto::msg::ClientFlows {
+                mac: [2, 0, 0, 0, 0, 1],
+                conns,
+                offloaded: 0,
+                tx_bytes: 0,
+                rx_bytes: 0,
+                tx_packets: 0,
+                rx_packets: 0,
+                top: vec![flow; listed],
+            }],
+        }
+    }
+
+    #[test]
+    fn a_full_table_answers_its_requests_and_is_not_kept() {
+        let mut s = state(&["ap1"]);
+        let mut reg = s.connect("ap1", hello("ap1")).unwrap();
+        let seq = |s: &State| s.ap("ap1").unwrap().flows.as_ref().map(|(f, _)| f.seq);
+        s.apply("ap1", reg.id, AgentMsg::Flows(flows(1, 9, 6)))
+            .unwrap();
+        let mut first = s.want_full("ap1").unwrap();
+        let mut second = s.want_full("ap1").unwrap();
+        // Asked once for both.
+        assert_eq!(
+            reg.outbox.try_recv().unwrap(),
+            CtlMsg::WantFlows { full: true }
+        );
+        assert!(reg.outbox.try_recv().is_err());
+        // A summary on the way meanwhile is not the answer.
+        s.apply("ap1", reg.id, AgentMsg::Flows(flows(2, 9, 6)))
+            .unwrap();
+        assert_eq!(seq(&s), Some(2));
+        assert!(first.try_recv().is_err());
+        s.apply("ap1", reg.id, AgentMsg::Flows(flows(3, 9, 9)))
+            .unwrap();
+        assert_eq!(
+            (
+                first.try_recv().unwrap().seq,
+                second.try_recv().unwrap().seq
+            ),
+            (3, 3)
+        );
+        assert_eq!(seq(&s), Some(2));
+        // With nobody asking, a table that lists everything is a summary.
+        s.apply("ap1", reg.id, AgentMsg::Flows(flows(4, 2, 2)))
+            .unwrap();
+        assert_eq!(seq(&s), Some(4));
     }
 }

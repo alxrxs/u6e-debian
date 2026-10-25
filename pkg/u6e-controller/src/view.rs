@@ -2,23 +2,107 @@
 //! clients by MAC, temperatures by zone), so that a change goes out as a JSON
 //! merge patch (RFC 7386) of only the fields that changed. Rates, utilization
 //! and retry ratios are worked out here from the counters of the AP's last two
-//! snapshots, and rounded so that a steady value is not resent.
+//! snapshots, and rounded so that a steady value is not resent. A client is
+//! named (`name`) when the reverse DNS of an address its flows show has a
+//! name; the UI shows its MAC otherwise.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value, json};
 use u6e_proto::PROTOCOL;
 use u6e_proto::mac;
-use u6e_proto::msg::{Band, Event, EventKind, Radio, RateMode, Snapshot, Station};
+use u6e_proto::msg::{Band, Event, EventKind, Flow, Flows, Radio, RateMode, Snapshot, Station};
 
-use crate::state::{Ap, ClientView, State};
+use crate::state::{Action, Ap, ClientView, State};
 
-/// The APs and clients of the APs `wanted` says yes to, as one object.
-pub fn view(state: &State, wanted: impl Fn(&str) -> bool) -> Value {
-    json!({
+/// The APs and clients of the APs `wanted` says yes to, as one object, with
+/// their flows when `flows`.
+pub fn view(state: &State, wanted: impl Fn(&str) -> bool, flows: bool) -> Value {
+    let mut v = json!({
         "aps": aps(state, &wanted),
         "clients": clients(state, &wanted),
+    });
+    if flows {
+        v["flows"] = self::flows(state, &wanted, None);
+    }
+    v
+}
+
+/// The latest flows of every wanted AP that has sent some, by AP; of one
+/// client only with `client`.
+pub fn flows(state: &State, wanted: impl Fn(&str) -> bool, client: Option<[u8; 6]>) -> Value {
+    let aps = state.aps().filter(|(name, _)| wanted(name));
+    let with = aps.filter_map(|(name, ap)| {
+        let (f, at) = ap.flows.as_ref()?;
+        Some((name.to_owned(), flows_of(state, f, *at, client)))
+    });
+    Value::Object(with.collect())
+}
+
+/// One AP's flows, as they came at `at`: its clients by MAC, named when
+/// they can be.
+pub fn flows_of(state: &State, f: &Flows, at: SystemTime, client: Option<[u8; 6]>) -> Value {
+    let clients = f
+        .clients
+        .iter()
+        .filter(|c| client.is_none_or(|m| m == c.mac))
+        .map(|c| {
+            let mut o = json!({
+                "conns": c.conns,
+                "offloaded": c.offloaded,
+                "tx_bytes": c.tx_bytes,
+                "rx_bytes": c.rx_bytes,
+                "tx_packets": c.tx_packets,
+                "rx_packets": c.rx_packets,
+                "top": c.top.iter().map(flow).collect::<Vec<_>>(),
+            });
+            if let Some(name) = state.name_of(&c.mac) {
+                o["name"] = name.into();
+            }
+            (mac::format(c.mac), o)
+        });
+    json!({
+        "at": unix_ms(at),
+        "seq": f.seq,
+        "complete": f.complete,
+        "clients": Value::Object(clients.collect()),
     })
+}
+
+/// One connection; `src` opened it, and tx/rx are the client's.
+fn flow(f: &Flow) -> Value {
+    json!({
+        "proto": f.proto,
+        "src": f.src.to_string(),
+        "sport": f.sport,
+        "dst": f.dst.to_string(),
+        "dport": f.dport,
+        "tx_bytes": f.tx_bytes,
+        "rx_bytes": f.rx_bytes,
+        "tx_packets": f.tx_packets,
+        "rx_packets": f.rx_packets,
+        "offloaded": f.offloaded,
+        "age": f.age_s,
+    })
+}
+
+/// An operator action as the events show it.
+pub fn action(a: &Action) -> Value {
+    let mut o = json!({
+        "at": unix_ms(a.at),
+        "kind": "action",
+        "action": a.action,
+        "mac": mac::format(a.mac),
+        "ok": a.ok,
+        "detail": a.detail,
+    });
+    if let Some(ap) = &a.ap {
+        o["ap"] = ap.clone().into();
+    }
+    if let Some(user) = &a.user {
+        o["user"] = user.clone().into();
+    }
+    o
 }
 
 /// Every wanted AP by name.
@@ -42,7 +126,8 @@ pub fn clients(state: &State, wanted: impl Fn(&str) -> bool) -> Value {
     Value::Object(clients)
 }
 
-/// The events of `ap`, or of every AP, oldest first.
+/// The events of `ap`, or of every AP, oldest first; the operator's actions
+/// among them (one carried out on no AP only in every AP's).
 pub fn events(state: &State, ap: Option<&str>) -> Vec<Value> {
     let mut out: Vec<(u64, Value)> = Vec::new();
     for (name, a) in state.aps().filter(|(n, _)| ap.is_none_or(|ap| ap == *n)) {
@@ -52,6 +137,11 @@ pub fn events(state: &State, ap: Option<&str>) -> Vec<Value> {
             .filter_map(|ev| Some((ev.at_ms, event(name, a, ev)?)));
         out.extend(at);
     }
+    let actions = state
+        .actions
+        .iter()
+        .filter(|a| ap.is_none_or(|ap| a.ap.as_deref() == Some(ap)));
+    out.extend(actions.map(|a| (unix_ms(a.at), action(a))));
     // Stable: one AP's events keep the order they came in.
     out.sort_by_key(|(at, _)| *at);
     out.into_iter().map(|(_, v)| v).collect()
@@ -285,6 +375,9 @@ fn client_view(state: &State, c: &ClientView) -> Value {
     });
     if let Some(b) = band {
         o["band"] = b.into();
+    }
+    if let Some(name) = state.name_of(&st.mac) {
+        o["name"] = name.into();
     }
     let rates = ap.and_then(|a| {
         let (prev, then) = a.previous.as_ref()?;

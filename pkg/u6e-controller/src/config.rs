@@ -1,11 +1,16 @@
-//! The controller's configuration file: where it listens, its key, and the APs
-//! it admits, each by the Ed25519 public key it pins.
+//! The controller's configuration file: where it listens, its key, the APs it
+//! admits, each by the Ed25519 public key it pins, and what the operator
+//! actions need: the origin the UI is served at (required), the group allowed
+//! to act, and where the decisions are kept.
 //!
 //! ```toml
 //! listen_agents = "[::]:8443"
 //! listen_http = "[::]:8080"
 //! listen_metrics = "[::]:9810"
 //! key = "/etc/wifi-controller/key.pem"
+//! public_origin = "https://wifi.example.org"
+//! admin_group = "wifi-admins"
+//! policy_path = "/var/lib/wifi-controller/policy.json"
 //!
 //! [aps.ap1]
 //! public_key = "<64 lowercase hex digits>"
@@ -29,6 +34,13 @@ pub struct Config {
     pub key: PathBuf,
     /// AP name to its public key.
     pub aps: BTreeMap<String, [u8; 32]>,
+    /// The scheme, host and port the browser reaches the UI at: the only
+    /// `Origin` an action is taken from.
+    pub public_origin: String,
+    /// The group, as the sign-in proxy names it, whose members may act.
+    pub admin_group: String,
+    /// The operator's decisions (the blocked clients), kept across restarts.
+    pub policy_path: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -44,6 +56,11 @@ struct File {
     key: PathBuf,
     #[serde(default)]
     aps: BTreeMap<String, ApFile>,
+    public_origin: String,
+    #[serde(default = "default_admin_group")]
+    admin_group: String,
+    #[serde(default = "default_policy")]
+    policy_path: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -68,6 +85,14 @@ fn default_key() -> PathBuf {
     "/etc/wifi-controller/key.pem".into()
 }
 
+fn default_admin_group() -> String {
+    "wifi-admins".into()
+}
+
+fn default_policy() -> PathBuf {
+    "/var/lib/wifi-controller/policy.json".into()
+}
+
 /// Why a configuration was refused.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ConfigError {
@@ -76,6 +101,10 @@ pub enum ConfigError {
     BadKey(String),
     /// Two APs share a key, so a connection could not be told apart.
     SharedKey(String, String),
+    /// `public_origin` is not spelled as a browser's `Origin` header is.
+    BadOrigin,
+    /// `admin_group` is empty, which no group header could match.
+    NoAdminGroup,
 }
 
 impl fmt::Display for ConfigError {
@@ -84,6 +113,10 @@ impl fmt::Display for ConfigError {
             Self::Syntax(e) => f.write_str(e.trim_end()),
             Self::BadKey(ap) => write!(f, "aps.{ap}.public_key is not 64 lowercase hex digits"),
             Self::SharedKey(a, b) => write!(f, "aps.{a} and aps.{b} have the same public_key"),
+            Self::BadOrigin => f.write_str(
+                "public_origin is not scheme://host[:port] (no path, no trailing slash)",
+            ),
+            Self::NoAdminGroup => f.write_str("admin_group is empty"),
         }
     }
 }
@@ -102,14 +135,34 @@ impl Config {
             }
             aps.insert(name, key);
         }
+        if !is_origin(&file.public_origin) {
+            return Err(ConfigError::BadOrigin);
+        }
+        if file.admin_group.trim().is_empty() {
+            return Err(ConfigError::NoAdminGroup);
+        }
         Ok(Config {
             listen_agents: file.listen_agents,
             listen_http: file.listen_http,
             listen_metrics: file.listen_metrics,
             key: file.key,
             aps,
+            public_origin: file.public_origin,
+            admin_group: file.admin_group,
+            policy_path: file.policy_path,
         })
     }
+}
+
+/// Whether `s` is spelled as a browser sends `Origin`: an http(s) scheme and
+/// a host, with nothing after it but a port, so that comparing the header with
+/// it byte for byte is the whole check.
+fn is_origin(s: &str) -> bool {
+    let Some((scheme, rest)) = s.split_once("://") else {
+        return false;
+    };
+    let host = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || "-.:[]".contains(c);
+    matches!(scheme, "http" | "https") && !rest.is_empty() && rest.chars().all(host)
 }
 
 /// The 32 bytes of 64 lowercase hex digits: one spelling per key, so a key
@@ -127,11 +180,12 @@ mod tests {
 
     const KEY1: &str = "0101010101010101010101010101010101010101010101010101010101010101";
     const KEY2: &str = "abababababababababababababababababababababababababababababababab";
+    const ORIGIN: &str = "public_origin = \"https://wifi.example.org\"\n";
 
     #[test]
     fn defaults_and_aps() {
         let c = Config::parse(&format!(
-            "[aps.ap1]\npublic_key = \"{KEY1}\"\n[aps.ap2]\npublic_key = \"{KEY2}\"\n"
+            "{ORIGIN}[aps.ap1]\npublic_key = \"{KEY1}\"\n[aps.ap2]\npublic_key = \"{KEY2}\"\n"
         ))
         .unwrap();
         assert_eq!(c.listen_agents, "[::]:8443".parse().unwrap());
@@ -140,13 +194,21 @@ mod tests {
         assert_eq!(c.key, PathBuf::from("/etc/wifi-controller/key.pem"));
         assert_eq!(c.aps["ap1"], [1; 32]);
         assert_eq!(c.aps["ap2"], [0xab; 32]);
+        assert_eq!(c.public_origin, "https://wifi.example.org");
+        assert_eq!(c.admin_group, "wifi-admins");
+        assert_eq!(
+            c.policy_path,
+            PathBuf::from("/var/lib/wifi-controller/policy.json")
+        );
     }
 
     #[test]
     fn listeners_and_key_are_set() {
         let c = Config::parse(
             "listen_agents = \"192.0.2.1:1\"\nlisten_http = \"192.0.2.1:2\"\n\
-             listen_metrics = \"[2001:db8::1]:3\"\nkey = \"/k.pem\"\n",
+             listen_metrics = \"[2001:db8::1]:3\"\nkey = \"/k.pem\"\n\
+             public_origin = \"http://[2001:db8::1]:8080\"\nadmin_group = \"ops\"\n\
+             policy_path = \"/p.json\"\n",
         )
         .unwrap();
         assert_eq!(c.listen_agents, "192.0.2.1:1".parse().unwrap());
@@ -154,6 +216,27 @@ mod tests {
         assert_eq!(c.listen_metrics, "[2001:db8::1]:3".parse().unwrap());
         assert_eq!(c.key, PathBuf::from("/k.pem"));
         assert!(c.aps.is_empty());
+        assert_eq!(c.public_origin, "http://[2001:db8::1]:8080");
+        assert_eq!(c.admin_group, "ops");
+        assert_eq!(c.policy_path, PathBuf::from("/p.json"));
+    }
+
+    #[test]
+    fn the_origin_is_required_and_spelled_as_browsers_send_it() {
+        assert!(matches!(Config::parse(""), Err(ConfigError::Syntax(_))));
+        for bad in [
+            "wifi.example.org",
+            "https://wifi.example.org/",
+            "https://wifi.example.org/ui",
+            "https://Wifi.example.org",
+            "ftp://wifi.example.org",
+            "https://",
+        ] {
+            let text = format!("public_origin = \"{bad}\"\n");
+            assert_eq!(Config::parse(&text), Err(ConfigError::BadOrigin), "{bad}");
+        }
+        let text = format!("{ORIGIN}admin_group = \" \"\n");
+        assert_eq!(Config::parse(&text), Err(ConfigError::NoAdminGroup));
     }
 
     #[test]
@@ -165,7 +248,7 @@ mod tests {
             upper.as_str(),
             &format!("+{}", &KEY1[1..]),
         ] {
-            let text = format!("[aps.ap1]\npublic_key = \"{bad}\"\n");
+            let text = format!("{ORIGIN}[aps.ap1]\npublic_key = \"{bad}\"\n");
             assert_eq!(
                 Config::parse(&text),
                 Err(ConfigError::BadKey("ap1".into())),
@@ -176,8 +259,9 @@ mod tests {
 
     #[test]
     fn shared_key_refused() {
-        let text =
-            format!("[aps.ap1]\npublic_key = \"{KEY1}\"\n[aps.ap2]\npublic_key = \"{KEY1}\"\n");
+        let text = format!(
+            "{ORIGIN}[aps.ap1]\npublic_key = \"{KEY1}\"\n[aps.ap2]\npublic_key = \"{KEY1}\"\n"
+        );
         assert_eq!(
             Config::parse(&text),
             Err(ConfigError::SharedKey("ap1".into(), "ap2".into()))
@@ -190,8 +274,9 @@ mod tests {
             "listen = \"[::]:1\"\n",
             "[aps.ap1]\npublic_key = \"\"\nname = \"x\"\n",
         ] {
+            let text = format!("{ORIGIN}{text}");
             assert!(
-                matches!(Config::parse(text), Err(ConfigError::Syntax(_))),
+                matches!(Config::parse(&text), Err(ConfigError::Syntax(_))),
                 "{text}"
             );
         }
