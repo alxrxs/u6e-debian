@@ -721,6 +721,7 @@ mod tests {
             radios: Vec::new(),
             bsss: Vec::new(),
             stations: Vec::new(),
+            config_sha256: None,
         }
     }
 

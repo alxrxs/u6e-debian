@@ -1,5 +1,6 @@
 //! Length-prefixed frames: a u32 little-endian length, then the postcard
-//! encoding of one message.
+//! encoding of one message. A frame read is wiped once decoded, and one that
+//! holds secrets (a Wi-Fi configuration) can be written the same way.
 
 use std::io::{self, ErrorKind, Read, Write};
 
@@ -12,19 +13,43 @@ pub const MAX_FRAME: u32 = 1 << 20;
 /// Writes one frame.
 pub fn write_frame<W: Write>(w: &mut W, msg: &impl Serialize) -> io::Result<()> {
     // One write, so a frame is never split across TLS records by its prefix.
+    w.write_all(&encode(msg)?)
+}
+
+/// Writes one frame that holds secrets, its encoding wiped once written.
+pub fn write_secret_frame<W: Write>(w: &mut W, msg: &impl Serialize) -> io::Result<()> {
+    let mut buf = encode(msg)?;
+    let r = w.write_all(&buf);
+    zeroize(&mut buf);
+    r
+}
+
+/// A frame of `msg`, length prefix included; what was encoded of one too
+/// large is wiped.
+fn encode(msg: &impl Serialize) -> io::Result<Vec<u8>> {
     let mut buf = vec![0; 4];
     postcard::to_io(msg, &mut buf).map_err(invalid)?;
     let len = u32::try_from(buf.len() - 4)
         .ok()
         .filter(|&n| n <= MAX_FRAME);
-    let len = len.ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "frame too large"))?;
+    let Some(len) = len else {
+        zeroize(&mut buf);
+        return Err(io::Error::new(ErrorKind::InvalidInput, "frame too large"));
+    };
     buf[..4].copy_from_slice(&len.to_le_bytes());
-    w.write_all(&buf)
+    Ok(buf)
 }
 
 /// Reads one frame; a length above [`MAX_FRAME`] is refused before anything is
 /// allocated for it.
 pub fn read_frame<R: Read, T: DeserializeOwned>(r: &mut R) -> io::Result<T> {
+    let mut body = read_body(r)?;
+    let msg = postcard::from_bytes(&body).map_err(invalid);
+    zeroize(&mut body);
+    msg
+}
+
+fn read_body<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
     let mut len = [0; 4];
     r.read_exact(&mut len)?;
     let len = u32::from_le_bytes(len);
@@ -36,7 +61,17 @@ pub fn read_frame<R: Read, T: DeserializeOwned>(r: &mut R) -> io::Result<T> {
     }
     let mut body = vec![0; len as usize];
     r.read_exact(&mut body)?;
-    postcard::from_bytes(&body).map_err(invalid)
+    Ok(body)
+}
+
+/// Overwrites `buf` with zeros in a way the compiler keeps, for memory that
+/// held secrets and is about to be freed or reused.
+pub fn zeroize(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        // SAFETY: `b` is a valid, aligned reference to one byte.
+        unsafe { std::ptr::write_volatile(b, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Decodes the first frame of `buf` and returns it with the bytes it took, or
@@ -76,6 +111,18 @@ fn invalid(e: postcard::Error) -> io::Error {
 mod tests {
     use super::*;
     use crate::msg::{AgentMsg, CtlMsg};
+
+    /// A frame with secrets goes out as any other; only the copy left
+    /// behind differs, and zeroize leaves nothing of it.
+    #[test]
+    fn a_secret_frame_is_an_ordinary_frame() {
+        let (mut plain, mut secret) = (Vec::new(), Vec::new());
+        write_frame(&mut plain, &AgentMsg::Pong(7)).unwrap();
+        write_secret_frame(&mut secret, &AgentMsg::Pong(7)).unwrap();
+        assert_eq!(plain, secret);
+        zeroize(&mut secret);
+        assert!(secret.iter().all(|&b| b == 0));
+    }
 
     #[test]
     fn frames_roundtrip_back_to_back() {

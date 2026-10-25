@@ -1,6 +1,7 @@
-//! The messages of the agent-to-controller link and the state they carry.
-//! postcard encodes them without a schema, so every change to their layout
-//! (a field, a variant, an order) bumps [`crate::PROTOCOL`].
+//! The messages of the agent-to-controller link and of the deploy runner's
+//! link to the controller, and the state they carry. postcard encodes them
+//! without a schema, so every change to their layout (a field, a variant, an
+//! order) bumps [`crate::PROTOCOL`].
 
 use std::net::IpAddr;
 
@@ -36,6 +37,8 @@ pub enum AgentMsg {
         running: bool,
         reason: String,
     },
+    /// The outcome of a [`CtlMsg::ApplyConfig`].
+    ConfigApplied(ConfigApplied),
 }
 
 /// Everything the controller sends.
@@ -71,6 +74,11 @@ pub enum CtlMsg {
     SpectrumStop {
         radio: String,
     },
+    /// Install this configuration and apply it the least disruptive way
+    /// [`Mechanism`] names; answered by an [`AgentMsg::ConfigApplied`] of the
+    /// same `sha256`. Signed by the deploy runner, the only party that
+    /// originates one: the controller relays it unread and cannot forge it.
+    ApplyConfig(SignedConfig),
 }
 
 /// What the AP is running, sent once per connection.
@@ -102,6 +110,9 @@ pub struct Snapshot {
     pub radios: Vec<Radio>,
     pub bsss: Vec<Bss>,
     pub stations: Vec<Station>,
+    /// The hash ([`crate::config::config_sha256`]) of the configuration
+    /// installed for the radios; `None` while it cannot be read.
+    pub config_sha256: Option<[u8; 32]>,
 }
 
 /// On the wire: a change to it bumps [`crate::PROTOCOL`].
@@ -319,7 +330,8 @@ pub struct Command {
 
 /// The closed set of actions. None carries free-form text, and the set is
 /// exhaustive, so a new action is a compile error at every end that must
-/// carry it out.
+/// carry it out. None changes the radios' configuration: only a signed
+/// [`CtlMsg::ApplyConfig`] does, so its hash always says what runs.
 ///
 /// On the wire: a change to it bumps [`crate::PROTOCOL`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -390,4 +402,190 @@ pub struct SpectrumFrame {
     pub bins: Vec<i8>,
     /// The noise floor the samples report.
     pub noise_dbm: i8,
+}
+
+/// One radio's configuration: the hostapd file u6e-wifi starts the radio's
+/// hostapd interface from, and the transmit power it sets. Opaque to the
+/// controller, which never stores or shows it: the text holds passphrases
+/// and keys, so it is not in this type's `Debug` either.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RadioConfig {
+    pub radio: Band,
+    pub text: String,
+    pub txpower_dbm: i8,
+}
+
+impl std::fmt::Debug for RadioConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RadioConfig")
+            .field("radio", &self.radio)
+            .field("text", &format_args!("<{} bytes>", self.text.len()))
+            .field("txpower_dbm", &self.txpower_dbm)
+            .finish()
+    }
+}
+
+/// The text is wiped before its memory goes back to the allocator.
+impl Drop for RadioConfig {
+    fn drop(&mut self) {
+        // SAFETY: zeros are valid UTF-8, and nothing reads the text after.
+        crate::frame::zeroize(unsafe { self.text.as_mut_vec() });
+    }
+}
+
+/// A whole configuration of one AP, as the deploy runner signed it: Ed25519
+/// over [`crate::config::payload`] (the protocol, `ap`, `seq` and `sha256`),
+/// by the key the AP's image pins. `seq` grows with every configuration the
+/// runner signs for the AP, so an old one cannot be replayed.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedConfig {
+    /// The AP it is for, by its host name.
+    pub ap: String,
+    pub seq: u64,
+    /// [`crate::config::config_sha256`] of `radios`.
+    pub sha256: [u8; 32],
+    /// Every radio of the AP, once each, in band order.
+    pub radios: Vec<RadioConfig>,
+    /// 64 bytes.
+    pub signature: Vec<u8>,
+}
+
+/// What came of a [`CtlMsg::ApplyConfig`].
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigApplied {
+    pub sha256: [u8; 32],
+    pub ok: bool,
+    /// What each radio went through, in the request's order; empty when the
+    /// request was refused before anything was installed.
+    pub radios: Vec<RadioApplied>,
+    /// Why it was refused or failed, or what each step answered.
+    pub detail: String,
+}
+
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RadioApplied {
+    pub radio: Band,
+    pub mechanism: Mechanism,
+}
+
+/// How a radio took a new configuration, least disruptive first.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Mechanism {
+    /// Nothing changed on the radio: its configuration is the same but for
+    /// comments.
+    Unchanged,
+    /// The changed BSS settings were set in the running hostapd, each one a
+    /// setting hostapd reads at every use: no client noticed.
+    InPlace,
+    /// Its channel or width changed by a channel switch announcement, which
+    /// the clients followed.
+    ChannelSwitch,
+    /// Only its transmit power changed, set through nl80211.
+    Power,
+    /// u6e-wifi restarted, after asking every client to move to another AP.
+    Restart,
+}
+
+/// Everything the deploy runner (`wifi-deploy`) sends the controller. The
+/// runner is the only party that originates configuration or images.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum RunnerMsg {
+    /// First message of a connection.
+    Hello(RunnerHello),
+    /// Answer to [`RunnerCtlMsg::Ping`], echoing its value.
+    Pong(u64),
+    /// Apply a rendered and signed configuration to the AP it names; the
+    /// controller relays it unchanged and answers with a
+    /// [`RunnerCtlMsg::ConfigApplied`] of the same id.
+    ApplyConfig { id: u64, config: SignedConfig },
+    /// One line of a rollout's log, as it runs.
+    RolloutLog { id: u64, line: String },
+    /// How a rollout ended: the last word on it.
+    RolloutResult(RolloutResult),
+}
+
+/// Everything the controller sends the deploy runner.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum RunnerCtlMsg {
+    Ping(u64),
+    /// The agent's answer to a [`RunnerMsg::ApplyConfig`], or the
+    /// controller's own when the AP could not be asked.
+    ConfigApplied {
+        id: u64,
+        result: ConfigApplied,
+    },
+    /// The AP reconnected with an installed configuration other than the
+    /// one it last acknowledged (`acked`): sign the runner's last
+    /// configuration for it again, under a new sequence number (the old one
+    /// is a replay to the AP), and send it.
+    Repush {
+        ap: String,
+        acked: Option<[u8; 32]>,
+        installed: Option<[u8; 32]>,
+    },
+    /// Roll an image out to an AP, as an admin asked; the runner may refuse.
+    Rollout(RolloutRequest),
+    /// A rollout's health gate: whether the AP came back as the gate
+    /// requires, in its time. Unhealthy, the runner rolls the AP back.
+    RolloutGate {
+        id: u64,
+        healthy: bool,
+        detail: String,
+    },
+}
+
+/// What the runner is, sent once per connection.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnerHello {
+    pub version: String,
+}
+
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolloutRequest {
+    /// Chosen by the controller; the runner's log and result carry it.
+    pub id: u64,
+    pub ap: String,
+    /// The kept build to stage, as the image names itself.
+    pub image_id: String,
+    /// The admin who asked, for the runner's audit.
+    pub user: String,
+}
+
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolloutResult {
+    pub id: u64,
+    pub outcome: RolloutOutcome,
+    pub detail: String,
+}
+
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RolloutOutcome {
+    /// Not started: another rollout runs, the image is unknown, ...
+    Refused,
+    /// The AP runs the image and passed the health gate.
+    Done,
+    /// The AP failed the health gate and runs its previous image again.
+    RolledBack,
+    /// Neither the image nor the way back could be staged.
+    Failed,
 }

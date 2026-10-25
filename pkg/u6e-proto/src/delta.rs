@@ -50,9 +50,11 @@ fn unique<'a>(mut names: impl Iterator<Item = &'a String>) -> bool {
 
 /// Whether a delta can express the change from `prev` to `next`: the same
 /// temperature zones and the same radios, which do not change while a
-/// connection lives.
+/// connection lives, and the same configuration, which changes so rarely
+/// that a key frame carries the new one.
 fn same_shape(prev: &Snapshot, next: &Snapshot) -> bool {
-    prev.temps.len() == next.temps.len()
+    prev.config_sha256 == next.config_sha256
+        && prev.temps.len() == next.temps.len()
         && prev
             .temps
             .iter()
@@ -439,6 +441,7 @@ mod tests {
             radios,
             bsss,
             stations: a,
+            config_sha256: Some([0xab; 32]),
         };
         let mut second = first.clone();
         second.seq += 1;
@@ -589,6 +592,11 @@ mod tests {
         let mut n = successor(&a);
         n.radios[0].phy = "phy9".into();
         assert_eq!(diff(&a, &n), None);
+        for hash in [None, Some([0xcd; 32])] {
+            let mut n = successor(&a);
+            n.config_sha256 = hash;
+            assert_eq!(diff(&a, &n), None);
+        }
     }
 
     #[test]

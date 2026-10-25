@@ -1,8 +1,10 @@
 //! The wire format pinned: an instance of every message and every variant,
 //! each field set (numbers too large for the next smaller type, each u8 above
 //! 127 so that a widening to a varint shows), encoded and compared with
-//! `golden/protocol-<PROTOCOL>.txt`. Bytes that differ while PROTOCOL did not
-//! fail the test, as does a variant with no instance.
+//! `golden/protocol-<PROTOCOL>.txt`, with the hash of a sample configuration
+//! and the bytes the deploy runner signs for it, which every end computes.
+//! Bytes that differ while PROTOCOL did not fail the test, as does a variant
+//! with no instance.
 //!
 //! After a change to the messages, bump [`PROTOCOL`] and write the new golden:
 //!
@@ -19,11 +21,13 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::PROTOCOL;
+use crate::config::{config_sha256, payload};
 use crate::mac::hex;
 use crate::msg::{
-    AgentMsg, Band, Bss, ClientFlows, Command, CommandKind, CommandResult, CtlMsg, Event,
-    EventKind, FieldDelta, Flow, Flows, Hello, Radio, RateMode, RecDelta, Snapshot, SnapshotDelta,
-    SpectrumFrame, Station, Temp,
+    AgentMsg, Band, Bss, ClientFlows, Command, CommandKind, CommandResult, ConfigApplied, CtlMsg,
+    Event, EventKind, FieldDelta, Flow, Flows, Hello, Mechanism, Radio, RadioApplied, RadioConfig,
+    RateMode, RecDelta, RolloutOutcome, RolloutRequest, RolloutResult, RunnerCtlMsg, RunnerHello,
+    RunnerMsg, SignedConfig, Snapshot, SnapshotDelta, SpectrumFrame, Station, Temp,
 };
 
 const HOW: &str = "bump u6e_proto::PROTOCOL (pkg/u6e-proto/src/version.rs) and write the \
@@ -106,8 +110,62 @@ fn radio(phy: &str, band: Band) -> Radio {
 /// Messages, each with its name in the golden.
 type Named<T> = Vec<(&'static str, T)>;
 
-/// One of every message, by name.
-fn samples() -> (Named<AgentMsg>, Named<CtlMsg>) {
+/// One of every message of each end, by name.
+struct Samples {
+    agent: Named<AgentMsg>,
+    ctl: Named<CtlMsg>,
+    runner: Named<RunnerMsg>,
+    runner_ctl: Named<RunnerCtlMsg>,
+}
+
+/// A configuration of every radio, each text past 127 bytes so that its
+/// length takes two bytes of varint, each power negative.
+fn radio_configs() -> Vec<RadioConfig> {
+    [Band::B24, Band::B5, Band::B6]
+        .into_iter()
+        .map(|radio| RadioConfig {
+            radio,
+            text: format!("interface=wlan0\n{}\n", "#".repeat(130)),
+            txpower_dbm: -100,
+        })
+        .collect()
+}
+
+/// A signed configuration, its signature a fixed stand-in (the golden pins
+/// the layout; `config` tests the signing).
+fn signed_config() -> SignedConfig {
+    SignedConfig {
+        ap: "ap1".into(),
+        seq: (1 << 42) + 2,
+        sha256: [0x82; 32],
+        radios: radio_configs(),
+        signature: (0..64).map(|i| 0x80 + i).collect(),
+    }
+}
+
+fn config_applied() -> ConfigApplied {
+    let mechanisms = [
+        Mechanism::Unchanged,
+        Mechanism::InPlace,
+        Mechanism::ChannelSwitch,
+        Mechanism::Power,
+        Mechanism::Restart,
+    ];
+    ConfigApplied {
+        sha256: [0x80; 32],
+        ok: true,
+        radios: mechanisms
+            .into_iter()
+            .map(|mechanism| RadioApplied {
+                radio: Band::B6,
+                mechanism,
+            })
+            .collect(),
+        detail: "wlan6: OK".into(),
+    }
+}
+
+fn samples() -> Samples {
     let snapshot = Snapshot {
         seq: 1 << 40,
         uptime_s: 70_005,
@@ -129,6 +187,7 @@ fn samples() -> (Named<AgentMsg>, Named<CtlMsg>) {
             .zip(1..)
             .map(|(m, last)| station(last, m))
             .collect(),
+        config_sha256: Some([0x81; 32]),
     };
     let rec = |idx| RecDelta {
         idx,
@@ -208,6 +267,7 @@ fn samples() -> (Named<AgentMsg>, Named<CtlMsg>) {
             reason: "started".into(),
         },
     ));
+    agent.push(("ConfigApplied", AgentMsg::ConfigApplied(config_applied())));
     let mut ctl = vec![
         ("SetTick", CtlMsg::SetTick { secs: 300 }),
         ("WantKey", CtlMsg::WantKey),
@@ -234,7 +294,83 @@ fn samples() -> (Named<AgentMsg>, Named<CtlMsg>) {
     let radio = || "radio5".to_owned();
     ctl.push(("SpectrumStart", CtlMsg::SpectrumStart { radio: radio() }));
     ctl.push(("SpectrumStop", CtlMsg::SpectrumStop { radio: radio() }));
-    (agent, ctl)
+    ctl.push(("ApplyConfig", CtlMsg::ApplyConfig(signed_config())));
+    let id = (1 << 42) + 1;
+    let rollout = |outcome| {
+        RunnerMsg::RolloutResult(RolloutResult {
+            id,
+            outcome,
+            detail: "staged".into(),
+        })
+    };
+    let runner = vec![
+        (
+            "RunnerHello",
+            RunnerMsg::Hello(RunnerHello {
+                version: "1.0.0".into(),
+            }),
+        ),
+        ("RunnerPong", RunnerMsg::Pong(1 << 50)),
+        (
+            "RunnerApplyConfig",
+            RunnerMsg::ApplyConfig {
+                id,
+                config: signed_config(),
+            },
+        ),
+        (
+            "RolloutLog",
+            RunnerMsg::RolloutLog {
+                id,
+                line: "staging".into(),
+            },
+        ),
+        ("RolloutRefused", rollout(RolloutOutcome::Refused)),
+        ("RolloutDone", rollout(RolloutOutcome::Done)),
+        ("RolloutRolledBack", rollout(RolloutOutcome::RolledBack)),
+        ("RolloutFailed", rollout(RolloutOutcome::Failed)),
+    ];
+    let runner_ctl = vec![
+        ("RunnerPing", RunnerCtlMsg::Ping(1 << 50)),
+        (
+            "RunnerConfigApplied",
+            RunnerCtlMsg::ConfigApplied {
+                id,
+                result: config_applied(),
+            },
+        ),
+        (
+            "Repush",
+            RunnerCtlMsg::Repush {
+                ap: "ap1".into(),
+                acked: Some([0x83; 32]),
+                installed: None,
+            },
+        ),
+        (
+            "Rollout",
+            RunnerCtlMsg::Rollout(RolloutRequest {
+                id,
+                ap: "ap1".into(),
+                image_id: "u6e-ap1-20261025".into(),
+                user: "admin".into(),
+            }),
+        ),
+        (
+            "RolloutGate",
+            RunnerCtlMsg::RolloutGate {
+                id,
+                healthy: true,
+                detail: "radios up".into(),
+            },
+        ),
+    ];
+    Samples {
+        agent,
+        ctl,
+        runner,
+        runner_ctl,
+    }
 }
 
 /// A client's flows, one of each address family.
@@ -271,14 +407,25 @@ fn flows() -> Flows {
     }
 }
 
-/// The golden text: one `<name> <hex>` line per message.
+/// The golden text: one `<name> <hex>` line per message, then the hash of
+/// the sample configuration and the bytes the runner signs for it, which
+/// every end must compute alike too.
 fn render() -> String {
-    let (agent, ctl) = samples();
-    let agent = agent.iter().map(|(n, m)| (n, postcard::to_stdvec(m)));
-    let ctl = ctl.iter().map(|(n, m)| (n, postcard::to_stdvec(m)));
-    agent
-        .chain(ctl)
-        .map(|(n, b)| format!("{n} {}\n", hex(&b.unwrap())))
+    fn lines<T: Serialize>(named: &Named<T>) -> impl Iterator<Item = String> + '_ {
+        named
+            .iter()
+            .map(|(n, m)| format!("{n} {}\n", hex(&postcard::to_stdvec(m).unwrap())))
+    }
+    let s = samples();
+    let sha256 = config_sha256(&radio_configs());
+    let hash = format!("ConfigSha256 {}\n", hex(&sha256));
+    let signed = payload(PROTOCOL, "ap1", (1 << 42) + 2, &sha256);
+    let signed = format!("SignedPayload {}\n", hex(&signed));
+    lines(&s.agent)
+        .chain(lines(&s.ctl))
+        .chain(lines(&s.runner))
+        .chain(lines(&s.runner_ctl))
+        .chain([hash, signed])
         .collect()
 }
 
@@ -288,11 +435,15 @@ fn path(protocol: u16) -> PathBuf {
 
 #[test]
 fn every_variant_has_an_instance() {
-    let (agent, ctl) = samples();
-    let agent: Vec<AgentMsg> = agent.into_iter().map(|(_, m)| m).collect();
-    let ctl: Vec<CtlMsg> = ctl.into_iter().map(|(_, m)| m).collect();
+    fn values<T>(named: Named<T>) -> Vec<T> {
+        named.into_iter().map(|(_, m)| m).collect()
+    }
+    let s = samples();
+    let (agent, ctl) = (values(s.agent), values(s.ctl));
+    let (runner, runner_ctl) = (values(s.runner), values(s.runner_ctl));
     let mut events = Vec::new();
     let (mut bands, mut modes, mut addrs) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut mechanisms, mut outcomes) = (Vec::new(), Vec::new());
     for m in &agent {
         match m {
             AgentMsg::Event(e) => events.push(e.kind.clone()),
@@ -304,7 +455,13 @@ fn every_variant_has_an_instance() {
                 let flows = f.clients.iter().flat_map(|c| &c.top);
                 addrs.extend(flows.flat_map(|f| [f.src, f.dst]));
             }
+            AgentMsg::ConfigApplied(c) => mechanisms.extend(c.radios.iter().map(|r| r.mechanism)),
             _ => {}
+        }
+    }
+    for m in &runner {
+        if let RunnerMsg::RolloutResult(r) = m {
+            outcomes.push(r.outcome);
         }
     }
     let commands: Vec<CommandKind> = ctl
@@ -321,6 +478,10 @@ fn every_variant_has_an_instance() {
     assert_every_variant("RateMode", &modes);
     assert_every_variant("IpAddr", &addrs);
     assert_every_variant("CommandKind", &commands);
+    assert_every_variant("RunnerMsg", &runner);
+    assert_every_variant("RunnerCtlMsg", &runner_ctl);
+    assert_every_variant("Mechanism", &mechanisms);
+    assert_every_variant("RolloutOutcome", &outcomes);
 }
 
 #[test]

@@ -636,6 +636,7 @@ mod tests {
             radios: Vec::new(),
             bsss,
             stations: vec![station(STA, 2)],
+            config_sha256: None,
         }
     }
 

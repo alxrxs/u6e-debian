@@ -315,6 +315,7 @@ impl Collector {
             radios,
             bsss,
             stations,
+            config_sha256: None,
         }
     }
 

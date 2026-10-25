@@ -13,4 +13,5 @@ rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs
 
 [features]
 default = ["tls"]
-tls = ["dep:rustls", "dep:aws-lc-rs"]
+digest = ["dep:aws-lc-rs"]
+tls = ["dep:rustls", "digest"]

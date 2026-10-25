@@ -844,6 +844,7 @@ mod tests {
                 vlan: 0,
             }],
             stations,
+            config_sha256: None,
         }
     }
 

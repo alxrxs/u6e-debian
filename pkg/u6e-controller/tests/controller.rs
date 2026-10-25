@@ -367,6 +367,7 @@ fn snapshot(seq: u64, bsss: Vec<Bss>, stations: Vec<Station>) -> Snapshot {
         }],
         bsss,
         stations,
+        config_sha256: None,
     }
 }
 
