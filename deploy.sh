@@ -118,6 +118,11 @@ fi
 # (ap-image.sh's image_tree), the blobs, the site and the two source trees.
 tree=$(image_tree) || fail "image_tree: cannot read this checkout's image inputs"
 image=$tree/$(head_of "$BLOBS")/$(sha256sum < site.conf | cut -c1-16)/$(head_of linux-7.2.8)/$(head_of backports-7.2)
+# The deploy runner's stagings lock images/ too (u6e-deploy --stage-helper),
+# so a rollout and this loop never have two APs down at once.
+mkdir -p images
+exec {lock}<images
+flock -n "$lock" || { echo "waiting for the staging under way (images/ is locked)"; flock "$lock"; }
 for ap in "$@"; do
 	export U6E_AP=$ap
 	ap_image "$ap" "$image" || continue
