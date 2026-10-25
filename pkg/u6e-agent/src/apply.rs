@@ -462,7 +462,7 @@ impl Apply {
                 .filter(|t| t.ssid == own.ssid && !ours.contains(&t.nr.bssid))
                 .max_by_key(|t| band_group(t.nr.op_class) == band);
             if let Some(t) = to {
-                let req = steer_request(sta.mac, &t.nr);
+                let req = steer_request(sta.mac, &t.nr, true);
                 asked += usize::from(ask(&mut self.hostapd, &bss.ifname, &req).is_ok());
             }
         }

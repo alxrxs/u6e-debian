@@ -6,8 +6,9 @@
 //! hostapd has it at that moment (a snapshot can be a tick old, and a client
 //! that changed bands since is no longer where it says), and a steer target
 //! must be a BSS of the latest 802.11k round, of the station's SSID. A steer
-//! asks politely (the client may decline and stays where it is) and reports
-//! the client's answer.
+//! asks politely (the client may decline and stays where it is) unless it is
+//! forced (a client that declines is disassociated about 10 s later), and
+//! reports the client's answer.
 //! Blocks live in RAM: on each connection the controller sends the whole set
 //! (`SyncBlocks`), which every BSS's deny ACL is made to hold exactly, and
 //! they go back onto a BSS whose hostapd started again without them.
@@ -26,9 +27,10 @@ use crate::clientsock::ClientSocket;
 use crate::neighbors::{ANSWER_WAIT, Element, Hostapd, Target};
 use crate::{collect, events};
 
-/// TBTTs for which a steer's candidate list stays valid: ~10 s at the
-/// default beacon interval, time for a few scans and a reassociation.
-/// hostapd's default validity, 1 TBTT, expires before a client's scan ends.
+/// TBTTs for which a steer's candidate list stays valid, and a forced
+/// steer's client has before hostapd disassociates it: ~10 s at the default
+/// beacon interval, time for a few scans and a reassociation. hostapd's
+/// default validity, 1 TBTT, expires before a client's scan ends.
 const STEER_TBTT: u16 = 100;
 /// How long a steer waits for the client's BSS Transition Management
 /// Response; the controller waits 5 s for the whole command.
@@ -122,7 +124,11 @@ impl Commands {
                 self.on_every_bss(&format!("DENY_ACL DEL_MAC {}", mac::format(mac)))
             }
             CommandKind::SyncBlocks { ref macs } => self.sync(macs, last),
-            CommandKind::Steer { mac, target_bssid } => {
+            CommandKind::Steer {
+                mac,
+                target_bssid,
+                force,
+            } => {
                 let mac = station(mac)?;
                 let targets = crate::lock(&self.targets).clone();
                 let find = |bssid| targets.iter().find(|t| t.nr.bssid == bssid);
@@ -137,17 +143,18 @@ impl Commands {
                 if find(bss.bssid).map(|t| &t.ssid) != Some(&target.ssid) {
                     return Err("the target serves another SSID".into());
                 }
-                self.steer(&bss.ifname, mac, &target.nr)
+                self.steer(&bss.ifname, mac, &target.nr, force)
             }
         }
     }
 
     /// Asks `mac` on `iface` to move to `to`, and waits up to [`BTM_WAIT`]
-    /// for its answer: a decline fails the steer with the client's reason.
-    fn steer(&mut self, iface: &str, mac: [u8; 6], to: &Element) -> Outcome {
+    /// for its answer: a decline fails the steer with the client's reason,
+    /// unless it was forced, when the client goes all the same.
+    fn steer(&mut self, iface: &str, mac: [u8; 6], to: &Element, force: bool) -> Outcome {
         // Attached before the request, so its answer cannot come first.
         let events = self.attach(iface);
-        let sent = self.ask(iface, &steer_request(mac, to))?;
+        let sent = self.ask(iface, &steer_request(mac, to, force))?;
         let Some(events) = events else {
             return Ok(format!("{sent}, the client's answer not watched"));
         };
@@ -155,6 +162,10 @@ impl Commands {
         let _ = events.send(b"DETACH");
         match answer {
             Some(0) => Ok(format!("{iface}: accepted")),
+            Some(code) if force => Ok(format!(
+                "{iface}: {}; disassociated in ~10 s",
+                declined(code)
+            )),
             Some(code) => Err(format!("{iface}: {}", declined(code))),
             None => Ok(format!(
                 "{sent}, no answer from the client in {} s",
@@ -360,11 +371,17 @@ fn associated_for(reply: &str, mac: [u8; 6]) -> Option<u64> {
 
 /// A request naming `to` as the one candidate, most preferred (its BSS
 /// Transition Candidate Preference subelement, 255), every other BSS excluded
-/// (abridged). No disassociation is imminent: a client that declines stays.
-pub fn steer_request(mac: [u8; 6], to: &Element) -> String {
+/// (abridged). No disassociation is imminent, so a client that declines
+/// stays, unless `force`: then hostapd disassociates it after [`STEER_TBTT`].
+pub fn steer_request(mac: [u8; 6], to: &Element, force: bool) -> String {
+    let force = if force {
+        format!(" disassoc_imminent=1 disassoc_timer={STEER_TBTT}")
+    } else {
+        String::new()
+    };
     format!(
         "BSS_TM_REQ {} neighbor={},0x{:08x},{},{},{},0301ff pref=1 abridged=1 \
-         valid_int={STEER_TBTT}",
+         valid_int={STEER_TBTT}{force}",
         mac::format(mac),
         mac::format(to.bssid),
         to.bssid_info,
@@ -676,6 +693,7 @@ mod tests {
             CommandKind::Steer {
                 mac,
                 target_bssid: TARGET,
+                force: false,
             },
             CommandKind::SyncBlocks {
                 macs: vec![STA, mac],
@@ -744,6 +762,7 @@ mod tests {
         let steer = |target_bssid| CommandKind::Steer {
             mac: STA,
             target_bssid,
+            force: false,
         };
         for (to, why) in [
             ([0x02, 0, 0, 0, 0, 0x99], "unknown target"),
@@ -771,6 +790,7 @@ mod tests {
                 CommandKind::Steer {
                     mac,
                     target_bssid: TARGET,
+                    force: false,
                 },
             ]
         };
@@ -913,6 +933,7 @@ mod tests {
         let res = r.run(CommandKind::Steer {
             mac: STA,
             target_bssid: TARGET,
+            force: false,
         });
         assert_eq!((res.ok, res.detail.as_str()), (true, "wlan5-1: accepted"));
         let req = "wlan5-1 BSS_TM_REQ 02:00:00:00:00:01 \
@@ -944,10 +965,39 @@ mod tests {
         let res = r.run(CommandKind::Steer {
             mac: STA,
             target_bssid: TARGET,
+            force: false,
         });
         assert_eq!(
             (res.ok, res.detail.as_str()),
             (false, "wlan5-1: declined: no suitable candidates")
+        );
+    }
+
+    /// A forced steer says the disassociation is imminent; a client that
+    /// declines it goes all the same, so the steer worked.
+    #[test]
+    fn a_forced_steer_disassociates_a_client_that_declines() {
+        fn declines(req: &str) -> Vec<String> {
+            btm_response(req, "status_code=7 bss_termination_delay=0")
+        }
+        let mut r = Rig::with_events(ok, declines);
+        let res = r.run(CommandKind::Steer {
+            mac: STA,
+            target_bssid: TARGET,
+            force: true,
+        });
+        assert_eq!(
+            (res.ok, res.detail.as_str()),
+            (
+                true,
+                "wlan5-1: declined: no suitable candidates; disassociated in ~10 s"
+            )
+        );
+        assert_eq!(
+            r.requests(),
+            ["wlan5-1 BSS_TM_REQ 02:00:00:00:00:01 \
+              neighbor=02:00:00:00:00:0a,0x00005cff,128,149,14,0301ff \
+              pref=1 abridged=1 valid_int=100 disassoc_imminent=1 disassoc_timer=100"]
         );
     }
 
@@ -959,6 +1009,7 @@ mod tests {
         let res = r.run(CommandKind::Steer {
             mac: STA,
             target_bssid: TARGET,
+            force: false,
         });
         assert_eq!(
             (res.ok, res.detail.as_str()),
@@ -974,6 +1025,7 @@ mod tests {
         let res = r.run(CommandKind::Steer {
             mac: STA,
             target_bssid: TARGET,
+            force: false,
         });
         assert_eq!(
             (res.ok, res.detail.as_str()),
@@ -1012,6 +1064,7 @@ mod tests {
         let res = r.run(CommandKind::Steer {
             mac: STA,
             target_bssid: [0x02, 0, 0, 0, 0, 0x12],
+            force: false,
         });
         assert_eq!((res.ok, res.detail.as_str()), (true, "wlan24: accepted"));
         let reqs = r.requests();
@@ -1025,6 +1078,7 @@ mod tests {
         let res = r.run(CommandKind::Steer {
             mac: STA,
             target_bssid: [0x02, 0, 0, 0, 0, 0x12],
+            force: false,
         });
         assert_eq!(
             (res.ok, res.detail.as_str()),

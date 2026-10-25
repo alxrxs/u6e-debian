@@ -280,7 +280,14 @@ fn samples() -> Samples {
         ("Kick", CommandKind::Kick { mac }),
         ("Block", CommandKind::Block { mac }),
         ("Unblock", CommandKind::Unblock { mac }),
-        ("Steer", CommandKind::Steer { mac, target_bssid }),
+        (
+            "Steer",
+            CommandKind::Steer {
+                mac,
+                target_bssid,
+                force: true,
+            },
+        ),
         (
             "SyncBlocks",
             CommandKind::SyncBlocks {

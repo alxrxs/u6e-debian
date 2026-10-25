@@ -93,9 +93,19 @@ function ask(root, { title, text, choices, confirm, danger, pick }) {
 }
 
 /** The steer picker: one choice per BSS, with its band, channel and AP;
- * picking one names it on the confirm button `ok`, disabled until then. */
+ * picking one names it on the confirm button `ok`, disabled until then.
+ * Below them, whether to force the move. */
 function steerChoices(list, c, ok) {
   ok.disabled = true;
+  const force = h('label', { class: 'choice' },
+    h('input', { type: 'checkbox', name: 'steer-force' }),
+    h('span', { class: 'choice-main' },
+      h('b', {}, 'Force (disconnects the client if it declines)'),
+      h('small', {}, 'A client that declines is disconnected about 10 s later and has to reconnect, briefly losing its connection.')));
+  return h('div', {}, steerTargets(list, c, ok), force);
+}
+
+function steerTargets(list, c, ok) {
   return h('fieldset', { class: 'choices' },
     h('legend', {}, `BSSs of ${c.ssid}`),
     list.map((t, i) => {
@@ -147,7 +157,11 @@ function outcome(action, res, who, target) {
   if (!res.ok) return ['bad', `${no}: ${why(res.detail || 'no reason given')}`];
   switch (action) {
     case 'kick': return ['ok', `Kicked ${who} off ${ap}. It may rejoin at once; block it to keep it off.`];
-    case 'steer': return ['ok', `Asked ${who} to move to ${target}. The client makes the move; this page shows it when it does.`];
+    case 'steer': {
+      const forced = /declined: (.*); disassociated/.exec(res.detail || '');
+      if (forced) return ['ok', `${who} declined to move to ${target} (${forced[1]}), so ${ap} disconnects it in about 10 s; it reconnects where it can.`];
+      return ['ok', `Asked ${who} to move to ${target}. The client makes the move; this page shows it when it does.`];
+    }
     default: return ['ok', `${DID[action][0].toUpperCase()}${DID[action].slice(1)} ${who}.`];
   }
 }
@@ -211,16 +225,19 @@ export default {
       let target = '';
       if (action === 'steer') {
         const list = targets(store, c);
-        const bssid = await ask(root, {
+        const picked = await ask(root, {
           title: `Steer ${who}`,
-          text: `Asks it to move off ${c.ap}’s ${bandName(c.band)} BSS to the one picked here (802.11v). The client decides; one that does not support it stays.`,
+          text: `Asks it to move off ${c.ap}’s ${bandName(c.band)} BSS to the one picked here (802.11v). The client decides; one that does not support it stays, unless the move is forced.`,
           choices: (ok) => steerChoices(list, c, ok), confirm: 'Steer',
-          pick: (dlg) => dlg.querySelector('input:checked')?.value ?? null,
+          pick: (dlg) => {
+            const bssid = dlg.querySelector('input[name=steer-target]:checked')?.value;
+            return bssid ? { bssid, force: dlg.querySelector('input[name=steer-force]').checked } : null;
+          },
         });
-        if (!bssid) return;
-        const t = list.find((x) => x.bssid === bssid);
+        if (!picked) return;
+        const t = list.find((x) => x.bssid === picked.bssid);
         target = `${t.ap}, ${bandName(t.band)} channel ${t.channel}`;
-        body = { target_bssid: bssid };
+        body = { target_bssid: picked.bssid, force: picked.force };
       } else {
         const text = {
           kick: c ? `It is disconnected from ${c.ssid} on ${c.ap}. Most devices rejoin at once; to keep it off, block it.` : '',

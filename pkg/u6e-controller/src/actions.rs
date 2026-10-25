@@ -1,5 +1,6 @@
 //! The operator's actions on a client, `POST /api/clients/{mac}/kick`,
-//! `/block`, `/unblock` and `/steer` (`{"target_bssid": "<mac>"}`).
+//! `/block`, `/unblock` and `/steer` (`{"target_bssid": "<mac>"}`, and
+//! `"force": true` to have the client disassociated if it declines).
 //!
 //! A request acts only when it comes from the UI's own page and from an
 //! admin, checked in that order ([`refusal`], which also gates the start of a
@@ -168,6 +169,9 @@ pub async fn unblock(web: Ext<Web>, Path(mac): Path<String>, req: HeaderMap) -> 
 #[serde(deny_unknown_fields)]
 struct SteerBody {
     target_bssid: String,
+    /// Disassociate the client if it declines; polite when left out.
+    #[serde(default)]
+    force: bool,
 }
 
 pub async fn steer(
@@ -177,9 +181,14 @@ pub async fn steer(
     body: Bytes,
 ) -> Response {
     act(&web, &req, "steer", &mac, |mac| {
-        let b: SteerBody = serde_json::from_slice(&body).map_err(|_| "not {\"target_bssid\"}")?;
+        let b: SteerBody =
+            serde_json::from_slice(&body).map_err(|_| "not {\"target_bssid\", \"force\"}")?;
         let target_bssid = mac::parse(&b.target_bssid).ok_or("target_bssid is not a MAC")?;
-        Ok(CommandKind::Steer { mac, target_bssid })
+        Ok(CommandKind::Steer {
+            mac,
+            target_bssid,
+            force: b.force,
+        })
     })
     .await
 }

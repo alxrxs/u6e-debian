@@ -1627,6 +1627,7 @@ fn steer_routed_to_the_clients_ap() {
     let id = two.expect_command(CommandKind::Steer {
         mac: MAC,
         target_bssid: target,
+        force: false,
     });
     two.reply(id, false, "unknown target");
     let (status, body) = t.join().unwrap();
@@ -1649,11 +1650,31 @@ fn steer_routed_to_the_clients_ap() {
     one.reply(id, true, "wlan5: OK");
     assert_eq!(t.join().unwrap().0, 200);
 
+    // Forced: a client that declines is disassociated, which is a success.
+    let body = "{\"target_bssid\": \"02:00:00:00:10:09\", \"force\": true}";
+    let t = {
+        let admin = admin.clone();
+        thread::spawn(move || post(r.c.http, &format!("{CLIENT}/steer"), &admin, body))
+    };
+    let id = two.expect_command(CommandKind::Steer {
+        mac: MAC,
+        target_bssid: target,
+        force: true,
+    });
+    let declined = "wlan5: declined: no suitable candidates; disassociated in ~10 s";
+    two.reply(id, true, declined);
+    let (status, body) = t.join().unwrap();
+    assert_eq!(
+        (status, body),
+        (200, json!({"ap": "ap2", "ok": true, "detail": declined}))
+    );
+
     for bad in [
         "",
         "{}",
         "{\"target_bssid\": \"nope\"}",
         "{\"target_bssid\": \"02:00:00:00:10:09\", \"x\": 1}",
+        "{\"target_bssid\": \"02:00:00:00:10:09\", \"force\": 1}",
     ] {
         let (status, _) = post(r.c.http, &format!("{CLIENT}/steer"), &admin, bad);
         assert_eq!(status, 400, "{bad}");

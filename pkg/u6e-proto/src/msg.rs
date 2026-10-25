@@ -348,10 +348,13 @@ pub enum CommandKind {
         mac: [u8; 6],
     },
     /// Ask the client to move to the BSS `target_bssid` (802.11v BSS
-    /// transition management).
+    /// transition management). A client may decline and stay; with `force`,
+    /// the request says its disassociation is imminent, and one that
+    /// declines is disassociated about 10 s later.
     Steer {
         mac: [u8; 6],
         target_bssid: [u8; 6],
+        force: bool,
     },
     /// Make the AP's blocks exactly `macs`, on every BSS: what the controller
     /// sends after the first key frame of each connection, so that a client
