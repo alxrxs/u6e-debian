@@ -277,7 +277,8 @@ fi
 # The agent runs as its own user with no capabilities: hostapd gives that
 # user's group its control sockets (ctrl_interface_group, boot/wifi-up.sh),
 # u6e-nss its ECM state device, systemd opens the root-only NSS load file
-# for it, and it asks for
+# for it, u6e-spectral (below) runs the radios' spectral scans for it on a
+# socket of that group's, and it asks for
 # u6e-arm/u6e-fallback by a file (below) rather than starting them. Every
 # sandbox setting is at its most restrictive but where a comment says what
 # the agent's work needs instead.
@@ -333,8 +334,9 @@ RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
-# hostapd's control sockets and its own (UNIX), nl80211 (NETLINK), the peer
-# exchange, the controller link and the gateway check (INET, INET6).
+# hostapd's control sockets, its own and u6e-spectral's (UNIX), nl80211
+# (NETLINK), the peer exchange, the controller link and the gateway check
+# (INET, INET6).
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 SystemCallArchitectures=native
 SystemCallErrorNumber=EPERM
@@ -345,6 +347,88 @@ SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @privile
 WantedBy=multi-user.target
 UNIT
 ln -sf /etc/systemd/system/u6e-agent.service $W/u6e-agent.service
+
+# u6e-spectral (pkg/u6e-spectral): a radio's spectral scan for the agent, which
+# cannot run one (the scan's debugfs and relay files are root's own, 0600).
+# Socket-activated: the agent connects to /run/u6e-spectral/sock (its group's
+# alone) to start a scan, the helper ends 10 s after its last client, and
+# every scan stops with the client that asked for it. It runs as root for
+# those files' owner, with no capabilities, no network and a debugfs that
+# holds each radio's four spectral files and nothing else; every other sandbox
+# setting is at its most restrictive. Its last step disables every radio's
+# scan, however it ended.
+install -m0755 target/aarch64-unknown-linux-musl/release/u6e-spectral $RF/usr/local/sbin/
+install -d $RF/usr/lib/tmpfiles.d
+printf 'd /run/u6e-spectral 0750 root u6e-agent -\n' > $RF/usr/lib/tmpfiles.d/u6e-spectral.conf
+spectral_files=
+for r in radio24 radio5 radio6; do
+	d=/sys/kernel/debug/ieee80211/$r/ath11k
+	spectral_files+="BindReadOnlyPaths=-$d/spectral_scan0
+BindPaths=-$d/spectral_scan_ctl -$d/spectral_bins -$d/spectral_count
+"
+done
+cat > $RF/etc/systemd/system/u6e-spectral.socket <<'UNIT'
+[Unit]
+Description=U6E spectrum helper socket, for u6e-agent
+
+[Socket]
+ListenStream=/run/u6e-spectral/sock
+SocketUser=root
+SocketGroup=u6e-agent
+SocketMode=0660
+
+[Install]
+WantedBy=sockets.target
+UNIT
+install -d $RF/etc/systemd/system/sockets.target.wants
+ln -sf /etc/systemd/system/u6e-spectral.socket $RF/etc/systemd/system/sockets.target.wants/u6e-spectral.socket
+cat > $RF/etc/systemd/system/u6e-spectral.service <<UNIT
+[Unit]
+Description=U6E spectrum helper: radio spectral scans for u6e-agent
+After=u6e-wifi.service
+
+[Service]
+ExecStart=/usr/local/sbin/u6e-spectral serve
+ExecStopPost=/usr/local/sbin/u6e-spectral disable-all
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+UMask=0077
+KeyringMode=private
+RemoveIPC=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectProc=invisible
+ProcSubset=pid
+PrivateDevices=yes
+DevicePolicy=closed
+PrivateNetwork=yes
+IPAddressDeny=any
+PrivateIPC=yes
+# Identity-mapped rather than root alone, so the agent's group, which the
+# helper checks on each client, reads as itself and not as nobody.
+PrivateUsers=identity
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=strict
+PrivateMounts=yes
+TemporaryFileSystem=/sys/kernel/debug:ro
+$spectral_files
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+SystemCallFilter=@system-service
+SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @privileged @raw-io @reboot @resources @swap memfd_create
+UNIT
 
 # The boot that brought this image up was one-shot: U-Boot disarmed it before
 # starting us. u6e-arm re-arms it from the steps go8.sh staged, or with "disarm"

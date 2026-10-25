@@ -86,6 +86,10 @@ sed -i '/^name = "libc"$/{n;s/^version = .*/version = "0.2.999"/}' Cargo.lock
 key "a dependency of the agent" new Cargo.lock
 echo >> pkg/u6e-agent/src/main.rs
 key "an agent source change" new pkg/u6e-agent/src/main.rs
+echo >> pkg/u6e-spectral/tests/fixtures/radio5-80mhz.relay
+key "a spectrum helper test fixture" same pkg/u6e-spectral/tests/fixtures/radio5-80mhz.relay
+echo >> pkg/u6e-spectral/src/main.rs
+key "a spectrum helper source change" new pkg/u6e-spectral/src/main.rs
 echo >> prep-rootfs.sh
 key "a prep-rootfs.sh change" new prep-rootfs.sh
 exit $bad

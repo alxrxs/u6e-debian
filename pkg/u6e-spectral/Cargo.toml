@@ -1,0 +1,10 @@
+[package]
+name = "u6e-spectral"
+version = "1.0.0"
+edition = "2024"
+license = "GPL-2.0-only"
+publish = false
+
+[dependencies]
+libc = "0.2"
+u6e-proto = { path = "../u6e-proto", default-features = false }
