@@ -320,6 +320,12 @@ pub enum CommandKind {
         mac: [u8; 6],
         target_bssid: [u8; 6],
     },
+    /// Make the AP's blocks exactly `macs`, on every BSS: what the controller
+    /// sends after the first key frame of each connection, so that a client
+    /// unblocked while the AP could not be told is let on there too.
+    SyncBlocks {
+        macs: Vec<[u8; 6]>,
+    },
 }
 
 /// What came of a [`Command`].

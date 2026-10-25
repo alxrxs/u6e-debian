@@ -200,6 +200,12 @@ fn samples() -> (Named<AgentMsg>, Named<CtlMsg>) {
         ("Block", CommandKind::Block { mac }),
         ("Unblock", CommandKind::Unblock { mac }),
         ("Steer", CommandKind::Steer { mac, target_bssid }),
+        (
+            "SyncBlocks",
+            CommandKind::SyncBlocks {
+                macs: vec![mac, target_bssid],
+            },
+        ),
     ];
     for (name, kind) in commands {
         ctl.push((name, CtlMsg::Command(Command { id: 1 << 42, kind })));

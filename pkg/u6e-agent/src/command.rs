@@ -4,8 +4,9 @@
 //! checked before hostapd is asked anything: the address must be a station's,
 //! the station must be on this AP in the link's latest snapshot, and a steer
 //! target must be a BSS of the latest 802.11k round, of the station's SSID.
-//! Blocks live in RAM (the controller sends them again on each connection),
-//! and go back onto a BSS whose hostapd started again without them.
+//! Blocks live in RAM: on each connection the controller sends the whole set
+//! (`SyncBlocks`), which every BSS's deny ACL is made to hold exactly, and
+//! they go back onto a BSS whose hostapd started again without them.
 
 use std::collections::BTreeSet;
 use std::io::{self, ErrorKind};
@@ -28,6 +29,8 @@ const STEER_TBTT: u16 = 100;
 const KICK_REASON: u16 = 3;
 const DETAIL_MAX: usize = 200;
 const NOT_HERE: &str = "not associated here";
+/// The most blocks a sync may set: each one is a request to every BSS.
+pub const SYNC_MAX: usize = 1024;
 
 /// The blocked addresses, held while each is in every BSS's deny ACL.
 pub type Blocks = Mutex<BTreeSet<[u8; 6]>>;
@@ -75,19 +78,14 @@ impl Commands {
     }
 
     fn carry_out(&mut self, kind: &CommandKind, last: Option<&Snapshot>) -> Outcome {
-        let (CommandKind::Kick { mac }
-        | CommandKind::Block { mac }
-        | CommandKind::Unblock { mac }
-        | CommandKind::Steer { mac, .. }) = *kind;
-        if !station_address(mac) {
-            return Err("not a station address".into());
-        }
         match *kind {
-            CommandKind::Kick { .. } => {
+            CommandKind::Kick { mac } => {
+                let mac = station(mac)?;
                 let bss = bss_of(last, mac).ok_or(NOT_HERE)?;
                 self.kick(&bss.ifname, mac)
             }
-            CommandKind::Block { .. } => {
+            CommandKind::Block { mac } => {
+                let mac = station(mac)?;
                 // Held through the change, so a reassertion never interleaves.
                 let blocks = Arc::clone(&self.blocks);
                 let mut held = crate::lock(&blocks);
@@ -100,13 +98,16 @@ impl Commands {
                 let label = |d| format!("kick: {d}");
                 both(acl, kick.map(label).map_err(label))
             }
-            CommandKind::Unblock { .. } => {
+            CommandKind::Unblock { mac } => {
+                let mac = station(mac)?;
                 let blocks = Arc::clone(&self.blocks);
                 let mut held = crate::lock(&blocks);
                 held.remove(&mac);
                 self.on_every_bss(&format!("DENY_ACL DEL_MAC {}", mac::format(mac)))
             }
-            CommandKind::Steer { target_bssid, .. } => {
+            CommandKind::SyncBlocks { ref macs } => self.sync(macs, last),
+            CommandKind::Steer { mac, target_bssid } => {
+                let mac = station(mac)?;
                 let targets = crate::lock(&self.targets).clone();
                 let find = |bssid| targets.iter().find(|t| t.nr.bssid == bssid);
                 let target = find(target_bssid).ok_or("unknown target")?;
@@ -119,6 +120,56 @@ impl Commands {
                 }
                 self.ask(&bss.ifname, &steer_request(mac, &target.nr))
             }
+        }
+    }
+
+    /// Makes the blocks exactly `macs`. Each BSS's deny ACL gets those it
+    /// lacks and loses those it holds beyond them: hostapd's own list, so a
+    /// block an earlier agent left there goes too. A client of `macs` still on
+    /// the AP is kicked.
+    fn sync(&mut self, macs: &[[u8; 6]], last: Option<&Snapshot>) -> Outcome {
+        if macs.len() > SYNC_MAX {
+            return Err(format!("more than {SYNC_MAX} blocks"));
+        }
+        for &m in macs {
+            station(m)?;
+        }
+        let want: BTreeSet<[u8; 6]> = macs.iter().copied().collect();
+        let blocks = Arc::clone(&self.blocks);
+        let mut held = crate::lock(&blocks);
+        held.clone_from(&want);
+        let acl = collect::bss_order(&self.dir)
+            .iter()
+            .map(|iface| self.sync_bss(iface, &want))
+            .reduce(both)
+            .unwrap_or_else(|| Err("no BSS".into()));
+        let label = |d| format!("kick: {d}");
+        want.iter()
+            .filter_map(|&m| Some((bss_of(last, m)?, m)))
+            .map(|(bss, m)| self.kick(&bss.ifname, m).map(label).map_err(label))
+            .fold(acl, both)
+    }
+
+    /// One BSS's deny ACL made to hold exactly `want`.
+    fn sync_bss(&mut self, iface: &str, want: &BTreeSet<[u8; 6]>) -> Outcome {
+        let listed = deny_list(&self.request(iface, "DENY_ACL SHOW")?);
+        let mut fails = Vec::new();
+        let (mut added, mut removed) = (0, 0);
+        for m in want.difference(&listed) {
+            match self.ask(iface, &format!("DENY_ACL ADD_MAC {}", mac::format(*m))) {
+                Ok(_) => added += 1,
+                Err(e) => fails.push(e),
+            }
+        }
+        for m in listed.difference(want) {
+            match self.ask(iface, &format!("DENY_ACL DEL_MAC {}", mac::format(*m))) {
+                Ok(_) => removed += 1,
+                Err(e) => fails.push(e),
+            }
+        }
+        match fails.into_iter().next() {
+            None => Ok(format!("{iface}: {added} added, {removed} removed")),
+            Some(first) => Err(first),
         }
     }
 
@@ -138,13 +189,29 @@ impl Commands {
 
     /// hostapd's reply to `cmd` on `iface`, a success when it is "OK".
     fn ask(&mut self, iface: &str, cmd: &str) -> Outcome {
-        match self.hostapd.try_request(iface, cmd) {
-            Ok(r) if r.trim_end() == "OK" => Ok(format!("{iface}: OK")),
-            Ok(r) => Err(format!("{iface}: {}", r.trim_end())),
-            Err(e) if e.kind() == ErrorKind::TimedOut => Err(format!("{iface}: no answer")),
-            Err(e) => Err(format!("{iface}: {e}")),
+        match self.request(iface, cmd)? {
+            r if r.trim_end() == "OK" => Ok(format!("{iface}: OK")),
+            r => Err(format!("{iface}: {}", r.trim_end())),
         }
     }
+
+    /// hostapd's reply to `cmd` on `iface`, whatever it says.
+    fn request(&mut self, iface: &str, cmd: &str) -> Outcome {
+        self.hostapd
+            .try_request(iface, cmd)
+            .map_err(|e| match e.kind() {
+                ErrorKind::TimedOut => format!("{iface}: no answer"),
+                _ => format!("{iface}: {e}"),
+            })
+    }
+}
+
+/// The addresses of a `DENY_ACL SHOW` reply: "<address> VLAN_ID=<n>" each.
+fn deny_list(reply: &str) -> BTreeSet<[u8; 6]> {
+    reply
+        .lines()
+        .filter_map(|l| mac::parse(l.split(' ').next()?))
+        .collect()
 }
 
 /// Puts each held block back on a BSS whose deny ACL lacks it, as after a
@@ -158,12 +225,7 @@ pub fn reassert(h: &mut Hostapd, blocks: &Blocks, dir: &Path) {
         let Ok(list) = h.try_request(&iface, "DENY_ACL SHOW") else {
             continue;
         };
-        // "<address> VLAN_ID=<n>" per entry.
-        let listed: BTreeSet<[u8; 6]> = list
-            .lines()
-            .filter_map(|l| mac::parse(l.split(' ').next()?))
-            .collect();
-        for m in held.difference(&listed) {
+        for m in held.difference(&deny_list(&list)) {
             h.request(&iface, &format!("DENY_ACL ADD_MAC {}", mac::format(*m)));
         }
     }
@@ -173,6 +235,15 @@ pub fn reassert(h: &mut Hostapd, blocks: &Blocks, dir: &Path) {
 /// `DEAUTHENTICATE ff:ff:ff:ff:ff:ff`, and no station has a group address.
 fn station_address(m: [u8; 6]) -> bool {
     m[0] & 1 == 0 && m != [0; 6]
+}
+
+/// `m`, refused unless it is a station's address.
+fn station(m: [u8; 6]) -> Result<[u8; 6], String> {
+    if station_address(m) {
+        Ok(m)
+    } else {
+        Err("not a station address".into())
+    }
 }
 
 /// The BSS `mac` is a station of in `last`.
@@ -359,7 +430,7 @@ mod tests {
         }
     }
 
-    fn kinds(mac: [u8; 6]) -> [CommandKind; 4] {
+    fn kinds(mac: [u8; 6]) -> [CommandKind; 5] {
         [
             CommandKind::Kick { mac },
             CommandKind::Block { mac },
@@ -367,6 +438,9 @@ mod tests {
             CommandKind::Steer {
                 mac,
                 target_bssid: TARGET,
+            },
+            CommandKind::SyncBlocks {
+                macs: vec![STA, mac],
             },
         ]
     }
@@ -600,6 +674,97 @@ mod tests {
         assert!(!res.ok);
         assert_eq!(res.detail.chars().count(), DETAIL_MAX);
         assert!(res.detail.starts_with("wlan5-1: xxx"));
+    }
+
+    /// A stale block (a client unblocked while the AP could not be told) is
+    /// on wlan5 and wlan6, `STA` is new: the sync adds `STA` where it is
+    /// missing, removes the stale one, and kicks `STA`.
+    #[test]
+    fn sync_makes_the_blocks_exactly_the_list() {
+        fn acl(iface: &str, req: &str) -> Option<String> {
+            match (iface, req) {
+                ("wlan5" | "wlan6", "DENY_ACL SHOW") => {
+                    Some("02:00:00:00:00:55 VLAN_ID=0\n".into())
+                }
+                ("wlan24", "DENY_ACL SHOW") => Some("02:00:00:00:00:01 VLAN_ID=0\n".into()),
+                (_, "DENY_ACL SHOW") => Some(String::new()),
+                _ => Some("OK\n".into()),
+            }
+        }
+        let stale = [0x02, 0, 0, 0, 0, 0x55];
+        let mut r = Rig::new(acl);
+        r.blocks.lock().unwrap().insert(stale);
+        let res = r.run(CommandKind::SyncBlocks { macs: vec![STA] });
+        assert_eq!(
+            (res.ok, res.detail.as_str()),
+            (
+                true,
+                "wlan24: 0 added, 0 removed; wlan5: 1 added, 1 removed; \
+                 wlan5-1: 1 added, 0 removed; wlan6: 1 added, 1 removed; kick: wlan5-1: OK"
+            )
+        );
+        let add = |b| format!("{b} DENY_ACL ADD_MAC 02:00:00:00:00:01");
+        let del = |b| format!("{b} DENY_ACL DEL_MAC 02:00:00:00:00:55");
+        let show = |b| format!("{b} DENY_ACL SHOW");
+        assert_eq!(
+            r.requests(),
+            [
+                show("wlan24"),
+                show("wlan5"),
+                add("wlan5"),
+                del("wlan5"),
+                show("wlan5-1"),
+                add("wlan5-1"),
+                show("wlan6"),
+                add("wlan6"),
+                del("wlan6"),
+                "wlan5-1 DEAUTHENTICATE 02:00:00:00:00:01 reason=3".into(),
+            ]
+        );
+        assert_eq!(*r.blocks.lock().unwrap(), BTreeSet::from([STA]));
+    }
+
+    /// What the ACLs hold already is asked for and left alone.
+    #[test]
+    fn sync_again_changes_nothing() {
+        fn acl(_: &str, req: &str) -> Option<String> {
+            match req {
+                "DENY_ACL SHOW" => Some("02:00:00:00:00:99 VLAN_ID=0\n".into()),
+                _ => Some("OK\n".into()),
+            }
+        }
+        let mut r = Rig::new(acl);
+        let away = [0x02, 0, 0, 0, 0, 0x99];
+        for _ in 0..2 {
+            let res = r.run(CommandKind::SyncBlocks { macs: vec![away] });
+            assert!(res.ok, "{}", res.detail);
+        }
+        let shows: Vec<String> = BSSS.iter().map(|b| format!("{b} DENY_ACL SHOW")).collect();
+        assert_eq!(r.requests(), [shows.clone(), shows].concat());
+        // An empty list clears every block.
+        r.log.lock().unwrap().clear();
+        assert!(r.run(CommandKind::SyncBlocks { macs: Vec::new() }).ok);
+        assert_eq!(r.requests().len(), 2 * BSSS.len());
+        assert!(r.blocks.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_sync_beyond_the_cap_is_refused_before_any_request() {
+        let mut r = Rig::new(ok);
+        r.blocks.lock().unwrap().insert(STA);
+        let macs: Vec<[u8; 6]> = (0..=SYNC_MAX as u16)
+            .map(|i| {
+                let [hi, lo] = i.to_be_bytes();
+                [0x02, 0, 0, 0, hi, lo]
+            })
+            .collect();
+        let res = r.run(CommandKind::SyncBlocks { macs });
+        assert_eq!(
+            (res.ok, res.detail.as_str()),
+            (false, "more than 1024 blocks")
+        );
+        assert!(r.requests().is_empty());
+        assert_eq!(*r.blocks.lock().unwrap(), BTreeSet::from([STA]));
     }
 
     /// A hostapd started again has an empty deny ACL: each held block goes
