@@ -684,9 +684,11 @@ rm -rf modstage
 # Nothing NSS loads on its own: u6e-nss.service brings the plane up in
 # order once networkd has configured lan, and only then loads the radios.
 # The firmware computes the TX checksums (12.2 honours the host's flags),
-# so the glue keeps checksum offload and TSO on lan.
+# so the glue keeps checksum offload and TSO on lan. The firmware's shapers
+# come from a pool that holds one interface shaper and about 410 classes on
+# its own; qos_mem_size gives it that many MB of host RAM more, for good.
 printf '%s\n' 'options ath11k nss_offload=1 frame_mode=2' 'options qca-dwmac-nss ifname=lan fw_if=1 fw_csum=1' \
-	'blacklist ath11k_ahb' 'blacklist ath11k_pci' > $RF/etc/modprobe.d/u6e-nss.conf
+	'options qca-nss-drv qos_mem_size=4' 'blacklist ath11k_ahb' 'blacklist ath11k_pci' > $RF/etc/modprobe.d/u6e-nss.conf
 # The OpenWrt wireless stack makes no default interface (a station vif
 # taken through NSS offload hangs the NSS core); add each radio's as an AP.
 # First the radio's wiphy is named after its band, by the device it sits on:
@@ -801,6 +803,13 @@ if [ -n "$major" ] && mknod -m 0440 /dev/ecm_state c "$major" 0; then
 	chgrp u6e-agent /dev/ecm_state
 else
 	echo "u6e-nss: no ECM state device" >&2
+fi
+# One client's capture (nss/u6e-pcc): the mirror instance nssmirror0, then
+# ECM's PCC registrant; registering defuncts every connection, cheap at boot.
+if echo create > /proc/sys/dev/nss/mirror/config && [ -d /sys/class/net/nssmirror0 ]; then
+	modprobe u6e-pcc || echo "u6e-nss: u6e-pcc did not load" >&2
+else
+	echo "u6e-nss: no mirror instance nssmirror0" >&2
 fi
 modprobe qca-nss-netlink
 NSS
