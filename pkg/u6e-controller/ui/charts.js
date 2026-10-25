@@ -100,9 +100,11 @@ function ticks(lo, hi, n = 4) {
 
 /**
  * A line chart of samples over time:
- * `{ times, series: [{ label, color, values }], min, max, format, zones }`,
- * zones being shaded value ranges `{ from, to, color }`. Pointing at it
- * reads out the nearest sample.
+ * `{ times, series: [{ label, color, values, width, dash }], min, max, format, zones }`,
+ * zones being shaded value ranges `{ from, to, color }`. Each series is drawn
+ * over the ones before it; a thinner, dashed one (`dash`: a canvas line-dash
+ * pattern) on a wider one shows both where they meet. Pointing at it reads out
+ * the nearest sample.
  */
 export function lineChart(canvas, opts) {
   canvas.chart = opts;
@@ -180,9 +182,10 @@ function drawLine(canvas) {
   }
 
   ctx.lineJoin = 'round';
-  ctx.lineWidth = 1.8;
   for (const s of series) {
     ctx.strokeStyle = s.color;
+    ctx.lineWidth = s.width ?? 1.8;
+    ctx.setLineDash(s.dash || []);
     ctx.beginPath();
     let pen = false;
     s.values.forEach((v, i) => {
@@ -196,6 +199,7 @@ function drawLine(canvas) {
     });
     ctx.stroke();
   }
+  ctx.setLineDash([]);
 
   if (canvas.hoverX === null || canvas.hoverX === undefined) return;
   const want = t0 + ((canvas.hoverX - box.l) / (box.r - box.l)) * (t1 - t0);

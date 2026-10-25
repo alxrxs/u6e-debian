@@ -20,11 +20,18 @@ function chartPanel(title) {
   return { el, canvas, wait, legend, since };
 }
 
-function swatch(color) {
-  const i = h('i');
-  i.style.background = color;
+/** A legend key: a square, or a dashed line for a dashed series. */
+function swatch(color, dashed) {
+  const i = h('i', { class: dashed && 'dash' });
+  if (dashed) i.style.borderColor = color;
+  else i.style.background = color;
   return i;
 }
+
+// A chart's second series is drawn thin and dashed over a wide first, so equal
+// rates (or no traffic either way) still show both.
+const FIRST = 2.6;
+const SECOND = { width: 1.4, dash: [5, 4] };
 
 export default {
   mount(root, store, mac) {
@@ -81,10 +88,10 @@ export default {
           const color = p.band[c.band] || p.accent;
           const legends = [
             [['Signal', color]],
-            [['Transmit', color], ['Receive', p.ink3]],
-            [['Download', color], ['Upload', p.ink3]],
+            [['Transmit', color], ['Receive', p.ink3, true]],
+            [['Download', color], ['Upload', p.ink3, true]],
           ];
-          charts.forEach((ch, i) => ch.legend.replaceChildren(...legends[i].map(([l, col]) => h('span', {}, swatch(col), l))));
+          charts.forEach((ch, i) => ch.legend.replaceChildren(...legends[i].map(([l, col, dashed]) => h('span', {}, swatch(col, dashed), l))));
           if (enough) {
             const zones = [
               { from: -62, to: 0, color: p.ok },
@@ -98,11 +105,11 @@ export default {
             });
             lineChart(charts[1].canvas, {
               times: s.times, min: 0, format: (v) => `${Math.round(v)} Mbps`,
-              series: [{ label: 'Transmit', color, values: s.tx }, { label: 'Receive', color: p.ink3, values: s.rx }],
+              series: [{ label: 'Transmit', color, values: s.tx, width: FIRST }, { label: 'Receive', color: p.ink3, values: s.rx, ...SECOND }],
             });
             lineChart(charts[2].canvas, {
               times: s.times, min: 0, format: (v) => bits(v).replace(' ', ' '),
-              series: [{ label: 'Download', color, values: s.down }, { label: 'Upload', color: p.ink3, values: s.up }],
+              series: [{ label: 'Download', color, values: s.down, width: FIRST }, { label: 'Upload', color: p.ink3, values: s.up, ...SECOND }],
             });
           }
         }
