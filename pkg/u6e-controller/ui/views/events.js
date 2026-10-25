@@ -1,15 +1,28 @@
 // Events: the live feed of what the APs report (joins, leaves, sign-ins,
-// radios), newest first, by day; a client's own history uses the same list.
+// radios) and of the operators' actions on clients, newest first, by day; a
+// client's own history uses the same list.
 
 import { h, dayOf, describe, time } from '../util.js';
 
 const PAGE = 300;
-const GROUPS = [['', 'All'], ['conn', 'Joins and leaves'], ['auth', 'Sign-ins'], ['radio', 'Radios']];
+const GROUPS = [['', 'All'], ['conn', 'Joins and leaves'], ['auth', 'Sign-ins'], ['radio', 'Radios'], ['action', 'Actions']];
 
 /** The radio an event names, with its band where the AP still lists it. */
 function radioName(store, e) {
   const band = store.state.aps[e.ap]?.radios?.[e.phy]?.band;
   return band ? `${e.phy} (${band} GHz)` : e.phy;
+}
+
+/** An action's line: who did what to which client, and what came of it
+ * (hostapd's bare "OK" says nothing a "done" does not). */
+function actionText(e, what, showMac) {
+  const who = e.user || 'Someone';
+  const result = e.ok
+    ? h('span', { class: 'muted' }, ` · ${!e.detail || e.detail === 'OK' ? 'done' : e.detail}`)
+    : `: failed, ${e.detail || 'no reason given'}`;
+  return showMac
+    ? [who, ` ${what.text} `, h('a', { href: `#/client/${e.mac}` }, e.mac), result]
+    : [`${what.text[0].toUpperCase()}${what.text.slice(1)} by ${who}`, result];
 }
 
 /**
@@ -27,17 +40,19 @@ export function feed(store, list, { seen, since = Infinity, showMac = true } = {
       lastDay = d;
     }
     const what = describe(e.phy ? { ...e, phy: radioName(store, e) } : e);
-    const key = `${e.ap}|${e.at}|${e.kind}|${e.mac || e.phy}`;
+    const key = `${e.ap}|${e.at}|${e.kind}|${e.action || ''}|${e.mac || e.phy}`;
     const fresh = seen && !seen.has(key) && e.at > since;
     seen?.add(key);
     out.push(h('li', { class: [what.tone, fresh ? 'fresh' : ''].join(' ').trim() || null },
       h('time', { datetime: new Date(e.at).toISOString(), title: new Date(e.at).toLocaleString() }, time(e.at)),
-      h('span', { class: 'ap-name' }, e.ap),
+      h('span', { class: 'ap-name' }, e.ap || '–'),
       h('span', { class: 'dot', 'aria-hidden': 'true' }),
-      h('span', { class: 'what' },
-        e.mac && showMac ? [h('a', { href: `#/client/${e.mac}` }, e.mac), ' '] : null,
-        e.mac && !showMac ? `${what.text[0].toUpperCase()}${what.text.slice(1)}` : what.text,
-        e.bss ? h('span', { class: 'muted' }, ` via ${e.bss}`) : null)));
+      e.kind === 'action'
+        ? h('span', { class: 'what' }, actionText(e, what, showMac))
+        : h('span', { class: 'what' },
+          e.mac && showMac ? [h('a', { href: `#/client/${e.mac}` }, e.mac), ' '] : null,
+          e.mac && !showMac ? `${what.text[0].toUpperCase()}${what.text.slice(1)}` : what.text,
+          e.bss ? h('span', { class: 'muted' }, ` via ${e.bss}`) : null)));
   }
   return out;
 }
@@ -64,7 +79,7 @@ export default {
       f.ap = apSelect.value;
       view.update();
     });
-    const search = h('input', { type: 'search', placeholder: 'Filter by MAC or SSID', 'aria-label': 'Filter events', value: f.q });
+    const search = h('input', { type: 'search', placeholder: 'Filter by MAC, SSID or user', 'aria-label': 'Filter events', value: f.q });
     search.addEventListener('input', () => {
       f.q = search.value;
       view.update();
@@ -96,7 +111,7 @@ export default {
         const all = store.events.filter((e) =>
           (!f.group || describe(e).group === f.group)
           && (!f.ap || e.ap === f.ap)
-          && (!q || [e.mac, e.ssid, e.bss, e.phy].some((v) => v && v.toLowerCase().includes(q))));
+          && (!q || [e.mac, e.ssid, e.bss, e.phy, e.user].some((v) => v && v.toLowerCase().includes(q))));
         const shown = all.slice(-limit).reverse();
         // The feed changes only with the events, so most ticks redraw nothing.
         const stamp = `${f.group}|${f.ap}|${q}|${store.events.length}|${shown[0]?.at}|${limit}|${dayOf(Date.now())}`;
@@ -109,7 +124,7 @@ export default {
         if (!shown.length) {
           empty.replaceChildren(
             h('strong', {}, store.events.length ? 'No event matches these filters' : 'No events yet'),
-            h('p', {}, store.events.length ? 'Change the filters to see more.' : 'Joins, leaves, sign-ins and radio changes appear here the moment an AP reports them.'));
+            h('p', {}, store.events.length ? 'Change the filters to see more.' : 'Joins, leaves, sign-ins, radio changes and actions on clients appear here the moment they happen.'));
           return;
         }
         list.replaceChildren(...feed(store, shown, { seen, since }));

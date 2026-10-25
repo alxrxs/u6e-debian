@@ -1,13 +1,16 @@
 // The controller's single-page UI: one WebSocket brings the state of every AP
 // (a key, then merge patches of what changed) and their events as they
 // happen; the views render from that, and the samples taken here every two
-// seconds draw the charts of each client's session.
+// seconds draw the charts of each client's session. A view that shows flows
+// opens the socket asking for them too, which makes the APs send them every
+// 10 s; the client actions are POSTs, answered with their result.
 
 import { icon } from './util.js';
 import devices from './views/devices.js';
 import clients from './views/clients.js';
 import client from './views/client.js';
 import events from './views/events.js';
+import flows from './views/flows.js';
 
 /** Samples kept per client and radio: an hour at one per tick. */
 const HISTORY = 1800;
@@ -17,6 +20,8 @@ const EVENTS_KEPT = 5000;
 const store = {
   state: { aps: {}, clients: {} },
   user: null,
+  /** `{ user, admin }` from `/api/me`; null until known. */
+  me: null,
   live: 'connecting',
   /** The state has arrived at least once. */
   keyed: false,
@@ -34,13 +39,21 @@ const store = {
   samples: new Map(),
   /** Per `ap/phy`: busy % samples. */
   radio: new Map(),
+  /** Per AP: its latest flows, `{ at, complete, clients: { mac: flows } }`,
+   * each client's with its `mac`, and `down` and `up` in bit/s since the
+   * AP's previous. */
+  flows: {},
+  /** Whether the socket has brought the flows it asked for. */
+  flowsKeyed: false,
   /** What the views remember across visits: sort, filters, open details. */
   ui: {},
   /** Fetches the events held before this page opened, once. */
   loadHistory,
+  act,
+  fullFlows,
 };
 
-const views = { devices, clients, client, events };
+const views = { devices, clients, client, flows, events };
 let current = null;
 let currentName = '';
 
@@ -54,7 +67,7 @@ function merge(target, patch) {
 }
 
 function eventKey(e) {
-  return `${e.ap}|${e.at}|${e.kind}|${e.mac || e.phy || ''}`;
+  return `${e.ap}|${e.at}|${e.kind}|${e.action || ''}|${e.mac || e.phy || ''}`;
 }
 
 function addEvents(list) {
@@ -86,23 +99,129 @@ async function loadHistory(again = false) {
   }
 }
 
+async function loadMe() {
+  try {
+    const r = await fetch('/api/me', { cache: 'no-store' });
+    if (!r.ok) throw new Error(r.status);
+    store.me = await r.json();
+  } catch {
+    store.me = null;
+  }
+  changed();
+}
+
+/** The response of a POST of `body` to `path`: its status and JSON body;
+ * status 0 when the controller could not be reached. Every POST says it is
+ * JSON, as the controller requires of a request that changes anything. */
+async function post(path, body) {
+  try {
+    const r = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      cache: 'no-store',
+    });
+    let data = {};
+    try {
+      data = await r.json();
+    } catch {}
+    return { status: r.status, ...data };
+  } catch {
+    return { status: 0 };
+  }
+}
+
+/** Takes `action` (kick, block, unblock, steer) on client `mac`. */
+async function act(mac, action, body = {}) {
+  const res = await post(`/api/clients/${encodeURIComponent(mac)}/${action}`, body);
+  if (res.status === 403 && res.error === 'not an admin' && store.me) store.me.admin = false;
+  return res;
+}
+
+/** Every connection `ap` forwards, which it is asked for: `{ status, at,
+ * complete, clients }` (each client with its `mac`), or `{ status, error }`. */
+async function fullFlows(ap) {
+  try {
+    const r = await fetch(`/api/flows/full?ap=${encodeURIComponent(ap)}`, { cache: 'no-store' });
+    let data = {};
+    try {
+      data = await r.json();
+    } catch {}
+    const f = data[ap];
+    if (!r.ok || !f) return { status: r.status, error: data.error };
+    return { status: r.status, at: f.at, complete: f.complete, clients: withMacs(f.clients) };
+  } catch {
+    return { status: 0 };
+  }
+}
+
+/** Each client's flows of an AP's (by MAC) with its MAC in them. */
+function withMacs(clients) {
+  return Object.entries(clients || {}).map(([mac, c]) => ({ ...c, mac }));
+}
+
+/** Takes the flows the socket keeps: each AP's as before, unless it sent new
+ * ones, whose clients then get their rates from the bytes since the previous. */
+function takeFlows() {
+  const next = {};
+  for (const [ap, f] of Object.entries(store.state.flows || {})) {
+    const stamp = `${f.seq}|${f.at}`;
+    const prev = store.flows[ap];
+    if (prev?.stamp === stamp) {
+      next[ap] = prev;
+      continue;
+    }
+    const secs = prev ? (f.at - prev.at) / 1000 : 0;
+    const clients = {};
+    for (const c of withMacs(f.clients)) {
+      const was = prev?.clients[c.mac];
+      if (was && secs > 0 && c.rx_bytes >= was.rx_bytes && c.tx_bytes >= was.tx_bytes) {
+        c.down = Math.round(((c.rx_bytes - was.rx_bytes) * 8) / secs);
+        c.up = Math.round(((c.tx_bytes - was.tx_bytes) * 8) / secs);
+      }
+      clients[c.mac] = c;
+    }
+    next[ap] = { at: f.at, stamp, complete: f.complete, clients };
+  }
+  store.flows = next;
+}
+
+let socket = null;
+/** Whether the socket open (or opening) asks for the flows. */
+let withFlows = false;
+
+/** Opens the socket again when the view wants flows and it does not bring
+ * them, or the other way round: the subscription is its first message. */
+function watchFlows(want) {
+  if (want === withFlows || !socket) return;
+  withFlows = want;
+  store.flowsKeyed = false;
+  socket.onclose = null;
+  socket.close();
+  connect();
+}
+
 let backoff = 1;
 
 function connect() {
   const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
-  ws.onopen = () => ws.send(JSON.stringify({ subscribe: '*' }));
+  socket = ws;
+  ws.onopen = () => ws.send(JSON.stringify({ subscribe: '*', flows: withFlows }));
   ws.onmessage = (e) => {
     const m = JSON.parse(e.data);
     if (m.key) {
       store.state = m.key;
       store.keyed = true;
+      store.flowsKeyed = withFlows;
       store.user = m.user ?? null;
+      // Events may have passed while the socket was down.
+      if (store.historyLoaded && store.live === 'down') loadHistory(true);
       store.live = 'live';
       backoff = 1;
-      // Events may have passed while the socket was down.
-      if (store.historyLoaded) loadHistory(true);
+      if (!store.me) loadMe();
     }
     if (m.patch) merge(store.state, m.patch);
+    if (m.key || m.patch?.flows) takeFlows();
     if (m.events) addEvents(m.events);
     if (m.lost && store.historyLoaded) loadHistory(true);
     changed();
@@ -164,6 +283,7 @@ function show() {
   const root = document.getElementById('view');
   root.replaceChildren();
   current = views[name].mount(root, store, arg);
+  watchFlows(!!views[name].flows);
   for (const a of document.querySelectorAll('.tabs a')) {
     const on = a.dataset.view === name || (name === 'client' && a.dataset.view === 'clients');
     if (on) a.setAttribute('aria-current', 'page');
@@ -190,10 +310,11 @@ function render() {
   const live = document.getElementById('live');
   live.dataset.state = store.live;
   live.textContent = LIVE[store.live];
+  const name = store.user || store.me?.user;
   const user = document.getElementById('user');
-  user.hidden = !store.user;
-  user.textContent = store.user || '';
-  user.title = store.user ? `Signed in as ${store.user}` : '';
+  user.hidden = !name;
+  user.textContent = name || '';
+  user.title = name ? `Signed in as ${name}${store.me?.admin ? ', a member of wifi-admins' : ''}` : '';
   const n = Object.keys(store.state.clients).length;
   document.getElementById('tally').textContent = store.live === 'live' ? String(n) : '';
   const banner = document.getElementById('banner');
@@ -204,7 +325,7 @@ function render() {
       ? `Live updates stopped: the controller cannot be reached. Trying again in ${s} s; the figures shown are the last received.`
       : `The controller cannot be reached. Trying again in ${s} s.`;
   }
-  const title = { devices: 'Devices', clients: 'Clients', client: 'Client', events: 'Events' }[currentName];
+  const title = { devices: 'Devices', clients: 'Clients', client: 'Client', flows: 'Flows', events: 'Events' }[currentName];
   document.title = `${title} – Wi-Fi`;
   current?.update();
 }
@@ -248,5 +369,7 @@ setInterval(sample, SAMPLE_MS);
 setInterval(() => store.live === 'down' && changed(), 1000);
 
 showTheme();
+withFlows = !!views[route()[0]].flows;
 show();
 connect();
+loadMe();

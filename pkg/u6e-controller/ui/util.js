@@ -130,6 +130,14 @@ export function palette() {
   };
 }
 
+/** The name a client goes by: its DNS name, else its MAC. */
+export function clientName(store, mac) {
+  return store.state.clients[mac]?.name || mac;
+}
+
+/** What each client action did, as the feed and the results say it. */
+export const DID = { kick: 'kicked', block: 'blocked', unblock: 'unblocked', steer: 'steered' };
+
 /** What an event says, as the feed and a client's history show it. */
 export function describe(ev) {
   const on = ev.ssid ? ` ${ev.ssid}` : '';
@@ -142,6 +150,7 @@ export function describe(ev) {
     case 'radio-up': return { text: `${ev.phy} came up`, tone: 'ok', group: 'radio' };
     case 'radio-down': return { text: `${ev.phy} went down`, tone: 'bad', group: 'radio' };
     case 'fw-crash': return { text: `${ev.phy} firmware crashed`, tone: 'bad', group: 'radio' };
+    case 'action': return { text: DID[ev.action] || ev.action, tone: ev.ok ? 'ok' : 'bad', group: 'action' };
     default: return { text: ev.kind, tone: '', group: 'other' };
   }
 }

@@ -7,7 +7,7 @@ import { sparkline } from '../charts.js';
 /** The columns: what the header says, how a row sorts and what its cell is.
  * `p` is the column's priority: the narrower the screen, the fewer show. */
 const COLUMNS = [
-  { key: 'mac', label: 'Client', sort: (m) => m, cell: (m, c) => h('td', {}, h('div', { class: 'who', 'data-band': c.band }, h('a', { class: 'mono', href: `#/client/${m}` }, m))) },
+  { key: 'mac', label: 'Client', sort: (m, c) => c.name || m, cell: clientCell },
   { key: 'ap', label: 'AP', p: 2, sort: (m, c) => `${c.ap} ${c.bss}`, cell: (m, c) => h('td', {}, c.ap, h('small', {}, c.bss)) },
   { key: 'band', label: 'Band', p: 2, sort: (m, c) => Number(c.band), cell: (m, c) => h('td', {}, h('span', { class: 'chip', 'data-band': c.band }, c.band ? `${c.band} GHz` : '?')) },
   { key: 'ssid', label: 'SSID', p: 3, sort: (m, c) => c.ssid, cell: (m, c) => h('td', {}, c.ssid) },
@@ -24,6 +24,13 @@ const COLUMNS = [
 
 const sparks = [];
 
+/** The client by its name, its MAC beneath; by its MAC when it has none. */
+function clientCell(m, c) {
+  const link = h('a', { class: c.name ? null : 'mono', href: `#/client/${m}` }, c.name || m);
+  return h('td', {}, h('div', { class: 'who', 'data-band': c.band },
+    h('div', { class: 'id' }, link, c.name ? h('small', { class: 'mono' }, m) : null)));
+}
+
 function signalCell(m, c) {
   const canvas = h('canvas', { 'aria-hidden': 'true' });
   sparks.push([canvas, m, c.band]);
@@ -34,7 +41,7 @@ function matches(f, m, c) {
   if (f.band && c.band !== f.band) return false;
   if (f.ap && c.ap !== f.ap) return false;
   const q = f.q.trim().toLowerCase();
-  return !q || [m, c.ap, c.bss, c.ssid, String(c.vlan)].some((v) => v.toLowerCase().includes(q));
+  return !q || [m, c.name || '', c.ap, c.bss, c.ssid, String(c.vlan)].some((v) => v.toLowerCase().includes(q));
 }
 
 export default {
@@ -42,7 +49,7 @@ export default {
     const f = (store.ui.clientFilter ||= { q: '', band: '', ap: '' });
     const sort = (store.ui.clientSort ||= { key: 'mac', dir: 1 });
     const sub = h('p');
-    const search = h('input', { type: 'search', placeholder: 'Filter by MAC, AP, SSID or VLAN', 'aria-label': 'Filter clients', value: f.q });
+    const search = h('input', { type: 'search', placeholder: 'Filter by name, MAC, AP, SSID or VLAN', 'aria-label': 'Filter clients', value: f.q });
     search.addEventListener('input', () => {
       f.q = search.value;
       view.update();
