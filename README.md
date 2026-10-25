@@ -8,7 +8,11 @@ The only thing ever written to the SPI flash (the small chip holding the boot lo
 
 ## What you need
 
-- An x86 Linux build machine with the aarch64 cross compiler (and the armhf one, for the 32-bit boot shim), `mmdebstrap`, `qemu-user-static`, `u-boot-tools`, Rust from rustup with the `aarch64-unknown-linux-musl` target, and `cargo-zigbuild` with `zig` (the agent cross-builds through zig's C toolchain).
+- An x86 Linux build machine with the aarch64 cross compiler (and the armhf one, for the 32-bit boot shim), `mmdebstrap`, `qemu-user-static`, `u-boot-tools`, rustup, and exactly this cross toolchain (the agent and the controller are built through zig's C toolchain, and another version of any of it builds another binary):
+  - Rust 1.97.1 with the `aarch64-unknown-linux-musl` and `x86_64-unknown-linux-musl` targets, pinned by `rust-toolchain.toml` (rustup installs it on the first `cargo` run in the checkout);
+  - `zig` 0.17.0 (the official release tarball) and `cargo-zigbuild` 0.24.0 (`cargo install --locked cargo-zigbuild --version 0.24.0`), pinned by `toolchain.env`.
+
+  `deploy.sh` checks all three versions before it builds the agent and stops on any other.
 - Optionally, an Apple silicon Mac with OrbStack, reachable over SSH (`NATIVE_BUILD` in `site.conf`): the arm64 package and root filesystem builds then run there natively, many times faster than under `qemu-user-static`.
 - SSH access to the stock firmware of each access point (the stock login set in `site.conf`).
 - `site.conf`: your site's settings. Copy `site.conf.example` and fill it in; it is never committed. It holds:
@@ -111,6 +115,7 @@ Wi-Fi starts by itself on every boot (`u6e-wifi.service`), with nothing else on 
 | Path | Contents |
 |---|---|
 | `deploy.sh` | Builds and boots everything, step by step |
+| `rust-toolchain.toml`, `toolchain.env` | The pinned build toolchain: Rust, and zig with cargo-zigbuild |
 | `ap-image.sh` | Chooses the image `deploy.sh` boots on an access point: the one already built for the current inputs, or a new one |
 | `trees.sh`, `export.sh` | Create the source trees from the patch series, and export commits back to patches |
 | `kernel/`, `backports/` | Upstream release address and our patches |

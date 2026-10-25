@@ -12,7 +12,8 @@
 # nss/ and the kernel), the hostapd and iproute2 packages (their versions) and
 # the rootfs (those packages and mkrootfs.sh); the packages and the rootfs on
 # the native builder if it answers (arm64 below), and u6e-agent
-# (pkg/u6e-agent). Then each AP whose running image was built from other
+# (pkg/u6e-agent, only by the toolchain rust-toolchain.toml and toolchain.env
+# pin). Then each AP whose running image was built from other
 # inputs (stamps/ap-<ap>) gets its image of the current inputs (ap-image.sh:
 # the one an earlier run kept under images/, else a new one from
 # prep-rootfs.sh), boots it (boot/stage.sh) and must bring its radios up by
@@ -23,6 +24,7 @@ set -uo pipefail
 cd "$(dirname "$0")" || exit 1
 . ./site.conf
 . ./ap-image.sh
+. ./toolchain.env
 L=$PWD/log
 mkdir -p "$L"
 fail() { echo "$*" >&2; exit 1; }
@@ -92,10 +94,19 @@ deb=pkg/netlogd/out/systemd-netlogd_${netlogd}_arm64.deb
 step rootfs "$hostapd/$iproute2/$netlogd/$(head_of . HEAD:mkrootfs.sh)" arm64 rootfs 'rm -rf rootfs && ./mkrootfs.sh' \
 	mkrootfs.sh pkg/hostapd/out pkg/iproute2-nss/out pkg/netlogd/out
 # u6e-agent: a static arm64 binary from the cargo workspace, cross-built here
-# (cargo-zigbuild: zig is the C toolchain for musl crates such as aws-lc-sys).
+# (cargo-zigbuild: zig is the C toolchain for musl crates such as aws-lc-sys),
+# only by the pinned toolchain: any other builds another binary.
+export PATH=$PATH:$HOME/.cargo/bin
+rust=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+[ "$(rustc --version 2>/dev/null | cut -d' ' -f2)" = "$rust" ] ||
+	fail "rustc $rust needed (rust-toolchain.toml, through rustup), found: $(rustc --version 2>&1)"
+[ "$(zig version 2>/dev/null)" = "$ZIG_VERSION" ] ||
+	fail "zig $ZIG_VERSION needed (toolchain.env), found: $(zig version 2>&1)"
+[ "$(cargo-zigbuild --version 2>/dev/null)" = "cargo-zigbuild $CARGO_ZIGBUILD_VERSION" ] ||
+	fail "cargo-zigbuild $CARGO_ZIGBUILD_VERSION needed (toolchain.env), found: $(cargo-zigbuild --version 2>&1)"
 [ -x target/aarch64-unknown-linux-musl/release/u6e-agent ] || rm -f stamps/agent
-step agent "$(head_of . HEAD:Cargo.toml)/$(head_of . HEAD:Cargo.lock)/$(head_of . HEAD:.cargo)/$(head_of . HEAD:pkg/u6e-agent)/$(head_of . HEAD:pkg/u6e-proto)" sh -c \
-	'PATH=$PATH:$HOME/.cargo/bin cargo zigbuild --release --locked --target aarch64-unknown-linux-musl -p u6e-agent'
+step agent "$(head_of . HEAD:Cargo.toml)/$(head_of . HEAD:Cargo.lock)/$(head_of . HEAD:.cargo)/$(head_of . HEAD:rust-toolchain.toml)/$(head_of . HEAD:toolchain.env)/$(head_of . HEAD:pkg/u6e-agent)/$(head_of . HEAD:pkg/u6e-proto)" \
+	cargo zigbuild --release --locked --target aarch64-unknown-linux-musl -p u6e-agent
 
 if [ $# = 0 ]; then
 	read -ra aps <<<"$U6E_APS"
