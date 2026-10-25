@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{fs, thread};
 
-use crate::clientsock::{ClientSocket, RUN};
+use crate::clientsock::{self, ClientSocket};
 
 pub const HOSTAPD: &str = "/run/hostapd";
 const ROUND: Duration = Duration::from_secs(ROUND_SECS);
@@ -75,7 +75,7 @@ pub struct Hostapd {
 
 impl Hostapd {
     pub fn open() -> io::Result<Self> {
-        Self::bind(Path::new(RUN), "ctrl", Path::new(HOSTAPD))
+        Self::bind(&clientsock::run_dir(), "ctrl", Path::new(HOSTAPD))
     }
 
     /// A client named after `what` in `run`, talking to the sockets in `dir`.

@@ -2,12 +2,16 @@
 //! gateway must resolve over ARP (not ICMP: a gateway may well drop pings).
 //! The first time it does, a persistent image re-arms its boot
 //! (u6e-arm.service); when it does not, u6e-fallback.service disarms it, keeps
-//! the evidence in pstore and reboots into stock.
+//! the evidence in pstore and reboots into stock. The agent may start no unit
+//! itself: it asks for each by a file in its run directory, which the unit's
+//! path unit watches.
 
 use std::net::{Ipv4Addr, UdpSocket};
-use std::process::Command;
+use std::path::Path;
 use std::time::Duration;
 use std::{fs, thread};
+
+use crate::clientsock;
 
 const FIRST_CHECK_SECS: f64 = 180.0;
 const INTERVAL: Duration = Duration::from_secs(60);
@@ -34,11 +38,9 @@ fn reachable(gw: Ipv4Addr) -> bool {
     fs::read_to_string("/proc/net/arp").is_ok_and(|a| resolved(&a, gw))
 }
 
-fn start(unit: &str) -> bool {
-    Command::new("systemctl")
-        .args(["start", unit])
-        .status()
-        .is_ok_and(|s| s.success())
+/// Asks for `what` (u6e-<what>.service) by creating `<run>/<what>`.
+fn ask(run: &Path, what: &str) -> bool {
+    fs::write(run.join(what), "").is_ok()
 }
 
 fn uptime() -> f64 {
@@ -53,15 +55,16 @@ pub fn run(gw: Ipv4Addr, arm: bool) {
     if wait > 0.0 {
         thread::sleep(Duration::from_secs_f64(wait));
     }
+    let run = clientsock::run_dir();
     let mut armed = !arm;
     loop {
         if reachable(gw) {
             if !armed {
-                armed = start("u6e-arm.service");
+                armed = ask(&run, "arm");
             }
         } else {
             eprintln!("no gateway at {gw}: back to stock");
-            start("u6e-fallback.service");
+            ask(&run, "fallback");
         }
         thread::sleep(INTERVAL);
     }
@@ -76,6 +79,14 @@ mod tests {
 192.0.2.1        0x1         0x2         02:00:00:00:00:01     *        vlan0
 192.0.2.16       0x1         0x0         00:00:00:00:00:00     *        vlan0
 ";
+
+    #[test]
+    fn a_unit_is_asked_for_by_a_file_in_the_run_directory() {
+        let t = crate::testdir::TestDir::new();
+        assert!(ask(t.path(), "arm"));
+        assert!(t.path().join("arm").is_file());
+        assert!(!ask(&t.path().join("absent"), "fallback"));
+    }
 
     #[test]
     fn a_resolved_gateway_is_reachable() {

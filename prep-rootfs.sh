@@ -262,15 +262,27 @@ NR_PORT=8211
 peers=$(for a in $U6E_APS; do (U6E_AP=$a; . ./site.conf; echo "${MGMT_ADDR%/*}"); done | { grep -vx "$MGMT_IP" || true; } | sed 's/^/--peer /' | tr '\n' ' ')
 arm=; [ "${U6E_PERSIST:-0}" = 1 ] && arm=--arm
 # With CONTROLLER set, it also streams the AP's Wi-Fi state to the controller,
-# which it pins by CONTROLLER_KEY; this AP's own key (agent_key) is root's only.
+# which it pins by CONTROLLER_KEY; this AP's own key (agent_key) is root's only,
+# and systemd hands the agent a copy (LoadCredential).
 link=
+cred=
 if [ -n "${CONTROLLER:-}" ]; then
 	[[ ${CONTROLLER_KEY:-} =~ ^[0-9a-fA-F]{64}$ ]] || { echo "CONTROLLER_KEY must be 64 hex digits" >&2; exit 1; }
 	install -d -m0700 $RF/etc/u6e-agent
 	(umask 077; agent_key > $RF/etc/u6e-agent/key.pem)
 	grep -q -- '-----BEGIN PRIVATE KEY-----' $RF/etc/u6e-agent/key.pem || { echo "agent_key: no PKCS#8 private key" >&2; exit 1; }
-	link="--controller $CONTROLLER --key /etc/u6e-agent/key.pem --controller-key $CONTROLLER_KEY"
+	link="--controller $CONTROLLER --key %d/key.pem --controller-key $CONTROLLER_KEY"
+	cred=LoadCredential=key.pem:/etc/u6e-agent/key.pem
 fi
+# The agent runs as its own user with no capabilities: hostapd gives that
+# user's group its control sockets (ctrl_interface_group, boot/wifi-up.sh),
+# systemd opens the root-only NSS load file for it, and it asks for
+# u6e-arm/u6e-fallback by a file (below) rather than starting them. Every
+# sandbox setting is at its most restrictive but where a comment says what
+# the agent's work needs instead.
+install -d $RF/usr/lib/sysusers.d
+printf 'u u6e-agent - "U6E agent" -\n' > $RF/usr/lib/sysusers.d/u6e-agent.conf
+chroot $RF systemd-sysusers
 install -m0755 target/aarch64-unknown-linux-musl/release/u6e-agent $RF/usr/local/sbin/
 cat > $RF/etc/systemd/system/u6e-agent.service <<UNIT
 [Unit]
@@ -279,14 +291,52 @@ After=u6e-wifi.service
 
 [Service]
 ExecStart=/usr/local/sbin/u6e-agent --listen $MGMT_IP --port $NR_PORT --gateway $MGMT_GW $arm $peers $link
+User=u6e-agent
+Group=u6e-agent
+$cred
+# graceful: an AP without NSS stats still starts its agent, reading 0.
+OpenFile=/sys/kernel/debug/qca-nss-drv/stats/cpu_load_ubi:nss-load:read-only,graceful
 RuntimeDirectory=u6e-agent
 RuntimeDirectoryMode=0755
 Restart=always
 RestartSec=10
+CapabilityBoundingSet=
+AmbientCapabilities=
 NoNewPrivileges=yes
+UMask=0077
+KeyringMode=private
+RemoveIPC=yes
 ProtectSystem=strict
 ProtectHome=yes
-PrivateTmp=yes
+PrivateTmp=disconnected
+ProtectProc=invisible
+# /proc/uptime, loadavg, meminfo, net/arp and sys/kernel: the state it reports.
+ProcSubset=all
+PrivateDevices=yes
+# The Wi-Fi firmware crashes are counted from the kernel log.
+DeviceAllow=/dev/kmsg r
+BindReadOnlyPaths=/dev/kmsg
+ProtectKernelLogs=no
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=strict
+PrivateMounts=yes
+PrivateIPC=yes
+PrivateUsers=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# hostapd's control sockets and its own (UNIX), nl80211 (NETLINK), the peer
+# exchange, the controller link and the gateway check (INET, INET6).
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+SystemCallFilter=@system-service
+SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @privileged @raw-io @reboot @resources @swap memfd_create
 
 [Install]
 WantedBy=multi-user.target
@@ -322,12 +372,21 @@ chmod 0755 $RF/usr/local/sbin/u6e-arm
 # that the gateway resolves over ARP. With U6E_PERSIST the first success starts
 # u6e-arm.service, so a reboot or power cut comes back here; a failure starts
 # u6e-fallback.service: disarm, put the journal into pstore and warm-reboot, so
-# the fallback to stock keeps the evidence (boot/ramoops.sh). Both run outside
-# the agent's sandbox.
-printf '[Unit]\nDescription=U6E boot re-armed into this image\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/usr/local/sbin/u6e-arm\n' \
+# the fallback to stock keeps the evidence (boot/ramoops.sh). Both run as root,
+# outside the agent's sandbox: the agent asks for each by creating
+# /run/u6e-agent/<arm|fallback>, which a path unit watches. u6e-arm is retried
+# every minute until it succeeds, as is u6e-fallback while the agent asks.
+install -d $RF/etc/systemd/system/paths.target.wants
+for u in arm fallback; do
+	printf '[Unit]\nDescription=U6E %s, when u6e-agent asks\n\n[Path]\nPathExists=/run/u6e-agent/%s\n' $u $u \
+		> $RF/etc/systemd/system/u6e-$u.path
+	ln -sf /etc/systemd/system/u6e-$u.path $RF/etc/systemd/system/paths.target.wants/u6e-$u.path
+done
+printf '[Unit]\nDescription=U6E boot re-armed into this image\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/usr/local/sbin/u6e-arm\nRestart=on-failure\nRestartSec=60\n' \
 	> $RF/etc/systemd/system/u6e-arm.service
 cat > $RF/usr/local/sbin/u6e-fallback <<'FALLBACK'
 #!/bin/sh
+rm -f /run/u6e-agent/fallback
 /usr/local/sbin/u6e-arm disarm
 { echo "u6e-fallback: no gateway at $(cut -d' ' -f1 /proc/uptime)s; links:"; ip -br link; ip -br addr; ip neigh
   mount -t debugfs none /sys/kernel/debug 2>/dev/null; D=/sys/kernel/debug/qca-nss-drv/stats

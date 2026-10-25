@@ -7,9 +7,9 @@
 //! hostapd that exits reads as radios down rather than as no radios.
 
 use std::collections::{BTreeMap, HashMap};
-use std::fs;
+use std::fs::{self, File};
 use std::io;
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileExt, FileTypeExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -38,7 +38,7 @@ impl Default for Paths {
             root: "/".into(),
             hostapd: crate::neighbors::HOSTAPD.into(),
             kmsg: "/dev/kmsg".into(),
-            run: crate::clientsock::RUN.into(),
+            run: crate::clientsock::run_dir(),
         }
     }
 }
@@ -48,6 +48,12 @@ impl Paths {
         self.root.join("sys")
     }
 }
+
+/// The NSS cores' load, under the debugfs; root-only, so the unit passes it
+/// open (as [`NSS_LOAD_NAME`]).
+const NSS_LOAD: &str = "sys/kernel/debug/qca-nss-drv/stats/cpu_load_ubi";
+/// The name of the NSS load file the service manager passes.
+pub const NSS_LOAD_NAME: &str = "nss-load";
 
 /// The BSSs, by interface name: the AP interfaces, one per hostapd control
 /// socket, sorted. `Snapshot::bsss` and the BSS index of every event follow
@@ -168,6 +174,8 @@ pub struct Collector {
     hostapd: Source<Hostapd>,
     kmsg: Kmsg,
     paths: Paths,
+    /// The NSS load file as passed open; without it, it is opened by path.
+    nss_load: Option<File>,
     crashes: u64,
     /// Whether each BSS's radio was up at the last answer.
     up: HashMap<String, bool>,
@@ -177,8 +185,13 @@ pub struct Collector {
 }
 
 impl Collector {
-    pub fn new() -> Self {
-        Self::with_paths(Paths::default())
+    /// The collector of the AP itself, reading the NSS load from `nss_load`
+    /// when the service manager passed it.
+    pub fn new(nss_load: Option<File>) -> Self {
+        Collector {
+            nss_load,
+            ..Self::with_paths(Paths::default())
+        }
     }
 
     pub fn with_paths(paths: Paths) -> Self {
@@ -191,6 +204,7 @@ impl Collector {
             hostapd: Source::new("hostapd control socket"),
             kmsg,
             paths,
+            nss_load: None,
             crashes,
             up: HashMap::new(),
             seen: BTreeMap::new(),
@@ -288,9 +302,10 @@ impl Collector {
             load_milli: first_field(&root.join("proc/loadavg"))
                 .map_or(0, |v| (v * 1000.0).round() as u32),
             mem_avail_kb: mem_available_kb(&root.join("proc/meminfo")),
-            nss_load_pct: nss_load_pct(
-                &root.join("sys/kernel/debug/qca-nss-drv/stats/cpu_load_ubi"),
-            ),
+            nss_load_pct: nss_load_pct(&match &self.nss_load {
+                Some(f) => read_from_start(f),
+                None => fs::read_to_string(root.join(NSS_LOAD)).unwrap_or_default(),
+            }),
             temps: temps(&sys, &radios),
             radios,
             bsss,
@@ -329,10 +344,19 @@ fn mem_available_kb(path: &Path) -> u32 {
         .unwrap_or(0)
 }
 
+/// A file held open, read afresh from its start: a debugfs file renders its
+/// text again at every read.
+fn read_from_start(f: &File) -> String {
+    let (mut out, mut buf) = (Vec::new(), [0; 4096]);
+    while let Ok(n @ 1..) = f.read_at(&mut buf, out.len() as u64) {
+        out.extend_from_slice(&buf[..n]);
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// The average of the per-core "Avg" figures; the file lists, per core, a
 /// "Min Avg Max" header and a line of percentages.
-fn nss_load_pct(path: &Path) -> u8 {
-    let text = fs::read_to_string(path).unwrap_or_default();
+fn nss_load_pct(text: &str) -> u8 {
     let mut lines = text.lines();
     let mut avgs = Vec::new();
     while let Some(l) = lines.next() {
@@ -1011,10 +1035,15 @@ mod tests {
         let t = TestDir::new();
         let file = t.path().join("cpu_load_ubi");
         fs::write(&file, "CPU Utilization:\nNote: Averaged over 1 second\n\nCore 0:\nMin\tAvg\tMax\n 1%\t 10%\t 30%\n\nCore 1:\nMin\tAvg\tMax\n 1%\t 21%\t 30%\n").unwrap();
-        assert_eq!(nss_load_pct(&file), 16);
+        let open = File::open(&file).unwrap();
+        assert_eq!(nss_load_pct(&read_from_start(&open)), 16);
         fs::write(&file, "CPU Utilization:\nNote: Averaged over 1 second\n\nCore 0:\nMin\tAvg\tMax\n 1%\t 1%\t 1%\n").unwrap();
-        assert_eq!(nss_load_pct(&file), 1);
-        assert_eq!(nss_load_pct(&t.path().join("absent")), 0);
+        assert_eq!(
+            nss_load_pct(&read_from_start(&open)),
+            1,
+            "read again from the start"
+        );
+        assert_eq!(nss_load_pct(""), 0);
     }
 
     #[test]

@@ -5,16 +5,18 @@
 //! with its socket, and those of processes that have died are swept at the
 //! next bind.
 
-use std::fs;
-use std::io;
 use std::ops::Deref;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::{env, fs, io};
 
-/// The agent's run directory (the unit's `RuntimeDirectory=`).
-pub const RUN: &str = "/run/u6e-agent";
+/// The agent's run directory: the unit's `RuntimeDirectory=`, which hostapd
+/// reaches at the same path, or /run/u6e-agent outside a unit.
+pub fn run_dir() -> PathBuf {
+    env::var_os("RUNTIME_DIRECTORY").map_or_else(|| "/run/u6e-agent".into(), PathBuf::from)
+}
 
 static NEXT: AtomicU32 = AtomicU32::new(0);
 

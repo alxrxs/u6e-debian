@@ -1,6 +1,7 @@
 //! The AP's resident agent: the neighbor report exchange between APs, the
 //! management network check and the state line for the syslog collector. One
-//! process; it starts a process only for u6e-arm/u6e-fallback.service.
+//! process, which starts no other; it runs as its own user, with no
+//! capabilities (see prep-rootfs.sh for the unit).
 //!
 //!   u6e-agent --listen <address> --port <port> --gateway <address> [--arm]
 //!             [--peer <address>]...
@@ -18,6 +19,7 @@ mod link;
 mod neighbors;
 mod netcheck;
 mod nl80211;
+mod passed;
 mod rates;
 mod stats;
 #[cfg(test)]
@@ -149,8 +151,9 @@ fn spawn_or_log(name: &str, f: impl FnOnce() + Send + 'static) {
 }
 
 fn main() {
+    let nss_load = passed::take(collect::NSS_LOAD_NAME);
     if env::args().nth(1).as_deref() == Some("--print-snapshot") {
-        let mut c = collect::Collector::new();
+        let mut c = collect::Collector::new(nss_load);
         println!("{:#?}", c.snapshot(0));
         let ok = c.has_nl80211();
         // Its client sockets go with it; exit would skip that.
@@ -170,7 +173,7 @@ fn main() {
         eprintln!("u6e-agent: hostapd control socket: {e}");
         process::exit(1);
     });
-    let collector = Arc::new(Mutex::new(collect::Collector::new()));
+    let collector = Arc::new(Mutex::new(collect::Collector::new(nss_load)));
     let peers: Vec<SocketAddr> = a
         .peers
         .iter()
