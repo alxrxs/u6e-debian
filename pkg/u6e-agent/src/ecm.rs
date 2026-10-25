@@ -2,10 +2,13 @@
 //! tracks them, summarized per client. ECM's state device dumps its
 //! connection database as `conns.conn.<serial>.<field>=<value>` lines, one
 //! connection per read; the bytes and packets are those ECM counts, the NSS
-//! hardware's included, so no packet is looked at on the CPU. A connection
-//! is offloaded when its front end's `accel_mode` (the field
-//! `conns.conn.<serial>.nss_v4.ported.accel_mode`, or `nss_v6`, `non_ported`
-//! for the others) is ECM's ACCEL, 2: the NSS hardware forwards it.
+//! hardware's included, so no packet is looked at on the CPU. The image asks
+//! for the brief record (output mask 4097, nss/patches/qca-nss-ecm/902):
+//! addresses, ports, nodes, protocol, totals, `age` and the front end's
+//! `accel_mode`, 13 lines where the full record has 175. A connection is
+//! offloaded when that mode is ECM's ACCEL, 2: the NSS hardware forwards it.
+//! A full record (mask 1, where the mode is in the front end's block, e.g.
+//! `nss_v4.ported.accel_mode`) parses too, without its age.
 //!
 //! Each open of the device starts a new dump, which walks ECM's list by
 //! reference, so a connection added or removed meanwhile is either whole in
@@ -17,7 +20,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{self, ErrorKind, Read};
 use std::net::IpAddr;
 use std::ops::ControlFlow;
@@ -30,13 +33,11 @@ use u6e_proto::msg::{ClientFlows, Flow, Flows};
 /// ECM's state device, under the collectors' root. ECM registers it with a
 /// dynamic major and no uevent, so the image creates it (prep-rootfs.sh).
 pub const DEVICE: &str = "dev/ecm_state";
-/// The uptime ECM's clock (seconds since it loaded) counts from, which the
-/// image records as it loads ECM.
-pub const EPOCH: &str = "run/u6e-nss/ecm-epoch";
 /// The most connections one dump is read for, a full table's included.
 pub const CAP: usize = 4096;
-/// The connections a summary lists per client.
-pub const TOP: usize = 8;
+/// The connections a summary lists per client: with 6, a summary of 17
+/// busy clients is 2.7 KB, under 300 B/s at the fastest cadence.
+pub const TOP: usize = 6;
 /// ECM's `accel_mode` of a connection the hardware forwards
 /// (ECM_FRONT_END_ACCELERATION_MODE_ACCEL).
 const ACCEL: i32 = 2;
@@ -59,8 +60,8 @@ pub struct Conn {
     pub from_packets: u64,
     pub to_packets: u64,
     pub offloaded: bool,
-    /// ECM's clock when the connection was added.
-    pub added: u32,
+    /// Seconds since ECM added it; 0 from a full record, which has none.
+    pub age_s: u32,
 }
 
 /// The connections of one dump.
@@ -75,21 +76,6 @@ pub struct EcmTable {
 /// Reads a dump from the device at `path`, at most `cap` connections of it.
 pub fn read(path: &Path, cap: usize) -> io::Result<EcmTable> {
     Ok(parse(File::open(path)?, cap))
-}
-
-/// ECM's clock now, from the uptime under `root` and the epoch the image
-/// recorded; `None` when either is missing.
-pub fn clock(root: &Path) -> Option<u32> {
-    let first = |p: &str| -> Option<f64> {
-        fs::read_to_string(root.join(p))
-            .ok()?
-            .split_whitespace()
-            .next()?
-            .parse()
-            .ok()
-    };
-    let since = first("proc/uptime")? - first(EPOCH)?;
-    (since >= 0.0).then_some(since as u32)
 }
 
 /// The table in the dump `r`. A record missing a field, and a read error,
@@ -157,7 +143,7 @@ fn lines(mut r: impl Read, mut each: impl FnMut(&[u8]) -> ControlFlow<()>) -> io
         }
         let end = len + n;
         let mut start = 0;
-        while let Some(i) = find(&buf[start..end], b'\n') {
+        while let Some(i) = buf[start..end].iter().position(|&c| c == b'\n') {
             let line = &buf[start..start + i];
             start += i + 1;
             if !std::mem::take(&mut skipping) && each(line).is_break() {
@@ -174,38 +160,12 @@ fn lines(mut r: impl Read, mut each: impl FnMut(&[u8]) -> ControlFlow<()>) -> io
     }
 }
 
-/// Where `b` is in `s`, looked for a word at a time: the agent is built for
-/// size, so a byte loop is not vectorized, and over the megabytes of a dump
-/// this takes the AP half the time of musl's memchr.
-fn find(s: &[u8], b: u8) -> Option<usize> {
-    const ONES: u64 = u64::from_ne_bytes([1; 8]);
-    const HIGHS: u64 = u64::from_ne_bytes([0x80; 8]);
-    let pattern = ONES * u64::from(b);
-    let mut at = 0;
-    for w in s.chunks_exact(8) {
-        let x = u64::from_ne_bytes(w.try_into().unwrap_or_default()) ^ pattern;
-        // A byte of `x` is zero where `w` holds `b`.
-        if x.wrapping_sub(ONES) & !x & HIGHS != 0 {
-            break;
-        }
-        at += 8;
-    }
-    s[at..].iter().position(|&c| c == b).map(|i| at + i)
-}
-
-/// A connection's serial, and the field and value of one of its lines;
-/// `None` for a line of a block the parse has no use for: the interface
-/// hierarchies (`from_interfaces`, `to_nat_interfaces`, ...), the classifiers
-/// and the bridge VLAN filter, nine lines in ten, told apart by their first
-/// bytes alone.
+/// A connection's serial, and the field and value of one of its lines.
 fn split(line: &[u8]) -> Option<(u32, &[u8], &[u8])> {
     let rest = line.strip_prefix(b"conns.conn.")?;
-    let dot = find(rest, b'.')?;
+    let dot = rest.iter().position(|&c| c == b'.')?;
     let (serial, rest) = (&rest[..dot], &rest[dot + 1..]);
-    if let [b'f', b'r', ..] | [b't', b'o', b'_', ..] | [b'c', b'l', ..] | [b'b', b'r', ..] = rest {
-        return None;
-    }
-    let eq = find(rest, b'=')?;
+    let eq = rest.iter().position(|&c| c == b'=')?;
     Some((value(serial)?, &rest[..eq], &rest[eq + 1..]))
 }
 
@@ -231,7 +191,7 @@ struct Pending {
     from_packets: Option<u64>,
     to_packets: Option<u64>,
     accel_mode: Option<i32>,
-    added: Option<u32>,
+    age: Option<u32>,
 }
 
 impl Pending {
@@ -252,14 +212,16 @@ impl Pending {
             b"dip_address" => self.dst = value(v),
             b"dport" => self.dport = value(v),
             b"dnode_address" => self.dst_mac = mac(v),
-            b"time_added" => self.added = value(v),
+            b"age" => self.age = value(v),
             b"adv_stats.from_data_total" => self.from_bytes = value(v),
             b"adv_stats.to_data_total" => self.to_bytes = value(v),
             b"adv_stats.from_packet_total" => self.from_packets = value(v),
             b"adv_stats.to_packet_total" => self.to_packets = value(v),
-            // The front end's block (`nss_v4.ported`, `nss_v6.non_ported`,
-            // ...) is the one that carries it.
-            f if f.ends_with(b".accel_mode") => self.accel_mode = value(v),
+            // A full record has it in the front end's block (`nss_v4.ported`,
+            // `nss_v6.non_ported`, ...).
+            f if f == b"accel_mode" || f.ends_with(b".accel_mode") => {
+                self.accel_mode = value(v);
+            }
             _ => {}
         }
     }
@@ -278,7 +240,7 @@ impl Pending {
             from_packets: self.from_packets?,
             to_packets: self.to_packets?,
             offloaded: self.accel_mode? == ACCEL,
-            added: self.added?,
+            age_s: self.age.unwrap_or(0),
         })
     }
 }
@@ -296,18 +258,17 @@ impl EcmTable {
     /// Each station's connections, by MAC: totals over all of them and its
     /// largest [`TOP`] by bytes, or every one when `full`. A connection
     /// between two stations counts for both; one of no station is left out,
-    /// and so is a station without connections. `now` is ECM's clock, for
-    /// the ages (0 without it).
-    pub fn flows(&self, seq: u64, stations: &[[u8; 6]], full: bool, now: Option<u32>) -> Flows {
+    /// and so is a station without connections.
+    pub fn flows(&self, seq: u64, stations: &[[u8; 6]], full: bool) -> Flows {
         let stations: BTreeSet<[u8; 6]> = stations.iter().copied().collect();
         let mut per: BTreeMap<[u8; 6], Vec<Flow>> = BTreeMap::new();
         for c in &self.conns {
             if stations.contains(&c.src_mac) {
-                per.entry(c.src_mac).or_default().push(flow(c, true, now));
+                per.entry(c.src_mac).or_default().push(flow(c, true));
             }
             // A connection a station has with itself counts once.
             if c.dst_mac != c.src_mac && stations.contains(&c.dst_mac) {
-                per.entry(c.dst_mac).or_default().push(flow(c, false, now));
+                per.entry(c.dst_mac).or_default().push(flow(c, false));
             }
         }
         let clients = per
@@ -341,7 +302,7 @@ impl EcmTable {
 }
 
 /// `c` as the station at its opening end (`opened`) or at the other sees it.
-fn flow(c: &Conn, opened: bool, now: Option<u32>) -> Flow {
+fn flow(c: &Conn, opened: bool) -> Flow {
     let (tx_bytes, rx_bytes, tx_packets, rx_packets) = if opened {
         (c.from_bytes, c.to_bytes, c.from_packets, c.to_packets)
     } else {
@@ -358,19 +319,19 @@ fn flow(c: &Conn, opened: bool, now: Option<u32>) -> Flow {
         tx_packets,
         rx_packets,
         offloaded: c.offloaded,
-        age_s: now.map_or(0, |n| n.saturating_sub(c.added)),
+        age_s: c.age_s,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testdir::TestDir;
     use std::net::Ipv4Addr;
 
-    /// Recorded on an AP: its 12 newest connections and the newest the
-    /// hardware does not forward. Its stations are 02:00:00:00:00:08 to :18;
-    /// :19 is the gateway, :1b and :1c wired hosts.
+    /// Recorded on an AP, in full records (mask 1): its 12 newest
+    /// connections and the newest the hardware does not forward. Its
+    /// stations are 02:00:00:00:00:08 to :18; :19 is the gateway, :1b and :1c
+    /// wired hosts.
     const FIXTURE: &str = include_str!("../tests/fixtures/ecm-state.txt");
 
     const fn m(n: u8) -> [u8; 6] {
@@ -385,12 +346,10 @@ mod tests {
         Ipv4Addr::new(192, 0, 2, n).into()
     }
 
-    /// A connection's record with the fields the parse reads, as ECM
-    /// writes them (but the interfaces, front end and classifiers blocks).
+    /// A connection's brief record, as the image's ECM writes it.
     fn record(serial: u32, from: [u8; 6], to: [u8; 6], bytes: [u64; 2]) -> String {
         let p = format!("conns.conn.{serial}");
         [
-            format!("serial={serial}"),
             "sip_address=192.0.2.1".into(),
             format!("sport={}", 1000 + serial % 60000),
             format!("snode_address={}", mac::format(from)),
@@ -398,12 +357,12 @@ mod tests {
             "dport=443".into(),
             format!("dnode_address={}", mac::format(to)),
             "protocol=6".into(),
-            "time_added=10".into(),
             format!("adv_stats.from_data_total={}", bytes[0]),
             format!("adv_stats.to_data_total={}", bytes[1]),
             "adv_stats.from_packet_total=3".into(),
             "adv_stats.to_packet_total=4".into(),
-            "nss_v4.ported.accel_mode=2".into(),
+            "age=10".into(),
+            "accel_mode=2".into(),
         ]
         .iter()
         .map(|l| format!("{p}.{l}\n"))
@@ -449,7 +408,7 @@ mod tests {
                 from_packets: 1,
                 to_packets: 1,
                 offloaded: true,
-                added: 896,
+                age_s: 0,
             }
         );
         // ECM writes every IPv6 group in full.
@@ -469,13 +428,37 @@ mod tests {
                 from_packets: 9,
                 to_packets: 0,
                 offloaded: false,
-                added: 874,
+                age_s: 0,
             }
         );
         assert_eq!(t.conns.iter().filter(|c| c.offloaded).count(), 12);
     }
 
     /// Any split of the reads gives the same table.
+    #[test]
+    fn a_brief_record_parses_exactly() {
+        let t = parse(record(7, m(1), m(9), [100, 900]).as_bytes(), CAP);
+        assert!(t.complete);
+        assert_eq!(
+            t.conns,
+            [Conn {
+                proto: 6,
+                src: v4(1),
+                sport: 1007,
+                src_mac: m(1),
+                dst: v4(2),
+                dport: 443,
+                dst_mac: m(9),
+                from_bytes: 100,
+                to_bytes: 900,
+                from_packets: 3,
+                to_packets: 4,
+                offloaded: true,
+                age_s: 10,
+            }]
+        );
+    }
+
     #[test]
     fn the_parse_does_not_depend_on_how_the_reads_split() {
         let whole = parse(FIXTURE.as_bytes(), CAP);
@@ -491,7 +474,7 @@ mod tests {
 
     #[test]
     fn each_station_gets_its_totals_and_largest_connections() {
-        let f = parse(FIXTURE.as_bytes(), CAP).flows(7, &stations(), false, Some(900));
+        let f = parse(FIXTURE.as_bytes(), CAP).flows(7, &stations(), false);
         assert_eq!((f.seq, f.complete), (7, true));
         let macs: Vec<_> = f.clients.iter().map(|c| c.mac).collect();
         assert_eq!(macs, [m(0x08), m(0x0e), m(0x0f), m(0x16)]);
@@ -520,7 +503,7 @@ mod tests {
                         tx_packets: 21,
                         rx_packets: 26,
                         offloaded: true,
-                        age_s: 7,
+                        age_s: 0,
                     },
                     Flow {
                         proto: 17,
@@ -533,7 +516,7 @@ mod tests {
                         tx_packets: 5,
                         rx_packets: 5,
                         offloaded: true,
-                        age_s: 7,
+                        age_s: 0,
                     },
                     Flow {
                         proto: 17,
@@ -546,7 +529,7 @@ mod tests {
                         tx_packets: 0,
                         rx_packets: 1,
                         offloaded: true,
-                        age_s: 7,
+                        age_s: 0,
                     },
                 ],
             }
@@ -570,19 +553,18 @@ mod tests {
     #[test]
     fn non_station_flows_are_ignored() {
         let t = parse(FIXTURE.as_bytes(), CAP);
-        let f = t.flows(1, &[m(0x08)], false, None);
+        let f = t.flows(1, &[m(0x08)], false);
         assert_eq!(f.clients.len(), 1);
         assert_eq!((f.clients[0].conns, f.clients[0].tx_bytes), (3, 300));
-        assert!(f.clients[0].top.iter().all(|f| f.age_s == 0));
-        assert!(t.flows(1, &[], false, None).clients.is_empty());
+        assert!(t.flows(1, &[], false).clients.is_empty());
         // A station that is not this AP's is not one of its clients.
-        assert!(t.flows(1, &[m(0x30)], false, None).clients.is_empty());
+        assert!(t.flows(1, &[m(0x30)], false).clients.is_empty());
     }
 
     #[test]
     fn a_flow_between_two_stations_counts_for_both() {
         let dump = record(5, m(1), m(2), [100, 900]) + &record(6, m(3), m(3), [5, 5]);
-        let f = parse(dump.as_bytes(), CAP).flows(1, &[m(1), m(2), m(3)], false, None);
+        let f = parse(dump.as_bytes(), CAP).flows(1, &[m(1), m(2), m(3)], false);
         let view: Vec<_> = f
             .clients
             .iter()
@@ -601,16 +583,16 @@ mod tests {
     }
 
     #[test]
-    fn a_summary_lists_the_largest_eight_and_a_full_table_every_one() {
+    fn a_summary_lists_the_largest_six_and_a_full_table_every_one() {
         let dump: String = (0..10)
             .map(|i| record(i, m(1), m(9), [i.into(), 0]))
             .collect();
         let t = parse(dump.as_bytes(), CAP);
-        let f = t.flows(1, &[m(1)], false, None);
+        let f = t.flows(1, &[m(1)], false);
         let sent: Vec<_> = f.clients[0].top.iter().map(|f| f.tx_bytes).collect();
-        assert_eq!(sent, [9, 8, 7, 6, 5, 4, 3, 2]);
+        assert_eq!(sent, [9, 8, 7, 6, 5, 4]);
         assert_eq!((f.clients[0].conns, f.clients[0].tx_bytes), (10, 45));
-        assert_eq!(t.flows(1, &[m(1)], true, None).clients[0].top.len(), 10);
+        assert_eq!(t.flows(1, &[m(1)], true).clients[0].top.len(), 10);
     }
 
     /// A table larger than the cap: the first `cap` connections, marked
@@ -627,7 +609,7 @@ mod tests {
         assert_eq!((t.conns.len(), t.complete), (CAP, false));
         // 904 of the 5000 records are left, less what one read took.
         assert!(r.data.len() > dump.len() / 6, "read on past the cap");
-        let f = t.flows(1, &[m(1)], true, None);
+        let f = t.flows(1, &[m(1)], true);
         assert_eq!((f.complete, f.clients[0].conns), (false, CAP as u32));
         // Exactly the cap is a whole table.
         let exact: String = (0..4).map(|i| record(i, m(1), m(9), [1, 1])).collect();
@@ -660,7 +642,7 @@ mod tests {
         let t = parse(garbled.as_bytes(), CAP);
         assert_eq!(t.conns, whole.conns[1..]);
         assert!(!t.complete);
-        let f = t.flows(1, &stations(), false, None);
+        let f = t.flows(1, &stations(), false);
         let c = f.clients.iter().find(|c| c.mac == m(0x08)).unwrap();
         assert_eq!((c.conns, c.tx_bytes), (2, 200));
     }
@@ -671,17 +653,5 @@ mod tests {
         let dump = record(5, m(1), m(9), [1, 2]).replacen('\n', &format!("\n{long}"), 1);
         let t = parse(dump.as_bytes(), CAP);
         assert_eq!((t.conns.len(), t.complete), (1, true));
-    }
-
-    #[test]
-    fn the_clock_counts_from_the_epoch() {
-        let t = TestDir::new();
-        fs::create_dir_all(t.path().join("proc")).unwrap();
-        fs::create_dir_all(t.path().join("run/u6e-nss")).unwrap();
-        assert_eq!(clock(t.path()), None);
-        fs::write(t.path().join("proc/uptime"), "905.37 1700.10\n").unwrap();
-        assert_eq!(clock(t.path()), None);
-        fs::write(t.path().join(EPOCH), "9.12\n").unwrap();
-        assert_eq!(clock(t.path()), Some(896));
     }
 }

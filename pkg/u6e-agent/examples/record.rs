@@ -178,7 +178,7 @@ fn ecm_part(dump: &str) -> String {
             _ => records.push(vec![line]),
         }
     }
-    let forwarded = |r: &Vec<&str>| r.iter().any(|l| l.ends_with(".accel_mode=2"));
+    let forwarded = |r: &Vec<&str>| r.iter().any(|l| l.ends_with("accel_mode=2"));
     let slow = records.iter().position(|r| !forwarded(r));
     let mut out = String::new();
     for (i, r) in records.iter().enumerate() {

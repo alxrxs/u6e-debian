@@ -321,11 +321,10 @@ impl Collector {
     /// The connections of `stations`, as [`ecm::EcmTable::flows`] sums
     /// them; `None` while ECM cannot be read.
     pub fn flows(&mut self, seq: u64, stations: &[[u8; 6]], full: bool) -> Option<Flows> {
-        let root = &self.paths.root;
-        match ecm::read(&root.join(ecm::DEVICE), ecm::CAP) {
+        match ecm::read(&self.paths.root.join(ecm::DEVICE), ecm::CAP) {
             Ok(t) => {
                 self.ecm.ok();
-                Some(t.flows(seq, stations, full, ecm::clock(root)))
+                Some(t.flows(seq, stations, full))
             }
             Err(e) => {
                 self.ecm.report(&e);
@@ -1192,8 +1191,8 @@ mod tests {
         assert_eq!(c.fw_crashes(), 1);
     }
 
-    /// The flows come from the ECM device under the root, aged by ECM's
-    /// clock; without the device there are none to send.
+    /// The flows come from the ECM device under the root; without it there
+    /// are none to send.
     #[test]
     fn flows_read_the_ecm_device() {
         let t = TestDir::new();
@@ -1206,18 +1205,11 @@ mod tests {
         });
         let station = [2, 0, 0, 0, 0, 8];
         assert_eq!(c.flows(1, &[station], false), None);
-        for (path, text) in [
-            (ecm::DEVICE, include_str!("../tests/fixtures/ecm-state.txt")),
-            ("proc/uptime", "910.5 1800.0\n"),
-            (ecm::EPOCH, "10.2\n"),
-        ] {
-            let path = root.join(path);
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(path, text).unwrap();
-        }
+        let device = root.join(ecm::DEVICE);
+        fs::create_dir_all(device.parent().unwrap()).unwrap();
+        let dump = include_str!("../tests/fixtures/ecm-state.txt");
+        fs::write(device, dump).unwrap();
         let f = c.flows(2, &[station], false).unwrap();
-        assert_eq!((f.seq, f.clients.len()), (2, 1));
-        // ECM's clock is at 900; the newest connection was added at 896.
-        assert_eq!(f.clients[0].top[0].age_s, 4);
+        assert_eq!((f.seq, f.clients.len(), f.clients[0].conns), (2, 1, 3));
     }
 }

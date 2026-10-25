@@ -166,7 +166,7 @@ fn print_flows(nss_load: Option<fs::File>, full: bool) {
         eprintln!("u6e-agent: ECM connection table: {e}");
         process::exit(1);
     });
-    let flows = table.flows(1, &stations, full, ecm::clock(Path::new("/")));
+    let flows = table.flows(1, &stations, full);
     let (used, wall) = (cpu() - used, start.elapsed());
     let mut frame = Vec::new();
     // Into a Vec: it cannot fail.

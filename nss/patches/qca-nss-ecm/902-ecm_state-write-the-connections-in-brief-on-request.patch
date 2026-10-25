@@ -1,0 +1,131 @@
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Subject: [PATCH] ecm_state: write the connections in brief on request
+
+A reader that sums the flows per host (the AP agent's flow summaries) needs
+a connection's addresses, ports, nodes, protocol, byte and packet totals,
+age and acceleration mode: 13 lines. The full record is about 175, nine in
+ten of them the four interface hierarchies, the front end and the
+classifiers, and writing it costs the AP about 0.4 ms of CPU per
+connection: 250 ms for a 600-connection table, every read.
+
+Output mask bit 4096 (with 1, connections) writes each connection in brief:
+those 13 values, in the full record's keys, but for "age" (seconds since
+the connection was added, which the full record gives only as time_added
+on a clock it does not show) and the front end's "accel_mode" at the
+top level. The default mask and every other bit are unchanged.
+---
+--- a/ecm_state.h
++++ b/ecm_state.h
+@@ -15,6 +15,7 @@
+ int ecm_state_prefix_remove(struct ecm_state_file_instance *sfi);
+ 
+ int ecm_state_write(struct ecm_state_file_instance *sfi, char *name, char *fmt, ...);
++bool ecm_state_brief(struct ecm_state_file_instance *sfi);
+ 
+ int ecm_state_init(struct dentry *dentry);
+ void ecm_state_exit(void);
+\ No newline at end of file
+--- a/ecm_state.c
++++ b/ecm_state.c
+@@ -91,6 +91,7 @@
+ #ifdef ECM_DB_CTA_TRACK_ENABLE
+ #define ECM_STATE_FILE_OUTPUT_CLASSIFIER_TYPE_ASSIGNMENTS 2048
+ #endif
++#define ECM_STATE_FILE_OUTPUT_CONNECTIONS_BRIEF 4096
+ 
+ /*
+  * struct ecm_state_file_instance
+@@ -272,6 +273,18 @@
+ }
+ 
+ /*
++ * ecm_state_brief()
++ *	Whether connections are written in brief: their addresses, counters,
++ *	age and acceleration mode alone, without the interface hierarchies,
++ *	front end and classifier state that make up most of each record.
++ */
++bool ecm_state_brief(struct ecm_state_file_instance *sfi)
++{
++	DEBUG_CHECK_MAGIC(sfi, ECM_STATE_FILE_INSTANCE_MAGIC, "%px: magic failed", sfi);
++	return sfi->output_mask & ECM_STATE_FILE_OUTPUT_CONNECTIONS_BRIEF;
++}
++
++/*
+  * ecm_state_char_dev_conn_msg_prep()
+  *	Prepare a connection message
+  */
+@@ -928,6 +941,9 @@
+ 	 * To Dump classifier info
+ 	 * echo 2048 > /proc/sys/net/ecm/ecm_state/state_file_output_mask
+ 	 *
++	 * To Dump connection info in brief (with 1)
++	 * echo 4097 > /proc/sys/net/ecm/ecm_state/state_file_output_mask
++	 *
+ 	 * To Read status:
+ 	 * cat /proc/sys/net/ecm/ecm_state/state_file_output_mask
+ 	 */
+--- a/ecm_db/ecm_db_connection.c
++++ b/ecm_db/ecm_db_connection.c
+@@ -4182,6 +4182,7 @@
+ 	uint16_t generation;
+ 	uint16_t global_generation;
+ 	uint32_t time_added;
++	uint32_t age;
+ 	uint32_t serial;
+ 	uint64_t from_data_total;
+ 	uint64_t to_data_total;
+@@ -4200,6 +4201,7 @@
+ 	struct ecm_classifier_instance *assignments[ECM_CLASSIFIER_TYPES];
+ 	int32_t first_interface;
+ 	struct ecm_db_iface_instance *interfaces[ECM_DB_IFACE_HEIRARCHY_MAX];
++	ecm_front_end_acceleration_mode_t accel_mode;
+ 
+ 	DEBUG_TRACE("Prep conn msg for %px\n", ci);
+ 
+@@ -4223,6 +4225,7 @@
+ 	regen_in_progress = ci->regen_in_progress;
+ 	generation = ci->generation;
+ 	global_generation = ecm_db_connection_generation;
++	age = ecm_db_time - ci->time_added;
+ 
+ 	spin_unlock_bh(&ecm_db_lock);
+ 
+@@ -4279,6 +4282,38 @@
+ 		return result;
+ 	}
+ 
++	/*
++	 * In brief: what a reader summing the flows per host needs, in the same
++	 * keys as the full record but for the age (seconds since the connection
++	 * was added) and the front end's acceleration mode at the top level.
++	 */
++	if (ecm_state_brief(sfi)) {
++		feci = ecm_db_connection_front_end_get_and_ref(ci);
++		accel_mode = ecm_front_end_connection_accel_state_get(feci);
++		ecm_front_end_connection_deref(feci);
++
++		if ((result = ecm_state_write(sfi, "sip_address", "%s", sip_address))
++				|| (result = ecm_state_write(sfi, "sport", "%d", sport))
++				|| (result = ecm_state_write(sfi, "snode_address", "%s", snode_address))
++				|| (result = ecm_state_write(sfi, "dip_address", "%s", dip_address))
++				|| (result = ecm_state_write(sfi, "dport", "%d", dport))
++				|| (result = ecm_state_write(sfi, "dnode_address", "%s", dnode_address))
++				|| (result = ecm_state_write(sfi, "protocol", "%d", protocol))
++				|| (result = ecm_state_write(sfi, "adv_stats.from_data_total", "%llu", from_data_total))
++				|| (result = ecm_state_write(sfi, "adv_stats.to_data_total", "%llu", to_data_total))
++				|| (result = ecm_state_write(sfi, "adv_stats.from_packet_total", "%llu", from_packet_total))
++				|| (result = ecm_state_write(sfi, "adv_stats.to_packet_total", "%llu", to_packet_total))
++				|| (result = ecm_state_write(sfi, "age", "%u", age))
++				|| (result = ecm_state_write(sfi, "accel_mode", "%d", accel_mode))) {
++			return result;
++		}
++
++		if ((result = ecm_state_prefix_remove(sfi))) {
++			return result;
++		}
++		return ecm_state_prefix_remove(sfi);
++	}
++
+ 	if ((result = ecm_state_write(sfi, "serial", "%u", serial))) {
+ 		return result;
+ 	}

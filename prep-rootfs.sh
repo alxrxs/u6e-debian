@@ -616,13 +616,12 @@ modprobe -a qca-nss-crypto qca-nss-cfi-cryptoapi qca-mcs nat46 qca-nss-qdisc act
 modprobe nf_conntrack
 s net.netfilter.nf_conntrack_tcp_no_window_check=1 net.netfilter.nf_conntrack_max=32768
 modprobe ecm front_end_selection=1
-# For u6e-agent's flows (pkg/u6e-agent/src/ecm.rs): the uptime ECM's clock
-# counts from, for the connections' ages; its state dump of connections only;
-# and that dump's device, which ECM registers with a dynamic major and no
-# uevent, for the agent's group (each open is a new dump, so the agent opens
-# it itself, rather than being passed it once).
-mkdir -p /run/u6e-nss && cut -d' ' -f1 /proc/uptime > /run/u6e-nss/ecm-epoch
-s net.ecm.ecm_state.state_file_output_mask=1
+# For u6e-agent's flows (pkg/u6e-agent/src/ecm.rs): ECM's state dump of
+# connections in brief (4096, patches/qca-nss-ecm/902: 13 lines of the full
+# record's 175), and its device, which ECM registers with a dynamic major
+# and no uevent, for the agent's group (each open is a new dump, so the
+# agent opens it itself, rather than being passed it once).
+s net.ecm.ecm_state.state_file_output_mask=4097
 major=$(awk '$2 == "ecm_state" {print $1}' /proc/devices)
 rm -f /dev/ecm_state
 if [ -n "$major" ] && mknod -m 0440 /dev/ecm_state c "$major" 0; then

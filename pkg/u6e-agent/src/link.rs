@@ -47,8 +47,8 @@ const KEY_EVERY: Duration = Duration::from_secs(60);
 /// The flows' cadence until the controller sets one; what it may set is
 /// held between [`FLOWS_MIN`] and this.
 const FLOWS_DEFAULT: Duration = Duration::from_secs(60);
-/// Each read of ECM's table costs about half a millisecond of CPU per
-/// connection in it: no faster than this.
+/// Each read of ECM's table costs CPU in proportion to the connections in
+/// it: no faster than this.
 const FLOWS_MIN: Duration = Duration::from_secs(10);
 /// An event this close to the next tick waits and rides in its record.
 const COALESCE: Duration = Duration::from_millis(50);
