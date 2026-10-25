@@ -8,7 +8,7 @@
 # nss-drv, ECM, the clients and MCS, qosmio's fixes for the client managers and
 # nss-drv paths kuncy7 does not build, and our own); headers a later package
 # includes are staged in stage/, modules land in out/<kernel release>/. The wireless stack is the
-# patched ../backports-7.2 tree that trees.sh builds. Ethernet is mainline
+# patched ../backports-7.2 tree that trees.sh builds; u6e-pcc/ is our own module. Ethernet is mainline
 # dwmac-ipq5018; qca-dwmac-nss hands its GMACs to the NSS firmware.
 # Flags mirror the OpenWrt package recipes with every engine the IPQ5018
 # firmware ships switched on.
@@ -33,7 +33,7 @@ W="-Wno-missing-prototypes -Wno-missing-declarations"
 
 prepare() { # <package>: pinned source + its patches
 	local s=$N/src/$1 url rev sub repo
-	case $1 in backports|firmware) return ;; esac
+	case $1 in backports|firmware|u6e-pcc) return ;; esac
 	read -r url rev sub < <(awk -v p="$1" '$1==p {print $2, $3, $4}' "$N/sources.txt")
 	if [ -n "$sub" ]; then
 		# A package that lives in a subdirectory of a larger repo (a blobless
@@ -117,7 +117,7 @@ build() {
 			ECM_INTERFACE_TUNIPIP6_ENABLE=y ECM_INTERFACE_IPSEC_ENABLE=y ECM_INTERFACE_MAP_T_ENABLE=y \
 			ECM_CLASSIFIER_MARK_ENABLE=y ECM_CLASSIFIER_DSCP_ENABLE=y ECM_CLASSIFIER_DSCP_IGS=y \
 			ECM_CLASSIFIER_PCC_ENABLE=y ECM_DB_ADVANCED_STATS_ENABLE=y modules
-		stage qca-nss-ecm "$s"/exports/* ;;
+		stage qca-nss-ecm "$s"/exports/* "$s"/ecm_classifier_pcc_public.h ;;
 	qca-nss-clients)
 		"${KM[@]}" M="$s" SoC=ipq50xx_64 KBUILD_EXTRA_SYMBOLS="$(symvers)" \
 			qdisc=y igs=y netlink=y vxlanmgr=y match=y mirror=y vlan-mgr=y lag-mgr=y \
@@ -125,6 +125,13 @@ build() {
 			ipsecmgr=y ipsecmgr-xfrm=y map-t=y wifi-meshmgr=y IPSECMGR_DIR=v2.0 \
 			CFLAGS_MODULE="-I$STAGE/qca-nss-drv -I$STAGE/qca-nss-crypto -I$STAGE/qca-nss-cfi -I$STAGE/nat46 -I$STAGE/qca-nss-ecm -I$s/exports -DNSS_VXLAN_ENABLED $NSSFW_DEF $W -Wno-empty-body -include $s/compat.h" modules
 		stage qca-nss-clients "$s"/netlink/include/* "$s"/exports/* ;;
+	u6e-pcc)
+		# ECM's PCC registrant that mirrors one client's offloaded flows into
+		# an NSS mirror instance (u6e-pcc/u6e-pcc.c), built from a copy so
+		# the tracked tree stays clean.
+		rm -rf "$s"; cp -r "$N/u6e-pcc" "$s"
+		"${KM[@]}" M="$s" KBUILD_EXTRA_SYMBOLS="$(symvers)" \
+			CFLAGS_MODULE="-I$STAGE/qca-nss-ecm -I$STAGE/qca-nss-drv -I$STAGE/qca-nss-clients $NSSFW_DEF" modules ;;
 	backports)
 		# The 7.2 wireless subsystem; the kernel's own cfg80211/mac80211 are off.
 		rm -rf "$s"; mkdir -p "$s"
@@ -157,5 +164,5 @@ build() {
 }
 
 rm -rf "$STAGE" "$OUT"
-for p in qca-dwmac-nss qca-nss-drv qca-nss-crypto qca-nss-cfi nat46 qca-mcs qca-nss-ecm qca-nss-clients backports firmware; do build "$p"; done
+for p in qca-dwmac-nss qca-nss-drv qca-nss-crypto qca-nss-cfi nat46 qca-mcs qca-nss-ecm qca-nss-clients u6e-pcc backports firmware; do build "$p"; done
 ls "$OUT"

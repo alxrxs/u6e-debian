@@ -50,7 +50,7 @@ sudo FORCE=1 ./deploy.sh ap1      # boot ap1 again even though it already runs t
 1. `trees.sh`: prepares the kernel and Wi-Fi driver sources (see [Sources and patches](#sources-and-patches)).
 2. `fw/mk-board2.sh`: assembles the board data files for the radios.
 3. `config-u6e.sh` and `make`: configures and builds the kernel.
-4. `nss/build.sh`: builds the NSS drivers and the Wi-Fi stack, and fetches the NSS firmware.
+4. `nss/build.sh`: builds the NSS drivers, our `u6e-pcc` module and the Wi-Fi stack, and fetches the NSS firmware.
 5. `pkg/hostapd/build.sh`: builds hostapd (the program that runs the Wi-Fi networks) as a Debian package.
 6. `pkg/iproute2-nss/build.sh`: builds Debian's `iproute2` with the NSS traffic-shaping options added to `tc`.
 7. `pkg/netlogd/build.sh`: builds Debian's `systemd-netlogd`, which forwards the log, with a fix for its journal file rotation.
@@ -124,7 +124,7 @@ Wi-Fi starts by itself on every boot (`u6e-wifi.service`), with nothing else on 
 | `trees.sh`, `export.sh` | Create the source trees from the patch series, and export commits back to patches |
 | `kernel/`, `backports/` | Upstream release address and our patches |
 | `config-u6e.sh` | Kernel configuration |
-| `nss/` | Builds the NSS drivers, the Wi-Fi stack and the NSS firmware download, with the patches for each |
+| `nss/` | Builds the NSS drivers, the Wi-Fi stack and the NSS firmware download, with the patches for each, and `u6e-pcc` (`nss/u6e-pcc/`), our module that has ECM accelerate one client's TCP and UDP connections with an NSS mirror rule, so the NSS core copies their packets to a mirror device while they stay offloaded (built, not yet in the image) |
 | `fw/` | Builds the board data files; includes `ath11k-bdencoder` |
 | `pkg/hostapd/` | hostapd build with our 29 patches |
 | `pkg/iproute2-nss/` | `iproute2` with NSS support in `tc` |
