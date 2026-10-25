@@ -1,9 +1,9 @@
 // The controller's single-page UI: one WebSocket brings the state of every AP
 // (a key, then merge patches of what changed) and their events as they
 // happen; the views render from that, and the samples taken here every two
-// seconds draw the charts of each client's session. A view that shows flows
-// opens the socket asking for them too, which makes the APs send them every
-// 10 s; the client actions are POSTs, answered with their result.
+// seconds draw the charts of each client's session. While a view shows flows
+// the socket asks for them too, which makes the APs send them every 10 s;
+// the client actions are POSTs, answered with their result.
 
 import { icon } from './util.js';
 import devices from './views/devices.js';
@@ -43,7 +43,7 @@ const store = {
    * each client's with its `mac`, and `down` and `up` in bit/s since the
    * AP's previous. */
   flows: {},
-  /** Whether the socket has brought the flows it asked for. */
+  /** Whether the flows asked for have come. */
   flowsKeyed: false,
   /** What the views remember across visits: sort, filters, open details. */
   ui: {},
@@ -187,18 +187,15 @@ function takeFlows() {
 }
 
 let socket = null;
-/** Whether the socket open (or opening) asks for the flows. */
+/** Whether the view shows flows, and so the socket asks for them. */
 let withFlows = false;
 
-/** Opens the socket again when the view wants flows and it does not bring
- * them, or the other way round: the subscription is its first message. */
+/** Tells the socket whether the view shows flows; one still opening says so
+ * in its subscription. */
 function watchFlows(want) {
-  if (want === withFlows || !socket) return;
+  if (want === withFlows) return;
   withFlows = want;
-  store.flowsKeyed = false;
-  socket.onclose = null;
-  socket.close();
-  connect();
+  if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ flows: want }));
 }
 
 let backoff = 1;
@@ -212,7 +209,6 @@ function connect() {
     if (m.key) {
       store.state = m.key;
       store.keyed = true;
-      store.flowsKeyed = withFlows;
       store.user = m.user ?? null;
       // Events may have passed while the socket was down.
       if (store.historyLoaded && store.live === 'down') loadHistory(true);
@@ -221,7 +217,10 @@ function connect() {
       if (!store.me) loadMe();
     }
     if (m.patch) merge(store.state, m.patch);
-    if (m.key || m.patch?.flows) takeFlows();
+    if (m.key || (m.patch && 'flows' in m.patch)) {
+      takeFlows();
+      store.flowsKeyed = 'flows' in store.state;
+    }
     if (m.events) addEvents(m.events);
     if (m.lost && store.historyLoaded) loadHistory(true);
     changed();

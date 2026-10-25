@@ -9,7 +9,8 @@
 //! or `{"subscribe":"*"}`, with `"flows":true` for their clients' flows too);
 //! it then gets their state as one JSON `key`, a JSON merge `patch` of what
 //! changed after each update, and their new `events`. While it is open each of
-//! those APs reports every 2 s, and its flows every 10 s when asked for.
+//! those APs reports every 2 s, and its flows every 10 s while the socket asks
+//! for them, which it can change at any time with `{"flows":true|false}`.
 //!
 //! `GET /api/flows?ap=&client=` is the latest flows, `GET /api/flows/full?ap=`
 //! asks the AP for every connection it forwards (at most every 10 s) and
@@ -340,27 +341,41 @@ async fn subscription(ws: &mut WebSocket, state: &Shared) -> Option<(Vec<String>
     Some((aps, sub.flows))
 }
 
+/// What a socket says after its subscription: whether it shows the flows.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShowFlows {
+    flows: bool,
+}
+
 async fn send(ws: &mut WebSocket, msg: &Value) -> Result<(), axum::Error> {
     ws.send(Message::Text(msg.to_string().into())).await
 }
 
+/// Sends what changed from `sent` to `next`, if anything did; `next` is then
+/// what the socket holds.
+async fn patch(ws: &mut WebSocket, sent: &mut Value, next: Value) -> Result<(), axum::Error> {
+    if let Some(p) = view::diff(sent, &next) {
+        send(ws, &json!({ "patch": p })).await?;
+        *sent = next;
+    }
+    Ok(())
+}
+
 /// Serves one WebSocket until either end closes it.
 async fn live(mut ws: WebSocket, state: Shared, user: Option<String>) {
-    let Some((names, flows)) = subscription(&mut ws, &state).await else {
+    let Some((names, mut flows)) = subscription(&mut ws, &state).await else {
         return;
     };
     let wanted = |ap: &str| names.iter().any(|n| n == ap);
-    // Held until the socket ends: the watchers are what set the 2 s tick and
-    // the 10 s flow cadence.
-    let flow_watchers = names
-        .iter()
-        .filter(|_| flows)
-        .filter_map(|n| state.watch_flows(n));
-    let _watching: Vec<WatchGuard> = names
-        .iter()
-        .filter_map(|n| state.watch(n))
-        .chain(flow_watchers)
-        .collect();
+    // Held until the socket ends: the watchers are what set the 2 s tick.
+    let _watching: Vec<WatchGuard> = names.iter().filter_map(|n| state.watch(n)).collect();
+    // Held while it shows the flows: they set the 10 s flow cadence.
+    let watch_flows = |on: bool| -> Vec<WatchGuard> {
+        let names = names.iter().filter(|_| on);
+        names.filter_map(|n| state.watch_flows(n)).collect()
+    };
+    let mut _watching_flows = watch_flows(flows);
     // Subscribed first, so nothing between the key and the first patch is lost.
     let mut changes = state.read().subscribe();
     let mut sent = view::view(&state.read(), wanted, flows);
@@ -374,7 +389,22 @@ async fn live(mut ws: WebSocket, state: Shared, user: Option<String>) {
         let change = tokio::select! {
             c = changes.recv() => c,
             m = ws.recv() => match m {
-                // Nothing else a client says means anything yet.
+                Some(Ok(Message::Text(text))) => {
+                    // Anything else a client says means nothing yet.
+                    let Ok(show) = serde_json::from_str::<ShowFlows>(&text) else {
+                        continue;
+                    };
+                    if show.flows != flows {
+                        flows = show.flows;
+                        _watching_flows = watch_flows(flows);
+                        // The flows come, or go, with this patch.
+                        let next = view::view(&state.read(), wanted, flows);
+                        if patch(&mut ws, &mut sent, next).await.is_err() {
+                            return;
+                        }
+                    }
+                    continue;
+                }
                 Some(Ok(_)) => continue,
                 _ => return,
             },
@@ -407,11 +437,8 @@ async fn live(mut ws: WebSocket, state: Shared, user: Option<String>) {
             continue;
         }
         let next = view::view(&state.read(), wanted, flows);
-        if let Some(patch) = view::diff(&sent, &next) {
-            if send(&mut ws, &json!({ "patch": patch })).await.is_err() {
-                return;
-            }
-            sent = next;
+        if patch(&mut ws, &mut sent, next).await.is_err() {
+            return;
         }
     }
 }

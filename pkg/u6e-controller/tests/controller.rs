@@ -1870,6 +1870,37 @@ fn cadence_follows_watchers() {
     assert_eq!(a.expect(), CtlMsg::SetTick { secs: TICK_IDLE });
 }
 
+/// The page asks for the flows, and stops, on the socket it has open: the
+/// AP's cadence follows, and the flows come and go in the patches.
+#[test]
+fn ws_flows_follow_the_page() {
+    let r = controller(Timing::default());
+    let mut a = ap_with_client(&r, KEY_AP1, "ap1", &[]);
+    let mut ui = Ui::subscribe(r.c.http, json!(["ap1"]));
+    assert!(ui.recv()["key"].get("flows").is_none());
+    assert_eq!(a.expect(), CtlMsg::SetTick { secs: TICK_WATCHED });
+
+    ui.send(&json!({"flows": true}));
+    assert_eq!(ui.recv(), json!({"patch": {"flows": {}}}));
+    assert_eq!(
+        a.expect(),
+        CtlMsg::FlowCadence {
+            secs: FLOWS_WATCHED
+        }
+    );
+    // Said again, or something else said, it changes nothing.
+    ui.send(&json!({"flows": true}));
+    ui.send(&json!({"what": 1}));
+    assert_eq!(r.c.state.read().flow_watchers("ap1"), 1);
+
+    ui.send(&json!({"flows": false}));
+    assert_eq!(ui.recv(), json!({"patch": {"flows": null}}));
+    assert_eq!(a.expect(), CtlMsg::FlowCadence { secs: FLOWS_IDLE });
+    assert_eq!(r.c.state.read().flow_watchers("ap1"), 0);
+    // The socket still watches the AP itself.
+    assert_eq!(r.c.state.read().watchers("ap1"), 1);
+}
+
 /// A client whose only connection was opened from outside is named by its
 /// own address, never by the end that opened it.
 #[test]
