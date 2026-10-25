@@ -5,6 +5,9 @@
 //! hold the same list in the same order. [`valid`] states what that takes;
 //! [`diff`] declines and [`apply`] refuses whatever is not valid, so a broken
 //! snapshot costs a key frame instead of misattributed counters.
+//!
+//! Which bit stands for which field is wire format too: a change to it bumps
+//! [`crate::PROTOCOL`].
 
 use std::collections::{HashMap, HashSet};
 

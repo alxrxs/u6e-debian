@@ -1,8 +1,12 @@
 //! The messages of the agent-to-controller link and the state they carry.
+//! postcard encodes them without a schema, so every change to their layout
+//! (a field, a variant, an order) bumps [`crate::PROTOCOL`].
 
 use serde::{Deserialize, Serialize};
 
 /// Everything the agent sends.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum AgentMsg {
@@ -18,6 +22,8 @@ pub enum AgentMsg {
 }
 
 /// Everything the controller sends.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum CtlMsg {
@@ -31,6 +37,8 @@ pub enum CtlMsg {
 }
 
 /// What the AP is running, sent once per connection.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Hello {
     pub ap: String,
@@ -44,6 +52,8 @@ pub struct Hello {
 ///
 /// `stations` is sorted by MAC, each MAC once, as [`crate::delta::valid`]
 /// requires; a snapshot that is not goes out as a key frame.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
     pub seq: u64,
@@ -57,12 +67,14 @@ pub struct Snapshot {
     pub stations: Vec<Station>,
 }
 
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Temp {
     pub zone: String,
     pub milli_c: i32,
 }
 
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Band {
     B24,
@@ -70,6 +82,7 @@ pub enum Band {
     B6,
 }
 
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Radio {
     pub phy: String,
@@ -85,6 +98,7 @@ pub struct Radio {
     pub up: bool,
 }
 
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bss {
     pub ifname: String,
@@ -94,6 +108,7 @@ pub struct Bss {
     pub vlan: u16,
 }
 
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Station {
     pub mac: [u8; 6],
@@ -126,6 +141,8 @@ pub struct Station {
 }
 
 /// The PHY mode a rate was sent in, which says what its MCS index means.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RateMode {
     /// 802.11a/b/g: no MCS.
@@ -142,6 +159,8 @@ pub enum RateMode {
 /// radio's phy) left out; `vals` holds the differences of the set bits, lowest
 /// bit first. The scalar bits are the four numbers of [`Snapshot`], then one per
 /// temperature.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotDelta {
     pub seq: u64,
@@ -157,6 +176,8 @@ pub struct SnapshotDelta {
 }
 
 /// Changed fields of a record that has no index.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FieldDelta {
     pub mask: u32,
@@ -164,6 +185,8 @@ pub struct FieldDelta {
 }
 
 /// Changed fields of the record at `idx` of the base snapshot's list.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecDelta {
     pub idx: u16,
@@ -172,12 +195,15 @@ pub struct RecDelta {
 }
 
 /// Something that happened between two ticks.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
     pub at_ms: u64,
     pub kind: EventKind,
 }
 
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum EventKind {

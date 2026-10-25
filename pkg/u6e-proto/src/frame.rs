@@ -42,9 +42,18 @@ pub fn read_frame<R: Read, T: DeserializeOwned>(r: &mut R) -> io::Result<T> {
 /// Decodes the first frame of `buf` and returns it with the bytes it took, or
 /// `None` while `buf` holds only part of one. For a reader that accumulates
 /// bytes from a stream that can time out, where [`read_frame`] would lose its
-/// place mid-frame. A length above [`MAX_FRAME`] is refused without waiting for
-/// the body.
+/// place mid-frame.
 pub fn decode_frame<T: DeserializeOwned>(buf: &[u8]) -> io::Result<Option<(T, usize)>> {
+    let Some((body, end)) = frame_body(buf)? else {
+        return Ok(None);
+    };
+    Ok(Some((postcard::from_bytes(body).map_err(invalid)?, end)))
+}
+
+/// The body of the first frame of `buf`, undecoded, with the bytes the frame
+/// took; `None` while `buf` holds only part of it. A length above
+/// [`MAX_FRAME`] is refused without waiting for the body.
+pub fn frame_body(buf: &[u8]) -> io::Result<Option<(&[u8], usize)>> {
     let Some(prefix) = buf.first_chunk::<4>() else {
         return Ok(None);
     };
@@ -56,10 +65,7 @@ pub fn decode_frame<T: DeserializeOwned>(buf: &[u8]) -> io::Result<Option<(T, us
         ));
     }
     let end = 4 + len as usize;
-    let Some(body) = buf.get(4..end) else {
-        return Ok(None);
-    };
-    Ok(Some((postcard::from_bytes(body).map_err(invalid)?, end)))
+    Ok(buf.get(4..end).map(|body| (body, end)))
 }
 
 fn invalid(e: postcard::Error) -> io::Error {
