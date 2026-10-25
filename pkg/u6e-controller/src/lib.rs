@@ -4,6 +4,9 @@
 //! UI (`http`, which reads it through `view`). The UI's operators act on
 //! clients through `actions`; what must outlive the process is in `policy`.
 //! The radios' spectrum scans run while the UI watches them (`spectrum`).
+//! The deploy runner dials the same listener with its own key (`runner`):
+//! its signed Wi-Fi configurations are relayed to the APs, and the image
+//! rollouts admins ask for go to it, each health-gated here.
 
 pub mod actions;
 pub mod agents;
@@ -12,6 +15,7 @@ pub mod http;
 pub mod metrics;
 pub mod names;
 pub mod policy;
+pub mod runner;
 pub mod spectrum;
 pub mod state;
 pub mod view;
@@ -23,12 +27,14 @@ use std::sync::{Arc, RwLock};
 
 use axum::Router;
 use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
 use u6e_proto::tls::{self, AllowedKeys, Identity};
 
 use crate::actions::Access;
-use crate::agents::Timing;
+use crate::agents::{Listener, Timing};
 use crate::config::Config;
 use crate::names::{Lookups, Resolve};
+use crate::policy::Store;
 use crate::state::{Shared, State};
 
 /// A running controller: its state and the addresses it listens on.
@@ -48,13 +54,19 @@ pub async fn start(
     resolver: Arc<dyn Resolve>,
 ) -> io::Result<Controller> {
     let path = &config.policy_path;
-    let blocked = policy::load(path)
+    let saved = policy::load(path)
         .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
-    let state = State::new(config.aps.keys().cloned())
-        .with_blocked(blocked)
+    let mut state = State::new(config.aps.keys().cloned())
+        .with_policy(saved)
         .with_spectrum(timing.spectrum);
+    if config.runner.is_some() {
+        state = state.with_runner();
+    }
     let state = Shared::new(state);
-    let keys: HashMap<_, _> = config.aps.iter().map(|(n, k)| (*k, n.clone())).collect();
+    // The handshake admits the runner's key beside the APs'; which one a
+    // connection holds says which it is (agents).
+    let mut keys: HashMap<_, _> = config.aps.iter().map(|(n, k)| (*k, n.clone())).collect();
+    keys.extend(config.runner.map(|k| (k, "(deploy runner)".to_owned())));
     let allowed: AllowedKeys = Arc::new(RwLock::new(keys));
     let bind = |addr| async move {
         TcpListener::bind(addr)
@@ -70,16 +82,18 @@ pub async fn start(
         http: http.local_addr()?,
         metrics: metrics.local_addr()?,
     };
-    let server = tls::server_config(identity, Arc::clone(&allowed));
-    tokio::spawn(agents::serve(
-        agents,
-        server,
+    let store = Store::new(config.policy_path.clone());
+    let listener = Listener {
+        acceptor: TlsAcceptor::from(tls::server_config(identity, Arc::clone(&allowed))),
         allowed,
-        state.clone(),
+        runner: config.runner,
+        state: state.clone(),
         timing,
-        Lookups::new(resolver),
-    ));
-    let access = Access::new(config, timing.command);
+        lookups: Lookups::new(resolver),
+        store: store.clone(),
+    };
+    tokio::spawn(agents::serve(agents, listener));
+    let access = Access::new(config, timing.command, store);
     let web = http::router(state.clone(), access);
     tokio::spawn(serve_http("http", http, web));
     tokio::spawn(spectrum::supervise(state.clone()));

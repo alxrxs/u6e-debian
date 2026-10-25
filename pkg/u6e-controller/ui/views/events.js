@@ -13,13 +13,15 @@ function radioName(store, e) {
   return band ? `${e.phy} (${band} GHz)` : e.phy;
 }
 
-/** An action's line: who did what to which client, and what came of it
- * (hostapd's bare "OK" says nothing a "done" does not). */
+/** An action's line: who did what to which client (or to the AP, for the
+ * deploy runner's), and what came of it (hostapd's bare "OK" says nothing a
+ * "done" does not). */
 function actionText(e, what, showMac) {
-  const who = e.user || 'Someone';
+  const who = e.user || (e.mac ? 'Someone' : 'The deploy runner');
   const result = e.ok
     ? h('span', { class: 'muted' }, ` · ${!e.detail || e.detail === 'OK' ? 'done' : e.detail}`)
     : `: failed, ${e.detail || 'no reason given'}`;
+  if (!e.mac) return [`${who} ${what.text}`, result];
   return showMac
     ? [who, ` ${what.text} `, h('a', { href: `#/client/${e.mac}` }, e.mac), result]
     : [`${what.text[0].toUpperCase()}${what.text.slice(1)} by ${who}`, result];

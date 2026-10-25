@@ -1,6 +1,8 @@
 //! The operator's actions on a client, `POST /api/clients/{mac}/kick`,
 //! `/block`, `/unblock` and `/steer` (`{"target_bssid": "<mac>"}`, and
-//! `"force": true` to have the client disassociated if it declines).
+//! `"force": true` to have the client disassociated if it declines); and on an
+//! AP, `POST /api/aps/{ap}/upgrade` (`{"image_id": "<kept image>"}`), the
+//! rollout the deploy runner then carries out and the controller gates.
 //!
 //! A request acts only when it comes from the UI's own page and from an
 //! admin, checked in that order ([`refusal`], which also gates the start of a
@@ -17,9 +19,9 @@
 //! tells it again, then sent to every connected AP; an AP that is away is
 //! given the whole policy when it reconnects. Each AP's result is awaited for
 //! `Timing::command` (504 past it), and each is an event and a journal line.
+//! An upgrade is answered once the runner has it (202 with its id; 409 when
+//! it cannot start); how it goes is in `/api/rollouts` and the events.
 
-use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use axum::body::Bytes;
@@ -28,14 +30,14 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 use u6e_proto::mac;
 use u6e_proto::msg::CommandKind;
 
 use crate::config::Config;
 use crate::http::{error, json_response};
-use crate::policy;
+use crate::policy::{self, Policy, Store};
 use crate::state::{Action, Shared, Waiter, action_name};
 
 /// The user the sign-in proxy names.
@@ -49,18 +51,18 @@ pub const GROUPS_HEADER: &str = "x-auth-request-groups";
 pub struct Access {
     pub public_origin: String,
     pub admin_group: String,
-    /// The policy file; holding the lock is what makes one save at a time.
-    policy: Arc<Mutex<PathBuf>>,
+    /// The policy file.
+    policy: Store,
     /// How long an AP has to answer a command.
     pub timeout: Duration,
 }
 
 impl Access {
-    pub fn new(config: &Config, timeout: Duration) -> Self {
+    pub fn new(config: &Config, timeout: Duration, policy: Store) -> Self {
         Access {
             public_origin: config.public_origin.clone(),
             admin_group: config.admin_group.clone(),
-            policy: Arc::new(Mutex::new(config.policy_path.clone())),
+            policy,
             timeout,
         }
     }
@@ -193,6 +195,56 @@ pub async fn steer(
     .await
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpgradeBody {
+    image_id: String,
+}
+
+/// Whether `id` could name a kept image: one path component of letters,
+/// digits, `.`, `_` and `-`, not starting with a dot. The runner checks that
+/// one of that name is kept for the AP.
+fn image_name(id: &str) -> bool {
+    let ok = |c: char| c.is_ascii_alphanumeric() || "._-".contains(c);
+    (1..=128).contains(&id.len()) && !id.starts_with('.') && id.chars().all(ok)
+}
+
+/// `POST /api/aps/{ap}/upgrade`: an admin's rollout of a kept image to the
+/// AP, handed to the deploy runner.
+pub async fn upgrade(
+    Ext(web): Ext<Web>,
+    Path(ap): Path<String>,
+    req: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Some(why) = refusal(&req, &web.access, Via::Post, &format!("upgrade {ap}")) {
+        return error(StatusCode::FORBIDDEN, why);
+    }
+    let Ok(b) = serde_json::from_slice::<UpgradeBody>(&body) else {
+        return error(StatusCode::BAD_REQUEST, "not {\"image_id\"}");
+    };
+    if !image_name(&b.image_id) {
+        return error(StatusCode::BAD_REQUEST, "image_id is not an image's name");
+    }
+    let who = user(&req).unwrap_or_else(|| "(no user)".into());
+    let mut state = web.state.write();
+    match state.upgrade(&ap, &b.image_id, &who) {
+        Ok(id) => (StatusCode::ACCEPTED, json_response(&json!({ "id": id }))).into_response(),
+        Err(why) => {
+            state.record(Action {
+                at: SystemTime::now(),
+                user: Some(who),
+                action: "upgrade",
+                mac: None,
+                ap: Some(ap),
+                ok: false,
+                detail: format!("{}: {why}", b.image_id),
+            });
+            error(StatusCode::CONFLICT, &why)
+        }
+    }
+}
+
 /// Checks the request, then takes `action`, the command `kind` makes of the
 /// client's MAC.
 async fn act(
@@ -302,7 +354,7 @@ impl Ctx<'_> {
             at: SystemTime::now(),
             user: self.user.clone(),
             action: self.action,
-            mac: self.mac,
+            mac: Some(self.mac),
             ap: ap.map(str::to_owned),
             ok,
             detail,
@@ -381,17 +433,18 @@ impl Ctx<'_> {
     /// into the state; the APs connected then, which are to be told.
     async fn save(&self, access: &Access, blocking: bool) -> std::io::Result<Vec<String>> {
         let path = access.policy.lock().await;
-        let mut next = self.state.read().blocked.clone();
+        let Policy {
+            blocked: mut next,
+            configs,
+        } = self.state.read().policy();
         let changed = if blocking {
             next.insert(self.mac)
         } else {
             next.remove(&self.mac)
         };
         if changed {
-            let (path, next) = (path.clone(), next.clone());
-            tokio::task::spawn_blocking(move || policy::save(&path, &next))
-                .await
-                .map_err(std::io::Error::other)??;
+            let blocked = next.clone();
+            policy::write(&path, Policy { blocked, configs }).await?;
         }
         let mut state = self.state.write();
         state.blocked = next;
@@ -466,6 +519,24 @@ mod tests {
             &[("content-type", "application/json"), ("origin", "null")],
         ] {
             assert!(cross_site(&headers(bad), ORIGIN, Via::Post), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn an_image_is_named_by_one_plain_path_component() {
+        assert!(image_name("20261025-120000-abc1234-def5678-ap1"));
+        for bad in [
+            "",
+            ".",
+            "..",
+            ".hidden",
+            "a/b",
+            "../ap1",
+            "a b",
+            "ä",
+            &"a".repeat(129),
+        ] {
+            assert!(!image_name(bad), "{bad}");
         }
     }
 

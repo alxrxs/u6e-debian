@@ -45,6 +45,7 @@ use u6e_controller::agents::Timing;
 use u6e_controller::config::Config;
 use u6e_controller::http;
 use u6e_controller::names::Resolve;
+use u6e_controller::policy::Store;
 use u6e_proto::frame::{decode_frame, frame_body, write_frame};
 use u6e_proto::msg::{
     AgentMsg, Band, Bss, CommandKind, CommandResult, CtlMsg, Event, EventKind, Flows, Hello, Radio,
@@ -980,7 +981,8 @@ async fn main() -> io::Result<()> {
         }
         async move { req }
     };
-    let web_router = http::router(c.state.clone(), Access::new(&config, timing.command))
+    let store = Store::new(config.policy_path.clone());
+    let web_router = http::router(c.state.clone(), Access::new(&config, timing.command, store))
         .layer(middleware::map_request(signed_in));
     let listener = tokio::net::TcpListener::bind(web).await?;
     eprintln!(

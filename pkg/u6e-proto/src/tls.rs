@@ -275,13 +275,10 @@ pub fn server_config(me: &Identity, allowed: AllowedKeys) -> Arc<ServerConfig> {
     Arc::new(config)
 }
 
-/// The enrolled name of the peer whose handshake `conn` completed.
-pub fn peer_name(
-    conn: &ServerConnection,
-    allowed: &RwLock<HashMap<[u8; 32], String>>,
-) -> Option<String> {
-    let key = ed25519_key(conn.peer_certificates()?.first()?.as_ref())?;
-    allowed.read().ok()?.get(&key).cloned()
+/// The key the peer whose handshake `conn` completed presented, which
+/// `allowed` admitted: what the server tells its peers apart by.
+pub fn peer_key(conn: &ServerConnection) -> Option<[u8; 32]> {
+    ed25519_key(conn.peer_certificates()?.first()?.as_ref())
 }
 
 #[cfg(test)]
@@ -352,7 +349,7 @@ mod tests {
             c.negotiated_key_exchange_group().unwrap().name(),
             rustls::NamedGroup::X25519MLKEM768
         );
-        assert_eq!(peer_name(&s, &map).as_deref(), Some("ap1"));
+        assert_eq!(peer_key(&s), Some(ap.public_key()));
     }
 
     #[test]
@@ -373,7 +370,7 @@ mod tests {
         assert!(err.to_string().contains(&fp), "{err} lacks {fp}");
         assert_eq!(side, "server");
         assert!(s.reader().read(&mut [0u8; 8]).is_err());
-        assert_eq!(peer_name(&s, &map), None);
+        assert_eq!(peer_key(&s), None);
     }
 
     #[test]
@@ -402,7 +399,7 @@ mod tests {
         );
         let (mut c, mut s) = connect(cc.clone(), sc.clone());
         pump(&mut c, &mut s).unwrap();
-        assert_eq!(peer_name(&s, &map).as_deref(), Some("ap1"));
+        assert_eq!(peer_key(&s), Some(ap.public_key()));
         map.write().unwrap().clear();
         let (mut c, mut s) = connect(cc, sc);
         let (side, err) = pump(&mut c, &mut s).unwrap_err();

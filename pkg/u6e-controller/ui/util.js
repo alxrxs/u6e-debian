@@ -136,7 +136,16 @@ export function clientName(store, mac) {
 }
 
 /** What each client action did, as the feed and the results say it. */
-export const DID = { kick: 'kicked', block: 'blocked', unblock: 'unblocked', steer: 'steered' };
+export const DID = {
+  kick: 'kicked',
+  block: 'blocked',
+  unblock: 'unblocked',
+  steer: 'steered',
+  apply: 'applied a Wi-Fi configuration',
+  repush: 'asked for the Wi-Fi configuration again',
+  upgrade: 'asked for an image rollout',
+  rollout: 'rolled an image out',
+};
 
 /** What an event says, as the feed and a client's history show it. */
 export function describe(ev) {

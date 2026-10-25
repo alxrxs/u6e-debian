@@ -7,6 +7,13 @@
 //! name; the UI shows its MAC otherwise. The clients the policy blocks are
 //! listed whole (`blocked`), associated or not, so that one kept off every AP
 //! can still be found and unblocked; an associated client says it too.
+//!
+//! Each AP's Wi-Fi configuration is shown by hash only (`config`): the one it
+//! reports installed, the one it last acknowledged and the one the deploy
+//! runner sent it last, whether it drifts (runs another than it
+//! acknowledged), and how the last one went. The runner's link (`runner`) and
+//! the image rollouts with their gate, result and log (`rollouts`) are beside
+//! the APs.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -15,7 +22,8 @@ use u6e_proto::PROTOCOL;
 use u6e_proto::mac;
 use u6e_proto::msg::{Band, Event, EventKind, Flow, Flows, Radio, RateMode, Snapshot, Station};
 
-use crate::state::{Action, Ap, ClientView, State};
+use crate::policy::ConfigId;
+use crate::state::{Action, Ap, ClientView, Rollout, State, mechanism_name, outcome_name};
 
 /// The APs and clients of the APs `wanted` says yes to, and the clients
 /// blocked, as one object, with their flows when `flows`.
@@ -24,6 +32,8 @@ pub fn view(state: &State, wanted: impl Fn(&str) -> bool, flows: bool) -> Value 
         "aps": aps(state, &wanted),
         "clients": clients(state, &wanted),
         "blocked": blocked(state),
+        "runner": runner(state),
+        "rollouts": rollouts(state, LIVE_LOG),
     });
     if flows {
         v["flows"] = self::flows(state, &wanted, None);
@@ -96,16 +106,107 @@ fn flow(f: &Flow) -> Value {
     })
 }
 
-/// An operator action as the events show it.
+/// The deploy runner's link: whether it admits one, and whether one is
+/// connected, since when, running what.
+pub fn runner(state: &State) -> Value {
+    let r = &state.runner;
+    let mut o = json!({ "configured": r.configured, "up": r.is_up() });
+    if let Some(v) = &r.version {
+        o["version"] = v.clone().into();
+    }
+    if let Some(t) = r.connected_since {
+        o["since"] = unix_ms(t).into();
+    }
+    o
+}
+
+/// Lines of a rollout's log in the live view: a merge patch replaces an
+/// array whole, so each new line resends them all.
+const LIVE_LOG: usize = 20;
+
+/// The rollouts, each by its id, with the last `log` lines of each.
+pub fn rollouts(state: &State, log: usize) -> Value {
+    let all = state
+        .rollouts
+        .iter()
+        .map(|r| (r.id.to_string(), rollout(r, log)));
+    Value::Object(all.collect())
+}
+
+fn rollout(r: &Rollout, log: usize) -> Value {
+    let skip = r.log.len().saturating_sub(log);
+    let mut o = json!({
+        "id": r.id,
+        "ap": r.ap,
+        "image": r.image_id,
+        "previous": r.previous,
+        "user": r.user,
+        "at": unix_ms(r.at),
+        "log": r.log.iter().skip(skip).collect::<Vec<_>>(),
+    });
+    if let Some((healthy, detail)) = &r.gate {
+        o["gate"] = json!({ "healthy": healthy, "detail": detail });
+    }
+    if let Some((outcome, detail)) = &r.result {
+        o["result"] = json!({ "outcome": outcome_name(*outcome), "detail": detail });
+    }
+    o
+}
+
+/// Every AP's configuration, by AP, as `config_of` shows it.
+pub fn config(state: &State) -> Value {
+    let aps = state
+        .aps()
+        .map(|(n, a)| (n.to_owned(), Value::Object(config_of(a))));
+    Value::Object(aps.collect())
+}
+
+/// An AP's configuration, by hash, as far as it is known: installed (while
+/// connected), acknowledged (with whether it drifts from that) and sent
+/// last, and how the last one went. An AP that reports no hash and was never
+/// sent a configuration has none of it.
+pub fn config_of(ap: &Ap) -> Map<String, Value> {
+    let id = |c: ConfigId| json!({ "sha256": mac::hex(&c.sha256), "seq": c.seq });
+    let mut o = Map::new();
+    if let Some(h) = ap.installed() {
+        o.insert("installed".into(), mac::hex(&h).into());
+    }
+    if let Some(c) = ap.acked {
+        o.insert("acked".into(), id(c));
+        o.insert("drift".into(), ap.drifts().into());
+    }
+    if let Some(c) = ap.wanted {
+        o.insert("wanted".into(), id(c));
+    }
+    if let Some(a) = &ap.last_apply {
+        let radios =
+            a.result.radios.iter().map(
+                |r| json!({ "band": band(r.radio), "mechanism": mechanism_name(r.mechanism) }),
+            );
+        let last = json!({
+            "at": unix_ms(a.at),
+            "sha256": mac::hex(&a.result.sha256),
+            "ok": a.result.ok,
+            "radios": radios.collect::<Vec<_>>(),
+            "detail": a.result.detail,
+        });
+        o.insert("last".into(), last);
+    }
+    o
+}
+
+/// An action as the events show it.
 pub fn action(a: &Action) -> Value {
     let mut o = json!({
         "at": unix_ms(a.at),
         "kind": "action",
         "action": a.action,
-        "mac": mac::format(a.mac),
         "ok": a.ok,
         "detail": a.detail,
     });
+    if let Some(m) = a.mac {
+        o["mac"] = mac::format(m).into();
+    }
     if let Some(ap) = &a.ap {
         o["ap"] = ap.clone().into();
     }
@@ -292,6 +393,10 @@ fn ap_view(ap: &Ap) -> Value {
     }
     if let Some(t) = ap.connected_since {
         o.insert("since".into(), unix_ms(t).into());
+    }
+    let config = config_of(ap);
+    if !config.is_empty() {
+        o.insert("config".into(), Value::Object(config));
     }
     // While up, the agent is heard every tick: only an AP that is down
     // needs to say when.

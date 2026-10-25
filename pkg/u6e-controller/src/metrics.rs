@@ -3,6 +3,9 @@
 //! their number follows the clients on the air, not every MAC ever seen; the
 //! connection counts only for those of an AP that has sent its flows. The
 //! spectrum series are per radio that scans, of every AP with a snapshot.
+//! The deploy runner's series exist only when the configuration admits one;
+//! the configurations relayed and the rollouts ended are counted by result,
+//! every result always exported.
 
 use std::collections::BTreeSet;
 use std::fmt::Write;
@@ -24,6 +27,8 @@ use crate::view::band;
 /// The operator's actions and their results, every pair always exported.
 const ACTIONS: [&str; 4] = ["kick", "block", "unblock", "steer"];
 const RESULTS: [&str; 3] = ["ok", "failed", "timeout"];
+/// How a rollout ended (`state::outcome_name`).
+const OUTCOMES: [&str; 4] = ["done", "rolled_back", "failed", "refused"];
 
 const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
@@ -398,6 +403,9 @@ pub fn render(state: &State) -> String {
         }
     }
 
+    if state.runner.configured {
+        deploy(&mut m, state, &aps);
+    }
     m.family(
         "wifi_blocked_clients",
         GAUGE,
@@ -419,6 +427,44 @@ pub fn render(state: &State) -> String {
         }
     }
     m.out
+}
+
+/// The deploy runner's link, the APs' configurations and the rollouts.
+fn deploy(m: &mut Text, state: &State, aps: &[(&str, &Ap)]) {
+    m.family(
+        "wifi_runner_connected",
+        GAUGE,
+        "Whether the deploy runner is connected.",
+    );
+    m.sample(&[], f64::from(u8::from(state.runner.is_up())));
+    m.family(
+        "wifi_config_drift",
+        GAUGE,
+        "Whether the connected AP runs another Wi-Fi configuration than the one it last acknowledged.",
+    );
+    for &(ap, a) in aps {
+        if a.acked.is_some() && a.snapshot.is_some() {
+            m.sample(&[("ap", ap)], f64::from(u8::from(a.drifts())));
+        }
+    }
+    m.family(
+        "wifi_config_applies_total",
+        COUNTER,
+        "Configurations relayed to the APs, by result (timeout: the AP did not answer in time).",
+    );
+    for result in RESULTS {
+        let n = state.apply_counts.get(result).copied();
+        m.sample(&[("result", result)], n.unwrap_or(0) as f64);
+    }
+    m.family(
+        "wifi_rollouts_total",
+        COUNTER,
+        "Image rollouts the deploy runner ended, by outcome.",
+    );
+    for outcome in OUTCOMES {
+        let n = state.rollout_counts.get(outcome).copied();
+        m.sample(&[("outcome", outcome)], n.unwrap_or(0) as f64);
+    }
 }
 
 #[cfg(test)]

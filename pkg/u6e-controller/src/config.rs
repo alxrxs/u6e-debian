@@ -1,7 +1,9 @@
 //! The controller's configuration file: where it listens, its key, the APs it
-//! admits, each by the Ed25519 public key it pins, and what the operator
-//! actions need: the origin the UI is served at (required), the group allowed
-//! to act, and where the decisions are kept.
+//! admits, each by the Ed25519 public key it pins, the deploy runner it
+//! admits on the same listener by its own key (without one, configurations
+//! and rollouts are off), and what the operator actions need: the origin the
+//! UI is served at (required), the group allowed to act, and where the
+//! decisions are kept.
 //!
 //! ```toml
 //! listen_agents = "[::]:8443"
@@ -13,6 +15,9 @@
 //! policy_path = "/var/lib/wifi-controller/policy.json"
 //!
 //! [aps.ap1]
+//! public_key = "<64 lowercase hex digits>"
+//!
+//! [runner]
 //! public_key = "<64 lowercase hex digits>"
 //! ```
 
@@ -34,6 +39,9 @@ pub struct Config {
     pub key: PathBuf,
     /// AP name to its public key.
     pub aps: BTreeMap<String, [u8; 32]>,
+    /// The deploy runner's public key (its link's, not the one it signs
+    /// configurations with, which only the APs check).
+    pub runner: Option<[u8; 32]>,
     /// The scheme, host and port the browser reaches the UI at: the only
     /// `Origin` an action is taken from.
     pub public_origin: String,
@@ -56,6 +64,7 @@ struct File {
     key: PathBuf,
     #[serde(default)]
     aps: BTreeMap<String, ApFile>,
+    runner: Option<KeyFile>,
     public_origin: String,
     #[serde(default = "default_admin_group")]
     admin_group: String,
@@ -66,6 +75,12 @@ struct File {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ApFile {
+    public_key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeyFile {
     public_key: String,
 }
 
@@ -101,6 +116,10 @@ pub enum ConfigError {
     BadKey(String),
     /// Two APs share a key, so a connection could not be told apart.
     SharedKey(String, String),
+    /// The runner's `public_key` is not 64 lowercase hex digits.
+    BadRunnerKey,
+    /// The runner's key is an AP's: that AP could act as the runner.
+    RunnerIsAp(String),
     /// `public_origin` is not spelled as a browser's `Origin` header is.
     BadOrigin,
     /// `admin_group` is empty, which no group header could match.
@@ -113,6 +132,8 @@ impl fmt::Display for ConfigError {
             Self::Syntax(e) => f.write_str(e.trim_end()),
             Self::BadKey(ap) => write!(f, "aps.{ap}.public_key is not 64 lowercase hex digits"),
             Self::SharedKey(a, b) => write!(f, "aps.{a} and aps.{b} have the same public_key"),
+            Self::BadRunnerKey => f.write_str("runner.public_key is not 64 lowercase hex digits"),
+            Self::RunnerIsAp(ap) => write!(f, "runner.public_key is aps.{ap}'s"),
             Self::BadOrigin => f.write_str(
                 "public_origin is not scheme://host[:port] (no path, no trailing slash)",
             ),
@@ -135,6 +156,13 @@ impl Config {
             }
             aps.insert(name, key);
         }
+        let runner = match file.runner {
+            Some(r) => Some(parse_key(&r.public_key).ok_or(ConfigError::BadRunnerKey)?),
+            None => None,
+        };
+        if let Some(ap) = runner.and_then(|k| owner.remove(&k)) {
+            return Err(ConfigError::RunnerIsAp(ap));
+        }
         if !is_origin(&file.public_origin) {
             return Err(ConfigError::BadOrigin);
         }
@@ -147,6 +175,7 @@ impl Config {
             listen_metrics: file.listen_metrics,
             key: file.key,
             aps,
+            runner,
             public_origin: file.public_origin,
             admin_group: file.admin_group,
             policy_path: file.policy_path,
@@ -194,6 +223,7 @@ mod tests {
         assert_eq!(c.key, PathBuf::from("/etc/wifi-controller/key.pem"));
         assert_eq!(c.aps["ap1"], [1; 32]);
         assert_eq!(c.aps["ap2"], [0xab; 32]);
+        assert_eq!(c.runner, None);
         assert_eq!(c.public_origin, "https://wifi.example.org");
         assert_eq!(c.admin_group, "wifi-admins");
         assert_eq!(
@@ -265,6 +295,23 @@ mod tests {
         assert_eq!(
             Config::parse(&text),
             Err(ConfigError::SharedKey("ap1".into(), "ap2".into()))
+        );
+    }
+
+    /// The runner is admitted by a key of its own, never an AP's: the
+    /// listener tells the two roles apart by the key alone.
+    #[test]
+    fn the_runner_has_a_key_of_its_own() {
+        let ap = format!("{ORIGIN}[aps.ap1]\npublic_key = \"{KEY1}\"\n");
+        let c = Config::parse(&format!("{ap}[runner]\npublic_key = \"{KEY2}\"\n")).unwrap();
+        assert_eq!(c.runner, Some([0xab; 32]));
+        assert_eq!(
+            Config::parse(&format!("{ap}[runner]\npublic_key = \"{KEY1}\"\n")),
+            Err(ConfigError::RunnerIsAp("ap1".into()))
+        );
+        assert_eq!(
+            Config::parse(&format!("{ap}[runner]\npublic_key = \"{}\"\n", &KEY2[1..])),
+            Err(ConfigError::BadRunnerKey)
         );
     }
 

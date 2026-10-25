@@ -23,7 +23,10 @@
 //!
 //! `GET /api/flows?ap=&client=` is the latest flows, `GET /api/flows/full?ap=`
 //! asks the AP for every connection it forwards (at most every 10 s) and
-//! waits for the answer.
+//! waits for the answer. `GET /api/config` is each AP's Wi-Fi configuration
+//! by hash (installed, acknowledged, sent last, drift), `GET /api/rollouts`
+//! the image rollouts with their whole logs (the WebSocket's view carries
+//! their last lines).
 //!
 //! The listener is reached only through the reverse proxy that signs users
 //! in, which names the user in `X-Forwarded-Preferred-Username` and their
@@ -48,7 +51,7 @@ use u6e_proto::mac;
 
 use crate::actions::{self, Access, Via, Web};
 use crate::spectrum::{self, Watching};
-use crate::state::{Change, Full, Shared, WatchGuard};
+use crate::state::{Change, Full, ROLLOUT_LOG_CAP, Shared, WatchGuard};
 use crate::view;
 
 /// How long a new WebSocket may take to say what it watches.
@@ -150,6 +153,9 @@ pub fn router(state: Shared, access: Access) -> Router {
         .route("/api/clients/{mac}/block", post(actions::block))
         .route("/api/clients/{mac}/unblock", post(actions::unblock))
         .route("/api/clients/{mac}/steer", post(actions::steer))
+        .route("/api/config", get(api_config))
+        .route("/api/rollouts", get(api_rollouts))
+        .route("/api/aps/{ap}/upgrade", post(actions::upgrade))
         .route("/ws", get(ws))
         .with_state(Web { state, access })
 }
@@ -226,6 +232,14 @@ async fn api_aps(Ext(state): Ext<Shared>) -> Response {
 
 async fn api_clients(Ext(state): Ext<Shared>) -> Response {
     json_response(&view::clients(&state.read(), |_| true))
+}
+
+async fn api_config(Ext(state): Ext<Shared>) -> Response {
+    json_response(&view::config(&state.read()))
+}
+
+async fn api_rollouts(Ext(state): Ext<Shared>) -> Response {
+    json_response(&view::rollouts(&state.read(), ROLLOUT_LOG_CAP))
 }
 
 #[derive(Deserialize)]
@@ -536,7 +550,7 @@ async fn live(mut ws: WebSocket, state: Shared, user: Option<String>, scans: Gat
             }
             Ok(Change::Up(ap) | Change::Down(ap) | Change::Snapshot(ap)) => (wanted(&ap), None),
             Ok(Change::Flows(ap)) => (flows && wanted(&ap), None),
-            Ok(Change::Names) => (true, None),
+            Ok(Change::Names | Change::Deploy) => (true, None),
             // A block or an unblock changes the list of clients blocked.
             Ok(Change::Action(a)) if a.ap.as_deref().is_none_or(wanted) => {
                 (true, Some(json!({ "events": [view::action(&a)] })))
