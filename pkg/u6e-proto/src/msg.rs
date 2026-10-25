@@ -286,7 +286,8 @@ pub struct Flows {
 pub struct ClientFlows {
     pub mac: [u8; 6],
     pub conns: u32,
-    /// Connections the NSS hardware forwards, past the CPU.
+    /// Connections the NSS hardware forwards past the CPU, or forwarded most
+    /// of the packets of before they ended.
     pub offloaded: u32,
     pub tx_bytes: u64,
     pub rx_bytes: u64,

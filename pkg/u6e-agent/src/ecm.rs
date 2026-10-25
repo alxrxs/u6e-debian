@@ -5,10 +5,13 @@
 //! hardware's included, so no packet is looked at on the CPU. The image asks
 //! for the brief record (output mask 4097, nss/patches/qca-nss-ecm/902):
 //! addresses, ports, nodes, protocol, totals, `age` and the front end's
-//! `accel_mode`, 13 lines where the full record has 175. A connection is
-//! offloaded when that mode is ECM's ACCEL, 2: the NSS hardware forwards it.
-//! A full record (mask 1, where the mode is in the front end's block, e.g.
-//! `nss_v4.ported.accel_mode`) parses too, without its age.
+//! `accel_mode` and `slow_path_packets`, 14 lines where the full record has
+//! 175. A connection is offloaded when the NSS hardware forwards it now (its
+//! mode is ECM's ACCEL, 2) or forwarded most of its packets (fewer than half
+//! took the slow path): an ended connection is decelerated, yet it keeps its
+//! totals until conntrack lets it go, minutes later. A full record (mask 1,
+//! where both are in the front end's block, e.g. `nss_v4.ported.accel_mode`)
+//! parses too, without its age.
 //!
 //! Each open of the device starts a new dump, which walks ECM's list by
 //! reference, so a connection added or removed meanwhile is either whole in
@@ -59,6 +62,7 @@ pub struct Conn {
     pub to_bytes: u64,
     pub from_packets: u64,
     pub to_packets: u64,
+    /// The NSS hardware forwards it, or forwarded most of its packets.
     pub offloaded: bool,
     /// Seconds since ECM added it; 0 from a full record, which has none.
     pub age_s: u32,
@@ -191,6 +195,7 @@ struct Pending {
     from_packets: Option<u64>,
     to_packets: Option<u64>,
     accel_mode: Option<i32>,
+    slow_path_packets: Option<u64>,
     age: Option<u32>,
 }
 
@@ -217,16 +222,21 @@ impl Pending {
             b"adv_stats.to_data_total" => self.to_bytes = value(v),
             b"adv_stats.from_packet_total" => self.from_packets = value(v),
             b"adv_stats.to_packet_total" => self.to_packets = value(v),
-            // A full record has it in the front end's block (`nss_v4.ported`,
-            // `nss_v6.non_ported`, ...).
+            // A full record has these in the front end's block
+            // (`nss_v4.ported`, `nss_v6.non_ported`, ...).
             f if f == b"accel_mode" || f.ends_with(b".accel_mode") => {
                 self.accel_mode = value(v);
+            }
+            f if f == b"slow_path_packets" || f.ends_with(b".slow_path_packets") => {
+                self.slow_path_packets = value(v);
             }
             _ => {}
         }
     }
 
     fn finish(self) -> Option<Conn> {
+        let packets = self.from_packets? + self.to_packets?;
+        let offloaded = self.accel_mode? == ACCEL || self.slow_path_packets? * 2 < packets;
         Some(Conn {
             proto: self.proto?,
             src: self.src?,
@@ -239,7 +249,7 @@ impl Pending {
             to_bytes: self.to_bytes?,
             from_packets: self.from_packets?,
             to_packets: self.to_packets?,
-            offloaded: self.accel_mode? == ACCEL,
+            offloaded,
             age_s: self.age.unwrap_or(0),
         })
     }
@@ -364,6 +374,7 @@ mod tests {
             "adv_stats.to_packet_total=4".into(),
             "age=10".into(),
             "accel_mode=2".into(),
+            "slow_path_packets=1".into(),
         ]
         .iter()
         .map(|l| format!("{p}.{l}\n"))
@@ -458,6 +469,37 @@ mod tests {
                 age_s: 10,
             }]
         );
+    }
+
+    /// Recorded on an AP during and after a 5-stream iperf3 through it, in
+    /// full records: a live stream, then one that ended a few seconds before,
+    /// decelerated with 3.3 GB of totals, 8 of its 2.3 million packets on
+    /// the slow path.
+    #[test]
+    fn an_ended_connection_counts_where_its_packets_went() {
+        let t = parse(
+            include_str!("../tests/fixtures/ecm-state-ended.txt").as_bytes(),
+            CAP,
+        );
+        assert!(t.complete);
+        let got: Vec<_> = t.conns.iter().map(|c| (c.sport, c.offloaded)).collect();
+        assert_eq!(got, [(33350, true), (42482, true)]);
+        assert_eq!(t.conns[1].from_bytes, 3_317_265_521);
+    }
+
+    /// A decelerated connection is offloaded while fewer than half of its
+    /// packets took the slow path.
+    #[test]
+    fn a_decelerated_connection_is_offloaded_by_its_slow_path_share() {
+        let decel = |slow: u32| {
+            let r = record(7, m(1), m(9), [100, 900])
+                .replace("accel_mode=2", "accel_mode=0")
+                .replace("slow_path_packets=1", &format!("slow_path_packets={slow}"));
+            parse(r.as_bytes(), CAP).conns[0].offloaded
+        };
+        // 7 packets in all.
+        assert!(decel(3));
+        assert!(!decel(4));
     }
 
     #[test]

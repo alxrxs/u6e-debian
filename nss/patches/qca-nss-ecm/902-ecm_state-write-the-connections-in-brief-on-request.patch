@@ -3,16 +3,21 @@ Subject: [PATCH] ecm_state: write the connections in brief on request
 
 A reader that sums the flows per host (the AP agent's flow summaries) needs
 a connection's addresses, ports, nodes, protocol, byte and packet totals,
-age and acceleration mode: 13 lines. The full record is about 175, nine in
-ten of them the four interface hierarchies, the front end and the
-classifiers, and writing it costs the AP about 0.4 ms of CPU per
-connection: 250 ms for a 600-connection table, every read.
+age, acceleration mode and slow path packet count: 14 lines. The full
+record is about 175, nine in ten of them the four interface hierarchies,
+the front end and the classifiers, and writing it costs the AP about 0.4 ms
+of CPU per connection: 250 ms for a 600-connection table, every read.
 
 Output mask bit 4096 (with 1, connections) writes each connection in brief:
-those 13 values, in the full record's keys, but for "age" (seconds since
+those 14 values, in the full record's keys, but for "age" (seconds since
 the connection was added, which the full record gives only as time_added
-on a clock it does not show) and the front end's "accel_mode" at the
-top level. The default mask and every other bit are unchanged.
+on a clock it does not show) and the front end's "accel_mode" and
+"slow_path_packets" at the top level. The mode says where the connection's
+packets go now; the count says where they went, which is what an ended
+connection still needs: a TCP connection is decelerated as it closes, so
+its mode is DECEL, yet it keeps its totals, gigabytes the hardware
+forwarded, until conntrack lets it go minutes later. The default mask and every other bit
+are unchanged.
 ---
 --- a/ecm_state.h
 +++ b/ecm_state.h
@@ -74,15 +79,16 @@ top level. The default mask and every other bit are unchanged.
  	uint32_t serial;
  	uint64_t from_data_total;
  	uint64_t to_data_total;
-@@ -4200,6 +4201,7 @@
+@@ -4200,6 +4201,8 @@
  	struct ecm_classifier_instance *assignments[ECM_CLASSIFIER_TYPES];
  	int32_t first_interface;
  	struct ecm_db_iface_instance *interfaces[ECM_DB_IFACE_HEIRARCHY_MAX];
 +	ecm_front_end_acceleration_mode_t accel_mode;
++	uint64_t slow_path_packets;
  
  	DEBUG_TRACE("Prep conn msg for %px\n", ci);
  
-@@ -4223,6 +4225,7 @@
+@@ -4223,6 +4226,7 @@
  	regen_in_progress = ci->regen_in_progress;
  	generation = ci->generation;
  	global_generation = ecm_db_connection_generation;
@@ -90,18 +96,22 @@ top level. The default mask and every other bit are unchanged.
  
  	spin_unlock_bh(&ecm_db_lock);
  
-@@ -4279,6 +4282,38 @@
+@@ -4279,6 +4283,43 @@
  		return result;
  	}
  
 +	/*
 +	 * In brief: what a reader summing the flows per host needs, in the same
 +	 * keys as the full record but for the age (seconds since the connection
-+	 * was added) and the front end's acceleration mode at the top level.
++	 * was added) and the front end's acceleration mode and slow path packet
++	 * count at the top level. The count tells where the packets of an ended
++	 * connection went: it is decelerated, but keeps its totals until
++	 * conntrack lets it go.
 +	 */
 +	if (ecm_state_brief(sfi)) {
 +		feci = ecm_db_connection_front_end_get_and_ref(ci);
 +		accel_mode = ecm_front_end_connection_accel_state_get(feci);
++		slow_path_packets = ecm_front_end_get_slow_packet_count(feci);
 +		ecm_front_end_connection_deref(feci);
 +
 +		if ((result = ecm_state_write(sfi, "sip_address", "%s", sip_address))
@@ -116,7 +126,8 @@ top level. The default mask and every other bit are unchanged.
 +				|| (result = ecm_state_write(sfi, "adv_stats.from_packet_total", "%llu", from_packet_total))
 +				|| (result = ecm_state_write(sfi, "adv_stats.to_packet_total", "%llu", to_packet_total))
 +				|| (result = ecm_state_write(sfi, "age", "%u", age))
-+				|| (result = ecm_state_write(sfi, "accel_mode", "%d", accel_mode))) {
++				|| (result = ecm_state_write(sfi, "accel_mode", "%d", accel_mode))
++				|| (result = ecm_state_write(sfi, "slow_path_packets", "%llu", slow_path_packets))) {
 +			return result;
 +		}
 +
