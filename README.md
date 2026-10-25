@@ -37,6 +37,7 @@ cp site.conf.example site.conf    # then edit it
 sudo ./deploy.sh                  # build everything and boot every access point in U6E_APS
 sudo ./deploy.sh ap1 ap2          # or only the named ones
 sudo BOOT=0 ./deploy.sh           # build everything, each image included, but boot nothing yet
+sudo FORCE=1 ./deploy.sh ap1      # boot ap1 again even though it already runs the current build
 ```
 
 `deploy.sh` runs these steps in order and skips any whose inputs have not changed since the last run (it records them in `stamps/`; logs go to `log/`):
@@ -50,7 +51,7 @@ sudo BOOT=0 ./deploy.sh           # build everything, each image included, but b
 7. `pkg/netlogd/build.sh`: builds Debian's `systemd-netlogd`, which forwards the log, with a fix for its journal file rotation.
 8. `mkrootfs.sh`: creates the Debian root filesystem.
 9. `pkg/u6e-agent` (a member of the cargo workspace in `Cargo.toml`): builds the access point's resident agent (Rust, one static binary): the neighbor report exchange between access points, the management network check, the state line in the log, the collectors that read the access point's Wi-Fi state (nl80211, hostapd, sysfs, the kernel log) into snapshots and events, and, when given a controller (`--controller`, `--key`, `--controller-key`), the link that streams them to it over post-quantum TLS with pinned keys.
-10. For each access point whose running image was built from other inputs (this repository except `pkg/u6e-controller`, `$BLOBS`, `site.conf` or the source trees): `prep-rootfs.sh` builds its image, `boot/stage.sh` boots it, and `deploy.sh` waits until all three radios are up. An access point already running the current build is left alone; `FORCE=1` boots a new image anyway. With `BOOT=0` each image is built and kept but not booted, so the access points keep running until a later run boots it.
+10. For each access point whose running image was built from other inputs (this repository except `pkg/u6e-controller`, `$BLOBS`, `site.conf` or the source trees): `prep-rootfs.sh` builds its image, unless the image built last for that access point (recorded in `stamps/built-<ap>`) has these inputs and is still in `images/` (`ap-image.sh` makes this choice); `boot/stage.sh` boots that image, and `deploy.sh` waits until all three radios are up. An access point already running the current build is left alone; `FORCE=1` boots it anyway, with the image already built for the current inputs if there is one (delete `stamps/built-<ap>` to build a fresh one). With `BOOT=0` each image is built and kept but not booted, so the access points keep running until a later run boots that same image.
 
 Every image is kept in `images/` with a `MANIFEST` (versions and checksums), so an earlier build can be booted again without rebuilding. The image itself carries its `images/` name and the same versions in `/etc/u6e-image`.
 
@@ -110,6 +111,7 @@ Wi-Fi starts by itself on every boot (`u6e-wifi.service`), with nothing else on 
 | Path | Contents |
 |---|---|
 | `deploy.sh` | Builds and boots everything, step by step |
+| `ap-image.sh` | Chooses the image `deploy.sh` boots on an access point: the one already built for the current inputs, or a new one |
 | `trees.sh`, `export.sh` | Create the source trees from the patch series, and export commits back to patches |
 | `kernel/`, `backports/` | Upstream release address and our patches |
 | `config-u6e.sh` | Kernel configuration |
@@ -137,6 +139,8 @@ Wi-Fi starts by itself on every boot (`u6e-wifi.service`), with nothing else on 
 - `test/sniff.sh <MHz> <width> [<center MHz>] <seconds> <out.pcap>` captures radio traffic.
 - `test/bip-verify.py <pcap> <BSSID> <key>` checks the beacon protection signature of every beacon in a capture.
 - `U6E_AP=<ap> test/oce-retry.sh <interface> [<count>]` counts how many times a radio retries unanswered management frames (`mgmtsend.c` is its helper).
+
+`test/ap-image.sh` needs no access point: it checks offline, with a stub `prep-rootfs.sh`, which image `ap-image.sh` picks (an image built with `BOOT=0` is the one booted next; changed inputs or a deleted image mean a new build; `FORCE=1` reuses the kept image; a failed build stops `deploy.sh` and records nothing).
 
 ## Licence
 

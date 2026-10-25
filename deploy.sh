@@ -2,7 +2,7 @@
 # Build whatever the checked-out commits need and boot it on the APs. Run as
 # root:
 #   ./deploy.sh [<ap>...]      (default: every AP in U6E_APS)
-#   FORCE=1 ./deploy.sh ...    (boot a new image even where nothing changed)
+#   FORCE=1 ./deploy.sh ...    (boot even an AP that already runs this build)
 #   BOOT=0 ./deploy.sh ...     (build everything, each AP's image included,
 #                               but boot nothing: a later run boots it)
 # First the source trees (trees.sh: the kernel and backports releases with our
@@ -12,14 +12,17 @@
 # nss/ and the kernel), the hostapd and iproute2 packages (their versions) and
 # the rootfs (those packages and mkrootfs.sh); the packages and the rootfs on
 # the native builder if it answers (arm64 below), and u6e-agent
-# (pkg/u6e-agent). Then each AP whose running
-# image was built from other inputs (stamps/ap-<ap>) gets a new one (prep-rootfs.sh,
-# kept under images/), boots it (boot/stage.sh) and must bring its radios up by
-# itself. Sources and trees are built as the checkout's
-# owner, the packages and images as root. Logs go to log/.
+# (pkg/u6e-agent). Then each AP whose running image was built from other
+# inputs (stamps/ap-<ap>) gets its image of the current inputs (ap-image.sh:
+# the one an earlier run kept under images/, else a new one from
+# prep-rootfs.sh), boots it (boot/stage.sh) and must bring its radios up by
+# itself; FORCE=1 boots it even on an AP that already runs it. Sources and
+# trees are built as the checkout's owner, the packages and images as root.
+# Logs go to log/.
 set -uo pipefail
 cd "$(dirname "$0")" || exit 1
 . ./site.conf
+. ./ap-image.sh
 L=$PWD/log
 mkdir -p "$L"
 fail() { echo "$*" >&2; exit 1; }
@@ -105,17 +108,12 @@ image_tree() { git -c safe.directory='*' ls-tree -r HEAD | grep -v $'\tpkg/u6e-c
 image=$(image_tree)/$(head_of "$BLOBS")/$(sha256sum < site.conf | cut -c1-16)/$(head_of linux-7.2.8)/$(head_of backports-7.2)
 for ap in "$@"; do
 	export U6E_AP=$ap
-	if [ "${FORCE:-0}" != 1 ] && [ "$(cat "stamps/ap-$ap" 2>/dev/null)" = "$image" ]; then
-		echo "$ap: already runs this image"
-		continue
-	fi
-	./prep-rootfs.sh > "$L/prep-$ap.log" 2>&1 || fail "$ap: image build failed, see $L/prep-$ap.log"
-	grep "^kept as" "$L/prep-$ap.log"
+	ap_image "$ap" "$image" || continue
 	if [ "${BOOT:-1}" = 0 ]; then
-		echo "$ap: image built, not booted (BOOT=0)"
+		echo "$ap: not booted (BOOT=0)"
 		continue
 	fi
-	boot/stage.sh || fail "$ap: did not boot the image"
+	boot/stage.sh "$IMAGE" || fail "$ap: did not boot $IMAGE"
 	up=
 	for _ in $(seq 30); do
 		up=$(cd boot && . ./lib.sh && T=15 ap_root -n 'systemctl is-active -q u6e-wifi &&
