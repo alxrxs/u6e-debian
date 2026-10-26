@@ -114,6 +114,37 @@ const STAGE: &str = "echo \"$U6E_AP ${1##*/}\" >> @SITE@/staged; \
                      echo staging $U6E_AP; \
                      case $1 in *slow*) sleep 1.5 ;; *bad*) exit 1 ;; esac; echo staged";
 
+/// The site's live deploy, root's command: logs the commit, fails while
+/// `deploy-fails` is there.
+const DEPLOY: &str = "echo \"deploying $1\"; \
+                      [ -e @SITE@/deploy-fails ] && { echo 'the AP did not take it'; exit 3; }; \
+                      echo \"$1\" >> @SITE@/deployed; echo deployed";
+
+/// The site file of the site's repository.
+const SITE_FILE: &str =
+    "u6e:\n  aps:\n    ap1:\n      radios:\n        \"5\":\n          channel: 36\n";
+
+/// What `git` prints in `dir`, which must succeed.
+fn git_in(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .args([
+            "-c",
+            "user.name=someone",
+            "-c",
+            "user.email=someone@example.org",
+        ])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
 fn runtime() -> Runtime {
     Builder::new_multi_thread()
         .worker_threads(2)
@@ -157,6 +188,7 @@ impl Site {
             keep(&site.dir.0.join("images"), id, ap);
         }
         tree(&site.dir.0);
+        site_repo(&site.dir.0);
         let config = site.runner_config(&site.socket, gate);
         // The stage helper as systemd runs it: one per connection.
         let helper = std::os::unix::net::UnixListener::bind(&config.rollout.helper).unwrap();
@@ -190,7 +222,8 @@ impl Site {
              signing_key = \"unused\"\nsocket = \"{}\"\nstate = \"{}\"\ngate_secs = {}\n\
              [aps.ap1]\nhostname = \"u6e-ap1\"\n[aps.ap2]\nhostname = \"u6e-ap2\"\n\
              [rollout]\nimages = \"{}\"\ntree = \"{}\"\n\
-             helper = \"{}\"\ngroup = \"root\"\n",
+             helper = \"{}\"\ngroup = \"root\"\n\
+             [site]\nremote = \"{}\"\nclone = \"{}\"\nfile = \"wifi/site.yml\"\ncommand = \"{}\"\n",
             self.controller.agents,
             mac::hex(&identity(KEY_CONTROLLER).public_key()),
             socket.display(),
@@ -199,6 +232,9 @@ impl Site {
             self.dir.0.join("images").display(),
             self.dir.0.join("tree").display(),
             self.dir.0.join("stage.sock").display(),
+            self.dir.0.join("site.git").display(),
+            socket.with_extension("site").display(),
+            self.dir.0.join("deploy").display(),
         );
         Config::parse(&text).unwrap()
     }
@@ -295,6 +331,70 @@ impl Site {
     fn state(&self) -> PathBuf {
         self.socket.with_extension("state")
     }
+
+    /// Commits a change of `path` to the site's repository and pushes it;
+    /// the commit.
+    fn commit(&self, path: &str, from: &str, to: &str) -> String {
+        let work = self.dir.0.join("site-work");
+        let file = work.join(path);
+        let text = fs::read_to_string(&file).unwrap().replace(from, to);
+        fs::write(&file, text).unwrap();
+        git_in(&work, &["commit", "--quiet", "-am", "a change"]);
+        git_in(&work, &["push", "--quiet", "origin", "HEAD:main"]);
+        git_in(&work, &["rev-parse", "HEAD"]).trim().to_owned()
+    }
+
+    /// Has the controller ask the runner to deploy `rev`, and waits for the
+    /// runner's last word on it: its state and detail.
+    fn deploy_site(&self, rev: &str) -> (String, String) {
+        let id = self
+            .controller
+            .state
+            .write()
+            .deploy_site(rev, Some("alice".into()));
+        let mut word = None;
+        wait_for("the deploy's end", || {
+            let state = self.controller.state.read();
+            let d = state.site_deploy.as_ref().filter(|d| d.id == id);
+            let name = d.map(|d| u6e_controller::state::site_deploy_name(d.state));
+            word = d.map(|d| (name.unwrap_or_default().to_owned(), d.detail.clone()));
+            matches!(name, Some("done" | "failed" | "refused"))
+        });
+        word.unwrap()
+    }
+
+    /// The commits the site's deploy command was run for.
+    fn deployed(&self) -> Vec<String> {
+        let text = fs::read_to_string(self.dir.0.join("deployed")).unwrap_or_default();
+        text.lines().map(str::to_owned).collect()
+    }
+}
+
+/// The site's repository in `dir` (a bare remote and a clone that commits to
+/// it), and its live deploy command, root's.
+fn site_repo(dir: &Path) {
+    git_in(
+        dir,
+        &[
+            "init",
+            "--quiet",
+            "--bare",
+            "--initial-branch=main",
+            "site.git",
+        ],
+    );
+    git_in(dir, &["clone", "--quiet", "site.git", "site-work"]);
+    let work = dir.join("site-work");
+    fs::create_dir_all(work.join("wifi")).unwrap();
+    fs::write(work.join("wifi/site.yml"), SITE_FILE).unwrap();
+    fs::write(work.join("README.md"), "the site\n").unwrap();
+    git_in(&work, &["add", "--", "wifi/site.yml", "README.md"]);
+    git_in(&work, &["commit", "--quiet", "-m", "the site"]);
+    git_in(&work, &["push", "--quiet", "origin", "HEAD:main"]);
+    let command = dir.join("deploy");
+    let script = DEPLOY.replace("@SITE@", &dir.display().to_string());
+    fs::write(&command, format!("#!/bin/sh\n{script}\n")).unwrap();
+    fs::set_permissions(&command, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 /// A controller on `rt` listening for agents at `agents`, its policy in
@@ -1412,4 +1512,81 @@ fn a_lock_held_a_moment_at_resume_is_waited_for() {
     assert_eq!(ended(&site, "failed"), None);
     assert_eq!(site.staged(), ["ap1 img-2-ap1"]);
     assert!(asked.join().unwrap().is_err());
+}
+
+/// The controller asks for a deploy of the commit the RF planner pushed: the
+/// runner deploys the branch's head when its change is radio settings of the
+/// site file alone, and refuses anything else, at once and running nothing.
+#[test]
+fn a_site_deploy_is_checked_and_run_by_the_helper() {
+    let site = Site::new("site-deploy", Duration::from_secs(60));
+    wait_for("the runner", || site.runner_up());
+    let rev = site.commit("wifi/site.yml", "channel: 36", "channel: 44");
+    assert_eq!(site.deploy_site(&rev), ("done".into(), "deployed".into()));
+    assert_eq!(site.deployed(), std::slice::from_ref(&rev));
+    // A change beside the site file.
+    let readme = site.commit("README.md", "the site", "the site, changed");
+    let (state, why) = site.deploy_site(&readme);
+    assert_eq!(state, "refused");
+    assert!(
+        why.contains("touches README.md besides wifi/site.yml"),
+        "{why}"
+    );
+    // A commit that is no longer the branch's head.
+    let (state, why) = site.deploy_site(&rev);
+    assert_eq!(state, "refused");
+    assert!(why.contains("is not the head of main"), "{why}");
+    assert_eq!(site.deployed(), [rev]);
+    // Each is an event of the controller's.
+    let state = site.controller.state.read();
+    let words: Vec<&str> = state
+        .actions
+        .iter()
+        .filter(|a| a.action == "site-deploy")
+        .map(|a| a.detail.as_str())
+        .collect();
+    assert!(
+        words.iter().any(|w| w.ends_with(": done: deployed")),
+        "{words:?}"
+    );
+}
+
+#[test]
+fn a_site_deploy_that_fails_says_why() {
+    let site = Site::new("site-deploy-fails", Duration::from_secs(60));
+    wait_for("the runner", || site.runner_up());
+    fs::write(site.dir.0.join("deploy-fails"), "").unwrap();
+    let rev = site.commit("wifi/site.yml", "channel: 36", "channel: 44");
+    assert_eq!(
+        site.deploy_site(&rev),
+        (
+            "failed".into(),
+            "the deploy exited with 3: the AP did not take it".into()
+        )
+    );
+    assert!(site.deployed().is_empty());
+}
+
+/// A person deploys by hand what the runner would refuse, and says so: the
+/// next deploy is checked against that commit.
+#[test]
+fn a_deploy_by_hand_is_what_the_next_is_checked_against() {
+    let site = Site::new("site-deploy-hand", Duration::from_secs(60));
+    wait_for("the runner", || site.runner_up());
+    let readme = site.commit("README.md", "the site", "the site, changed");
+    let told = site.block_on(local::deployed(&site.socket, &readme));
+    assert!(told.is_ok(), "{told:?}");
+    // An older commit is not what the site runs.
+    let first = git_in(&site.dir.0.join("site-work"), &["rev-parse", "HEAD~1"]);
+    let older = site.block_on(local::deployed(&site.socket, first.trim()));
+    assert!(older.is_err_and(|e| e.contains("is not newer than")));
+    // A value no planner writes is refused; the plain one after it is
+    // deployed, the change since the hand's commit being plain.
+    let odd = site.commit("wifi/site.yml", "channel: 36", "channel: \"44; reboot\"");
+    let (state, why) = site.deploy_site(&odd);
+    assert_eq!(state, "refused");
+    assert!(why.contains("more than radio settings"), "{why}");
+    let rev = site.commit("wifi/site.yml", "channel: \"44; reboot\"", "channel: 44");
+    assert_eq!(site.deploy_site(&rev), ("done".into(), "deployed".into()));
+    assert_eq!(site.deployed(), [rev]);
 }

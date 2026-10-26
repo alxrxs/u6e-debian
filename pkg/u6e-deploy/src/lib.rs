@@ -13,14 +13,20 @@
 //! runner, its latest configuration per AP, the image it staged on each and
 //! the rollout under way, is in its state directory (`store`).
 //! Configurations come as `boot/wifi-up.sh --print` renders them (`script`).
+//! The controller may also ask it to deploy a commit of the site's
+//! repository the RF planner pushed (`live`): checked to be the branch's head
+//! and plain radio settings of the site file alone (`site`), then run by the
+//! stage helper as the site's own command.
 
 pub mod config;
 mod frames;
 pub mod link;
+mod live;
 pub mod local;
 mod rollout;
 pub mod runner;
 pub mod script;
+pub mod site;
 pub mod stage;
 mod store;
 
@@ -73,6 +79,9 @@ pub async fn start(
     let (runner, resumed, outbox) = Runner::new(config, key)?;
     tokio::spawn(link::run(Arc::clone(&runner), identity, outbox));
     tokio::spawn(local::serve(Arc::clone(&runner), listener));
+    if runner.config.site.is_some() {
+        tokio::spawn(live::run(Arc::clone(&runner)));
+    }
     if let Some(flight) = resumed {
         runner.resume(flight);
     }

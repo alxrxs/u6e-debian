@@ -26,7 +26,8 @@
 //! a restarted runner goes on with it, and told to the controller as taken
 //! on, and each result is sent until the controller acknowledges it. A state
 //! file the runner cannot read is set aside and told to the controller at
-//! each session, until someone removes it.
+//! each session, until someone removes it. The site's live deploys the
+//! controller asks for are `live`'s.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
@@ -45,6 +46,7 @@ use u6e_proto::msg::{
 };
 
 use crate::config::Config;
+use crate::live::{self, Live};
 use crate::local::Reply;
 use crate::rollout;
 use crate::stage::Helper;
@@ -194,6 +196,8 @@ pub struct Runner {
     store: Store,
     inner: Mutex<Inner>,
     outbox: mpsc::Sender<RunnerMsg>,
+    /// The site's live deploys.
+    pub(crate) live: Live,
 }
 
 /// The name of a band, as the runner's output spells it.
@@ -241,6 +245,7 @@ impl Runner {
         inner.images = load(&store, IMAGES, notes)?.unwrap_or_default();
         inner.unacked = load(&store, RESULTS, notes)?.unwrap_or_default();
         let resumed = load::<InFlight>(&store, ROLLOUT, notes)?;
+        let site = load::<live::Record>(&store, live::FILE, notes)?.unwrap_or_default();
         inner.last_seq = latest.values().map(|l| l.seq).max().unwrap_or(0);
         inner.latest = latest;
         let (outbox, rx) = mpsc::channel(OUTBOX_CAP);
@@ -254,7 +259,12 @@ impl Runner {
             store,
             inner: Mutex::new(inner),
             outbox,
+            live: Live::new(site.clone()),
         };
+        // A deploy that was under way is told as ended, and kept so.
+        if site.running.is_some() {
+            runner.keep(live::FILE, &runner.live.record());
+        }
         Ok((Arc::new(runner), resumed, rx))
     }
 
@@ -264,7 +274,7 @@ impl Runner {
 
     /// Keeps `v` as `name`; a failure is the journal's, as the state in
     /// memory stands.
-    fn keep<T: Serialize>(&self, name: &str, v: &T) {
+    pub(crate) fn keep<T: Serialize>(&self, name: &str, v: &T) {
         if let Err(e) = self.store.save(name, v) {
             eprintln!("u6e-deploy: {}: not kept: {e}", self.config.state.display());
         }
@@ -282,6 +292,7 @@ impl Runner {
             sha256: config_sha256(&l.radios),
         });
         let mut said: Vec<RunnerMsg> = latest.collect();
+        said.extend(self.live.word());
         if let Some(r) = &inner.rollout {
             said.push(RunnerMsg::RolloutStarted { id: r.id });
         }
@@ -359,6 +370,12 @@ impl Runner {
                 });
             }
         }
+    }
+
+    /// Queues `msg` for the controller; one a lagging link cannot take is
+    /// dropped (the last word on a deploy is said again at the next session).
+    pub(crate) fn tell(&self, msg: RunnerMsg) {
+        let _ = self.outbox.try_send(msg);
     }
 
     /// Since when the link has been up.
@@ -494,6 +511,7 @@ impl Runner {
                 inner.unacked.retain(|r| r.id != id);
                 self.keep(RESULTS, &inner.unacked);
             }
+            RunnerCtlMsg::DeploySite { id, rev } => live::ask(self, id, rev),
             // A message of a newer protocol's would not have been decoded.
             _ => {}
         }

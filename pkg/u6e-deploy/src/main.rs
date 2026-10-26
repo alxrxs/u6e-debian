@@ -6,6 +6,7 @@
 //!   u6e-deploy rollout <ap> <image> [--config <path>]
 //!   u6e-deploy staged <ap> <image> [--config <path>]
 //!   u6e-deploy images [--config <path>]
+//!   u6e-deploy deployed <commit> [--config <path>]
 //!   u6e-deploy --stage-helper [--config <path>]
 //!
 //! Without a command it is the runner, until stopped. `apply` reads the
@@ -17,7 +18,10 @@
 //! site's own deploy (`deploy.sh`) staged a kept image on the AP, the one a
 //! failed gate rolls it back to from then on. `images` prints the kept
 //! images the runner needs, one a line, which the site's deploy keeps when
-//! it prunes the others (`prune-images.py`). `--stage-helper` is the root
+//! it prunes the others (`prune-images.py`). `deployed`, root's alone, tells
+//! the runner a person deployed the site's repository as that commit (its
+//! 40 hex digits), which the next deploy the controller asks for is checked
+//! against. `--stage-helper` is the root
 //! helper, answering the connection systemd passes it (see `stage`). The
 //! default configuration is /etc/u6e-deploy/config.toml.
 
@@ -38,7 +42,7 @@ use u6e_proto::tls::Identity;
 const DEFAULT_CONFIG: &str = "/etc/u6e-deploy/config.toml";
 
 const USAGE: &str = "usage: u6e-deploy [apply <ap> | rollout <ap> <image> | staged <ap> <image> \
-                     | images | --stage-helper] [--config <path>]";
+                     | images | deployed <commit> | --stage-helper] [--config <path>]";
 
 /// The command and its operands, and the configuration's path.
 fn args() -> Option<(Vec<String>, String)> {
@@ -74,7 +78,12 @@ fn main() -> ExitCode {
     let words: Vec<&str> = words.iter().map(String::as_str).collect();
     if !matches!(
         words.as_slice(),
-        [] | ["apply", _] | ["rollout", _, _] | ["staged", _, _] | ["images"] | ["--stage-helper"]
+        [] | ["apply", _]
+            | ["rollout", _, _]
+            | ["staged", _, _]
+            | ["images"]
+            | ["deployed", _]
+            | ["--stage-helper"]
     ) {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
@@ -84,6 +93,7 @@ fn main() -> ExitCode {
         ["rollout", ap, image] => rollout(&config, ap, image),
         ["staged", ap, image] => staged(&config, ap, image),
         ["images"] => images(&config),
+        ["deployed", rev] => deployed(&config, rev),
         ["--stage-helper"] => stage_helper(config),
         _ => run(config),
     });
@@ -153,6 +163,14 @@ fn rollout(config: &Config, ap: &str, image: &str) -> Result<(), String> {
 fn staged(config: &Config, ap: &str, image: &str) -> Result<(), String> {
     let rt = runtime().map_err(|e| format!("runtime: {e}"))?;
     let done = rt.block_on(local::staged(&config.socket, ap, image))?;
+    println!("{done}");
+    Ok(())
+}
+
+/// Tells the runner the site was deployed as `rev`.
+fn deployed(config: &Config, rev: &str) -> Result<(), String> {
+    let rt = runtime().map_err(|e| format!("runtime: {e}"))?;
+    let done = rt.block_on(local::deployed(&config.socket, rev))?;
     println!("{done}");
     Ok(())
 }

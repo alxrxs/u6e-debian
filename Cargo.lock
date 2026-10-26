@@ -1039,6 +1039,7 @@ dependencies = [
  "tokio-rustls",
  "toml",
  "u6e-controller",
+ "u6e-git",
  "u6e-proto",
 ]
 

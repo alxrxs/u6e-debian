@@ -25,7 +25,10 @@
 //! `Check` answers whether an image could be staged, `Newest` names an AP's
 //! newest kept image (by its name, which starts with its build time), and
 //! `Stage` streams the command's output, a line at a time, and then how it
-//! exited. One staging runs at a time, whoever asks: two APs rebooting at
+//! exited. `DeploySite` runs the site's live deploy (`site.command`, root's
+//! and written by no other) with the commit the runner checked, streamed the
+//! same way, with no lock: it stages nothing; the command checks the commit
+//! again in root's own clone. One staging runs at a time, whoever asks: two APs rebooting at
 //! once is what the runner's one rollout at a time exists to prevent, so the
 //! root end holds to it too, by a lock on the kept images' directory, which
 //! the site's own image deploys take too. A connection answers one request,
@@ -76,6 +79,10 @@ pub const HOLD_MAX: Duration = Duration::from_secs(
         + crate::rollout::LINGER.as_secs(),
 );
 
+/// The longest a site deploy may take: one AP at a time, each a minute or
+/// two.
+pub const DEPLOY_MAX: Duration = Duration::from_secs(30 * 60);
+
 /// How long a staging, and a hold, may last.
 #[derive(Debug, Clone, Copy)]
 pub struct Bounds {
@@ -103,6 +110,8 @@ pub enum Request {
     /// Take the lock for the life of the connection, which then carries
     /// further requests.
     Hold,
+    /// Run the site's live deploy for commit `rev`.
+    DeploySite { rev: String },
 }
 
 /// What the helper answers, in order.
@@ -215,42 +224,33 @@ pub fn newest(config: &Config, ap: &str) -> Result<String, String> {
         .ok_or_else(|| format!("no image of {ap} is kept"))
 }
 
-/// Why the staging tree could have been written by another than root (the
-/// helper's own user): the tree, an entry of it or of its `boot/` owned by
-/// another, writable by its group or by anyone, or a symbolic link; an
-/// ancestor of the tree owned by another, or writable by others without the
-/// sticky bit. Root runs and reads these files.
-fn untrusted(tree: &Path) -> Option<String> {
-    // SAFETY: geteuid has no preconditions.
-    let me = unsafe { libc::geteuid() };
-    let owned = |p: &Path, md: &fs::Metadata| -> Option<String> {
-        if md.file_type().is_symlink() {
-            return Some(format!("{} is a symbolic link", p.display()));
-        }
-        if md.uid() != me {
-            return Some(format!("{} is not root's", p.display()));
-        }
-        (md.permissions().mode() & 0o022 != 0)
-            .then(|| format!("{} is writable by others than root", p.display()))
-    };
-    let mut paths = vec![tree.to_owned(), tree.join("site.conf")];
-    for dir in [tree.to_owned(), tree.join("boot")] {
-        match fs::read_dir(&dir) {
-            Ok(entries) => paths.extend(entries.filter_map(|e| Some(e.ok()?.path()))),
-            Err(e) => return Some(format!("{}: {e}", dir.display())),
-        }
+/// Why `p` could have been written by another than root (the helper's own
+/// user): owned by another, writable by its group or by anyone, or a
+/// symbolic link.
+fn not_roots(p: &Path, md: &fs::Metadata, me: u32) -> Option<String> {
+    if md.file_type().is_symlink() {
+        return Some(format!("{} is a symbolic link", p.display()));
     }
-    for p in &paths {
-        match fs::symlink_metadata(p) {
-            Ok(md) => {
-                if let Some(why) = owned(p, &md) {
-                    return Some(why);
-                }
+    if md.uid() != me {
+        return Some(format!("{} is not root's", p.display()));
+    }
+    (md.permissions().mode() & 0o022 != 0)
+        .then(|| format!("{} is writable by others than root", p.display()))
+}
+
+/// Why `p` could have been written by another than root: itself (as
+/// [`not_roots`]) or an ancestor owned by another, or writable by others
+/// without the sticky bit.
+fn untrusted_path(p: &Path, me: u32) -> Option<String> {
+    match fs::symlink_metadata(p) {
+        Ok(md) => {
+            if let Some(why) = not_roots(p, &md, me) {
+                return Some(why);
             }
-            Err(e) => return Some(format!("{}: {e}", p.display())),
         }
+        Err(e) => return Some(format!("{}: {e}", p.display())),
     }
-    for dir in tree.ancestors().skip(1) {
+    for dir in p.ancestors().skip(1) {
         let md = match fs::metadata(dir) {
             Ok(md) => md,
             Err(e) => return Some(format!("{}: {e}", dir.display())),
@@ -261,6 +261,45 @@ fn untrusted(tree: &Path) -> Option<String> {
                 "{} could be written by others than root",
                 dir.display()
             ));
+        }
+    }
+    None
+}
+
+fn euid() -> u32 {
+    // SAFETY: geteuid has no preconditions.
+    unsafe { libc::geteuid() }
+}
+
+/// Why the command at `p` could have been written by another than root.
+/// Root runs it.
+fn untrusted_file(p: &Path) -> Option<String> {
+    untrusted_path(p, euid())
+}
+
+/// Why the staging tree could have been written by another than root: the
+/// tree, an entry of it or of its `boot/`, or an ancestor (as
+/// [`untrusted_path`]). Root runs and reads these files.
+fn untrusted(tree: &Path) -> Option<String> {
+    let me = euid();
+    if let Some(why) = untrusted_path(tree, me) {
+        return Some(why);
+    }
+    let mut paths = vec![tree.join("site.conf")];
+    for dir in [tree.to_owned(), tree.join("boot")] {
+        match fs::read_dir(&dir) {
+            Ok(entries) => paths.extend(entries.filter_map(|e| Some(e.ok()?.path()))),
+            Err(e) => return Some(format!("{}: {e}", dir.display())),
+        }
+    }
+    for p in &paths {
+        match fs::symlink_metadata(p) {
+            Ok(md) => {
+                if let Some(why) = not_roots(p, &md, me) {
+                    return Some(why);
+                }
+            }
+            Err(e) => return Some(format!("{}: {e}", p.display())),
         }
     }
     None
@@ -448,6 +487,7 @@ fn answer(
         }
         Request::Check { ap, image } | Request::Stage { ap, image } => (ap, image),
         Request::Hold => return write_frame(conn, &Reply::Refused("not first".into())),
+        Request::DeploySite { rev } => return deploy_site(config, conn, rev),
     };
     // Checked before use: the names go into a path and the command's
     // environment (the configuration's AP names are plain).
@@ -474,7 +514,17 @@ fn answer(
         Ok(c) => c,
         Err(why) => return write_frame(conn, &Reply::Refused(format!("not copied: {why}"))),
     };
-    let exit = stage(conn, &tree.join("boot/stage.sh"), ap, &copy.dir, bound)?;
+    let script = tree.join("boot/stage.sh");
+    let mut cmd = Command::new(&script);
+    cmd.arg(&copy.dir)
+        .current_dir(&copy.dir)
+        .env("U6E_AP", ap)
+        .env("PYTHONSAFEPATH", "1")
+        .env("PYTHONNOUSERSITE", "1")
+        .env_remove("PYTHONPATH")
+        .env_remove("PYTHONHOME")
+        .env_remove("PYTHONSTARTUP");
+    let exit = run(conn, cmd, &script, "the staging", bound)?;
     // Let go before the last word, so the staging asked for next is not
     // refused for a lock this one still held.
     drop(copy);
@@ -485,28 +535,38 @@ fn answer(
     }
 }
 
-/// Runs `script` for `ap` on the copied image `dir`, streaming its output,
-/// and stops it, its whole process group, past `bound`; its exit status,
-/// unless the runner went away.
-fn stage(
+/// Runs the site's live deploy for commit `rev`, streaming its output.
+fn deploy_site(config: &Config, conn: &mut impl Conn, rev: &str) -> io::Result<()> {
+    let Some(site) = &config.site else {
+        return write_frame(conn, &Reply::Refused("the runner deploys no site".into()));
+    };
+    if !crate::site::is_rev(rev) {
+        return write_frame(conn, &Reply::Refused("not a commit's full name".into()));
+    }
+    if let Some(why) = untrusted_file(&site.command) {
+        return write_frame(conn, &Reply::Refused(format!("not run: {why}")));
+    }
+    let mut cmd = Command::new(&site.command);
+    cmd.arg(rev).current_dir("/");
+    match run(conn, cmd, &site.command, "the deploy", DEPLOY_MAX)? {
+        Some(code) => write_frame(conn, &Reply::Exit(code)),
+        None => Ok(()),
+    }
+}
+
+/// Runs `cmd` (`script`, `what` it does), streaming its output, and stops
+/// it, its whole process group, past `bound`; its exit status, unless the
+/// runner went away.
+fn run(
     conn: &mut impl Conn,
+    mut cmd: Command,
     script: &Path,
-    ap: &str,
-    dir: &Path,
+    what: &str,
     bound: Duration,
 ) -> io::Result<Option<i32>> {
     let (reader, writer) = io::pipe()?;
     let child = {
-        let mut cmd = Command::new(script);
-        cmd.arg(dir)
-            .current_dir(dir)
-            .env("U6E_AP", ap)
-            .env("PYTHONSAFEPATH", "1")
-            .env("PYTHONNOUSERSITE", "1")
-            .env_remove("PYTHONPATH")
-            .env_remove("PYTHONHOME")
-            .env_remove("PYTHONSTARTUP")
-            .process_group(0)
+        cmd.process_group(0)
             .stdin(Stdio::null())
             .stdout(writer.try_clone()?)
             .stderr(writer);
@@ -525,6 +585,7 @@ fn stage(
             }
         }
     };
+    drop(cmd);
     let mut child = match child {
         Ok(c) => c,
         Err(e) => {
@@ -564,7 +625,7 @@ fn stage(
     *ended.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
     ended.1.notify_all();
     if watch.join().unwrap_or(false) && !gone {
-        let why = format!("the staging ran past {bound:?} and was stopped");
+        let why = format!("{what} ran past {bound:?} and was stopped");
         gone = write_frame(conn, &Reply::Line(why)).is_err();
     }
     Ok((!gone).then(|| status.code().unwrap_or(-1)))
@@ -675,6 +736,18 @@ impl Helper {
         }
     }
 
+    /// Runs the site's live deploy for commit `rev`, each line of its output
+    /// to `line`.
+    pub async fn deploy_site(&self, rev: &str, line: impl FnMut(String)) -> Staged {
+        let req = Request::DeploySite { rev: rev.into() };
+        match self.ask(&req).await {
+            Ok(mut conn) => staging(&mut conn, "the deploy", line)
+                .await
+                .unwrap_or_else(|s| s),
+            Err(e) => Staged::Refused(format!("the stage helper: {e}")),
+        }
+    }
+
     /// The lock on the kept images, held until the [`Hold`] is dropped;
     /// [`BUSY`] while another staging holds it.
     pub async fn hold(&self) -> Result<Hold, String> {
@@ -693,7 +766,9 @@ impl Helper {
             image: image.into(),
         };
         match self.ask(&req).await {
-            Ok(mut conn) => staging(&mut conn, line).await.unwrap_or_else(|s| s),
+            Ok(mut conn) => staging(&mut conn, "the staging", line)
+                .await
+                .unwrap_or_else(|s| s),
             Err(e) => Staged::Refused(format!("the stage helper: {e}")),
         }
     }
@@ -725,7 +800,7 @@ impl Hold {
         if let Err(e) = frames::write(&mut self.conn, &req).await {
             return Err(Lost(format!("the stage helper: {e}")));
         }
-        match staging(&mut self.conn, line).await {
+        match staging(&mut self.conn, "the staging", line).await {
             Ok(staged) => Ok(staged),
             Err(Staged::Failed(why)) => Err(Lost(why)),
             Err(other) => Ok(other),
@@ -758,10 +833,12 @@ impl Hold {
     }
 }
 
-/// How the staging on `conn` went, each line of its output to `line`;
-/// `Err` when the helper ended before it began (a [`Staged::Failed`]).
+/// How the command on `conn` (`what` it does: a staging, a deploy) went,
+/// each line of its output to `line`; `Err` when the helper ended before it
+/// began (a [`Staged::Failed`]).
 async fn staging(
     conn: &mut tokio::net::UnixStream,
+    what: &str,
     mut line: impl FnMut(String),
 ) -> Result<Staged, Staged> {
     let mut began = false;
@@ -772,7 +849,7 @@ async fn staging(
             Ok(Reply::Line(l)) => line(l),
             Ok(Reply::Exit(0)) => return Ok(Staged::Done),
             Ok(Reply::Exit(code)) => {
-                return Ok(Staged::Failed(format!("the staging exited with {code}")));
+                return Ok(Staged::Failed(format!("{what} exited with {code}")));
             }
             Ok(Reply::Image(_)) => {
                 return Ok(Staged::Failed(
@@ -781,9 +858,9 @@ async fn staging(
             }
             Err(e) if !began => return Err(Staged::Failed(format!("the stage helper: {e}"))),
             Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
-                return Ok(Staged::Failed(
-                    "the stage helper ended before the staging".into(),
-                ));
+                return Ok(Staged::Failed(format!(
+                    "the stage helper ended before {what} did"
+                )));
             }
             Err(e) => return Ok(Staged::Failed(format!("the stage helper: {e}"))),
         }
@@ -1385,5 +1462,63 @@ pub(crate) mod tests {
         let etc = "root:x:0:\nu6e-deploy:x:997:\nother:x:12:a,b\n";
         assert_eq!(group_id(etc, "u6e-deploy"), Some(997));
         assert_eq!(group_id(etc, "u6e"), None);
+    }
+
+    const REV: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// A configuration whose site deploy is `dir/deploy`, the script `body`.
+    fn site_config(t: &TestDir, body: &str) -> Config {
+        let mut c = config(t.path(), &[], "");
+        let command = t.path().join("deploy");
+        fs::write(&command, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&command, fs::Permissions::from_mode(0o755)).unwrap();
+        c.site = Some(crate::config::Site {
+            remote: u6e_git::Remote {
+                url: "/srv/site.git".into(),
+                ssh_key: None,
+                known_hosts: None,
+            },
+            clone: t.path().join("clone"),
+            branch: "main".into(),
+            file: "wifi/site.yml".into(),
+            command,
+        });
+        c
+    }
+
+    fn deploy(rev: &str) -> Request {
+        Request::DeploySite { rev: rev.into() }
+    }
+
+    #[test]
+    fn a_site_deploy_runs_the_command_with_the_commit() {
+        let t = TestDir::new();
+        let c = site_config(&t, "echo \"deploying $1 from $(pwd)\"; exit 3");
+        assert_eq!(
+            ask(&c, deploy(REV)),
+            [
+                Reply::Ok,
+                Reply::Line(format!("deploying {REV} from /")),
+                Reply::Exit(3)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_site_deploy_is_refused_unless_all_is_as_it_must_be() {
+        let t = TestDir::new();
+        let refused = |c: &Config, rev: &str| match &ask(c, deploy(rev))[..] {
+            [Reply::Refused(why)] => why.clone(),
+            other => panic!("{other:?}"),
+        };
+        let mut c = site_config(&t, "echo ran");
+        assert_eq!(refused(&c, "HEAD"), "not a commit's full name");
+        assert_eq!(refused(&c, &REV[1..]), "not a commit's full name");
+        // A command others may write, root does not run.
+        let command = c.site.as_ref().unwrap().command.clone();
+        fs::set_permissions(&command, fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(refused(&c, REV).contains("writable by others than root"));
+        c.site = None;
+        assert_eq!(refused(&c, REV), "the runner deploys no site");
     }
 }

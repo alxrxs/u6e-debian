@@ -1,9 +1,10 @@
 //! The runner's local socket: what its local callers (the site's
 //! configuration play, an operator's shell, the site's image deploy) may
-//! ask, which is exactly four things: apply a rendered Wi-Fi configuration
+//! ask, which is exactly five things: apply a rendered Wi-Fi configuration
 //! to an AP, roll a kept image out to one, name the kept images it needs
 //! (for the site's deploy, which prunes the others), and, root alone, record
-//! a kept image the site's own deploy staged on one. Only root and processes
+//! a kept image the site's own deploy staged on one, and the commit of the
+//! site's repository a person deployed by hand. Only root and processes
 //! of the runner's group are served. A connection carries one request; the
 //! runner answers with lines as the work goes and a last word.
 
@@ -39,6 +40,8 @@ pub enum Request {
     /// The kept images the runner needs: what it staged on each AP, and the
     /// two of a rollout under way. One `Line` each, then `Done`.
     Images,
+    /// A person deployed the site as this commit; root's alone.
+    Deployed { rev: String },
 }
 
 /// What the runner answers, in order.
@@ -141,6 +144,18 @@ pub async fn staged(socket: &Path, ap: &str, image_id: &str) -> Result<String, S
     }
 }
 
+/// Has the runner on `socket` record that the site was deployed as `rev`.
+pub async fn deployed(socket: &Path, rev: &str) -> Result<String, String> {
+    let req = Request::Deployed { rev: rev.into() };
+    let reply = async { frames::read(&mut ask(socket, &req).await?).await };
+    match reply.await {
+        Ok(Reply::Done { ok: true, detail }) => Ok(detail),
+        Ok(Reply::Done { ok: false, detail }) => Err(detail),
+        Ok(other) => Err(format!("the runner answered {other:?}")),
+        Err(e) => Err(format!("{}: {e}", socket.display())),
+    }
+}
+
 /// The kept images the runner on `socket` needs.
 pub async fn images(socket: &Path) -> Result<Vec<String>, String> {
     let mut conn = ask(socket, &Request::Images)
@@ -220,6 +235,20 @@ async fn caller(runner: Arc<Runner>, mut conn: UnixStream, ours: u32) {
                     Ok(()) => Reply::Done {
                         ok: true,
                         detail: format!("{ap} rolls back to {image_id}"),
+                    },
+                    Err(why) => done(why),
+                }
+            };
+            let _ = frames::write(&mut conn, &reply).await;
+        }
+        Request::Deployed { rev } => {
+            let reply = if cred.uid() != 0 {
+                done("only root may say what was deployed".into())
+            } else {
+                match crate::live::deployed(&runner, rev.clone()).await {
+                    Ok(()) => Reply::Done {
+                        ok: true,
+                        detail: format!("the next deploy is checked against {rev}"),
                     },
                     Err(why) => done(why),
                 }

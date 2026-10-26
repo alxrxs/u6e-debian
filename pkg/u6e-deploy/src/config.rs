@@ -2,7 +2,10 @@
 //! the controller it dials and the key it pins there, its own two keys (the
 //! link's, and the one it signs configurations with, which the APs' images
 //! pin), its local socket and state directory, the health gate's time, the
-//! APs, and how a kept image is staged on one.
+//! APs, how a kept image is staged on one, and, with `[site]`, the site's
+//! live deploys the controller may ask for (`site`): the site's repository,
+//! which the runner reads into a clone of its own, the site file, and the
+//! root-owned command the stage helper runs to deploy a commit of it.
 //!
 //! ```toml
 //! controller = "controller.example.net:8443"
@@ -27,6 +30,16 @@
 //! # The stage helper's socket, and the group whose processes it serves.
 //! helper = "/run/u6e-deploy-stage.sock"
 //! group = "u6e-deploy"
+//!
+//! [site]
+//! remote = "ssh://git@git.example.org/team/site.git"
+//! clone = "/var/lib/u6e-deploy/site"
+//! branch = "main"
+//! file = "wifi/site.yml"
+//! ssh_key = "/run/credentials/u6e-deploy.service/site-key"
+//! known_hosts = "/etc/u6e-deploy/site-known-hosts"
+//! # Run by the stage helper, as root, with the commit to deploy.
+//! command = "/usr/local/sbin/site-live-deploy"
 //! ```
 
 use std::collections::BTreeMap;
@@ -35,6 +48,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::Deserialize;
+use u6e_git::Remote;
 use u6e_proto::mac;
 
 /// The parsed, checked configuration.
@@ -57,6 +71,20 @@ pub struct Config {
     /// AP name to the host name its configurations are signed for.
     pub aps: BTreeMap<String, String>,
     pub rollout: Rollout,
+    pub site: Option<Site>,
+}
+
+/// The site's live deploys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Site {
+    pub remote: Remote,
+    /// The runner's own clone, which it only fetches into.
+    pub clone: PathBuf,
+    pub branch: String,
+    /// The site file, relative to the repository's root.
+    pub file: String,
+    /// What the stage helper runs, with the commit, to deploy it.
+    pub command: PathBuf,
 }
 
 /// How kept images are staged.
@@ -82,6 +110,24 @@ struct File {
     gate_secs: u64,
     aps: BTreeMap<String, ApFile>,
     rollout: RolloutFile,
+    site: Option<SiteFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SiteFile {
+    remote: String,
+    clone: PathBuf,
+    #[serde(default = "default_branch")]
+    branch: String,
+    file: String,
+    ssh_key: Option<PathBuf>,
+    known_hosts: Option<PathBuf>,
+    command: PathBuf,
+}
+
+fn default_branch() -> String {
+    "main".into()
 }
 
 #[derive(Deserialize)]
@@ -123,6 +169,8 @@ pub enum ConfigError {
     BadTree,
     /// `gate_secs` is 0, or past [`GATE_MAX`].
     BadGate,
+    /// `[site]` is not a site's: why.
+    BadSite(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -138,6 +186,7 @@ impl fmt::Display for ConfigError {
             Self::NoAps => f.write_str("no aps"),
             Self::BadTree => f.write_str("rollout.tree is not an absolute path"),
             Self::BadGate => write!(f, "gate_secs is not from 1 to {}", GATE_MAX.as_secs()),
+            Self::BadSite(why) => write!(f, "site: {why}"),
         }
     }
 }
@@ -149,6 +198,40 @@ impl std::error::Error for ConfigError {}
 pub fn plain(s: &str) -> bool {
     let ok = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-';
     (1..=63).contains(&s.len()) && !s.starts_with('-') && s.chars().all(ok)
+}
+
+impl SiteFile {
+    fn check(self) -> Result<Site, ConfigError> {
+        let bad = |why: &str| Err(ConfigError::BadSite(why.into()));
+        let remote = Remote {
+            url: self.remote,
+            ssh_key: self.ssh_key,
+            known_hosts: self.known_hosts,
+        };
+        remote.check().map_err(ConfigError::BadSite)?;
+        if remote.url.is_empty() || !self.clone.is_absolute() || !self.command.is_absolute() {
+            return bad("remote, an absolute clone and an absolute command are needed");
+        }
+        let plain = |s: &str| {
+            !s.is_empty()
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "/._-".contains(c))
+        };
+        if !plain(&self.branch)
+            || !plain(&self.file)
+            || self.file.starts_with('/')
+            || self.file.contains("..")
+        {
+            return bad("branch and file must be plain names, the file relative to the repository");
+        }
+        Ok(Site {
+            remote,
+            clone: self.clone,
+            branch: self.branch,
+            file: self.file,
+            command: self.command,
+        })
+    }
 }
 
 impl Config {
@@ -181,6 +264,7 @@ impl Config {
         if !(1..=GATE_MAX.as_secs()).contains(&file.gate_secs) {
             return Err(ConfigError::BadGate);
         }
+        let site = file.site.map(SiteFile::check).transpose()?;
         let r = file.rollout;
         Ok(Config {
             controller: file.controller,
@@ -197,6 +281,7 @@ impl Config {
                 helper: r.helper,
                 group: r.group,
             },
+            site,
         })
     }
 
@@ -271,6 +356,31 @@ pub(crate) mod tests {
         );
         let none = t.replace("[aps.ap1]\nhostname = \"u6e-ap1\"\n", "[aps]\n");
         assert_eq!(bad(&none), ConfigError::NoAps);
+    }
+
+    const SITE: &str = "[site]\nremote = \"ssh://git@git.example.org/site.git\"\n\
+                        clone = \"/var/lib/d/site\"\nfile = \"wifi/site.yml\"\n\
+                        ssh_key = \"/k/site\"\nknown_hosts = \"/k/hosts\"\n\
+                        command = \"/usr/local/sbin/deploy-site\"\n";
+
+    #[test]
+    fn a_site_to_deploy() {
+        let c = Config::parse(&format!("{}{SITE}", text(""))).unwrap();
+        let s = c.site.unwrap();
+        assert_eq!(
+            (s.branch.as_str(), s.file.as_str()),
+            ("main", "wifi/site.yml")
+        );
+        assert_eq!(s.command, PathBuf::from("/usr/local/sbin/deploy-site"));
+        assert_eq!(Config::parse(&text("")).unwrap().site, None);
+        let bad = |from: &str, to: &str| {
+            let t = format!("{}{}", text(""), SITE.replace(from, to));
+            matches!(Config::parse(&t), Err(ConfigError::BadSite(_)))
+        };
+        assert!(bad("known_hosts = \"/k/hosts\"\n", ""));
+        assert!(bad("/k/site", "/k/my key"));
+        assert!(bad("wifi/site.yml", "../site.yml"));
+        assert!(bad("/usr/local/sbin/deploy-site", "deploy-site"));
     }
 
     #[test]
