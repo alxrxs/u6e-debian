@@ -16,7 +16,9 @@
 //! runner sends it until then; one for a rollout not held here is kept and
 //! recorded as an orphan. A rollout the runner does not say it took on in
 //! `Timing::start` is closed as not started (`supervise`). The state files
-//! the runner set aside, which it tells at each session, are recorded.
+//! the runner set aside, which it tells at each session, are recorded. The
+//! site deploys the RF planner asks for after a push go to it too, and its
+//! word on each comes back to the state.
 
 use std::convert::Infallible;
 use std::io::{self, ErrorKind};
@@ -170,6 +172,13 @@ impl Session {
                     detail,
                     at_ms,
                 }),
+                // Its rev is the one asked for under that id: the state's.
+                RunnerMsg::SiteDeploy {
+                    id,
+                    state: s,
+                    detail,
+                    ..
+                } => state.site_deployed(id, s, detail),
                 // A Pong only proves the runner is alive, a second Hello
                 // says nothing new.
                 _ => {}

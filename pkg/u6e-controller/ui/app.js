@@ -170,9 +170,10 @@ async function rfPlan() {
   }
 }
 
-/** Commits the proposals of `radios` (`<ap>/<radio>`) to the site file. */
-function rfApply(radios) {
-  return adminPost('/api/rf/apply', { radios });
+/** Commits the proposals confirmed (`{ plan, radios }`, each radio with the
+ * setting it was shown) to the site file. */
+function rfApply(confirmed) {
+  return adminPost('/api/rf/apply', confirmed);
 }
 
 /** Every connection `ap` forwards, which it is asked for: `{ status, at,

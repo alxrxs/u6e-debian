@@ -30,7 +30,7 @@ use u6e_proto::delta::{self, Gap};
 use u6e_proto::msg::{
     AgentMsg, Command, CommandKind, CommandResult, ConfigApplied, CtlMsg, Event, EventKind, Flows,
     Hello, Mechanism, RolloutOutcome, RolloutRequest, RolloutResult, RunnerCtlMsg, SignedConfig,
-    Snapshot, Station,
+    SiteDeployState, Snapshot, Station,
 };
 use u6e_proto::{PROTOCOL, mac};
 
@@ -135,6 +135,32 @@ pub struct Runner {
     /// before told, which are not recorded again.
     pub discarded: Vec<Discarded>,
     discarded_before: Vec<Discarded>,
+}
+
+/// The deploy of the site file the RF planner asked the runner for last, and
+/// how it goes: no state until the runner answers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SiteDeploy {
+    pub id: u64,
+    /// The commit pushed.
+    pub rev: String,
+    pub user: Option<String>,
+    pub state: Option<SiteDeployState>,
+    pub detail: String,
+    /// When it was asked for, and when the runner last said anything of it.
+    pub asked: SystemTime,
+    pub at: SystemTime,
+}
+
+/// The name of a site deploy's state, as the API and the events spell it.
+pub fn site_deploy_name(s: Option<SiteDeployState>) -> &'static str {
+    match s {
+        None => "asked",
+        Some(SiteDeployState::Refused) => "refused",
+        Some(SiteDeployState::Running) => "running",
+        Some(SiteDeployState::Done) => "done",
+        Some(SiteDeployState::Failed) => "failed",
+    }
 }
 
 /// A state file of the runner's that it could not read and set aside.
@@ -535,6 +561,8 @@ pub struct State {
     /// Wakes `spectrum::supervise` when a scan's deadline may have moved.
     pub(crate) wake: Arc<Notify>,
     pub runner: Runner,
+    /// The site deploy asked for last.
+    pub site_deploy: Option<SiteDeploy>,
     /// The rollouts, newest last.
     pub rollouts: VecDeque<Rollout>,
     next_rollout: u64,
@@ -569,6 +597,7 @@ impl State {
             spectrum: Limits::default(),
             wake: Arc::new(Notify::new()),
             runner: Runner::default(),
+            site_deploy: None,
             rollouts: VecDeque::new(),
             next_rollout: 0,
             orphan: None,
@@ -1092,6 +1121,14 @@ impl State {
                 });
             }
         }
+        // A site deploy asked for while no runner was connected, or before
+        // one that restarted answered, is asked for again.
+        if let Some(d) = self.site_deploy.as_ref().filter(|d| d.state.is_none()) {
+            let _ = outbox_tx.try_send(RunnerCtlMsg::DeploySite {
+                id: d.id,
+                rev: d.rev.clone(),
+            });
+        }
         self.runner.session = Some(RunnerLive {
             id,
             _stop: stop_tx,
@@ -1111,6 +1148,68 @@ impl State {
             self.runner.connected_since = None;
             self.notify(Change::Deploy);
         }
+    }
+
+    /// Asks the runner to deploy the site file as commit `rev`, which the
+    /// RF planner pushed for `user`: now, or when the runner next connects.
+    /// Its id.
+    pub fn deploy_site(&mut self, rev: &str, user: Option<String>) -> u64 {
+        self.next_id += 1;
+        let id = self.next_id;
+        let now = SystemTime::now();
+        self.site_deploy = Some(SiteDeploy {
+            id,
+            rev: rev.to_owned(),
+            user: user.clone(),
+            state: None,
+            detail: String::new(),
+            asked: now,
+            at: now,
+        });
+        let sent = self.to_runner(RunnerCtlMsg::DeploySite {
+            id,
+            rev: rev.to_owned(),
+        });
+        let detail = if sent {
+            format!("{}: asked of the deploy runner", &rev[..rev.len().min(12)])
+        } else {
+            format!(
+                "{}: asked; the deploy runner is not connected, and is asked when it is",
+                &rev[..rev.len().min(12)]
+            )
+        };
+        self.record_site_deploy(user, true, detail);
+        id
+    }
+
+    /// The runner's word on site deploy `id`: a state it took is an event,
+    /// each line it runs with only the deploy's detail.
+    pub fn site_deployed(&mut self, id: u64, state: SiteDeployState, detail: String) {
+        let Some(d) = self.site_deploy.as_mut().filter(|d| d.id == id) else {
+            return;
+        };
+        let moved = d.state != Some(state);
+        (d.state, d.detail, d.at) = (Some(state), detail, SystemTime::now());
+        let rev = &d.rev[..d.rev.len().min(12)];
+        let word = format!("{rev}: {}: {}", site_deploy_name(d.state), d.detail);
+        let user = d.user.clone();
+        if moved {
+            let ok = !matches!(state, SiteDeployState::Refused | SiteDeployState::Failed);
+            self.record_site_deploy(user, ok, word);
+        }
+        self.notify(Change::Deploy);
+    }
+
+    fn record_site_deploy(&mut self, user: Option<String>, ok: bool, detail: String) {
+        self.record(Action {
+            at: SystemTime::now(),
+            user,
+            action: "site-deploy",
+            mac: None,
+            ap: None,
+            ok,
+            detail,
+        });
     }
 
     /// Queues `msg` for the runner; false when none is connected or it is too

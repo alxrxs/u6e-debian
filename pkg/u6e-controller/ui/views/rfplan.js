@@ -1,8 +1,11 @@
 // The RF plan, below the spectrum: for each radio of the site file, the
 // channel, width and power the controller proposes from what the last hours
 // measured, what it predicts the change does and why. Nothing changes until
-// an admin applies chosen proposals, which commits them to the site file;
-// the deploy path then takes them to the access points like any change of it.
+// an admin applies chosen proposals, exactly as shown (the controller refuses
+// them once the plan changed), which commits them to the site file; the
+// controller then asks the deploy runner to deploy that commit, and the
+// panel follows the deploy until it ends. Proposals that free each other's
+// spectrum are chosen together.
 
 import { h, icon, ask, ago, bandName } from '../util.js';
 
@@ -11,10 +14,21 @@ const LOCK = 'M6 11h12v10H6zM8 11V7a4 4 0 0 1 8 0v4';
 const OK = 'M12 3a9 9 0 1 0 0 18a9 9 0 0 0 0-18M8 12l3 3 5-6';
 const BAD = 'M12 3a9 9 0 1 0 0 18a9 9 0 0 0 0-18M12 8v5M12 16.5v.01';
 const INFO = 'M12 3a9 9 0 1 0 0 18a9 9 0 0 0 0-18M12 11v5M12 7.5v.01';
+const WAIT = 'M12 3a9 9 0 1 0 0 18a9 9 0 0 0 0-18M12 7v5l3 2';
 const REFRESH = 'M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7';
 const COMMIT = 'M12 8a4 4 0 1 0 0 8a4 4 0 0 0 0-8M3 12h5M16 12h5';
-/** How often the plan is asked for again while it is shown. */
+/** How often the plan is asked for again while it is shown, and while a
+ * deploy runs. */
 const EVERY_MS = 60_000;
+const DEPLOYING_MS = 3_000;
+/** What each state of a deploy says, and its tone. */
+const DEPLOY = {
+  asked: ['wait', 'asked of the deploy runner'],
+  running: ['wait', 'deploying'],
+  done: ['ok', 'deployed'],
+  refused: ['bad', 'refused by the deploy runner'],
+  failed: ['bad', 'failed'],
+};
 
 /** The planner's reason as a sentence. */
 function sentence(text) {
@@ -42,29 +56,43 @@ function effect(label, value, detail) {
   return h('div', {}, h('dt', {}, label), h('dd', {}, value, detail ? h('small', {}, detail) : null));
 }
 
-/** One radio's proposal; `pick` is its checkbox, when it may be chosen. */
-function row(r, pick) {
+/** From one setting to another: the first quiet, the changes marked. */
+function move(from, to) {
+  return h('p', { class: 'plan-set' }, h('span', { class: 'was' }, ...parts(from)),
+    h('span', { class: 'to', 'aria-label': 'to' }, '→'), h('span', {}, ...parts(to, from)));
+}
+
+/** One radio's proposal; `pick` is its checkbox, when it may be chosen, and
+ * `others` the keys of its group's others. */
+function row(r, pick, others) {
   const chips = [];
-  if (r.kept) chips.push(h('span', { class: 'chip' }, 'Kept'));
+  if (r.pending) chips.push(h('span', { class: 'chip wait' }, 'Pending deploy'));
+  else if (r.kept) chips.push(h('span', { class: 'chip' }, 'Kept'));
   else if (r.change && !r.measured) chips.push(h('span', { class: 'chip warn' }, 'Unmeasured'));
-  const setting = r.change
-    ? h('p', { class: 'plan-set' }, h('span', { class: 'was' }, ...parts(r.current)), h('span', { class: 'to', 'aria-label': 'to' }, '→'), h('span', {}, ...parts(r.proposed, r.current)))
-    : h('p', { class: 'plan-set same' }, 'Stays on ', ...parts(r.current, null, 'channel'));
+  if (r.restart) chips.push(h('span', { class: 'chip warn', title: r.restart }, 'Restarts Wi-Fi'));
+  if (others.length) chips.push(h('span', { class: 'chip', title: 'Applied together or not at all' }, `With ${others.join(', ')}`));
+  let setting;
+  if (r.pending && r.runs) setting = move(r.runs, r.current);
+  else if (r.change) setting = move(r.current, r.proposed);
+  else setting = h('p', { class: 'plan-set same' }, 'Stays on ', ...parts(r.current, null, 'channel'));
+  const shift = r.predicted_busy !== undefined && Math.round(r.predicted_busy) !== Math.round(r.busy);
   const busy = r.busy === undefined
     ? effect('Busy', '–', 'not measured')
-    : r.change && r.predicted_busy !== undefined && r.predicted_busy !== r.busy
+    : r.change && shift
       ? effect('Busy', `${r.busy.toFixed(0)} % → ${r.predicted_busy.toFixed(0)} %`, 'predicted')
       : effect('Busy', `${r.busy.toFixed(0)} %`, `${r.foreign.toFixed(0)} % other networks`);
   const snr = r.snr === undefined
     ? effect('Client SNR', '–', 'no clients heard')
     : effect('Client SNR', `${r.snr.toFixed(0)} dB`, r.change ? `weakest tenth, ${signed(r.snr_change)}` : 'weakest tenth');
   const clients = effect('Clients', r.clients === undefined ? '–' : r.clients.toFixed(1), r.hours ? `over ${r.hours} h` : null);
+  const why = [h('p', { class: 'plan-why' }, sentence(r.reason))];
+  if (r.restart) why.push(h('p', { class: 'plan-why warn' }, sentence(r.restart)));
   return h('li', { class: 'plan-radio', 'data-band': r.band, 'data-change': String(!!r.change) },
     h('div', { class: 'plan-pick' }, pick),
     h('div', { class: 'plan-main' },
       h('div', { class: 'plan-head' }, h('b', {}, r.ap), h('span', { class: 'chip', 'data-band': r.band }, bandName(r.band)), h('span', { class: 'muted' }, r.radio), ...chips),
       setting,
-      h('p', { class: 'plan-why' }, sentence(r.reason))),
+      ...why),
     h('dl', { class: 'plan-effect' }, busy, snr, clients));
 }
 
@@ -86,6 +114,14 @@ export function rfPlan(store) {
    * chosen until it is unchosen. */
   const chosen = new Set();
   const offered = new Set();
+  let timer = null;
+
+  /** Asks for the plan again in a while: soon while a deploy runs. */
+  function again() {
+    clearTimeout(timer);
+    const state = plan?.deploy?.state;
+    timer = setTimeout(load, state === 'asked' || state === 'running' ? DEPLOYING_MS : EVERY_MS);
+  }
 
   async function load() {
     if (loading) return;
@@ -99,31 +135,42 @@ export function rfPlan(store) {
     offered.clear();
     for (const k of changes) offered.add(k);
     render();
+    again();
+  }
+
+  /** The keys of the proposals applied with `r`: its group's others. */
+  function others(r) {
+    if (r.group === undefined) return [];
+    return (plan.radios || []).filter((o) => o.group === r.group && o.key !== r.key).map((o) => o.key);
   }
 
   async function apply() {
-    const keys = [...chosen];
-    const n = keys.length;
+    const picked = (plan.radios || []).filter((r) => r.change && chosen.has(r.key));
+    const n = picked.length;
+    const restarts = picked.filter((r) => r.restart).length;
+    const restart = restarts
+      ? ` ${restarts === 1 ? 'One of them restarts' : `${restarts} of them restart`} the AP’s Wi-Fi for a radar check of about a minute.`
+      : '';
     const yes = await ask(document.body, {
       title: `Apply ${n} ${n === 1 ? 'change' : 'changes'}?`,
-      text: `The controller commits ${n === 1 ? 'it' : 'them'} to ${plan.site?.file || 'the site file'} as wifi-controller, naming you. ` +
-        'The deploy runner then takes the file to the access points: a channel switch announcement moves their clients along, without a reboot.',
+      text: `The controller commits ${n === 1 ? 'it' : 'them'} to ${plan.site?.file || 'the site file'} as wifi-controller, naming you, ` +
+        'and has the deploy runner take the commit to the access points: a channel switch announcement moves their clients along, without a reboot.' + restart,
       confirm: 'Commit',
     });
     if (!yes) return;
     applying = true;
     result = null;
     render();
-    const res = await store.rfApply(keys);
+    const radios = picked.map((r) => ({ key: r.key, ...r.proposed }));
+    const res = await store.rfApply({ plan: plan.hash, radios });
     applying = false;
     result = res.ok
-      ? ['ok', `Committed ${res.commit.slice(0, 12)} to ${plan.site?.file || 'the site file'}. The access points take it once the deploy runner applies it.`]
+      ? ['ok', `Committed ${res.commit.slice(0, 12)} to ${plan.site?.file || 'the site file'}.`]
       : ['bad', `Not applied: ${res.error || 'the controller could not be reached'}.`];
     await load();
   }
 
   refresh.addEventListener('click', load);
-  const timer = setInterval(load, EVERY_MS);
 
   function resultLine() {
     const last = plan?.last;
@@ -131,6 +178,18 @@ export function rfPlan(store) {
       || (last ? [last.ok ? 'ok' : 'bad', `Last applied ${ago(last.at)}${last.user ? ` by ${last.user}` : ''}: ${last.ok ? last.detail : `failed, ${last.detail}`}.`] : []);
     if (!tone) return null;
     return h('p', { class: 'result', role: 'status', 'data-tone': tone }, icon(tone === 'ok' ? OK : BAD), h('span', {}, text));
+  }
+
+  /** How the deploy of the last commit goes. */
+  function deployLine() {
+    const d = plan?.deploy;
+    if (!d) return null;
+    const [tone, word] = d.state === 'asked' && !d.runner
+      ? ['wait', 'waiting for the deploy runner, which is not connected']
+      : DEPLOY[d.state] || ['wait', d.state];
+    const detail = d.detail && d.state !== 'asked' ? `: ${d.detail}` : '';
+    const text = `Deploy of ${d.rev.slice(0, 12)}: ${word}${detail} (${ago(d.at)}).`;
+    return h('p', { class: 'result deploy', role: 'status', 'data-tone': tone }, icon(tone === 'ok' ? OK : tone === 'bad' ? BAD : WAIT), h('span', {}, text));
   }
 
   function foot(changes) {
@@ -183,20 +242,24 @@ export function rfPlan(store) {
     const radios = plan.radios || [];
     const changes = radios.filter((r) => r.change);
     const list = h('ul', { class: 'plan-list' }, ...radios.map((r) => {
+      const group = others(r);
       let pick = null;
       if (r.change && admin) {
         pick = h('input', { type: 'checkbox', 'aria-label': `Apply ${r.ap}’s ${bandName(r.band)} proposal`, checked: chosen.has(r.key), disabled: applying });
+        // A group is chosen, and left out, whole.
         pick.addEventListener('change', () => {
-          if (pick.checked) chosen.add(r.key);
-          else chosen.delete(r.key);
+          for (const k of [r.key, ...group]) {
+            if (pick.checked) chosen.add(k);
+            else chosen.delete(k);
+          }
           render();
         });
       }
-      return row(r, pick);
+      return row(r, pick, group);
     }));
     const notes = (plan.notes || []).map((n) => h('p', { class: 'plan-note' }, icon(INFO), h('span', {}, n)));
     if (site.error) notes.push(h('p', { class: 'plan-note warn' }, icon(BAD), h('span', {}, `The site file could not be fetched (${site.error}); this plan reads it as last fetched.`)));
-    body.replaceChildren(...[...notes, list, resultLine(), foot(changes)].filter(Boolean));
+    body.replaceChildren(...[...notes, list, deployLine(), resultLine(), foot(changes)].filter(Boolean));
   }
 
   load();
@@ -208,7 +271,7 @@ export function rfPlan(store) {
       if ((store.me?.admin ?? null) !== shownAdmin) render();
     },
     unmount() {
-      clearInterval(timer);
+      clearTimeout(timer);
     },
   };
 }

@@ -194,6 +194,7 @@ main { padding: 22px 24px 48px; max-width: 1560px; }
 .chip[data-band="6"] { color: var(--b6); background: color-mix(in srgb, var(--b6) 13%, transparent); }
 .chip.bad { color: var(--bad); background: color-mix(in srgb, var(--bad) 12%, transparent); border-color: transparent; }
 .chip.warn { color: var(--warn); background: color-mix(in srgb, var(--warn) 13%, transparent); border-color: transparent; }
+.chip.wait { color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); border-color: transparent; }
 
 .btn {
   display: inline-flex;
@@ -628,6 +629,9 @@ table.conns { font-size: 12.5px; }
 .plan-set.same { display: block; color: var(--ink-2); font-weight: 450; }
 .plan-set mark { padding: 0 3px; border-radius: 4px; background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--ink); }
 .plan-why { margin: 4px 0 0; color: var(--ink-2); font-size: 13px; overflow-wrap: anywhere; }
+.plan-why.warn { color: var(--warn); }
+.result[data-tone="wait"] { background: color-mix(in srgb, var(--accent) 8%, var(--surface)); }
+.result[data-tone="wait"] svg { color: var(--accent); }
 .plan-effect { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px 14px; margin: 0; align-self: start; }
 .plan-effect dt { color: var(--ink-3); font-size: 12px; }
 .plan-effect dd { margin: 1px 0 0; font-weight: 600; white-space: nowrap; }

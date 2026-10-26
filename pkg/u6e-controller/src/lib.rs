@@ -60,6 +60,15 @@ pub async fn start(
     let path = &config.policy_path;
     let saved = policy::load(path)
         .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
+    // ssh refuses a key others may read, and would say so only at the first
+    // push: the controller refuses to start with one instead.
+    let key = config
+        .rf
+        .as_ref()
+        .and_then(|rf| rf.repo.remote.ssh_key.as_ref());
+    if let Some(key) = key {
+        u6e_git::check_key(key).map_err(|e| io::Error::other(format!("rf: {e}")))?;
+    }
     let window = config
         .rf
         .as_ref()

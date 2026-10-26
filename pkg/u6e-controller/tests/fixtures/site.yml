@@ -1,7 +1,13 @@
 ---
 # A site file of the shape the RF planner reads and edits, for its tests and
-# the replay example: two APs, with documentation addresses and names.
-# Secrets are paths into a secret store; none lives here.
+# the replay example: two APs, with documentation addresses and names, and a
+# made-up country (ZZ, a user-assigned code) whose channel table the tests
+# and the replay give.
+#
+# The planner leaves alone what a comment holding "planner: fixed" marks: an
+# AP's line keeps all its radios, a radio's line the radio, a channel line its
+# channel and width, a txpower line that power. Comments say why a setting is
+# what it is, never the channel numbers, which the planner may change.
 u6e:
   # What gets built, each repository at the commit pinned here.
   build:
@@ -22,17 +28,17 @@ u6e:
     key: {path: secret/wifi-controller, field: public_key_hex}
 
   management:
-    vlan: 11
+    vlan: 100
     gateway: 192.0.2.1
     dns: 192.0.2.53
     log_server: 192.0.2.10:514
 
   wifi:
     # The regulatory domain the radios run in.
-    country: KR
+    country: ZZ
     vlans:
-      default: 42
-      all: [42, 43]
+      default: 101
+      all: [101, 102]
     # Transmit power per radio in dBm.
     txpower: {"24": 20, "5": 23, "6": 18}
     mbssid_6ghz: true
@@ -40,11 +46,11 @@ u6e:
       - name: Example Enterprise
         kind: ent
         bands: ["5", "6"]
-        vlan: 42
+        vlan: 101
       - name: Example Guest
         kind: sae
         bands: ["24", "5", "6"]
-        vlan: 42
+        vlan: 102
         passphrase: {path: secret/wlans, field: guest}
     # hostapd settings per radio, for every AP unless the AP sets its own.
     radios:
@@ -58,9 +64,8 @@ u6e:
       stock_host_keys:
         - ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDexample1
       led: "off"
-      bss_colors: {"24": 11, "5": 22, "6": 33}
+      bss_colors: {"24": 1, "5": 2, "6": 3}
       radios:
-        # 36-48 at 80 MHz.
         "5":
           hw_mode: a
           channel: 36
@@ -70,7 +75,8 @@ u6e:
           vht_oper_centr_freq_seg0_idx: 42
           he_oper_chwidth: 1
           he_oper_centr_freq_seg0_idx: 42
-        # 160 MHz block 33-61 (primary 37, a PSC): each AP has its own.
+        # 160 MHz on a preferred scanning channel: each AP has a block of
+        # its own, as clients lose frames between two APs on one.
         "6":
           hw_mode: a
           op_class: 134
@@ -85,10 +91,10 @@ u6e:
       stock_host_keys:
         - ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDexample2
       led: blue
-      bss_colors: {"24": 44, "5": 55, "6": 60}
+      bss_colors: {"24": 4, "5": 5, "6": 6}
       radios:
-        # Primary 149 kept: a neighbouring 20/40 MHz BSS has it as its
-        # primary, which 802.11-2024 11.15.3.2 makes ours too.
+        # The primary of a neighbouring 20/40 MHz BSS, which 802.11-2024
+        # 11.15.3.2 makes this one's too.
         "5":
           hw_mode: a
           channel: 149  # planner: fixed
@@ -99,7 +105,7 @@ u6e:
           vht_oper_centr_freq_seg0_idx: 155
           he_oper_chwidth: 1
           he_oper_centr_freq_seg0_idx: 155
-        # 160 MHz block 65-93 (primary 69, a PSC), beside ap1's.
+        # 160 MHz on a preferred scanning channel, beside ap1's block.
         "6":
           hw_mode: a
           op_class: 134

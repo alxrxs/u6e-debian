@@ -969,7 +969,7 @@ async fn main() -> io::Result<()> {
          public_origin = \"http://{web}\"\npolicy_path = \"{}\"\n\
          [aps.ap1]\npublic_key = \"{}\"\n[aps.ap2]\npublic_key = \"{}\"\n\
          [rf]\nremote = \"{}\"\nrepo = \"{}\"\nfile = \"{}\"\n\
-         [rf.channels.KR]\n\"24\" = [{{ channels = \"1-13\", max_dbm = 23 }}]\n\
+         [rf.channels.ZZ]\n\"24\" = [{{ channels = \"1-13\", max_dbm = 23 }}]\n\
          \"5\" = [{{ channels = \"36-48\", max_dbm = 23 }}, {{ channels = \"52-64\", max_dbm = 20, dfs = true }}, \
          {{ channels = \"149-177\", max_dbm = 23 }}]\n\
          \"6\" = [{{ channels = \"1-93\", max_dbm = 24 }}]\n",

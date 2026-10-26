@@ -10,6 +10,8 @@
 //! `planner: fixed` on its line: on an AP's own line it keeps all of the AP's
 //! radios, on a radio's line the radio, on its `channel` line its channel and
 //! width, and on a `txpower` line the power of the bands that line holds.
+//! A radio with `no_pri_sec_switch: 1` keeps its primary channel: hostapd
+//! would otherwise not move it off a clash, and the site states it fixed.
 //! An edit changes only the keys that state what changed (the channel's and
 //! width's, or the AP's own power for that band), adding those missing; it
 //! is checked against what the plan read, so a file changed since is refused.
@@ -30,6 +32,8 @@ pub const PIN: &str = "planner: fixed";
 pub struct Pins {
     pub radio: bool,
     pub channel: bool,
+    /// The primary channel alone (`no_pri_sec_switch`): the width may change.
+    pub primary: bool,
     pub power: bool,
 }
 
@@ -113,6 +117,7 @@ pub fn read(text: &str) -> Result<Site, Error> {
             let pins = Pins {
                 radio: ap_pinned || pinned(&doc, &path)?,
                 channel: pinned(&doc, &at("channel"))?,
+                primary: doc.get(&at("no_pri_sec_switch"))?.as_deref() == Some("1"),
                 power: pinned(&doc, &power_at)?,
             };
             radios.push(SiteRadio {
@@ -134,7 +139,7 @@ fn at_key<'a>(path: &[&'a str], key: &'a str) -> Vec<&'a str> {
 }
 
 /// A radio's setting: its primary channel, width and power.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Setting {
     pub channel: u16,
     pub width: u16,
@@ -223,7 +228,7 @@ mod tests {
     #[test]
     fn reads_radios_power_and_pins() {
         let s = read(SITE).unwrap();
-        assert_eq!(s.country.as_deref(), Some("KR"));
+        assert_eq!(s.country.as_deref(), Some("ZZ"));
         let ap1 = &s.aps["ap1"];
         let ap2 = &s.aps["ap2"];
         let r = |rs: &[SiteRadio], b| rs.iter().find(|r| r.band == b).cloned().unwrap();
@@ -243,6 +248,7 @@ mod tests {
             b5.pins,
             Pins {
                 channel: true,
+                primary: true,
                 ..Pins::default()
             }
         );

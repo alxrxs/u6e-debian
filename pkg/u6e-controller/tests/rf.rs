@@ -3,6 +3,7 @@
 //! meanwhile), and its API on a controller in this process whose APs' state
 //! is fed in directly.
 
+use std::cell::Cell;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -12,7 +13,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::runtime::{Builder, Runtime};
 use u6e_controller::agents::Timing;
 use u6e_controller::config::Config;
@@ -20,6 +21,7 @@ use u6e_controller::names::Resolve;
 use u6e_controller::rf::git::{self, Repo};
 use u6e_controller::rf::site::{self, Change, Setting};
 use u6e_controller::{Controller, start};
+use u6e_git::Remote;
 use u6e_proto::mac;
 use u6e_proto::msg::{AgentMsg, Band, Bss, Hello, Radio, RateMode, Snapshot, Station};
 use u6e_proto::tls::Identity;
@@ -116,12 +118,14 @@ impl Scratch {
     /// The controller's clone, not made yet: the first use clones.
     fn repo(&self) -> Repo {
         Repo {
-            remote: self.remote().display().to_string(),
+            remote: Remote {
+                url: self.remote().display().to_string(),
+                ssh_key: None,
+                known_hosts: None,
+            },
             path: self.dir.0.join("clone"),
             branch: "main".into(),
             file: FILE.into(),
-            ssh_key: None,
-            known_hosts: None,
             email: "wifi-controller@example.org".into(),
         }
     }
@@ -135,9 +139,34 @@ impl Scratch {
         git_in(&other, &["push", "--quiet", "origin", "HEAD:main"]);
     }
 
+    /// Has the other clone push `text` as `path` from inside the next push
+    /// of the clone at `clone`: after the remote told that push where main
+    /// was, before it moves main.
+    fn push_other_during_push(&self, clone: &Path, path: &str, text: &str) {
+        let staged = self.dir.0.join("meanwhile");
+        fs::write(&staged, text).unwrap();
+        let hook = clone.join(".git/hooks/pre-push");
+        let script = format!(
+            "#!/bin/sh\n[ -e \"$0.done\" ] && exit 0\ntouch \"$0.done\"\nunset $(git rev-parse --local-env-vars)\n\
+             cd '{}' && cp '{}' '{path}' && \
+             git -c user.name=someone -c user.email=someone@example.org commit -qam meanwhile && \
+             git push -q origin HEAD:main\n",
+            self.other().display(),
+            staged.display()
+        );
+        fs::write(&hook, script).unwrap();
+        Command::new("chmod").arg("+x").arg(&hook).status().unwrap();
+    }
+
     /// `path` as the remote's main has it.
     fn on_main(&self, path: &str) -> String {
         git_in(&self.remote(), &["show", &format!("main:{path}")])
+    }
+
+    /// The subjects on the remote's main, newest first.
+    fn log(&self) -> Vec<String> {
+        let log = git_in(&self.remote(), &["log", "--format=%s", "main"]);
+        log.lines().map(str::to_owned).collect()
     }
 }
 
@@ -193,75 +222,67 @@ fn a_change_lands_as_one_commit_by_the_controller() {
     assert_eq!((rev, text), (landed.commit.clone(), s.on_main(FILE)));
 }
 
+/// Someone else lands a commit after the controller fetched, before it
+/// pushes: the change is made again on the new branch, which keeps theirs.
 #[test]
-fn a_push_turned_down_because_the_branch_moved_is_rebased_and_lands() {
+fn a_push_turned_down_because_the_branch_moved_is_made_again_and_lands() {
     let s = Scratch::new("rf-moved");
     let repo = s.repo();
-    // Someone else lands a commit after the controller fetched, before it
-    // pushes: its first push is turned down.
+    let once = Cell::new(true);
     let landed = repo
         .land(
             |text| {
-                s.push_other("README.md", "The site, meanwhile.\n");
+                if once.replace(false) {
+                    s.push_other("README.md", "The site, meanwhile.\n");
+                }
                 edit(text)
             },
             "wifi: one change\n",
         )
         .unwrap();
     assert_eq!(landed.rejected, 1);
-    let log = git_in(&s.remote(), &["log", "--format=%s", "main"]);
-    assert_eq!(
-        log.lines().collect::<Vec<_>>(),
-        ["wifi: one change", "meanwhile", "the site"]
-    );
+    assert_eq!(s.log(), ["wifi: one change", "meanwhile", "the site"]);
     assert_eq!(s.on_main("README.md"), "The site, meanwhile.\n");
     assert_eq!(s.on_main(FILE), edit(SITE).unwrap());
 }
 
+/// The other clone lands its commit while the controller's push is under
+/// way, which git reports as `failed to update ref`: made again too.
 #[test]
-fn a_push_racing_another_is_rebased_and_lands() {
+fn a_push_racing_another_is_made_again_and_lands() {
     let s = Scratch::new("rf-race");
     let repo = s.repo();
     repo.fetch().unwrap();
-    // The other clone lands its commit while the controller's push is under
-    // way: after the remote told it where main was, before it moved main.
-    let hook = repo.path.join(".git/hooks/pre-push");
-    let other = s.other();
-    let script = format!(
-        "#!/bin/sh\n[ -e \"$0.done\" ] && exit 0\ntouch \"$0.done\"\nunset $(git rev-parse --local-env-vars)\n\
-         cd '{}' && echo 'The site, meanwhile.' > README.md && \
-         git -c user.name=someone -c user.email=someone@example.org commit -qam meanwhile && \
-         git push -q origin HEAD:main\n",
-        other.display()
-    );
-    fs::write(&hook, script).unwrap();
-    Command::new("chmod").arg("+x").arg(&hook).status().unwrap();
+    s.push_other_during_push(&repo.path, "README.md", "The site, meanwhile.\n");
     let landed = repo.land(edit, "wifi: one change\n").unwrap();
     assert_eq!(landed.rejected, 1);
-    let log = git_in(&s.remote(), &["log", "--format=%s", "main"]);
-    assert_eq!(
-        log.lines().collect::<Vec<_>>(),
-        ["wifi: one change", "meanwhile", "the site"]
-    );
+    assert_eq!(s.log(), ["wifi: one change", "meanwhile", "the site"]);
     assert_eq!(s.on_main(FILE), edit(SITE).unwrap());
 }
 
+/// Meanwhile the radio is changed another way: the edit made again on the
+/// new branch finds the file no longer as planned, and nothing lands.
 #[test]
-fn a_rebase_that_conflicts_gives_up_and_leaves_nothing() {
+fn a_change_made_meanwhile_is_never_overwritten() {
     let s = Scratch::new("rf-conflict");
     let repo = s.repo();
-    // Meanwhile the same line of the site file is changed another way.
     let theirs = edit(SITE)
         .unwrap()
         .replace("          channel: 1\n", "          channel: 11\n");
+    let once = Cell::new(true);
     let landed = repo.land(
         |text| {
-            s.push_other(FILE, &theirs);
+            if once.replace(false) {
+                s.push_other(FILE, &theirs);
+            }
             edit(text)
         },
         "wifi: one change\n",
     );
-    assert_eq!(landed, Err(git::Error::Conflict));
+    assert!(
+        matches!(&landed, Err(git::Error::Edit(e)) if e.contains("no longer as planned")),
+        "{landed:?}"
+    );
     assert_eq!(s.on_main(FILE), theirs);
     assert_eq!(git_in(&repo.path, &["status", "--porcelain"]), "");
     assert_eq!(
@@ -282,10 +303,7 @@ fn a_push_the_remote_refuses_is_not_tried_again() {
         Err(git::Error::Git(e)) => assert!(e.contains("remote rejected"), "{e}"),
         other => panic!("{other:?}"),
     }
-    assert_eq!(
-        git_in(&s.remote(), &["log", "--format=%s", "main"]).trim(),
-        "the site"
-    );
+    assert_eq!(s.log(), ["the site"]);
     assert_eq!(git_in(&repo.path, &["status", "--porcelain"]), "");
 }
 
@@ -303,10 +321,7 @@ fn an_edit_refused_lands_nothing() {
         matches!(landed, Err(git::Error::Edit(ref e)) if e.contains("no longer as planned")),
         "{landed:?}"
     );
-    assert_eq!(
-        git_in(&s.remote(), &["rev-list", "--count", "main"]).trim(),
-        "1"
-    );
+    assert_eq!(s.log(), ["the site"]);
 }
 
 // The API, on a controller in this process.
@@ -346,7 +361,7 @@ fn controller(dir: &Path, scratch: Option<&Scratch>) -> Running {
     if let Some(s) = scratch {
         text.push_str(&format!(
             "[rf]\nremote = \"{}\"\nrepo = \"{}\"\nfile = \"{FILE}\"\nauthor_email = \"wifi-controller@example.org\"\n\
-             [rf.channels.KR]\n\"24\" = [{{ channels = \"1-13\", max_dbm = 23 }}]\n\
+             [rf.channels.ZZ]\n\"24\" = [{{ channels = \"1-13\", max_dbm = 23 }}]\n\
              \"5\" = [{{ channels = \"36-48\", max_dbm = 23 }}, {{ channels = \"149-177\", max_dbm = 23 }}]\n\
              \"6\" = [{{ channels = \"1-93\", max_dbm = 24 }}]\n",
             s.remote().display(),
@@ -395,27 +410,27 @@ fn station(mac: [u8; 6], bss: u16, signal: i8) -> Station {
         rx_airtime_us: 0,
         inactive_ms: 0,
         connected_s: 60,
-        vlan: 42,
+        vlan: 101,
     }
 }
 
-/// A snapshot of an AP on the fixture's channels, its counters at `secs`,
-/// with one client on its 2.4 GHz radio when `client`.
+/// A snapshot of an AP on the fixture's channels and powers, its counters
+/// at `secs`, with one client on its 2.4 GHz radio when `client`.
 fn snapshot(seq: u64, channels: [(u16, u16); 3], secs: u64, client: bool) -> Snapshot {
     let bands = [
-        (Band::B24, "radio24"),
-        (Band::B5, "radio5"),
-        (Band::B6, "radio6"),
+        (Band::B24, "radio24", 2000),
+        (Band::B5, "radio5", 2300),
+        (Band::B6, "radio6", 1800),
     ];
     let radios = bands
         .iter()
         .zip(channels)
-        .map(|((band, phy), (channel, width))| Radio {
+        .map(|((band, phy, mbm), (channel, width))| Radio {
             phy: (*phy).into(),
             band: *band,
             channel,
             width_mhz: width,
-            txpower_mbm: 2000,
+            txpower_mbm: *mbm,
             noise_dbm: -95,
             active_ms: secs * 1000,
             busy_ms: secs * 300,
@@ -427,12 +442,12 @@ fn snapshot(seq: u64, channels: [(u16, u16); 3], secs: u64, client: bool) -> Sna
     let bsss = bands
         .iter()
         .enumerate()
-        .map(|(i, (_, phy))| Bss {
+        .map(|(i, (_, phy, _))| Bss {
             ifname: format!("wlan{i}"),
             bssid: [2, 0, 0, 0, 1, i as u8],
             ssid: "ssid-a".into(),
             phy: (*phy).into(),
-            vlan: 42,
+            vlan: 101,
         })
         .collect();
     let stations = if client {
@@ -514,8 +529,26 @@ fn radio<'a>(plan: &'a Value, key: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("no {key} in {plan}"))
 }
 
+/// The body that confirms the proposals of `keys` as `plan` shows them.
+fn confirm(plan: &Value, keys: &[&str]) -> String {
+    let radios: Vec<Value> = keys
+        .iter()
+        .map(|k| {
+            let mut c = radio(plan, k)["proposed"].clone();
+            c["key"] = (*k).into();
+            c
+        })
+        .collect();
+    json!({ "plan": plan["hash"], "radios": radios }).to_string()
+}
+
 fn apply(r: &Running, headers: &str, body: &str) -> (u16, Value) {
     http(r.c.http, "POST", "/api/rf/apply", headers, body)
+}
+
+fn events(r: &Running, query: &str) -> Vec<Value> {
+    let (_, events) = http(r.c.http, "GET", &format!("/api/events{query}"), "", "");
+    events.as_array().unwrap().clone()
 }
 
 #[test]
@@ -531,6 +564,7 @@ fn the_plan_is_for_anyone_and_says_what_it_rests_on() {
         p["site"]["rev"],
         git_in(&s.remote(), &["rev-parse", "main"]).trim()
     );
+    assert_eq!(p["hash"].as_str().map(str::len), Some(16));
     assert!(
         p["notes"][0]
             .as_str()
@@ -543,88 +577,148 @@ fn the_plan_is_for_anyone_and_says_what_it_rests_on() {
     assert_eq!(ap2["change"], true, "{ap2}");
     assert_eq!(
         ap2["current"],
-        serde_json::json!({"channel": 6, "width": 20, "power": 20})
+        json!({"channel": 6, "width": 20, "power": 20})
     );
-    assert_eq!(ap2["measured"], false);
+    assert_eq!(
+        ap2["proposed"],
+        json!({"channel": 1, "width": 20, "power": 20, "center": 1})
+    );
+    assert_eq!(ap2["runs"], json!({"channel": 6, "width": 20, "power": 20}));
+    assert_eq!(
+        (ap2["measured"].as_bool(), ap2["pending"].as_bool()),
+        (Some(false), Some(false))
+    );
     assert_eq!(ap2["busy"], 30.0);
     let ap1 = radio(&p, "ap1/radio24");
     assert_eq!(ap1["change"], false);
+    // Heard at 36 dB from -59 dBm, sending at 15 dBm: it hears the AP's 20
+    // at 41.
     assert_eq!(
         (ap1["snr"].as_f64(), ap1["clients"].as_f64()),
-        (Some(36.0), Some(1.0))
+        (Some(41.0), Some(1.0))
     );
     assert_eq!(
         radio(&p, "ap2/radio5")["kept"],
         "the site file keeps its channel (planner: fixed)"
     );
+    assert!(p.get("deploy").is_none());
 }
 
 #[test]
-fn applying_a_plan_needs_an_admin_on_the_uis_page_and_a_change() {
+fn applying_a_plan_needs_an_admin_on_the_uis_page_and_what_was_confirmed() {
     let s = Scratch::new("rf-gate");
     let r = controller(&s.dir.0, Some(&s));
     feed_both(&r);
-    let body = r#"{"radios": ["ap2/radio24"]}"#;
+    let p = plan(&r);
+    let body = confirm(&p, &["ap2/radio24"]);
     assert_eq!(
-        apply(&r, ADMIN, body),
-        (403, serde_json::json!({"error": "cross-site"}))
+        apply(&r, ADMIN, &body),
+        (403, json!({"error": "cross-site"}))
     );
     let viewer = "X-Forwarded-Preferred-Username: bob\r\n";
-    assert_eq!(apply(&r, &format!("{SAME_SITE}{viewer}"), body).0, 403);
+    assert_eq!(apply(&r, &format!("{SAME_SITE}{viewer}"), &body).0, 403);
     let admin = format!("{SAME_SITE}{ADMIN}");
-    assert_eq!(apply(&r, &admin, "{\"radio\": []}").0, 400);
-    assert_eq!(apply(&r, &admin, r#"{"radios": []}"#).0, 400);
-    let (status, v) = apply(&r, &admin, r#"{"radios": ["ap1/radio5"]}"#);
+    assert_eq!(apply(&r, &admin, "{\"radios\": []}").0, 400);
+    let none = json!({"plan": p["hash"], "radios": []}).to_string();
+    assert_eq!(apply(&r, &admin, &none).0, 400);
+    // Another setting than the one proposed is not what the plan proposes.
+    let mut other: Value = serde_json::from_str(&body).unwrap();
+    other["radios"][0]["channel"] = 11.into();
+    other["radios"][0]["center"] = 11.into();
+    let (status, v) = apply(&r, &admin, &other.to_string());
     assert_eq!(
         (status, v["error"].as_str()),
-        (409, Some("ap1/radio5 no longer proposes a change"))
+        (
+            409,
+            Some("ap2/radio24 no longer proposes what was confirmed")
+        )
     );
-    let (status, _) = apply(&r, &admin, r#"{"radios": ["ap9/radio5"]}"#);
-    assert_eq!(status, 409);
-    // Nothing reached the remote.
+    // A radio that proposes no change.
+    let mut same: Value = serde_json::from_str(&body).unwrap();
+    same["radios"][0] =
+        json!({"key": "ap1/radio5", "channel": 36, "width": 80, "center": 42, "power": 23});
+    assert_eq!(apply(&r, &admin, &same.to_string()).0, 409);
+    // A plan that changed since it was shown.
+    let mut stale: Value = serde_json::from_str(&body).unwrap();
+    stale["plan"] = "0000000000000000".into();
+    let (status, v) = apply(&r, &admin, &stale.to_string());
     assert_eq!(
-        git_in(&s.remote(), &["rev-list", "--count", "main"]).trim(),
-        "1"
+        (status, v["error"].as_str()),
+        (409, Some("the plan changed: review it again"))
+    );
+    assert_eq!(s.log(), ["the site"]);
+}
+
+/// A name that is not of a radio of the site is refused before it is
+/// logged, once, escaped, and on no AP.
+#[test]
+fn a_radio_not_of_the_site_is_refused_before_it_is_logged() {
+    let s = Scratch::new("rf-names");
+    let r = controller(&s.dir.0, Some(&s));
+    feed_both(&r);
+    let p = plan(&r);
+    let admin = format!("{SAME_SITE}{ADMIN}");
+    let odd = json!({"plan": p["hash"], "radios": [
+        {"key": "ap9/radio5\nforged line", "channel": 1, "width": 20, "center": 1, "power": 1}
+    ]});
+    assert_eq!(apply(&r, &admin, &odd.to_string()).0, 400);
+    let twice = json!({"plan": p["hash"], "radios": [
+        {"key": "ap2/radio24", "channel": 1, "width": 20, "center": 1, "power": 20},
+        {"key": "ap2/radio24", "channel": 1, "width": 20, "center": 1, "power": 20}
+    ]});
+    assert_eq!(apply(&r, &admin, &twice.to_string()).0, 400);
+    let refused: Vec<Value> = events(&r, "")
+        .into_iter()
+        .filter(|e| e["action"] == "rf-plan")
+        .collect();
+    assert_eq!(refused.len(), 2);
+    assert!(
+        refused
+            .iter()
+            .all(|e| e.get("ap").is_none() && e["ok"] == false)
+    );
+    let detail = refused[0]["detail"].as_str().unwrap();
+    assert!(
+        !detail.contains('\n') && detail.contains("ap9/radio5\\nforged line"),
+        "{detail}"
     );
 }
 
 #[test]
-fn an_applied_plan_is_a_commit_an_event_and_then_out_of_step_until_deployed() {
+fn an_applied_plan_is_a_commit_an_event_a_deploy_asked_for_and_then_pending() {
     let s = Scratch::new("rf-apply");
     let r = controller(&s.dir.0, Some(&s));
     feed_both(&r);
-    let proposed = radio(&plan(&r), "ap2/radio24")["proposed"].clone();
+    let p = plan(&r);
     let (status, v) = apply(
         &r,
         &format!("{SAME_SITE}{ADMIN}"),
-        r#"{"radios": ["ap2/radio24"]}"#,
+        &confirm(&p, &["ap2/radio24"]),
     );
     assert_eq!(status, 200, "{v}");
     let commit = v["commit"].as_str().unwrap();
     assert_eq!(git_in(&s.remote(), &["rev-parse", "main"]).trim(), commit);
     let msg = git_in(&s.remote(), &["log", "-1", "--format=%an|%B", "main"]);
-    let channel = proposed["channel"].as_u64().unwrap();
-    assert!(msg.starts_with(&format!("wifi-controller|wifi: the RF planner sets ap2's 2.4 GHz radio to channel {channel} at 20 MHz, 20 dBm")), "{msg}");
+    assert!(
+        msg.starts_with(
+            "wifi-controller|wifi: the RF planner sets ap2's 2.4 GHz radio to channel 1 at 20 MHz, 20 dBm"
+        ),
+        "{msg}"
+    );
     assert!(
         msg.contains("Applied in the Wi-Fi controller by alice."),
         "{msg}"
     );
     let site = s.on_main(FILE);
     assert!(
-        site.contains(&format!(
-            "        \"24\":\n          hw_mode: g\n          channel: {channel}\n"
-        )),
+        site.contains("        \"24\":\n          hw_mode: g\n          channel: 1\n"),
         "{site}"
     );
     // The event, on the AP and without a client.
-    let (_, events) = http(r.c.http, "GET", "/api/events?ap=ap2", "", "");
-    let ev = events
-        .as_array()
-        .unwrap()
-        .iter()
+    let ev = events(&r, "?ap=ap2")
+        .into_iter()
         .find(|e| e["action"] == "rf-plan")
-        .unwrap()
-        .clone();
+        .unwrap();
     assert_eq!(
         (ev["ok"].as_bool(), ev["user"].as_str(), ev.get("mac")),
         (Some(true), Some("alice"), None)
@@ -633,20 +727,68 @@ fn an_applied_plan_is_a_commit_an_event_and_then_out_of_step_until_deployed() {
         ev["detail"].as_str().unwrap().contains(&commit[..12]),
         "{ev}"
     );
-    // Until the deploy path takes it to ap2, ap2 runs other than the file.
+    // The deploy of that commit is asked of the runner, which this
+    // controller has none of yet: it is asked when one connects.
+    assert!(v["deploy"].is_u64(), "{v}");
+    let asked = events(&r, "")
+        .into_iter()
+        .find(|e| e["action"] == "site-deploy")
+        .unwrap();
+    assert_eq!(
+        asked["detail"],
+        format!(
+            "{}: asked; the deploy runner is not connected, and is asked when it is",
+            &commit[..12]
+        )
+    );
     let p = plan(&r);
     assert_eq!(p["last"]["commit"], commit);
+    assert_eq!(
+        (
+            &p["deploy"]["rev"],
+            &p["deploy"]["state"],
+            &p["deploy"]["runner"]
+        ),
+        (&json!(commit), &json!("asked"), &json!(false))
+    );
+    // Until the deploy takes it to ap2, ap2 runs other than the file.
     let after = radio(&p, "ap2/radio24");
-    assert_eq!(after["change"], false);
-    assert!(
-        after["kept"]
-            .as_str()
-            .unwrap()
-            .contains("has not reached it yet"),
-        "{after}"
+    assert_eq!(
+        (after["change"].as_bool(), after["pending"].as_bool()),
+        (Some(false), Some(true))
+    );
+    assert_eq!(
+        after["kept"],
+        "waiting for the deploy: it runs channel 6 at 20 MHz, the site file says channel 1 at 20 MHz"
     );
     // What it shows measured is of the channel it still runs.
     assert_eq!(after["busy"], 30.0, "{after}");
+}
+
+/// While the controller lands the plan, someone keeps ap2 in the site file
+/// (`planner: fixed`) and moves ap1 onto the channel planned for ap2: made
+/// again on that branch, the confirmed proposal is no longer the plan's,
+/// and nothing lands.
+#[test]
+fn a_site_that_changed_while_the_plan_was_landing_is_reviewed_again() {
+    let s = Scratch::new("rf-replan");
+    let r = controller(&s.dir.0, Some(&s));
+    feed_both(&r);
+    let p = plan(&r);
+    let theirs = SITE.replace("    ap2:\n", "    ap2:  # planner: fixed\n");
+    s.push_other_during_push(&s.repo().path, FILE, &theirs);
+    let (status, v) = apply(
+        &r,
+        &format!("{SAME_SITE}{ADMIN}"),
+        &confirm(&p, &["ap2/radio24"]),
+    );
+    assert_eq!(status, 409, "{v}");
+    assert_eq!(
+        v["error"],
+        "the site changed (ap2/radio24 no longer proposes what was confirmed): review the plan again"
+    );
+    assert_eq!(s.log(), ["meanwhile", "the site"]);
+    assert_eq!(s.on_main(FILE), theirs);
 }
 
 #[test]
@@ -654,11 +796,10 @@ fn without_rf_the_planner_is_off() {
     let dir = TempDir::new("rf-off");
     let r = controller(&dir.0, None);
     let (status, v) = http(r.c.http, "GET", "/api/rf/plan", "", "");
-    assert_eq!((status, v), (200, serde_json::json!({"configured": false})));
-    let (status, _) = apply(
-        &r,
-        &format!("{SAME_SITE}{ADMIN}"),
-        r#"{"radios": ["ap1/radio5"]}"#,
-    );
+    assert_eq!((status, v), (200, json!({"configured": false})));
+    let body = json!({"plan": "x", "radios": [
+        {"key": "ap1/radio5", "channel": 36, "width": 80, "center": 42, "power": 23}
+    ]});
+    let (status, _) = apply(&r, &format!("{SAME_SITE}{ADMIN}"), &body.to_string());
     assert_eq!(status, 404);
 }

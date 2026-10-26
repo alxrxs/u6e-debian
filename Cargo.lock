@@ -1023,6 +1023,7 @@ dependencies = [
  "tokio-rustls",
  "toml",
  "tungstenite",
+ "u6e-git",
  "u6e-proto",
 ]
 
@@ -1039,6 +1040,13 @@ dependencies = [
  "toml",
  "u6e-controller",
  "u6e-proto",
+]
+
+[[package]]
+name = "u6e-git"
+version = "1.0.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

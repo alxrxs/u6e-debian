@@ -15,21 +15,28 @@
 //! author_email = "wifi-controller@example.org"
 //! window_hours = 24
 //! dfs = false
+//! client_dbm = 15
 //! widths = { "24" = [20], "5" = [20, 40, 80], "6" = [20, 40, 80, 160] }
 //!
-//! [rf.channels.KR]
-//! "24" = [{ channels = "1-13", max_dbm = 23 }]
+//! [rf.channels.ZZ]
+//! "24" = [{ channels = "1-13", max_dbm = 20 }]
 //! "5" = [{ channels = "36-48", max_dbm = 23 }, { channels = "52-64", max_dbm = 20, dfs = true }]
-//! "6" = [{ channels = "1-93", max_dbm = 24 }]
+//! "6" = [{ channels = "1-93", max_dbm = 18 }]
 //! ```
 //!
 //! A range holds every channel of its band from its first to its last;
-//! `dfs = true` marks those the planner leaves alone unless `dfs` allows them.
+//! `dfs = true` marks those the planner leaves alone unless `dfs` allows them
+//! (a move onto one is then applied by a restart with a radar check).
+//! `ssh_key` and `known_hosts` go together, as plain absolute paths (letters,
+//! digits and `/._-`), and the key must be its owner's alone (checked at
+//! start). `client_dbm` is the power a client is taken to send at, from which
+//! what clients hear of an AP is estimated.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::Deserialize;
+use u6e_git::Remote;
 
 use super::channels::{self, BANDS, WIDTHS};
 use super::git::Repo;
@@ -52,6 +59,8 @@ pub struct File {
     window_hours: u64,
     #[serde(default)]
     dfs: bool,
+    #[serde(default = "default_client")]
+    client_dbm: i32,
     #[serde(default)]
     widths: BTreeMap<String, Vec<u16>>,
     channels: BTreeMap<String, BTreeMap<String, Vec<RangeFile>>>,
@@ -80,6 +89,10 @@ fn default_email() -> String {
 
 fn default_window() -> u64 {
     24
+}
+
+fn default_client() -> i32 {
+    15
 }
 
 /// The longest window: a week of hours.
@@ -145,6 +158,15 @@ impl File {
         if self.author_email.trim().is_empty() || self.remote.trim().is_empty() {
             return Err("rf: remote and author_email may not be empty".into());
         }
+        if !(0..=30).contains(&self.client_dbm) {
+            return Err("rf: client_dbm is not 0 to 30".into());
+        }
+        let remote = Remote {
+            url: self.remote,
+            ssh_key: self.ssh_key,
+            known_hosts: self.known_hosts,
+        };
+        remote.check().map_err(|e| format!("rf: {e}"))?;
         let mut widths: [Vec<u16>; 3] = [0, 1, 2].map(default_widths);
         for (key, list) in &self.widths {
             let i = band_index(key)?;
@@ -173,17 +195,16 @@ impl File {
         }
         Ok(Settings {
             repo: Repo {
-                remote: self.remote,
+                remote,
                 path: self.repo,
                 branch: self.branch,
                 file: self.file,
-                ssh_key: self.ssh_key,
-                known_hosts: self.known_hosts,
                 email: self.author_email,
             },
             rules: Rules {
                 window_hours: self.window_hours,
                 dfs: self.dfs,
+                client_dbm: self.client_dbm,
                 widths,
                 countries,
             },
@@ -201,7 +222,7 @@ mod tests {
             .check()
     }
 
-    const MIN: &str = "remote = \"/srv/site.git\"\nrepo = \"/var/lib/site\"\n[channels.KR]\n";
+    const MIN: &str = "remote = \"/srv/site.git\"\nrepo = \"/var/lib/site\"\n[channels.ZZ]\n";
 
     #[test]
     fn defaults_and_tables() {
@@ -216,9 +237,9 @@ mod tests {
         assert!(!s.rules.dfs);
         assert_eq!(s.rules.widths[0], [20]);
         assert_eq!(s.rules.widths[2], [20, 40, 80, 160]);
-        let kr = &s.rules.countries["KR"];
+        let zz = &s.rules.countries["ZZ"];
         assert_eq!(
-            kr[0],
+            zz[0],
             [Allowed {
                 lo: 1,
                 hi: 13,
@@ -227,7 +248,7 @@ mod tests {
             }]
         );
         assert_eq!(
-            kr[1][1],
+            zz[1][1],
             Allowed {
                 lo: 52,
                 hi: 52,
@@ -235,7 +256,7 @@ mod tests {
                 dfs: true
             }
         );
-        assert!(kr[2].is_empty());
+        assert!(zz[2].is_empty());
     }
 
     #[test]
