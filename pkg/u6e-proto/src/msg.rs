@@ -579,6 +579,15 @@ pub enum RunnerMsg {
         detail: String,
         at_ms: u64,
     },
+    /// How the deploy of [`RunnerCtlMsg::DeploySite`] `id` goes, with what
+    /// the runner or the deploy said last. The last word on the latest one is
+    /// sent again at each session.
+    SiteDeploy {
+        id: u64,
+        rev: String,
+        state: SiteDeployState,
+        detail: String,
+    },
 }
 
 /// Everything the controller sends the deploy runner.
@@ -621,6 +630,30 @@ pub enum RunnerCtlMsg {
     RolloutAck {
         id: u64,
     },
+    /// Deploy the site file as commit `rev` (40 hex digits) of the site's
+    /// repository has it, which the controller just pushed: the runner takes
+    /// it only when `rev` is the head of the site's branch and what changed
+    /// since the commit it last deployed is plain settings of the site file
+    /// alone. The controller names a commit and supplies no content. Answered
+    /// by [`RunnerMsg::SiteDeploy`]s of the same id.
+    DeploySite {
+        id: u64,
+        rev: String,
+    },
+}
+
+/// Where a site deploy is.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SiteDeployState {
+    /// Not taken: the commit is not the branch's head, changes more than
+    /// the site file's settings, or another came after it.
+    Refused,
+    /// The live deploy runs.
+    Running,
+    Done,
+    Failed,
 }
 
 /// What the runner is, sent once per connection.

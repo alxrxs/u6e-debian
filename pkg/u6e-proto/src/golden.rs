@@ -27,8 +27,12 @@ use crate::msg::{
     AgentMsg, Band, Bss, ClientFlows, Command, CommandKind, CommandResult, ConfigApplied, CtlMsg,
     Event, EventKind, FieldDelta, Flow, Flows, Hello, Mechanism, Radio, RadioApplied, RadioConfig,
     RateMode, RecDelta, RolloutOutcome, RolloutRequest, RolloutResult, RunnerCtlMsg, RunnerHello,
-    RunnerMsg, SignedConfig, Snapshot, SnapshotDelta, SpectrumFrame, Station, Temp,
+    RunnerMsg, SignedConfig, SiteDeployState, Snapshot, SnapshotDelta, SpectrumFrame, Station,
+    Temp,
 };
+
+/// A commit of the site's repository.
+const REV: &str = "0123456789abcdef0123456789abcdef01234567";
 
 const HOW: &str = "bump u6e_proto::PROTOCOL (pkg/u6e-proto/src/version.rs) and write the \
                    golden: U6E_GOLDEN=write cargo test -p u6e-proto golden";
@@ -305,6 +309,12 @@ fn samples() -> Samples {
     ctl.push(("SpectrumStop", CtlMsg::SpectrumStop { radio: radio() }));
     ctl.push(("ApplyConfig", CtlMsg::ApplyConfig(signed_config())));
     let id = (1 << 42) + 1;
+    let site_deploy = |state| RunnerMsg::SiteDeploy {
+        id,
+        rev: REV.into(),
+        state,
+        detail: "deployed".into(),
+    };
     let rollout = |outcome| {
         RunnerMsg::RolloutResult(RolloutResult {
             id,
@@ -364,6 +374,10 @@ fn samples() -> Samples {
                 at_ms: (1 << 42) + 5,
             },
         ),
+        ("SiteDeployRefused", site_deploy(SiteDeployState::Refused)),
+        ("SiteDeployRunning", site_deploy(SiteDeployState::Running)),
+        ("SiteDeployDone", site_deploy(SiteDeployState::Done)),
+        ("SiteDeployFailed", site_deploy(SiteDeployState::Failed)),
     ];
     let runner_ctl = vec![
         ("RunnerPing", RunnerCtlMsg::Ping(1 << 50)),
@@ -400,6 +414,13 @@ fn samples() -> Samples {
             },
         ),
         ("RolloutAck", RunnerCtlMsg::RolloutAck { id }),
+        (
+            "DeploySite",
+            RunnerCtlMsg::DeploySite {
+                id,
+                rev: REV.into(),
+            },
+        ),
     ];
     Samples {
         agent,
@@ -479,7 +500,7 @@ fn every_variant_has_an_instance() {
     let (runner, runner_ctl) = (values(s.runner), values(s.runner_ctl));
     let mut events = Vec::new();
     let (mut bands, mut modes, mut addrs) = (Vec::new(), Vec::new(), Vec::new());
-    let (mut mechanisms, mut outcomes) = (Vec::new(), Vec::new());
+    let (mut mechanisms, mut outcomes, mut deploys) = (Vec::new(), Vec::new(), Vec::new());
     for m in &agent {
         match m {
             AgentMsg::Event(e) => events.push(e.kind.clone()),
@@ -496,8 +517,10 @@ fn every_variant_has_an_instance() {
         }
     }
     for m in &runner {
-        if let RunnerMsg::RolloutResult(r) = m {
-            outcomes.push(r.outcome);
+        match m {
+            RunnerMsg::RolloutResult(r) => outcomes.push(r.outcome),
+            RunnerMsg::SiteDeploy { state, .. } => deploys.push(*state),
+            _ => {}
         }
     }
     let commands: Vec<CommandKind> = ctl
@@ -518,6 +541,7 @@ fn every_variant_has_an_instance() {
     assert_every_variant("RunnerCtlMsg", &runner_ctl);
     assert_every_variant("Mechanism", &mechanisms);
     assert_every_variant("RolloutOutcome", &outcomes);
+    assert_every_variant("SiteDeployState", &deploys);
 }
 
 #[test]
