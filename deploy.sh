@@ -120,32 +120,16 @@ tree=$(image_tree) || fail "image_tree: cannot read this checkout's image inputs
 image=$tree/$(head_of "$BLOBS")/$(sha256sum < site.conf | cut -c1-16)/$(head_of linux-7.2.8)/$(head_of backports-7.2)
 # The deploy runner holds the same lock on images/ for each rollout, its gate
 # and its way back included (u6e-deploy --stage-helper), so a rollout and
-# this loop never have two APs down at once: while one runs, this refuses.
+# this loop never have two APs down at once: while one runs, this refuses,
+# as it does while the runner keeps one under way (restarting, say).
+if declare -F runner_rolling_out > /dev/null && runner_rolling_out; then
+	fail "the deploy runner has a rollout under way; run again once it is over"
+fi
 mkdir -p images
 exec {lock}<images
 flock -n "$lock" ||
 	fail "images/ is locked: a rollout of the deploy runner, or another deploy, is under way; run again once it is over"
 for ap in "$@"; do
 	export U6E_AP=$ap
-	ap_image "$ap" "$image" || continue
-	if [ "${BOOT:-1}" = 0 ]; then
-		echo "$ap: not booted (BOOT=0)"
-		continue
-	fi
-	boot/stage.sh "$IMAGE" || fail "$ap: did not boot $IMAGE"
-	up=
-	for _ in $(seq 30); do
-		up=$(cd boot && . ./lib.sh && T=15 ap_root -n 'systemctl is-active -q u6e-wifi &&
-			for i in wlan24 wlan5 wlan6; do hostapd_cli -p /run/hostapd -i $i status | grep -x state=ENABLED; done | wc -l' 2>/dev/null)
-		[ "$up" = 3 ] && break
-		sleep 10
-	done
-	[ "$up" = 3 ] || fail "$ap: Wi-Fi did not come up"
-	echo "$image" > "stamps/ap-$ap"
-	echo "$ap: Wi-Fi up on all three radios"
-	# The runner rolls an AP back to the image staged on it last.
-	if declare -F runner_staged > /dev/null; then
-		runner_staged "$ap" "${IMAGE##*/}" ||
-			fail "$ap: booted, but the deploy runner was not told it runs ${IMAGE##*/}"
-	fi
+	boot_ap "$ap" "$image"
 done

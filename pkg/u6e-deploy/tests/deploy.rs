@@ -1258,3 +1258,43 @@ fn an_unreadable_state_file_is_set_aside_and_told() {
         state.runner.is_up() && state.runner.discarded.is_empty()
     });
 }
+
+/// A runner restarted during a rollout's gate takes the kept images' lock
+/// back, or, when another took it meanwhile, fails the rollout at once and
+/// says so, staging nothing: the gate never runs without the lock.
+#[test]
+fn a_rollout_that_cannot_take_its_lock_back_fails_at_once() {
+    let mut site = Site::new("retake", Duration::from_secs(30));
+    wait_for("the runner", || site.runner_up());
+    let _ap1 = fake_ap(&site, KEY_AP1, "u6e-ap1", "img-1-ap1", 1, image_config(1));
+    wait_for("ap1", || up(&site, "ap1"));
+    let images = site.dir.0.join("images");
+    let asked = roll_out(&site, "ap1", "img-2-ap1");
+    wait_for("the gate awaited", || {
+        let state = site.controller.state.read();
+        let r = state.rollouts.back();
+        r.is_some_and(|r| r.log.iter().any(|l| l.starts_with("staged; waiting")))
+    });
+    site.stop_runner();
+    // What the site's own deploy would do in the gap, were it not refused.
+    let mut taken = None;
+    wait_for("the lock taken by another", || {
+        taken = stage::lock(&images).unwrap();
+        taken.is_some()
+    });
+    let started = Instant::now();
+    site.start_runner_again();
+    wait_for("the failure counted", || ended(&site, "failed") == Some(1));
+    assert!(started.elapsed() < Duration::from_secs(15));
+    let detail = {
+        let state = site.controller.state.read();
+        state.rollouts.back().unwrap().result.clone().unwrap().1
+    };
+    assert!(
+        detail.starts_with("the kept images' lock could not be taken back"),
+        "{detail}"
+    );
+    assert_eq!(site.staged(), ["ap1 img-2-ap1"]);
+    drop(taken);
+    assert!(asked.join().unwrap().is_err());
+}

@@ -30,15 +30,16 @@
 //! root end holds to it too, by a lock on the kept images' directory, which
 //! the site's own image deploys take too. A connection answers one request,
 //! unless its first is `Hold`: the lock is then taken and held for the
-//! connection's life, and its stagings run under it, so the runner keeps
-//! every other staging out through a rollout's gate and its way back. A
-//! command once started runs to its end even if the runner goes away (an AP
-//! left between two systems is worse than a staging nobody watches), but no
-//! longer than [`STAGE_MAX`].
+//! connection's life, but no longer than [`HOLD_MAX`], and its stagings run
+//! under it, so the runner keeps every other staging out through a
+//! rollout's gate and its way back. A command once started runs to its end
+//! even if the runner goes away (an AP left between two systems is worse
+//! than a staging nobody watches), but no longer than [`STAGE_MAX`].
 
+use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -65,6 +66,28 @@ const REQUEST_WAIT: Duration = Duration::from_secs(10);
 /// and 600 s for the image, around go8.sh's writes): the helper stops one
 /// that runs longer, and the runner waits no longer for it.
 pub const STAGE_MAX: Duration = Duration::from_secs(45 * 60);
+/// The longest a connection holds the lock: a rollout's staging and its way
+/// back, with a few minutes each to copy an image and to wait, its longest
+/// gate and the linger past it. A rollout never needs it longer; the helper
+/// then lets it go, and its unit must let a connection live past it.
+pub const HOLD_MAX: Duration = Duration::from_secs(
+    2 * (STAGE_MAX.as_secs() + 3 * 60)
+        + crate::config::GATE_MAX.as_secs()
+        + crate::rollout::LINGER.as_secs(),
+);
+
+/// How long a staging, and a hold, may last.
+#[derive(Debug, Clone, Copy)]
+pub struct Bounds {
+    pub stage: Duration,
+    pub hold: Duration,
+}
+
+/// The bounds a helper keeps to.
+pub const BOUNDS: Bounds = Bounds {
+    stage: STAGE_MAX,
+    hold: HOLD_MAX,
+};
 /// Why a staging or a hold is refused while another holds the lock.
 pub const BUSY: &str = "another staging is under way";
 
@@ -104,11 +127,63 @@ fn image_name(image: &str) -> bool {
     (1..=128).contains(&image.len()) && !image.starts_with('.') && image.chars().all(ok)
 }
 
-/// The AP an image's `MANIFEST` names: the first word of its `ap:` line.
-fn manifest_ap(dir: &Path) -> Option<String> {
-    let text = fs::read_to_string(dir.join("MANIFEST")).ok()?;
-    let line = text.lines().find_map(|l| l.strip_prefix("ap:"))?;
+/// The largest `MANIFEST` read.
+const MANIFEST_MAX: u64 = 64 * 1024;
+/// The most a staging copies of an image's files, all together: a real
+/// image is under 100 MB, and the copy is in the helper's own `/tmp`.
+pub const IMAGE_MAX: u64 = 256 * 1024 * 1024;
+
+/// A kept image's directory, opened without following a link to it.
+struct ImageDir(File);
+
+impl ImageDir {
+    fn open(dir: &Path) -> io::Result<ImageDir> {
+        let flags = libc::O_DIRECTORY | libc::O_NOFOLLOW;
+        let d = OpenOptions::new().read(true).custom_flags(flags).open(dir);
+        d.map(ImageDir)
+    }
+
+    /// Its file `name` and its size: no link followed, never waiting on a
+    /// FIFO or a device, and none but a regular file.
+    fn file(&self, name: &str) -> io::Result<(File, u64)> {
+        let c = CString::new(name).map_err(io::Error::other)?;
+        let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+        // SAFETY: `c` is a valid C string, and the descriptor `self.0` holds
+        // is open for as long as the call.
+        let fd = unsafe { libc::openat(self.0.as_raw_fd(), c.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` was just opened, and nothing else owns it.
+        let f = unsafe { File::from_raw_fd(fd) };
+        let md = f.metadata()?;
+        if !md.is_file() {
+            return Err(io::Error::other("not a regular file"));
+        }
+        Ok((f, md.len()))
+    }
+
+    /// Its `MANIFEST`, as long as it is not too long to be one.
+    fn manifest(&self) -> io::Result<String> {
+        let (f, len) = self.file("MANIFEST")?;
+        if len > MANIFEST_MAX {
+            return Err(io::Error::other("too long to be a MANIFEST"));
+        }
+        let mut text = String::new();
+        f.take(MANIFEST_MAX).read_to_string(&mut text)?;
+        Ok(text)
+    }
+}
+
+/// The AP a `MANIFEST` names: the first word of its `ap:` line.
+fn ap_of(manifest: &str) -> Option<String> {
+    let line = manifest.lines().find_map(|l| l.strip_prefix("ap:"))?;
     line.split_whitespace().next().map(str::to_owned)
+}
+
+/// The AP the `MANIFEST` of the image in `dir` names.
+fn manifest_ap(dir: &Path) -> Option<String> {
+    ap_of(&ImageDir::open(dir).and_then(|d| d.manifest()).ok()?)
 }
 
 /// Whether `image` names a kept image of `ap`: its directory, or why not.
@@ -243,10 +318,11 @@ impl Drop for Copy {
     }
 }
 
-/// Copies the image in `dir` (its `MANIFEST` and the files it lists, each
-/// checked against its SHA-256 as it is copied, none a symbolic link) into
+/// Copies the image of `ap` in `dir` (its `MANIFEST`, which must still name
+/// `ap`, and the files it lists, each checked against its SHA-256 as it is
+/// copied, none but a regular file, no more than [`IMAGE_MAX`] in all) into
 /// a new directory under `under`, root's alone.
-fn copy_image(dir: &Path, under: &Path) -> Result<Copy, String> {
+fn copy_image(dir: &Path, ap: &str, under: &Path) -> Result<Copy, String> {
     static N: AtomicU32 = AtomicU32::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -261,25 +337,29 @@ fn copy_image(dir: &Path, under: &Path) -> Result<Copy, String> {
     let made = fs::DirBuilder::new().mode(0o700).create(&copy.top);
     made.and_then(|()| fs::DirBuilder::new().mode(0o700).create(&copy.dir))
         .map_err(|e| format!("{}: {e}", copy.top.display()))?;
-    let read = |name: &str| -> Result<File, String> {
-        let path = dir.join(name);
-        let f = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        match f.metadata() {
-            Ok(md) if md.is_file() => Ok(f),
-            _ => Err(format!("{} is not a file", path.display())),
-        }
-    };
-    let mut manifest = String::new();
-    read("MANIFEST")?
-        .read_to_string(&mut manifest)
-        .map_err(|e| format!("the MANIFEST: {e}"))?;
+    let image = ImageDir::open(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let manifest = image.manifest().map_err(|e| format!("the MANIFEST: {e}"))?;
+    // The MANIFEST read here is the one copied: it must name the AP still.
+    if ap_of(&manifest).as_deref() != Some(ap) {
+        return Err(format!("its MANIFEST no longer names {ap}"));
+    }
     fs::write(copy.dir.join("MANIFEST"), &manifest).map_err(|e| e.to_string())?;
+    let mut files = Vec::new();
+    let mut total = 0;
     for (name, want) in listed(&manifest)? {
-        let mut src = read(&name)?;
+        let (src, len) = image.file(&name).map_err(|e| format!("{name}: {e}"))?;
+        total += len;
+        files.push((name, want, src));
+    }
+    if total > IMAGE_MAX {
+        return Err(format!(
+            "its files hold {total} B, more than the {IMAGE_MAX} B a staging copies"
+        ));
+    }
+    let mut left = IMAGE_MAX;
+    for (name, want, src) in files {
+        // No more than the bound, though a file grows while it is copied.
+        let mut src = src.take(left + 1);
         let mut dst = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -293,6 +373,9 @@ fn copy_image(dir: &Path, under: &Path) -> Result<Copy, String> {
             if n == 0 {
                 break;
             }
+            left = left.checked_sub(n as u64).ok_or_else(|| {
+                format!("its files hold more than the {IMAGE_MAX} B a staging copies")
+            })?;
             sha.update(&buf[..n]);
             dst.write_all(&buf[..n])
                 .map_err(|e| format!("{name}: {e}"))?;
@@ -316,8 +399,10 @@ impl Conn for UnixStream {
 }
 
 /// Answers a connection: its one request, or, when it holds the lock, each
-/// it sends until it closes. A staging is stopped past `bound`.
-pub fn serve(config: &Config, conn: &mut impl Conn, bound: Duration) -> io::Result<()> {
+/// it sends until it closes, or until it has held it for `bounds.hold`. A
+/// staging is stopped past `bounds.stage`.
+pub fn serve(config: &Config, conn: &mut impl Conn, bounds: Bounds) -> io::Result<()> {
+    let bound = bounds.stage;
     let req: Request = read_frame(conn)?;
     if req != Request::Hold {
         return answer(config, conn, req, None, bound);
@@ -326,14 +411,23 @@ pub fn serve(config: &Config, conn: &mut impl Conn, bound: Duration) -> io::Resu
         return write_frame(conn, &Reply::Refused(BUSY.into()));
     };
     write_frame(conn, &Reply::Ok)?;
-    // The runner asks again when its rollout needs it, a gate's time later.
-    conn.wait(None)?;
+    // The runner asks again when its rollout needs it, a gate's time later;
+    // past the hold's bound the lock goes, and the runner hears the end.
+    let until = std::time::Instant::now() + bounds.hold;
     loop {
+        let left = until.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Ok(());
+        }
+        conn.wait(Some(left))?;
         let next: io::Result<Request> = read_frame(conn);
         match next {
             Ok(Request::Hold) => write_frame(conn, &Reply::Refused("held already".into()))?,
             Ok(req) => answer(config, conn, req, Some(&held), bound)?,
             Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(()),
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                return Ok(());
+            }
             Err(e) => return Err(e),
         }
     }
@@ -376,7 +470,7 @@ fn answer(
             None => return write_frame(conn, &Reply::Refused(BUSY.into())),
         },
     };
-    let copy = match copy_image(&dir, &std::env::temp_dir()) {
+    let copy = match copy_image(&dir, ap, &std::env::temp_dir()) {
         Ok(c) => c,
         Err(why) => return write_frame(conn, &Reply::Refused(format!("not copied: {why}"))),
     };
@@ -466,11 +560,11 @@ fn stage(
 }
 
 /// Answers `conn`, if its peer is root or a process of group `gid` and asks
-/// within [`REQUEST_WAIT`].
+/// within `REQUEST_WAIT`.
 pub fn serve_peer(config: &Config, mut conn: UnixStream, gid: u32) -> io::Result<()> {
     conn.set_read_timeout(Some(REQUEST_WAIT))?;
     match peer(&conn)? {
-        (uid, g) if crate::local::allowed(uid, g, gid) => serve(config, &mut conn, STAGE_MAX),
+        (uid, g) if crate::local::allowed(uid, g, gid) => serve(config, &mut conn, BOUNDS),
         (uid, _) => Err(io::Error::other(format!("a caller of uid {uid} refused"))),
     }
 }
@@ -627,6 +721,18 @@ impl Hold {
         }
     }
 
+    /// Returns once the helper lets the lock go (stopped, say), and why: an
+    /// idle helper sends nothing while it holds it.
+    pub async fn lost(&mut self) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut byte = [0; 1];
+        match self.conn.read(&mut byte).await {
+            Ok(0) => "the stage helper ended".into(),
+            Ok(_) => "the stage helper spoke out of turn".into(),
+            Err(e) => format!("the stage helper: {e}"),
+        }
+    }
+
     /// Gives the lock up, and returns once the helper has: it closes the
     /// connection only after it let go, so a staging asked for next finds
     /// the lock free.
@@ -773,7 +879,11 @@ pub(crate) mod tests {
     fn ask_within(c: &Config, req: Request, bound: Duration) -> Vec<Reply> {
         let (mut a, mut b) = UnixStream::pair().unwrap();
         write_frame(&mut a, &req).unwrap();
-        serve(c, &mut b, bound).unwrap();
+        let bounds = Bounds {
+            stage: bound,
+            hold: HOLD_MAX,
+        };
+        serve(c, &mut b, bounds).unwrap();
         drop(b);
         let mut out = Vec::new();
         while let Ok(r) = read_frame(&mut a) {
@@ -940,6 +1050,71 @@ pub(crate) mod tests {
         assert!(!t.path().join("ran").exists());
     }
 
+    /// The shape of the build user's directory is not trusted: an image
+    /// directory or a MANIFEST that is a symbolic link is no kept image, a
+    /// listed FIFO is refused at once (never read, so never waited on), and
+    /// so are files too large together or a MANIFEST that no longer names
+    /// the AP when it is copied.
+    #[test]
+    fn an_image_of_the_wrong_shape_is_not_copied() {
+        let t = TestDir::new();
+        let c = config(
+            t.path(),
+            &[IMG],
+            &format!("echo ran > {}/ran", t.path().display()),
+        );
+        let images = &c.rollout.images;
+        // A symbolic link to a kept image, and a kept image whose MANIFEST
+        // is one.
+        std::os::unix::fs::symlink(images.join(IMG), images.join("20261025-link-ap1")).unwrap();
+        assert_eq!(
+            kept(&c, "ap1", "20261025-link-ap1"),
+            Err("no image 20261025-link-ap1 is kept".into())
+        );
+        keep(images, "20261025-m-ap1", "ap1");
+        let m = images.join("20261025-m-ap1/MANIFEST");
+        fs::rename(&m, images.join("20261025-m-ap1/real")).unwrap();
+        std::os::unix::fs::symlink("real", &m).unwrap();
+        assert_eq!(
+            kept(&c, "ap1", "20261025-m-ap1"),
+            Err("no image 20261025-m-ap1 is kept".into())
+        );
+        // A FIFO where its kernel should be.
+        let dir = images.join(IMG);
+        fs::remove_file(dir.join("Image")).unwrap();
+        let fifo = CString::new(dir.join("Image").into_os_string().into_encoded_bytes()).unwrap();
+        // SAFETY: a valid path, mode as for any file.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            ask(&c, stage(IMG)),
+            [Reply::Refused(
+                "not copied: Image: not a regular file".into()
+            )]
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // Files more than a staging copies, listed with any hash: refused
+        // before a byte is read.
+        fs::remove_file(dir.join("Image")).unwrap();
+        File::create(dir.join("Image"))
+            .unwrap()
+            .set_len(IMAGE_MAX + 1)
+            .unwrap();
+        let why = format!(
+            "not copied: its files hold {} B, more than the {IMAGE_MAX} B a staging copies",
+            IMAGE_MAX + 1
+        );
+        assert_eq!(ask(&c, stage(IMG)), [Reply::Refused(why)]);
+        // The MANIFEST, as copied, must name the AP asked for.
+        let under = t.path().join("copies");
+        fs::create_dir(&under).unwrap();
+        keep(images, "20261025-n-ap1", "ap1");
+        let other = copy_image(&images.join("20261025-n-ap1"), "ap2", &under);
+        assert_eq!(other.err(), Some("its MANIFEST no longer names ap2".into()));
+        assert!(copy_image(&images.join("20261025-n-ap1"), "ap1", &under).is_ok());
+        assert!(!t.path().join("ran").exists());
+    }
+
     /// A staging past its bound is stopped, its whole process group.
     #[test]
     fn a_staging_past_its_bound_is_stopped() {
@@ -969,7 +1144,7 @@ pub(crate) mod tests {
         let c = config(t.path(), &[IMG], "echo staged ${1##*/}");
         let (mut a, mut b) = UnixStream::pair().unwrap();
         let served = c.clone();
-        let helper = thread::spawn(move || serve(&served, &mut b, STAGE_MAX));
+        let helper = thread::spawn(move || serve(&served, &mut b, BOUNDS));
         write_frame(&mut a, &Request::Hold).unwrap();
         assert_eq!(read_frame::<_, Reply>(&mut a).unwrap(), Reply::Ok);
         assert_eq!(ask(&c, stage(IMG)), [Reply::Refused(BUSY.into())]);
@@ -994,6 +1169,44 @@ pub(crate) mod tests {
                 Reply::Exit(0)
             ]
         );
+    }
+
+    /// A rollout's longest hold, which the site's unit for the helper must
+    /// let live (the README says so).
+    #[test]
+    fn a_hold_is_bounded_as_the_readme_says() {
+        assert_eq!(HOLD_MAX, Duration::from_secs(2 * 3600 + 16 * 60));
+    }
+
+    /// A hold lasts no longer than its bound: the helper then lets the lock
+    /// go and ends the connection, which the runner's end hears.
+    #[test]
+    fn a_hold_past_its_bound_lets_the_lock_go() {
+        let t = TestDir::new();
+        let c = config(t.path(), &[IMG], "true");
+        let (a, mut b) = UnixStream::pair().unwrap();
+        let served = c.clone();
+        let bounds = Bounds {
+            stage: STAGE_MAX,
+            hold: Duration::from_millis(300),
+        };
+        let helper = thread::spawn(move || serve(&served, &mut b, bounds));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            a.set_nonblocking(true).unwrap();
+            let mut conn = tokio::net::UnixStream::from_std(a).unwrap();
+            frames::write(&mut conn, &Request::Hold).await.unwrap();
+            assert_eq!(frames::read::<Reply>(&mut conn).await.unwrap(), Reply::Ok);
+            let mut hold = Hold { conn };
+            let started = std::time::Instant::now();
+            assert_eq!(hold.lost().await, "the stage helper ended");
+            assert!(started.elapsed() >= Duration::from_millis(250));
+        });
+        helper.join().unwrap().unwrap();
+        when_free(&c.rollout.images);
     }
 
     /// Every Python the staging scripts run is isolated (`-I`): none imports

@@ -11,7 +11,7 @@
 //! signing_key = "/run/credentials/u6e-deploy.service/signing-key.pem"
 //! socket = "/run/u6e-deploy/sock"
 //! state = "/var/lib/u6e-deploy"
-//! gate_secs = 420
+//! gate_secs = 420                # 1 to 1800
 //!
 //! # Each AP by the name the site, its images and the controller give it,
 //! # with the host name its configurations are signed for.
@@ -100,6 +100,10 @@ struct RolloutFile {
 }
 
 /// Seven minutes: an AP boots and brings its radios up in about two.
+/// The longest gate: a rollout holds the kept images' lock through it
+/// (`rollout::HOLD_MAX`).
+pub const GATE_MAX: Duration = Duration::from_secs(30 * 60);
+
 fn default_gate() -> u64 {
     420
 }
@@ -117,7 +121,8 @@ pub enum ConfigError {
     NoAps,
     /// `rollout.tree` is not an absolute path.
     BadTree,
-    NoGate,
+    /// `gate_secs` is 0, or past [`GATE_MAX`].
+    BadGate,
 }
 
 impl fmt::Display for ConfigError {
@@ -132,7 +137,7 @@ impl fmt::Display for ConfigError {
             ),
             Self::NoAps => f.write_str("no aps"),
             Self::BadTree => f.write_str("rollout.tree is not an absolute path"),
-            Self::NoGate => f.write_str("gate_secs is 0"),
+            Self::BadGate => write!(f, "gate_secs is not from 1 to {}", GATE_MAX.as_secs()),
         }
     }
 }
@@ -173,8 +178,8 @@ impl Config {
         if !file.rollout.tree.is_absolute() {
             return Err(ConfigError::BadTree);
         }
-        if file.gate_secs == 0 {
-            return Err(ConfigError::NoGate);
+        if !(1..=GATE_MAX.as_secs()).contains(&file.gate_secs) {
+            return Err(ConfigError::BadGate);
         }
         let r = file.rollout;
         Ok(Config {
@@ -246,7 +251,8 @@ pub(crate) mod tests {
     fn what_is_refused() {
         let bad = |t: &str| Config::parse(t).unwrap_err();
         assert!(matches!(bad(&text("other = 1\n")), ConfigError::Syntax(_)));
-        assert_eq!(bad(&text("gate_secs = 0\n")), ConfigError::NoGate);
+        assert_eq!(bad(&text("gate_secs = 0\n")), ConfigError::BadGate);
+        assert_eq!(bad(&text("gate_secs = 1801\n")), ConfigError::BadGate);
         let t = text("");
         assert_eq!(bad(&t.replace(KEY, &"AB".repeat(32))), ConfigError::BadKey);
         assert_eq!(bad(&t.replace(KEY, "ab")), ConfigError::BadKey);

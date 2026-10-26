@@ -15,7 +15,7 @@
 //! rollouts. A result is acknowledged once the policy file holds it, and the
 //! runner sends it until then; one for a rollout not held here is kept and
 //! recorded as an orphan. A rollout the runner does not say it took on in
-//! `Timing::start` is closed as not started ([`supervise`]). The state files
+//! `Timing::start` is closed as not started (`supervise`). The state files
 //! the runner set aside, which it tells at each session, are recorded.
 
 use std::convert::Infallible;

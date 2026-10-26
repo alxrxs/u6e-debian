@@ -69,3 +69,32 @@ ap_image() {
 	echo "$key $IMAGE" > "stamps/built-$ap"
 	echo "$ap: built $IMAGE"
 }
+
+# boot_ap <ap> <key>: boot <ap>'s image of the inputs <key> (ap_image) on it,
+# unless it runs it already or BOOT=0, and wait for its radios; then
+# stamps/ap-<ap> records it. The deploy runner (site.conf's runner_staged)
+# is told what was staged as soon as it is, before anything can stop the
+# run: until it is told, no stamp is written, so the next run stages the
+# image again and tells it then.
+boot_ap() {
+	local ap=$1 key=$2 up=
+	ap_image "$ap" "$key" || return 0
+	if [ "${BOOT:-1}" = 0 ]; then
+		echo "$ap: not booted (BOOT=0)"
+		return 0
+	fi
+	boot/stage.sh "$IMAGE" || fail "$ap: did not boot $IMAGE"
+	if declare -F runner_staged > /dev/null; then
+		runner_staged "$ap" "${IMAGE##*/}" ||
+			fail "$ap: booted $IMAGE, but the deploy runner was not told; run again"
+	fi
+	for _ in $(seq 30); do
+		up=$(cd boot && . ./lib.sh && T=15 ap_root -n 'systemctl is-active -q u6e-wifi &&
+			for i in wlan24 wlan5 wlan6; do hostapd_cli -p /run/hostapd -i $i status | grep -x state=ENABLED; done | wc -l' 2>/dev/null)
+		[ "$up" = 3 ] && break
+		sleep 10
+	done
+	[ "$up" = 3 ] || fail "$ap: Wi-Fi did not come up"
+	echo "$key" > "stamps/ap-$ap"
+	echo "$ap: Wi-Fi up on all three radios"
+}

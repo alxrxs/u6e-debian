@@ -57,8 +57,11 @@ CONTROLLER_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 # runner signs with it, and nothing else; unset, it applies none.
 RUNNER_KEY=fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210
 # Optional, with RUNNER_KEY: how deploy.sh tells the runner, as root, the
-# kept image it staged on an AP, the one a failed rollout goes back to.
+# kept image it staged on an AP, the one a failed rollout goes back to; and
+# whether the runner keeps a rollout under way, when deploy.sh refuses to
+# start (the runner's state directory holds it as `rollout`).
 runner_staged() { u6e-deploy staged "$1" "$2"; }
+runner_rolling_out() { [ -e /var/lib/u6e-deploy/rollout ]; }
 
 # Stock firmware SSH: the controller's "Device Authentication" user, and a
 # command printing its password.

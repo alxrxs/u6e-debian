@@ -102,7 +102,7 @@ pub(crate) struct InFlight {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Phase {
-    /// Checking the images; nothing is kept of it.
+    /// Checking the images and taking the kept images' lock.
     Checking,
     Staging,
     /// Staged; the gate's verdict is awaited until `deadline_ms`.
@@ -548,6 +548,9 @@ impl Runner {
             phase: Phase::Checking,
         };
         let gate = self.current(&mut inner, &flight, follower);
+        // Kept before it is told as taken on: a runner restarted from here
+        // still names it at its next session, and goes on with it.
+        self.persist(&flight);
         let _ = self
             .outbox
             .try_send(RunnerMsg::RolloutStarted { id: flight.id });
@@ -738,6 +741,42 @@ mod tests {
         assert!(first_rx.try_recv().is_err());
         assert_eq!(runner.lock().asks.len(), 1);
         assert_eq!(runner.lock().asks[0].image_id, "img-a-ap1");
+    }
+
+    /// A rollout is kept before it is told to the controller as taken on: a
+    /// runner restarted while it checks the images still holds it, names it
+    /// at its next session and goes on with it.
+    #[test]
+    fn a_rollout_is_kept_before_it_is_told_as_taken_on() {
+        let t = TestDir::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (runner, mut sent) = runner(&t);
+            runner.handle(RunnerCtlMsg::Rollout(RolloutRequest {
+                id: 9,
+                ap: "ap1".into(),
+                image_id: "img-b-ap1".into(),
+                previous: "img-a-ap1".into(),
+                user: "admin".into(),
+            }));
+            // Told, and kept, before the rollout's first step has run.
+            assert!(matches!(
+                sent.try_recv(),
+                Ok(RunnerMsg::RolloutStarted { id: 9 })
+            ));
+            let kept: InFlight = runner.store.load(ROLLOUT).unwrap().unwrap();
+            assert_eq!((kept.id, kept.phase), (9, Phase::Checking));
+        });
+        drop(rt);
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let key = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let mut config = Config::parse(&text("")).unwrap();
+        config.state = t.path().join("state");
+        let (_, resumed, _) = Runner::new(config, key).unwrap();
+        assert_eq!(resumed.map(|f| (f.id, f.phase)), Some((9, Phase::Checking)));
     }
 
     /// A result is kept until the controller acknowledges it, across a

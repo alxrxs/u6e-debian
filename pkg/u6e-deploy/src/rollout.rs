@@ -16,11 +16,14 @@
 //!
 //! The gate's time runs out only on a controller that could have said: one
 //! the link reached all along, or that it reached again [`GRACE`] ago (a
-//! verdict it gave while the runner could not hear it, it gives again). A
-//! runner restarted during a staging waits for that staging to end (its
-//! helper holds the lock until then) and gives the AP the gate's time from
-//! there. A staging the helper stopped past `STAGE_MAX`, or a hold lost with
-//! its helper, is waited out the same way before the way back is staged.
+//! verdict it gave while the runner could not hear it, it gives again), and
+//! [`LINGER`] past its time in any case. A runner restarted during a staging
+//! waits for that staging to end (its helper holds the lock until then) and
+//! gives the AP the gate's time from there; one restarted during the gate,
+//! or whose helper let the lock go meanwhile, takes it back within
+//! [`RETAKE`] or fails the rollout, saying so: the gate never runs without
+//! the lock. A staging the helper stopped past `STAGE_MAX` is waited out
+//! before the way back is staged.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -34,10 +37,17 @@ use crate::stage::{BUSY, Hold, STAGE_MAX, Staged};
 
 /// How long a re-dialled controller has to give its verdict again.
 pub const GRACE: Duration = Duration::from_secs(60);
+/// The longest the gate is waited for past its time, for a controller that
+/// cannot be reached: then it has failed.
+pub const LINGER: Duration = Duration::from_secs(10 * 60);
 /// How often a held lock is asked for again.
 const RETRY: Duration = Duration::from_secs(2);
 /// Past the helper's own bound on a staging, which it answers for.
 const STAGE_WAIT: Duration = Duration::from_secs(STAGE_MAX.as_secs() + 60);
+/// How long a lock this rollout held is waited for when it must be taken
+/// again (its helper, gone with a restarted runner, letting it go): any
+/// longer, another holds it, and the rollout fails.
+const RETAKE: Duration = Duration::from_secs(5);
 
 pub(crate) async fn run(
     runner: Arc<Runner>,
@@ -94,7 +104,7 @@ async fn steps(
             // holding the lock: the gate's time starts once it is free.
             Phase::Staging => {
                 log("restarted during the staging: waiting for it to end".into());
-                f.phase = match held(runner, hold).await {
+                f.phase = match held(runner, hold, STAGE_WAIT).await {
                     Ok(()) => gate_from_now(runner),
                     Err(why) => {
                         let why = format!("the staging did not end: {why}");
@@ -104,16 +114,33 @@ async fn steps(
             }
             Phase::Gate { deadline_ms } => {
                 runner.persist(f);
-                // Resumed: the lock again, unless another took it meanwhile,
-                // which the way back then waits for.
-                if hold.is_none() {
-                    *hold = runner.helper.hold().await.ok();
+                // Resumed: the lock again, or the rollout fails at once.
+                if let Err(why) = held(runner, hold, RETAKE).await {
+                    return (RolloutOutcome::Failed, lock_lost(f, &why));
                 }
                 let wait = Duration::from_millis(deadline_ms.saturating_sub(unix_ms()));
                 log(format!(
                     "staged; waiting up to {wait:?} for the health gate"
                 ));
-                f.phase = match verdict(runner, gate, Instant::now() + wait).await {
+                let deadline = Instant::now() + wait;
+                // The lock is watched as the gate is: a helper that lets it go
+                // (stopped by its unit, say) is told, and the lock taken again.
+                let verdict = loop {
+                    let Some(h) = hold.as_mut() else {
+                        return (RolloutOutcome::Failed, lock_lost(f, "no hold"));
+                    };
+                    tokio::select! {
+                        v = verdict(runner, gate, deadline) => break v,
+                        why = h.lost() => {
+                            log(format!("the kept images' lock went ({why}): taking it again"));
+                            *hold = None;
+                            if let Err(why) = held(runner, hold, RETAKE).await {
+                                return (RolloutOutcome::Failed, lock_lost(f, &why));
+                            }
+                        }
+                    }
+                };
+                f.phase = match verdict {
                     Some((true, detail)) => {
                         return (RolloutOutcome::Done, detail);
                     }
@@ -128,7 +155,7 @@ async fn steps(
             Phase::RollingBack { why } => {
                 runner.persist(f);
                 log(format!("{why}: staging {} again", f.previous));
-                let staged = match held(runner, hold).await {
+                let staged = match held(runner, hold, STAGE_WAIT).await {
                     Ok(()) => stage(runner, hold, id, &f.ap, &f.previous).await,
                     Err(again) => Staged::Failed(again),
                 };
@@ -146,6 +173,16 @@ async fn steps(
             }
         }
     }
+}
+
+/// Why a rollout failed that lost its lock and could not take it back: the
+/// AP is left as the staging left it.
+fn lock_lost(f: &InFlight, why: &str) -> String {
+    format!(
+        "the kept images' lock could not be taken back ({why}); {} is left as the staging \
+         of {} left it",
+        f.ap, f.image_id
+    )
 }
 
 /// The gate from now, for the configured time.
@@ -175,10 +212,10 @@ async fn check(runner: &Runner, f: &InFlight) -> Result<(), String> {
     Ok(())
 }
 
-/// Makes sure `hold` holds the lock, waiting while a staging (one a
-/// restarted runner left running, or the site's own deploy) has it, for as
-/// long as a staging may take.
-async fn held(runner: &Runner, hold: &mut Option<Hold>) -> Result<(), String> {
+/// Makes sure `hold` holds the lock, waiting `within` at most while another
+/// has it: a staging a restarted runner left running, for as long as a
+/// staging may take, or a helper of this rollout letting it go.
+async fn held(runner: &Runner, hold: &mut Option<Hold>, within: Duration) -> Result<(), String> {
     if hold.is_some() {
         return Ok(());
     }
@@ -189,7 +226,7 @@ async fn held(runner: &Runner, hold: &mut Option<Hold>) -> Result<(), String> {
                 *hold = Some(h);
                 return Ok(());
             }
-            Err(why) if why == BUSY && started.elapsed() < STAGE_WAIT => sleep(RETRY).await,
+            Err(why) if why == BUSY && started.elapsed() < within => sleep(RETRY).await,
             Err(why) => return Err(why),
         }
     }
@@ -199,7 +236,7 @@ async fn held(runner: &Runner, hold: &mut Option<Hold>) -> Result<(), String> {
 /// a hold lost before the staging began is taken again once.
 async fn stage(runner: &Runner, hold: &mut Option<Hold>, id: u64, ap: &str, image: &str) -> Staged {
     for _ in 0..2 {
-        if let Err(why) = held(runner, hold).await {
+        if let Err(why) = held(runner, hold, STAGE_WAIT).await {
             return Staged::Failed(format!("the kept images' lock: {why}"));
         }
         let Some(h) = hold.as_mut() else {
@@ -225,7 +262,7 @@ async fn stage(runner: &Runner, hold: &mut Option<Hold>, id: u64, ap: &str, imag
 
 /// The gate's verdict, or `None` once the time is up: at `deadline`, if the
 /// link was up since before the wait began or for [`GRACE`], else as soon
-/// as it has been.
+/// as it has been, and [`LINGER`] past `deadline` in any case.
 async fn verdict(
     runner: &Runner,
     gate: &mut watch::Receiver<Option<(bool, String)>>,
@@ -242,6 +279,7 @@ async fn verdict(
         }
         match runner.linked_at() {
             Some(t) if t <= began || t.elapsed() >= GRACE => return None,
+            _ if deadline.elapsed() >= LINGER => return None,
             _ => sleep(Duration::from_secs(1)).await,
         }
     }
