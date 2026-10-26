@@ -512,7 +512,18 @@ fn stage(
             .stderr(writer);
         // The command's ends of the pipe close with `cmd`, so the reader
         // sees the end of the output once the command and its children exit.
-        cmd.spawn()
+        // A script still open for writing somewhere (a child forked while it
+        // was written, until it execs) is "busy" for a moment: tried again.
+        let mut tries = 0;
+        loop {
+            match cmd.spawn() {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && tries < 20 => {
+                    tries += 1;
+                    thread::sleep(Duration::from_millis(50));
+                }
+                spawned => break spawned,
+            }
+        }
     };
     let mut child = match child {
         Ok(c) => c,
