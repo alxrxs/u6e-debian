@@ -100,7 +100,9 @@ boot_ap() {
 	echo "$ap: Wi-Fi up on all three radios"
 }
 
-# prune_images: remove the kept images nothing needs (prune-images.py). Kept
+# prune_images [<tree>]: remove the kept images nothing needs from <tree>'s
+# images/ (default this checkout's), by this checkout's prune-images.py, so
+# another tree's is pruned by the same rule without running its code. Kept
 # are each AP's running image (stamps/running-<ap>, which boot_ap writes as
 # it stages one), its image of the current inputs (stamps/built-<ap>), the
 # images the deploy runner needs (site.conf's runner_images: what it staged
@@ -108,14 +110,15 @@ boot_ap() {
 # (default 3) of each AP. Nothing is pruned while an AP's running image is
 # not known, or the runner does not say which it needs.
 prune_images() {
-	local keep=() aps ap built ids id
+	local tree=${1:-.} here keep=() aps ap built ids id
+	here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 	read -ra aps <<< "$U6E_APS"
 	for ap in "${aps[@]}"; do
-		built=$(cat "stamps/built-$ap" 2> /dev/null) && keep+=(--keep "${built##*/}")
-		if [ -s "stamps/running-$ap" ]; then
-			keep+=(--keep "$(cat "stamps/running-$ap")")
-		elif [ -e "stamps/ap-$ap" ] && [ "$(cat "stamps/ap-$ap")" != "${built%% *}" ]; then
-			echo "images: what $ap runs is not known (no stamps/running-$ap); none pruned"
+		built=$(head -c 1024 "$tree/stamps/built-$ap" 2> /dev/null) && keep+=(--keep "${built##*/}")
+		if [ -s "$tree/stamps/running-$ap" ]; then
+			keep+=(--keep "$(head -c 1024 "$tree/stamps/running-$ap")")
+		elif [ -e "$tree/stamps/ap-$ap" ] && [ "$(head -c 1024 "$tree/stamps/ap-$ap")" != "${built%% *}" ]; then
+			echo "images: what $ap runs is not known (no stamps/running-$ap in $tree); none pruned"
 			return 0
 		fi
 	done
@@ -128,5 +131,5 @@ prune_images() {
 			keep+=(--keep "$id")
 		done
 	fi
-	python3 -I ./prune-images.py images --newest "${KEEP_IMAGES:-3}" "${keep[@]}"
+	python3 -I "$here/prune-images.py" "$tree/images" --newest "${KEEP_IMAGES:-3}" "${keep[@]}"
 }

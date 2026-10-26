@@ -267,3 +267,37 @@ fn nothing_is_built_without_room() {
     );
     assert!(!dir.join("dl").exists() && !dir.join("log/trees.log").exists());
 }
+
+/// Another tree's images are pruned by this checkout's rule and script,
+/// never by that tree's own (here one that would record its run).
+#[test]
+fn another_tree_is_pruned_by_this_checkouts_rule() {
+    let t = checkout("prune-own");
+    let other = checkout("prune-other");
+    let (dir, theirs) = (&t.0, &other.0);
+    for n in 1..=5 {
+        keep(theirs, &format!("2026100{n}-x-ap1"), "ap1");
+    }
+    fs::write(theirs.join("stamps/running-ap1"), "20261001-x-ap1\n").unwrap();
+    let ran = theirs.join("theirs-ran");
+    fs::write(
+        theirs.join("prune-images.py"),
+        format!("open('{}', 'w').write('ran')\n", ran.display()),
+    )
+    .unwrap();
+    let out = run(
+        dir,
+        &format!("U6E_APS=ap1; prune_images {}", theirs.display()),
+    );
+    assert!(out.status.success(), "{}", said(&out));
+    assert!(!ran.exists());
+    assert_eq!(
+        left(theirs),
+        [
+            "20261001-x-ap1",
+            "20261003-x-ap1",
+            "20261004-x-ap1",
+            "20261005-x-ap1"
+        ]
+    );
+}
