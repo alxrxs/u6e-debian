@@ -967,6 +967,12 @@ pub(crate) mod tests {
             newest("ap9"),
             [Reply::Refused("no AP ap9 in the configuration".into())]
         );
+        // An image a prune is removing is under a dot-name: never kept.
+        let pruning = ".20261030-x-ap1.pruning";
+        keep(&c.rollout.images, pruning, "ap1");
+        assert_eq!(newest("ap1"), [Reply::Image(IMG.into())]);
+        let why = format!("{pruning} is not an image's name");
+        assert_eq!(kept(&c, "ap1", pruning), Err(why));
     }
 
     /// The command gets the AP and a copy of the image (its directory, and

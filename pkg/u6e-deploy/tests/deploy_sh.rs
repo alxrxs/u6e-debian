@@ -154,24 +154,28 @@ fn pruning_keeps_what_any_ap_runs_goes_back_to_or_was_built_for() {
         runner_images() { printf '%s\\n' 20261001-x-ap1 20261005-x-ap2; }
         prune_images";
 
-    // A dry run lists, and removes nothing.
+    // A dry run, by the script alone, lists and removes nothing; it reads
+    // the stamps itself (ap1's running image is kept), not the runner.
     let out = Command::new("python3")
         .args([
             "-I",
             "prune-images.py",
-            "images",
+            ".",
+            "--ap",
+            "ap1",
+            "--ap",
+            "ap2",
             "--dry-run",
-            "--keep",
-            "20261002-x-ap1",
         ])
         .current_dir(dir)
         .output()
         .unwrap();
+    let listed = said(&out);
     assert!(
-        said(&out).contains("would prune 20261001-x-ap1 (ap1)"),
-        "{}",
-        said(&out)
+        listed.contains("would prune 20261001-x-ap1 (ap1)"),
+        "{listed}"
     );
+    assert!(!listed.contains("20261002-x-ap1"), "{listed}");
     assert_eq!(left(dir).len(), 19);
 
     let out = run(dir, prune);
@@ -179,9 +183,10 @@ fn pruning_keeps_what_any_ap_runs_goes_back_to_or_was_built_for() {
     assert_eq!(
         left(dir),
         [
-            // ap1: the runner's way back, what it runs, the newest three
-            // (its current build among them).
-            "20261000-deep-ap2",
+            // An image holding a directory: out of the kept images' names,
+            // left. ap1: the runner's way back, what it runs, the newest
+            // three (its current build among them).
+            ".20261000-deep-ap2.pruning",
             "20261000-link-ap1",
             "20261001-x-ap1",
             "20261002-x-ap1",
@@ -198,7 +203,78 @@ fn pruning_keeps_what_any_ap_runs_goes_back_to_or_was_built_for() {
         ]
     );
     assert!(outside.join("MANIFEST").exists());
-    assert!(said(&out).contains("left 20261000-deep-ap2 (ap2): it holds more than files"));
+    assert!(
+        said(&out).contains(".20261000-deep-ap2.pruning: it holds more than files; left"),
+        "{}",
+        said(&out)
+    );
+}
+
+/// The build user's stamps and images are read as root without following a
+/// link or waiting on a FIFO: a FIFO and a link for stamps are taken as
+/// missing (so what the AP runs is not known, and nothing is pruned), and
+/// a tree or images/ that is a link is refused; a leftover of an
+/// interrupted prune goes, and nothing a prune is removing stays under an
+/// image's name.
+#[test]
+fn a_tree_of_the_wrong_shape_is_read_safely() {
+    let t = checkout("prune-shape");
+    let dir = &t.0;
+    for n in 1..=5 {
+        keep(dir, &format!("2026100{n}-x-ap1"), "ap1");
+    }
+    let fifo = std::ffi::CString::new(
+        dir.join("stamps/running-ap1")
+            .into_os_string()
+            .into_encoded_bytes(),
+    )
+    .unwrap();
+    // SAFETY: a valid path, mode as for any file.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+    fs::write(dir.join("elsewhere"), "k1 images/20261001-x-ap1\n").unwrap();
+    std::os::unix::fs::symlink(dir.join("elsewhere"), dir.join("stamps/built-ap1")).unwrap();
+    fs::write(dir.join("stamps/ap-ap1"), "k1\n").unwrap();
+    let started = std::time::Instant::now();
+    let out = run(dir, "U6E_APS=ap1; prune_images");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    assert!(out.status.success(), "{}", said(&out));
+    assert!(
+        said(&out).contains("what ap1 runs is not known"),
+        "{}",
+        said(&out)
+    );
+    assert_eq!(left(dir).len(), 5);
+
+    // A tree, or its images/, that is a link: refused, nothing read there.
+    let link = dir.join("tree-link");
+    std::os::unix::fs::symlink(dir, &link).unwrap();
+    let out = run(
+        dir,
+        &format!("U6E_APS=ap1; prune_images {}", link.display()),
+    );
+    assert!(said(&out).contains("none pruned"), "{}", said(&out));
+    assert_eq!(left(dir).len(), 5);
+
+    // The stamps right, and the leftover of an interrupted prune.
+    fs::remove_file(dir.join("stamps/running-ap1")).unwrap();
+    fs::write(dir.join("stamps/running-ap1"), "20261001-x-ap1\n").unwrap();
+    keep(dir, "20261000-half-ap1", "ap1");
+    fs::rename(
+        dir.join("images/20261000-half-ap1"),
+        dir.join("images/.20261000-half-ap1.pruning"),
+    )
+    .unwrap();
+    let out = run(dir, "U6E_APS=ap1; prune_images");
+    assert!(out.status.success(), "{}", said(&out));
+    assert_eq!(
+        left(dir),
+        [
+            "20261001-x-ap1",
+            "20261003-x-ap1",
+            "20261004-x-ap1",
+            "20261005-x-ap1"
+        ]
+    );
 }
 
 /// Nothing is pruned while what an AP runs is not known, or the runner

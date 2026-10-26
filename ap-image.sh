@@ -102,26 +102,23 @@ boot_ap() {
 
 # prune_images [<tree>]: remove the kept images nothing needs from <tree>'s
 # images/ (default this checkout's), by this checkout's prune-images.py, so
-# another tree's is pruned by the same rule without running its code. Kept
-# are each AP's running image (stamps/running-<ap>, which boot_ap writes as
-# it stages one), its image of the current inputs (stamps/built-<ap>), the
-# images the deploy runner needs (site.conf's runner_images: what it staged
-# on each AP, both of a rollout under way), and the newest KEEP_IMAGES
-# (default 3) of each AP. Nothing is pruned while an AP's running image is
-# not known, or the runner does not say which it needs.
+# another tree's is pruned by the same rule without running its code; with
+# DRY_RUN=1 only list them. Kept are each AP's running image
+# (stamps/running-<ap>, which boot_ap writes as it stages one), its image of
+# the current inputs (stamps/built-<ap>), the images the deploy runner needs
+# (site.conf's runner_images: what it staged on each AP, both of a rollout
+# under way, both of one that failed), and the newest KEEP_IMAGES (default 3)
+# of each AP. Nothing is pruned while an AP's running image is not known, or
+# the runner does not say which it needs. prune-images.py reads the stamps,
+# root's to read in a tree another user can write.
 prune_images() {
-	local tree=${1:-.} here keep=() aps ap built ids id
+	local tree=${1:-.} here keep=() aps ap ids id
 	here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 	read -ra aps <<< "$U6E_APS"
 	for ap in "${aps[@]}"; do
-		built=$(head -c 1024 "$tree/stamps/built-$ap" 2> /dev/null) && keep+=(--keep "${built##*/}")
-		if [ -s "$tree/stamps/running-$ap" ]; then
-			keep+=(--keep "$(head -c 1024 "$tree/stamps/running-$ap")")
-		elif [ -e "$tree/stamps/ap-$ap" ] && [ "$(head -c 1024 "$tree/stamps/ap-$ap")" != "${built%% *}" ]; then
-			echo "images: what $ap runs is not known (no stamps/running-$ap in $tree); none pruned"
-			return 0
-		fi
+		keep+=(--ap "$ap")
 	done
+	[ "${DRY_RUN:-0}" = 1 ] && keep+=(--dry-run)
 	if declare -F runner_images > /dev/null; then
 		ids=$(runner_images) || {
 			echo "images: the deploy runner did not say which images it needs; none pruned"
@@ -131,5 +128,5 @@ prune_images() {
 			keep+=(--keep "$id")
 		done
 	fi
-	python3 -I "$here/prune-images.py" "$tree/images" --newest "${KEEP_IMAGES:-3}" "${keep[@]}"
+	python3 -I "$here/prune-images.py" "$tree" --newest "${KEEP_IMAGES:-3}" "${keep[@]}"
 }

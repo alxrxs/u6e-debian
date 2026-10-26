@@ -31,9 +31,9 @@ mkdir -p "$L"
 fail() { echo "$*" >&2; exit 1; }
 # A build needs room: with less than MIN_FREE_GIB (site.conf, default 15)
 # free on this tree's filesystem, nothing is built.
-free=$(df -B1G --output=avail . | tail -1 | tr -d ' ')
-[ "$free" -ge "${MIN_FREE_GIB:-15}" ] ||
-	fail "only $free GiB free on $(df --output=target . | tail -1 | tr -d ' '), less than the ${MIN_FREE_GIB:-15} GiB a build may take; free some first (python3 -I prune-images.py images --dry-run lists the kept images the retention rule would remove)"
+free=$(df -B1 --output=avail . | tail -1 | tr -d ' ')
+[ "$free" -ge $(("${MIN_FREE_GIB:-15}" << 30)) ] ||
+	fail "only $((free >> 20)) MiB free on $(df --output=target . | tail -1 | tr -d ' '), less than the ${MIN_FREE_GIB:-15} GiB a build may take; free some first (./prune.sh --dry-run lists the kept images the retention rule would remove, ./prune.sh removes them)"
 as_owner() { sudo -u "$(stat -c %U .)" "$@"; }
 head_of() { git -c safe.directory='*' -C "$1" rev-parse "${2:-HEAD}"; }
 # step <name> <inputs> <command>...: run the command unless stamps/<name>
