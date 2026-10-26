@@ -78,6 +78,24 @@ enum Waiting {
     Repush(String),
 }
 
+/// The images staged on the APs, by AP, as they outlive the runner.
+#[derive(Default, Serialize, Deserialize)]
+struct Images {
+    /// The image staged last: what a failed gate rolls the AP back to.
+    way_back: BTreeMap<String, String>,
+    /// The image of a rollout that failed part way, which the AP may run
+    /// instead of its way back until the next staging says which.
+    either: BTreeMap<String, String>,
+}
+
+impl Images {
+    /// `image` staged on `ap`, and known to be what it runs.
+    fn staged(&mut self, ap: &str, image: &str) {
+        self.way_back.insert(ap.to_owned(), image.to_owned());
+        self.either.remove(ap);
+    }
+}
+
 /// A local caller's rollout, until the controller hands it back.
 struct Ask {
     ap: String,
@@ -136,8 +154,9 @@ struct Inner {
     next_id: u64,
     /// The latest configuration signed for each AP, by host name.
     latest: HashMap<String, Latest>,
-    /// The image the runner staged on each AP, by AP.
-    images: BTreeMap<String, String>,
+    /// The images staged on each AP: its way back, and the image it may run
+    /// instead after a rollout that failed part way.
+    images: Images,
     applies: HashMap<u64, Waiting>,
     rollout: Option<Current>,
     /// Results the controller has not acknowledged.
@@ -281,17 +300,30 @@ impl Runner {
         said
     }
 
-    /// The kept images the runner needs, sorted: the one staged last on each
-    /// AP (its way back), and both of a rollout under way.
-    pub fn images(&self) -> Vec<String> {
+    /// The kept images the runner needs, sorted: each AP's way back, the
+    /// one it may run instead after a rollout that failed, and both of a
+    /// rollout under way. None while its record of them was unreadable and
+    /// set aside, until someone removes that file: it cannot say then.
+    pub fn images(&self) -> Result<Vec<String>, String> {
+        let lost = self.store.set_aside_files().map_err(|e| e.to_string())?;
+        if let Some((file, _)) = lost.iter().find(|(f, _)| f.starts_with(IMAGES)) {
+            return Err(format!(
+                "its record of the images it staged was unreadable, set aside as {file}"
+            ));
+        }
         let inner = self.lock();
-        let mut ids: Vec<String> = inner.images.values().cloned().collect();
+        let recorded = inner
+            .images
+            .way_back
+            .values()
+            .chain(inner.images.either.values());
+        let mut ids: Vec<String> = recorded.cloned().collect();
         if let Some(r) = &inner.rollout {
             ids.extend([r.image_id.clone(), r.previous.clone()]);
         }
         ids.sort();
         ids.dedup();
-        ids
+        Ok(ids)
     }
 
     /// The site's own deploy staged `image` on `ap` (a root caller's word,
@@ -306,7 +338,7 @@ impl Runner {
         if inner.rollout.as_ref().is_some_and(|r| r.ap == ap) {
             return Err(format!("{ap} is being rolled out to"));
         }
-        inner.images.insert(ap.to_owned(), image.to_owned());
+        inner.images.staged(ap, image);
         self.keep(IMAGES, &inner.images);
         eprintln!("u6e-deploy: {ap}: {image} staged by the site's deploy");
         Ok(())
@@ -528,6 +560,7 @@ impl Runner {
         let follower = asked.map(|i| inner.asks.remove(i).follower);
         let previous = inner
             .images
+            .way_back
             .get(&req.ap)
             .cloned()
             .unwrap_or(req.previous.clone());
@@ -666,19 +699,18 @@ impl Runner {
         {
             let mut inner = self.lock();
             match outcome {
-                RolloutOutcome::Done => {
-                    inner
-                        .images
-                        .insert(flight.ap.clone(), flight.image_id.clone());
-                }
-                RolloutOutcome::RolledBack => {
-                    inner
-                        .images
-                        .insert(flight.ap.clone(), flight.previous.clone());
-                }
-                // Where staging stopped, nothing is known.
+                RolloutOutcome::Done => inner.images.staged(&flight.ap, &flight.image_id),
+                RolloutOutcome::RolledBack => inner.images.staged(&flight.ap, &flight.previous),
+                // Where staging stopped, the AP runs either: both are kept,
+                // and the way back stays the way back.
                 RolloutOutcome::Failed => {
-                    inner.images.remove(&flight.ap);
+                    let images = &mut inner.images;
+                    images
+                        .way_back
+                        .insert(flight.ap.clone(), flight.previous.clone());
+                    images
+                        .either
+                        .insert(flight.ap.clone(), flight.image_id.clone());
                 }
                 // The controller's word alone, never the runner's.
                 RolloutOutcome::Refused | RolloutOutcome::NotStarted => {}

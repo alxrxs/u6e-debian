@@ -1273,9 +1273,16 @@ fn an_unreadable_state_file_is_set_aside_and_told() {
         let d = &state.runner.discarded[0];
         assert_eq!(
             (d.file.as_str(), d.detail.as_str()),
-            (aside[0].as_str(), "not of format 1")
+            (aside[0].as_str(), "not of format 2")
         );
     }
+    // Its record of the images it staged lost, it cannot say which it
+    // needs, so the site's deploy prunes nothing meanwhile.
+    let images = site.block_on(local::images(&site.socket)).unwrap_err();
+    assert!(
+        images.starts_with("its record of the images it staged was unreadable"),
+        "{images}"
+    );
     // Removed: the next runner tells nothing.
     fs::remove_file(site.state().join(&aside[0])).unwrap();
     site.restart_runner();
@@ -1283,6 +1290,7 @@ fn an_unreadable_state_file_is_set_aside_and_told() {
         let state = site.controller.state.read();
         state.runner.is_up() && state.runner.discarded.is_empty()
     });
+    assert_eq!(site.block_on(local::images(&site.socket)), Ok(Vec::new()));
 }
 
 /// A runner restarted during a rollout's gate takes the kept images' lock
@@ -1323,6 +1331,34 @@ fn a_rollout_that_cannot_take_its_lock_back_fails_at_once() {
     assert_eq!(site.staged(), ["ap1 img-2-ap1"]);
     drop(taken);
     assert!(asked.join().unwrap().is_err());
+
+    // The AP runs either image now: the runner needs both, and the prune
+    // (by the rule, its keeps the runner's) leaves both, and no other.
+    let needed = site.block_on(local::images(&site.socket)).unwrap();
+    assert_eq!(needed, ["img-1-ap1", "img-2-ap1"]);
+    let mut args = vec!["-I".to_owned(), "prune-images.py".to_owned()];
+    args.extend([
+        site.dir.0.display().to_string(),
+        "--ap".into(),
+        "ap1".into(),
+    ]);
+    args.extend(["--newest".into(), "0".into()]);
+    for id in &needed {
+        args.extend(["--keep".to_owned(), id.clone()]);
+    }
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let out = std::process::Command::new("python3")
+        .args(&args)
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let mut left: Vec<String> = fs::read_dir(site.dir.0.join("images"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    left.sort();
+    assert_eq!(left, ["img-1-ap1", "img-2-ap1"]);
 }
 
 /// A helper that lets the lock go during the gate (stopped by its unit's

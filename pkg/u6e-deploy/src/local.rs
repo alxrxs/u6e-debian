@@ -227,7 +227,14 @@ async fn caller(runner: Arc<Runner>, mut conn: UnixStream, ours: u32) {
             let _ = frames::write(&mut conn, &reply).await;
         }
         Request::Images => {
-            for id in runner.images() {
+            let ids = match runner.images() {
+                Ok(ids) => ids,
+                Err(why) => {
+                    let _ = frames::write(&mut conn, &done(why)).await;
+                    return;
+                }
+            };
+            for id in ids {
                 if frames::write(&mut conn, &Reply::Line(id)).await.is_err() {
                     return;
                 }
