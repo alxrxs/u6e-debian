@@ -123,6 +123,8 @@ pub struct Server {
     pub iw: String,
     /// How long the radios may take to come up after a restart.
     pub up_wait: Duration,
+    /// How long a radio may run its radar check (CAC) after a restart.
+    pub cac_wait: Duration,
     /// The deploy runner's public key, as the image pins it; without one,
     /// no configuration is taken.
     pub runner: Option<[u8; 32]>,
@@ -148,6 +150,8 @@ impl Server {
                 .to_vec(),
             iw: "iw".into(),
             up_wait: Duration::from_secs(30),
+            // Ten minutes on the weather radar channels, a minute elsewhere.
+            cac_wait: Duration::from_secs(11 * 60),
             runner,
             ap,
             floor,
@@ -304,20 +308,36 @@ impl Server {
         }
     }
 
-    /// Restarts u6e-wifi and waits until every radio of `radios` serves.
+    /// Restarts u6e-wifi and waits until every radio of `radios` serves; a
+    /// radio checking for radar (CAC, `state=DFS`) is waited for longer.
     fn restart_up(&self, radios: &[RadioConfig]) -> Result<(), String> {
         run(&self.restart.iter().map(String::as_str).collect::<Vec<_>>())?;
         let mut h = Hostapd::bind(&self.dir, "helper", &self.hostapd)
             .map_err(|e| format!("hostapd's control sockets: {e}"))?;
-        let end = Instant::now() + self.up_wait;
+        let start = Instant::now();
         let mut down: Vec<&str> = radios.iter().map(|r| wificonf::iface(r.radio)).collect();
         loop {
-            down.retain(|i| !neighbors::enabled(&h.request(i, "STATUS")));
+            let mut checking = false;
+            down.retain(|i| {
+                let status = h.request(i, "STATUS");
+                checking |= status.lines().any(|l| l == "state=DFS");
+                !neighbors::enabled(&status)
+            });
             if down.is_empty() {
                 return Ok(());
             }
-            if Instant::now() >= end {
-                return Err(format!("{} did not come up", down.join(", ")));
+            let wait = if checking {
+                self.cac_wait.max(self.up_wait)
+            } else {
+                self.up_wait
+            };
+            if start.elapsed() >= wait {
+                let how = if checking {
+                    " after its radar check"
+                } else {
+                    ""
+                };
+                return Err(format!("{} did not come up{how}", down.join(", ")));
             }
             thread::sleep(Duration::from_millis(500));
         }
@@ -423,18 +443,22 @@ pub mod tests {
     }
 
     /// Fake hostapds over the three radios that serve unless a radio's
-    /// installed configuration holds `dtim_period=7`.
+    /// installed configuration holds `dtim_period=7`; one on channel 100
+    /// checks for radar until `cac-done` is in `ctrl`.
     fn hostapds(ctrl: &Path, dir: &Path) {
         fs::create_dir_all(ctrl).unwrap();
         for band in wificonf::BANDS {
             let server = UnixDatagram::bind(ctrl.join(wificonf::iface(band))).unwrap();
             let conf = wificonf::path(dir, band);
+            let cac_done = ctrl.join("cac-done");
             thread::spawn(move || {
                 let mut buf = [0; 256];
                 while let Ok((_, from)) = server.recv_from(&mut buf) {
                     let text = fs::read_to_string(&conf).unwrap_or_default();
                     let state = if text.contains("dtim_period=7") {
                         "DISABLED"
+                    } else if text.contains("channel=100") && !cac_done.exists() {
+                        "DFS"
                     } else {
                         "ENABLED"
                     };
@@ -489,6 +513,7 @@ pub mod tests {
             restart: logs(&log, "restart"),
             iw: iw(t.path(), &log),
             up_wait: Duration::from_secs(2),
+            cac_wait: Duration::from_secs(5),
             runner: Some(runner_public()),
             ap: "ap1".into(),
             floor: 0,
@@ -635,6 +660,33 @@ pub mod tests {
         );
         assert_eq!(r.installed(), new);
         assert_eq!(r.log(), "restart\n");
+    }
+
+    /// A radio that checks for radar after the restart is waited for past
+    /// the usual wait, up to the check's; one still checking then is down.
+    #[test]
+    fn a_radio_checking_for_radar_is_waited_for() {
+        let r = Rig::new();
+        let dfs = with5(&edit(WLAN5, "channel=149", "channel=100"), 23);
+        let done_at = r.t.path().join("hostapd/cac-done");
+        let check = thread::spawn(move || {
+            thread::sleep(Duration::from_secs(3));
+            fs::write(done_at, "").unwrap();
+        });
+        assert_eq!(
+            r.install(signed(1, dfs.clone()), true),
+            done("installed and restarted")
+        );
+        check.join().unwrap();
+        assert_eq!(r.installed(), dfs);
+        let r = Rig::new();
+        assert_eq!(
+            r.install(signed(1, dfs), true),
+            Err(
+                "wlan5 did not come up after its radar check; the previous configuration is back"
+                    .into()
+            )
+        );
     }
 
     /// A configuration the radios do not come up with is replaced by the

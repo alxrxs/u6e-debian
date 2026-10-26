@@ -70,6 +70,7 @@ impl RadioState {
             center_mhz: self.center_mhz,
             width_mhz: self.width_mhz,
             sec_offset: sec_offset(self.freq_mhz, self.center_mhz, self.width_mhz),
+            cac: false,
         }
     }
 }
@@ -106,6 +107,9 @@ pub struct Switch {
     pub width_mhz: u16,
     /// Where the secondary 20 MHz channel is: 1 above, -1 below, 0 none.
     pub sec_offset: i8,
+    /// A channel of it is a DFS channel without a CAC: the radio must check
+    /// for radar first, off the air, which a channel switch cannot do.
+    pub cac: bool,
 }
 
 pub fn band_of(freq_mhz: u32) -> Band {
@@ -192,17 +196,14 @@ pub fn check_switch(band: Band, r: &RadioState, t: Target) -> Result<Switch, Str
     }
     let first = center_mhz - half + 10;
     let subs: Vec<u32> = (0..u32::from(w) / 20).map(|i| first + 20 * i).collect();
+    let mut cac = false;
     for &f in &subs {
         let c = r.caps.channels.iter().find(|c| c.freq_mhz == f);
         let n = channel_of(f);
         let c = c
             .filter(|c| !c.disabled)
             .ok_or(format!("channel {n} is not enabled"))?;
-        if c.radar && !c.dfs_available {
-            return Err(format!(
-                "channel {n} is a DFS channel without a CAC: switching there would take the radio off the air while one runs"
-            ));
-        }
+        cac |= c.radar && !c.dfs_available;
         if c.no_ir && !c.radar {
             return Err(format!("channel {n} may not be transmitted on first"));
         }
@@ -240,6 +241,7 @@ pub fn check_switch(band: Band, r: &RadioState, t: Target) -> Result<Switch, Str
         center_mhz,
         width_mhz: w,
         sec_offset,
+        cac,
     })
 }
 
@@ -404,7 +406,8 @@ pub mod tests {
                 freq_mhz: 5180,
                 center_mhz: 5210,
                 width_mhz: 80,
-                sec_offset: 1
+                sec_offset: 1,
+                cac: false
             })
         );
         assert_eq!(s(target(44, 80, 42)).map(|s| s.sec_offset), Ok(1));
@@ -419,7 +422,8 @@ pub mod tests {
                 freq_mhz: 6135,
                 center_mhz: 6185,
                 width_mhz: 160,
-                sec_offset: -1
+                sec_offset: -1,
+                cac: false
             })
         );
         assert_eq!(
@@ -435,9 +439,12 @@ pub mod tests {
     #[test]
     fn a_switch_outside_the_rules_is_refused_with_why() {
         let r = radio5();
+        // A DFS channel without a CAC is a switch that needs one.
+        let cac = |t| check_switch(Band::B5, &r, t).map(|s| s.cac);
+        assert_eq!(cac(target(100, 80, 106)), Ok(true));
+        assert_eq!(cac(target(36, 160, 50)), Ok(true));
+        assert_eq!(cac(target(36, 80, 42)), Ok(false));
         let s = |t| check_switch(Band::B5, &r, t).unwrap_err();
-        assert!(s(target(100, 80, 106)).contains("DFS channel without a CAC"));
-        assert!(s(target(36, 160, 50)).contains("DFS channel without a CAC"));
         assert_eq!(s(target(149, 160, 163)), "channel 149 allows no 160 MHz");
         assert_eq!(
             s(target(36, 80, 46)),
@@ -474,7 +481,7 @@ pub mod tests {
     }
 
     /// A DFS channel whose CAC is done (the radio was there, or a CAC ran)
-    /// takes a switch at once.
+    /// takes a switch at once; one whose CAC is not, a radar check first.
     #[test]
     fn a_dfs_channel_with_its_cac_done_takes_a_switch() {
         let mut r = radio5();
@@ -483,8 +490,9 @@ pub mod tests {
                 c.dfs_available = true;
             }
         }
-        assert!(check_switch(Band::B5, &r, target(100, 80, 106)).is_ok());
-        assert!(check_switch(Band::B5, &r, target(116, 80, 122)).is_err());
+        let cac = |t| check_switch(Band::B5, &r, t).map(|s| s.cac);
+        assert_eq!(cac(target(100, 80, 106)), Ok(false));
+        assert_eq!(cac(target(116, 80, 122)), Ok(true));
     }
 
     #[test]

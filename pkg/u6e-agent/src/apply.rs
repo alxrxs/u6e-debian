@@ -8,14 +8,16 @@
 //! applied and the image's build time and within its validity by a
 //! synchronized clock (no replay, not even after a reboot), its SHA-256, each
 //! radio's file, and any new channel or power one the radio may take now
-//! (nl80211's channels and rules; never a DFS channel that needs a CAC
-//! first). The installed configuration is the root helper's alone (it holds
+//! (nl80211's channels and rules). The installed configuration is the root
+//! helper's alone (it holds
 //! the secrets), so the helper says how each radio takes the new one
 //! (`wificonf::class`): nothing; BSS settings hostapd rereads at each use,
 //! which the agent `SET`s on their BSS before rebuilding its beacons; the
 //! channel or width, a channel switch announcement; the power alone, which
-//! the helper sets; anything else, a restart of u6e-wifi by the helper, after
-//! every client is asked to move to the other AP.
+//! the helper sets; anything else, and a move onto a DFS channel that needs
+//! a radar check (CAC) first, which hostapd runs as it starts, a restart of
+//! u6e-wifi by the helper, after every client is asked to move to the other
+//! AP.
 //! hostapd's own reloads would not do: RELOAD re-reads no file and
 //! deauthenticates every station of the radio; RELOAD_CONFIG re-reads it but
 //! deauthenticates the stations of every BSS without an unchanged
@@ -275,7 +277,8 @@ impl Apply {
             return Err("the config helper classified other radios".into());
         }
         let mut steps = Vec::new();
-        for ((band, class), (new, r)) in radios.into_iter().zip(news.into_iter().zip(&c.radios)) {
+        for ((band, mut class), (new, r)) in radios.into_iter().zip(news.into_iter().zip(&c.radios))
+        {
             let name = wificonf::iface(band);
             let goes = wificonf::target(band, &new.bsss[0]);
             let moves = match &class {
@@ -291,6 +294,18 @@ impl Apply {
                     let to = goes.ok_or(format!("{name}: the new channel cannot be told"))?;
                     let s = regdomain::check_switch(band, &now, to)
                         .map_err(|e| format!("{name}: {e}"))?;
+                    // A channel switch cannot run a radar check; a restart's
+                    // hostapd does, off the air for it.
+                    if s.cac && class == Class::Channel {
+                        let reason = format!(
+                            "{name}: channel {} needs a radar check (CAC) first",
+                            to.channel
+                        );
+                        class = Class::Restart {
+                            reason,
+                            moved: true,
+                        };
+                    }
                     (there.freq_mhz, there.center_mhz, there.width_mhz) =
                         (s.freq_mhz, s.center_mhz, s.width_mhz);
                     switch = Some((now, s));
@@ -712,6 +727,7 @@ mod tests {
                 restart: logs(&helper_log, "restart"),
                 iw: iw(t.path(), &helper_log),
                 up_wait: Duration::from_secs(2),
+                cac_wait: Duration::from_secs(2),
                 runner: Some(runner_public()),
                 ap: "ap1".into(),
                 floor: 0,
@@ -1077,10 +1093,10 @@ mod tests {
         );
     }
 
-    /// A move onto a DFS channel would take the radio off the air for its
-    /// CAC: refused, nothing touched.
+    /// A move onto a DFS channel needs a radar check (CAC) first, off the
+    /// air, which no channel switch runs: u6e-wifi restarts onto it.
     #[test]
-    fn a_move_that_needs_a_cac_is_refused() {
+    fn a_move_that_needs_a_cac_restarts_the_wifi() {
         let mut r = Rig::new();
         let text = edit(WLAN5, "channel=149", "channel=100");
         let text = edit(
@@ -1093,23 +1109,23 @@ mod tests {
             "he_oper_centr_freq_seg0_idx=",
             "he_oper_centr_freq_seg0_idx=106",
         );
-        let done = r.run(signed(1, with5(&text, 23)));
-        assert!(!done.ok);
+        let new = with5(&text, 23);
+        let done = r.run(signed(1, new.clone()));
+        assert!(done.ok, "{}", done.detail);
+        assert_eq!(mechanisms(&done), [Restart, Restart, Restart]);
         assert!(
             done.detail
-                .starts_with("refused: wlan5: channel 100 is a DFS channel without a CAC"),
+                .starts_with("restart (wlan5: channel 100 needs a radar check (CAC) first)"),
             "{}",
             done.detail
         );
-        // The same move with other changes, which would restart, too.
-        let text = edit(&text, "ssid=", "ssid=other");
         assert!(
-            r.run(signed(2, with5(&text, 23)))
-                .detail
-                .contains("DFS channel without a CAC")
+            r.requests().iter().all(|q| !q.contains("CHAN_SWITCH")),
+            "{:?}",
+            r.requests()
         );
-        assert!(r.requests().is_empty());
-        assert_eq!((r.helper(), r.installed()), (String::new(), fixture()));
+        assert_eq!(r.helper(), "restart\n");
+        assert_eq!(r.installed(), new);
     }
 
     /// A radio already where the configuration puts it only has its
