@@ -15,8 +15,8 @@
 //! Configurations come as `boot/wifi-up.sh --print` renders them (`script`).
 //! The controller may also ask it to deploy a commit of the site's
 //! repository the RF planner pushed (`live`): checked to be the branch's head
-//! and plain radio settings of the site file alone (`site`), then run by the
-//! stage helper as the site's own command.
+//! and, of what the deploy reads, plain radio settings of the site file alone
+//! (`site`), then run by the stage helper as the site's own command.
 
 pub mod config;
 mod frames;

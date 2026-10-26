@@ -1481,6 +1481,7 @@ pub(crate) mod tests {
             clone: t.path().join("clone"),
             branch: "main".into(),
             file: "wifi/site.yml".into(),
+            reads: vec!["wifi/".into()],
             command,
         });
         c

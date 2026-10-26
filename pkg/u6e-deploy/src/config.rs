@@ -4,8 +4,9 @@
 //! pin), its local socket and state directory, the health gate's time, the
 //! APs, how a kept image is staged on one, and, with `[site]`, the site's
 //! live deploys the controller may ask for (`site`): the site's repository,
-//! which the runner reads into a clone of its own, the site file, and the
-//! root-owned command the stage helper runs to deploy a commit of it.
+//! which the runner reads into a clone of its own, the site file, what the
+//! deploy reads of the repository besides it, and the root-owned command the
+//! stage helper runs to deploy a commit of it.
 //!
 //! ```toml
 //! controller = "controller.example.net:8443"
@@ -36,6 +37,9 @@
 //! clone = "/var/lib/u6e-deploy/site"
 //! branch = "main"
 //! file = "wifi/site.yml"
+//! # What the deploy reads besides the site file: files, and directories
+//! # (ending in "/"), relative to the repository's root.
+//! reads = ["wifi/", "lib/deploy/"]
 //! ssh_key = "/run/credentials/u6e-deploy.service/site-key"
 //! known_hosts = "/etc/u6e-deploy/site-known-hosts"
 //! # Run by the stage helper, as root, with the commit to deploy.
@@ -83,6 +87,9 @@ pub struct Site {
     pub branch: String,
     /// The site file, relative to the repository's root.
     pub file: String,
+    /// What the deploy reads besides the site file, relative to the
+    /// repository's root: a file, or a directory ending in `/`.
+    pub reads: Vec<String>,
     /// What the stage helper runs, with the commit, to deploy it.
     pub command: PathBuf,
 }
@@ -121,6 +128,7 @@ struct SiteFile {
     #[serde(default = "default_branch")]
     branch: String,
     file: String,
+    reads: Vec<String>,
     ssh_key: Option<PathBuf>,
     known_hosts: Option<PathBuf>,
     command: PathBuf,
@@ -217,18 +225,19 @@ impl SiteFile {
                 && s.chars()
                     .all(|c| c.is_ascii_alphanumeric() || "/._-".contains(c))
         };
-        if !plain(&self.branch)
-            || !plain(&self.file)
-            || self.file.starts_with('/')
-            || self.file.contains("..")
-        {
+        let relative = |s: &str| plain(s) && !s.starts_with('/') && !s.contains("..");
+        if !plain(&self.branch) || !relative(&self.file) {
             return bad("branch and file must be plain names, the file relative to the repository");
+        }
+        if self.reads.is_empty() || !self.reads.iter().all(|r| relative(r)) {
+            return bad("reads must list plain paths relative to the repository");
         }
         Ok(Site {
             remote,
             clone: self.clone,
             branch: self.branch,
             file: self.file,
+            reads: self.reads,
             command: self.command,
         })
     }
@@ -360,6 +369,7 @@ pub(crate) mod tests {
 
     const SITE: &str = "[site]\nremote = \"ssh://git@git.example.org/site.git\"\n\
                         clone = \"/var/lib/d/site\"\nfile = \"wifi/site.yml\"\n\
+                        reads = [\"wifi/\", \"lib/x.yml\"]\n\
                         ssh_key = \"/k/site\"\nknown_hosts = \"/k/hosts\"\n\
                         command = \"/usr/local/sbin/deploy-site\"\n";
 
@@ -372,6 +382,7 @@ pub(crate) mod tests {
             ("main", "wifi/site.yml")
         );
         assert_eq!(s.command, PathBuf::from("/usr/local/sbin/deploy-site"));
+        assert_eq!(s.reads, ["wifi/", "lib/x.yml"]);
         assert_eq!(Config::parse(&text("")).unwrap().site, None);
         let bad = |from: &str, to: &str| {
             let t = format!("{}{}", text(""), SITE.replace(from, to));
@@ -381,6 +392,12 @@ pub(crate) mod tests {
         assert!(bad("/k/site", "/k/my key"));
         assert!(bad("wifi/site.yml", "../site.yml"));
         assert!(bad("/usr/local/sbin/deploy-site", "deploy-site"));
+        // What the deploy reads is the configuration's to say.
+        let no_reads = SITE.replace("reads = [\"wifi/\", \"lib/x.yml\"]\n", "");
+        assert!(Config::parse(&format!("{}{no_reads}", text(""))).is_err());
+        assert!(bad("[\"wifi/\", \"lib/x.yml\"]", "[]"));
+        assert!(bad("lib/x.yml", "../x.yml"));
+        assert!(bad("wifi/\"", "/wifi/\""));
     }
 
     #[test]

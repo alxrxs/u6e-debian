@@ -1,13 +1,15 @@
 //! The site's live deploys: the controller names a commit of the site's
 //! repository it just pushed (the RF planner's), and the runner deploys it
 //! only after checking, in a clone of its own, that the commit is the head
-//! of the site's branch and that what changed since the commit it last
-//! deployed is plain settings of the site file alone: the keys the planner
-//! writes (a radio's channel and width, a power), with numbers or the few
-//! words those keys take, nothing a template could make into another
-//! command. So the controller can have deployed only what is on the branch,
-//! and nothing but radio settings, and never supplies a configuration. A
-//! commit whose change is more is refused, for a person to deploy.
+//! of the site's branch and that, of what the deploy reads (the site file
+//! and `reads`), what changed since the commit it last deployed is plain
+//! settings of the site file alone: the keys the planner writes (a radio's
+//! channel and width, a power), with numbers or the few words those keys
+//! take, nothing a template could make into another command. Changes to the
+//! rest of the repository, which the deploy never reads, do not matter. So
+//! the controller can have deployed only what is on the branch, and nothing
+//! but radio settings, and never supplies a configuration. A commit whose
+//! change is more is refused, for a person to deploy.
 //!
 //! The deploy itself is the stage helper's (`stage`): it runs the site's own
 //! command, as root, with the commit.
@@ -148,10 +150,20 @@ pub fn plain_line(line: &str) -> bool {
     KEYS.contains(&key) && plain_value(value.trim())
 }
 
+/// Whether the deploy reads `path` besides the site file: one of
+/// `site.reads`, or under one that names a directory.
+fn read_by_deploy(site: &Site, path: &str) -> bool {
+    site.reads.iter().any(|r| match r.strip_suffix('/') {
+        Some(dir) => path.strip_prefix(dir).is_some_and(|p| p.starts_with('/')),
+        None => path == r,
+    })
+}
+
 /// Checks commit `rev` for a deploy in the runner's clone, fetched first:
-/// the head of the site's branch, and what changed since `last` (the commit
-/// deployed last, when the branch holds it; `rev`'s parent otherwise) plain
-/// settings of the site file alone. The commit checked against.
+/// the head of the site's branch, and of what the deploy reads, what changed
+/// since `last` (the commit deployed last, when the branch holds it; `rev`'s
+/// parent otherwise) plain settings of the site file alone. The commit
+/// checked against.
 pub fn check(site: &Site, rev: &str, last: Option<&str>) -> Result<String, String> {
     if !is_rev(rev) {
         return Err("not a commit's full name".into());
@@ -174,10 +186,13 @@ pub fn check(site: &Site, rev: &str, last: Option<&str>) -> Result<String, Strin
     let files = g
         .ok(&site.clone, &["diff", "--name-only", &base, rev])
         .map_err(|e| e.to_string())?;
-    let others: Vec<&str> = files.lines().filter(|f| *f != site.file).collect();
+    let others: Vec<&str> = files
+        .lines()
+        .filter(|f| *f != site.file && read_by_deploy(site, f))
+        .collect();
     if !others.is_empty() {
         return Err(format!(
-            "the change since {} touches {} besides {}: a person deploys that",
+            "the change since {} touches {}, which the deploy reads, besides {}: a person deploys that",
             &base[..base.len().min(12)],
             others.join(", "),
             site.file
@@ -285,10 +300,22 @@ pub(crate) mod tests {
             );
             sh(dir, &["clone", "--quiet", "remote.git", "work"]);
             let work = dir.join("work");
-            fs::create_dir_all(work.join("wifi")).unwrap();
+            fs::create_dir_all(work.join("wifi/templates")).unwrap();
             fs::write(work.join("wifi/site.yml"), SITE).unwrap();
+            fs::write(work.join("wifi/templates/site.conf.j2"), "{{ site }}\n").unwrap();
+            fs::write(work.join("wifi-other.yml"), "other\n").unwrap();
             fs::write(work.join("README.md"), "the site\n").unwrap();
-            sh(&work, &["add", "--", "wifi/site.yml", "README.md"]);
+            sh(
+                &work,
+                &[
+                    "add",
+                    "--",
+                    "wifi/site.yml",
+                    "wifi/templates/site.conf.j2",
+                    "wifi-other.yml",
+                    "README.md",
+                ],
+            );
             sh(&work, &["commit", "--quiet", "-m", "the site"]);
             sh(&work, &["push", "--quiet", "origin", "HEAD:main"]);
             let site = Site {
@@ -300,6 +327,7 @@ pub(crate) mod tests {
                 clone: dir.join("runner-clone"),
                 branch: "main".into(),
                 file: "wifi/site.yml".into(),
+                reads: vec!["wifi/".into(), "lib/deploy.yml".into()],
                 command: dir.join("deploy"),
             };
             Repo {
@@ -333,26 +361,41 @@ pub(crate) mod tests {
         assert!(why.contains("is not the head of main"), "{why}");
     }
 
+    /// The rest of the repository moves on between two deploys: what the
+    /// deploy never reads blocks none.
+    #[test]
+    fn an_unrelated_commit_between_two_deploys_is_taken() {
+        let t = TestDir::new();
+        let r = Repo::new(t.path());
+        let first = r.commit("wifi/site.yml", "channel: 36", "channel: 44");
+        r.commit("README.md", "the site", "the site, changed");
+        // Not under wifi/, though its name starts so.
+        r.commit("wifi-other.yml", "other", "other, changed");
+        let second = r.commit("wifi/site.yml", "channel: 44", "channel: 48");
+        assert_eq!(check(&r.site, &second, Some(&first)), Ok(first));
+    }
+
     #[test]
     fn more_than_radio_settings_is_refused() {
         let t = TestDir::new();
         let r = Repo::new(t.path());
-        let readme = r.commit("README.md", "the site", "the site, changed");
-        let why = check(&r.site, &readme, None).unwrap_err();
-        assert!(
-            why.contains("touches README.md besides wifi/site.yml"),
-            "{why}"
-        );
         let base = r.commit("wifi/site.yml", "channel: 36", "channel: 44");
         let injected = r.commit("wifi/site.yml", "channel: 44", "channel: \"44$(id)\"");
         let why = check(&r.site, &injected, Some(&base)).unwrap_err();
         assert!(why.contains("more than radio settings"), "{why}");
-        // Something else changed since the last deploy: refused, even when
-        // the commit itself is plain.
-        r.commit("README.md", "the site", "the site, again");
+        // What the deploy reads changed since the last deploy: refused, even
+        // when the commit itself is plain.
+        r.commit(
+            "wifi/templates/site.conf.j2",
+            "{{ site }}",
+            "{{ site | x }}",
+        );
         let plain = r.commit("wifi/site.yml", "channel: \"44$(id)\"", "channel: 48");
         let why = check(&r.site, &plain, Some(&base)).unwrap_err();
-        assert!(why.contains("touches README.md"), "{why}");
+        assert!(
+            why.contains("touches wifi/templates/site.conf.j2, which the deploy reads"),
+            "{why}"
+        );
         assert!(
             check(&r.site, "HEAD", None)
                 .unwrap_err()

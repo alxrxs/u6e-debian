@@ -5,9 +5,9 @@
 //! file to its repository by the controller (`git`, line-level `yaml` edits
 //! of the affected keys only), after which the controller asks the deploy
 //! runner to deploy that commit: the runner checks it is the branch's head
-//! and changes only the site file's settings, and has the site's live deploy
-//! render it, sign it and take it to the APs (a channel switch or a power
-//! change, no reboot). The controller names a commit; it never supplies a
+//! and, of what the deploy reads, changes only the site file's settings, and
+//! has the site's live deploy render it, sign it and take it to the APs (a
+//! channel switch or a power change, no reboot). The controller names a commit; it never supplies a
 //! configuration.
 //!
 //! `GET /api/rf/plan` is the plan for anyone who may view, with its hash and

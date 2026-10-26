@@ -223,7 +223,8 @@ impl Site {
              [aps.ap1]\nhostname = \"u6e-ap1\"\n[aps.ap2]\nhostname = \"u6e-ap2\"\n\
              [rollout]\nimages = \"{}\"\ntree = \"{}\"\n\
              helper = \"{}\"\ngroup = \"root\"\n\
-             [site]\nremote = \"{}\"\nclone = \"{}\"\nfile = \"wifi/site.yml\"\ncommand = \"{}\"\n",
+             [site]\nremote = \"{}\"\nclone = \"{}\"\nfile = \"wifi/site.yml\"\n\
+             reads = [\"wifi/\"]\ncommand = \"{}\"\n",
             self.controller.agents,
             mac::hex(&identity(KEY_CONTROLLER).public_key()),
             socket.display(),
@@ -385,10 +386,20 @@ fn site_repo(dir: &Path) {
     );
     git_in(dir, &["clone", "--quiet", "site.git", "site-work"]);
     let work = dir.join("site-work");
-    fs::create_dir_all(work.join("wifi")).unwrap();
+    fs::create_dir_all(work.join("wifi/templates")).unwrap();
     fs::write(work.join("wifi/site.yml"), SITE_FILE).unwrap();
+    fs::write(work.join("wifi/templates/site.conf.j2"), "{{ site }}\n").unwrap();
     fs::write(work.join("README.md"), "the site\n").unwrap();
-    git_in(&work, &["add", "--", "wifi/site.yml", "README.md"]);
+    git_in(
+        &work,
+        &[
+            "add",
+            "--",
+            "wifi/site.yml",
+            "wifi/templates/site.conf.j2",
+            "README.md",
+        ],
+    );
     git_in(&work, &["commit", "--quiet", "-m", "the site"]);
     git_in(&work, &["push", "--quiet", "origin", "HEAD:main"]);
     let command = dir.join("deploy");
@@ -1515,8 +1526,9 @@ fn a_lock_held_a_moment_at_resume_is_waited_for() {
 }
 
 /// The controller asks for a deploy of the commit the RF planner pushed: the
-/// runner deploys the branch's head when its change is radio settings of the
-/// site file alone, and refuses anything else, at once and running nothing.
+/// runner deploys the branch's head when, of what the deploy reads, its
+/// change is radio settings of the site file alone, and refuses anything
+/// else, at once and running nothing.
 #[test]
 fn a_site_deploy_is_checked_and_run_by_the_helper() {
     let site = Site::new("site-deploy", Duration::from_secs(60));
@@ -1524,12 +1536,16 @@ fn a_site_deploy_is_checked_and_run_by_the_helper() {
     let rev = site.commit("wifi/site.yml", "channel: 36", "channel: 44");
     assert_eq!(site.deploy_site(&rev), ("done".into(), "deployed".into()));
     assert_eq!(site.deployed(), std::slice::from_ref(&rev));
-    // A change beside the site file.
-    let readme = site.commit("README.md", "the site", "the site, changed");
-    let (state, why) = site.deploy_site(&readme);
+    // A change of what the deploy reads, beside the site file.
+    let template = site.commit(
+        "wifi/templates/site.conf.j2",
+        "{{ site }}",
+        "{{ site | x }}",
+    );
+    let (state, why) = site.deploy_site(&template);
     assert_eq!(state, "refused");
     assert!(
-        why.contains("touches README.md besides wifi/site.yml"),
+        why.contains("touches wifi/templates/site.conf.j2, which the deploy reads"),
         "{why}"
     );
     // A commit that is no longer the branch's head.
@@ -1568,16 +1584,23 @@ fn a_site_deploy_that_fails_says_why() {
 }
 
 /// A person deploys by hand what the runner would refuse, and says so: the
-/// next deploy is checked against that commit.
+/// next deploy is checked against that commit, the rest of the repository
+/// having moved on meanwhile.
 #[test]
 fn a_deploy_by_hand_is_what_the_next_is_checked_against() {
     let site = Site::new("site-deploy-hand", Duration::from_secs(60));
     wait_for("the runner", || site.runner_up());
-    let readme = site.commit("README.md", "the site", "the site, changed");
-    let told = site.block_on(local::deployed(&site.socket, &readme));
+    let template = site.commit(
+        "wifi/templates/site.conf.j2",
+        "{{ site }}",
+        "{{ site | x }}",
+    );
+    let told = site.block_on(local::deployed(&site.socket, &template));
     assert!(told.is_ok(), "{told:?}");
+    // What the deploy never reads.
+    site.commit("README.md", "the site", "the site, changed");
     // An older commit is not what the site runs.
-    let first = git_in(&site.dir.0.join("site-work"), &["rev-parse", "HEAD~1"]);
+    let first = git_in(&site.dir.0.join("site-work"), &["rev-parse", "HEAD~2"]);
     let older = site.block_on(local::deployed(&site.socket, first.trim()));
     assert!(older.is_err_and(|e| e.contains("is not newer than")));
     // A value no planner writes is refused; the plain one after it is
