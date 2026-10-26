@@ -1,0 +1,114 @@
+---
+# A site file of the shape the RF planner reads and edits, for its tests and
+# the replay example: two APs, with documentation addresses and names.
+# Secrets are paths into a secret store; none lives here.
+u6e:
+  # What gets built, each repository at the commit pinned here.
+  build:
+    user: builder
+    gitea: https://git.example.org/team
+    debian:
+      path: /srv/build/u6e-debian
+      repo: u6e-debian
+      branch: main
+      ref: 0000000000000000000000000000000000000000
+    native: {ssh: builder@192.0.2.50, machine: u6e-build}
+    persist: true
+
+  # The Wi-Fi controller each AP's agent dials.
+  controller:
+    address: wifi-controller.example.org
+    port: 8443
+    key: {path: secret/wifi-controller, field: public_key_hex}
+
+  management:
+    vlan: 11
+    gateway: 192.0.2.1
+    dns: 192.0.2.53
+    log_server: 192.0.2.10:514
+
+  wifi:
+    # The regulatory domain the radios run in.
+    country: KR
+    vlans:
+      default: 42
+      all: [42, 43]
+    # Transmit power per radio in dBm.
+    txpower: {"24": 20, "5": 23, "6": 18}
+    mbssid_6ghz: true
+    ssids:
+      - name: Example Enterprise
+        kind: ent
+        bands: ["5", "6"]
+        vlan: 42
+      - name: Example Guest
+        kind: sae
+        bands: ["24", "5", "6"]
+        vlan: 42
+        passphrase: {path: secret/wlans, field: guest}
+    # hostapd settings per radio, for every AP unless the AP sets its own.
+    radios:
+      "24": {hw_mode: g, channel: 6}
+
+  aps:
+    ap1:
+      hostname: u6-ap1
+      address: 192.0.2.16/24
+      agent_key: {path: secret/u6e-agent/ap1, field: private_key_pem}
+      stock_host_keys:
+        - ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDexample1
+      led: "off"
+      bss_colors: {"24": 11, "5": 22, "6": 33}
+      radios:
+        # 36-48 at 80 MHz.
+        "5":
+          hw_mode: a
+          channel: 36
+          ht_capab: "[HT40+]"
+          ieee80211ac: 1
+          vht_oper_chwidth: 1
+          vht_oper_centr_freq_seg0_idx: 42
+          he_oper_chwidth: 1
+          he_oper_centr_freq_seg0_idx: 42
+        # 160 MHz block 33-61 (primary 37, a PSC): each AP has its own.
+        "6":
+          hw_mode: a
+          op_class: 134
+          channel: 37
+          he_oper_chwidth: 2
+          he_oper_centr_freq_seg0_idx: 47
+          he_6ghz_reg_pwr_type: 0
+    ap2:
+      hostname: u6-ap2
+      address: 192.0.2.17/24
+      agent_key: {path: secret/u6e-agent/ap2, field: private_key_pem}
+      stock_host_keys:
+        - ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDexample2
+      led: blue
+      bss_colors: {"24": 44, "5": 55, "6": 60}
+      radios:
+        # Primary 149 kept: a neighbouring 20/40 MHz BSS has it as its
+        # primary, which 802.11-2024 11.15.3.2 makes ours too.
+        "5":
+          hw_mode: a
+          channel: 149  # planner: fixed
+          no_pri_sec_switch: 1
+          ht_capab: "[HT40+]"
+          ieee80211ac: 1
+          vht_oper_chwidth: 1
+          vht_oper_centr_freq_seg0_idx: 155
+          he_oper_chwidth: 1
+          he_oper_centr_freq_seg0_idx: 155
+        # 160 MHz block 65-93 (primary 69, a PSC), beside ap1's.
+        "6":
+          hw_mode: a
+          op_class: 134
+          channel: 69
+          he_oper_chwidth: 2
+          he_oper_centr_freq_seg0_idx: 79
+          he_6ghz_reg_pwr_type: 0
+
+  # The test client the tools drive.
+  test_client:
+    ssh: tester@192.0.2.132
+    iface: wlan0

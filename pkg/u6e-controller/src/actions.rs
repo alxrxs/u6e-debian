@@ -6,7 +6,8 @@
 //!
 //! A request acts only when it comes from the UI's own page and from an
 //! admin, checked in that order ([`refusal`], which also gates the start of a
-//! radio's spectrum scan over the WebSocket, since a scan costs airtime):
+//! radio's spectrum scan over the WebSocket, since a scan costs airtime, and
+//! the RF planner's apply, `rf`):
 //! - its `Origin` is the one the UI is served at, and a POST says
 //!   `Content-Type: application/json`, which no cross-site form can send
 //!   without a preflight this listener never grants (403 `cross-site`);
@@ -22,6 +23,7 @@
 //! An upgrade is answered once the runner has it (202 with its id; 409 when
 //! it cannot start); how it goes is in `/api/rollouts` and the events.
 
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use axum::body::Bytes;
@@ -39,6 +41,7 @@ use crate::agents::save_policy;
 use crate::config::Config;
 use crate::http::{error, json_response};
 use crate::policy::{self, Store};
+use crate::rf::{self, Planner};
 use crate::state::{Action, Shared, Waiter, action_name};
 
 /// The user the sign-in proxy names.
@@ -56,6 +59,8 @@ pub struct Access {
     policy: Store,
     /// How long an AP has to answer a command.
     pub timeout: Duration,
+    /// The RF planner, when the configuration has one.
+    pub rf: Option<Arc<Planner>>,
 }
 
 impl Access {
@@ -65,6 +70,7 @@ impl Access {
             admin_group: config.admin_group.clone(),
             policy,
             timeout,
+            rf: rf::from(config.rf.as_ref()),
         }
     }
 }

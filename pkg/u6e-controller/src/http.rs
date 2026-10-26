@@ -26,7 +26,8 @@
 //! waits for the answer. `GET /api/config` is each AP's Wi-Fi configuration
 //! by hash (installed, acknowledged, sent last, drift), `GET /api/rollouts`
 //! the image rollouts with their whole logs (the WebSocket's view carries
-//! their last lines).
+//! their last lines). `GET /api/rf/plan` and `POST /api/rf/apply` are the RF
+//! planner's (`rf`).
 //!
 //! The listener is reached only through the reverse proxy that signs users
 //! in, which names the user in `X-Forwarded-Preferred-Username` and their
@@ -50,6 +51,7 @@ use tokio::time::{interval, timeout};
 use u6e_proto::mac;
 
 use crate::actions::{self, Access, Via, Web};
+use crate::rf;
 use crate::spectrum::{self, Watching};
 use crate::state::{Change, Full, ROLLOUT_LOG_CAP, Shared, WatchGuard};
 use crate::view;
@@ -156,6 +158,8 @@ pub fn router(state: Shared, access: Access) -> Router {
         .route("/api/config", get(api_config))
         .route("/api/rollouts", get(api_rollouts))
         .route("/api/aps/{ap}/upgrade", post(actions::upgrade))
+        .route("/api/rf/plan", get(rf::get_plan))
+        .route("/api/rf/apply", post(rf::apply))
         .route("/ws", get(ws))
         .with_state(Web { state, access })
 }

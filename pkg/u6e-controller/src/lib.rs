@@ -6,7 +6,10 @@
 //! The radios' spectrum scans run while the UI watches them (`spectrum`).
 //! The deploy runner dials the same listener with its own key (`runner`):
 //! its signed Wi-Fi configurations are relayed to the APs, and the image
-//! rollouts admins ask for go to it, each health-gated here.
+//! rollouts admins ask for go to it, each health-gated here. The RF planner
+//! (`rf`) proposes the radios' channels, widths and powers from their
+//! history, and commits a proposal an admin applies to the site file, which
+//! then reaches the APs through the runner like any other change of it.
 
 pub mod actions;
 pub mod agents;
@@ -15,6 +18,7 @@ pub mod http;
 pub mod metrics;
 pub mod names;
 pub mod policy;
+pub mod rf;
 pub mod runner;
 pub mod spectrum;
 pub mod state;
@@ -56,9 +60,14 @@ pub async fn start(
     let path = &config.policy_path;
     let saved = policy::load(path)
         .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
+    let window = config
+        .rf
+        .as_ref()
+        .map_or(rf::history::WINDOW, |rf| rf.rules.window_hours);
     let mut state = State::new(config.hostnames.clone())
         .with_policy(saved)
-        .with_spectrum(timing.spectrum);
+        .with_spectrum(timing.spectrum)
+        .with_history(window);
     if config.runner.is_some() {
         state = state.with_runner();
     }

@@ -4,7 +4,8 @@
 //! admits on the same listener by its own key (without one, configurations
 //! and rollouts are off), and what the operator actions need: the origin the
 //! UI is served at (required), the group allowed to act, and where the
-//! decisions are kept.
+//! decisions are kept; and, in `[rf]`, the RF planner's (`rf::config`),
+//! without which it is off.
 //!
 //! ```toml
 //! listen_agents = "[::]:8443"
@@ -31,6 +32,8 @@ use std::path::PathBuf;
 use serde::Deserialize;
 use u6e_proto::mac;
 
+use crate::rf;
+
 /// The parsed, checked configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -55,6 +58,8 @@ pub struct Config {
     pub admin_group: String,
     /// The operator's decisions (the blocked clients), kept across restarts.
     pub policy_path: PathBuf,
+    /// The RF planner's settings, if it is on.
+    pub rf: Option<rf::config::Settings>,
 }
 
 #[derive(Deserialize)]
@@ -76,6 +81,7 @@ struct File {
     admin_group: String,
     #[serde(default = "default_policy")]
     policy_path: PathBuf,
+    rf: Option<rf::config::File>,
 }
 
 #[derive(Deserialize)]
@@ -135,6 +141,8 @@ pub enum ConfigError {
     BadOrigin,
     /// `admin_group` is empty, which no group header could match.
     NoAdminGroup,
+    /// `[rf]` is not a planner's configuration: why.
+    Rf(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -151,6 +159,7 @@ impl fmt::Display for ConfigError {
                 "public_origin is not scheme://host[:port] (no path, no trailing slash)",
             ),
             Self::NoAdminGroup => f.write_str("admin_group is empty"),
+            Self::Rf(e) => f.write_str(e),
         }
     }
 }
@@ -192,6 +201,11 @@ impl Config {
         if file.admin_group.trim().is_empty() {
             return Err(ConfigError::NoAdminGroup);
         }
+        let rf = file
+            .rf
+            .map(rf::config::File::check)
+            .transpose()
+            .map_err(ConfigError::Rf)?;
         Ok(Config {
             listen_agents: file.listen_agents,
             listen_http: file.listen_http,
@@ -203,6 +217,7 @@ impl Config {
             public_origin: file.public_origin,
             admin_group: file.admin_group,
             policy_path: file.policy_path,
+            rf,
         })
     }
 }
@@ -250,6 +265,7 @@ mod tests {
         // Without a hostname, an AP's agent names itself by the AP's name.
         assert_eq!(c.hostnames["ap1"], "ap1");
         assert_eq!(c.runner, None);
+        assert_eq!(c.rf, None);
         assert_eq!(c.public_origin, "https://wifi.example.org");
         assert_eq!(c.admin_group, "wifi-admins");
         assert_eq!(
@@ -364,6 +380,22 @@ mod tests {
             Config::parse(&format!("{ap}[runner]\npublic_key = \"{}\"\n", &KEY2[1..])),
             Err(ConfigError::BadRunnerKey)
         );
+    }
+
+    /// `[rf]` turns the planner on, and its errors are the configuration's.
+    #[test]
+    fn the_rf_planner_is_configured_in_its_own_section() {
+        let rf = "[rf]\nremote = \"/srv/site.git\"\nrepo = \"/var/lib/site\"\nfile = \"wifi/site.yml\"\n\
+                  [rf.channels.KR]\n\"6\" = [{ channels = \"1-93\", max_dbm = 24 }]\n";
+        let c = Config::parse(&format!("{ORIGIN}{rf}")).unwrap();
+        let s = c.rf.unwrap();
+        assert_eq!(
+            (s.repo.file.as_str(), s.repo.branch.as_str()),
+            ("wifi/site.yml", "main")
+        );
+        assert_eq!(s.rules.countries["KR"][2][0].max_dbm, 24);
+        let bad = format!("{ORIGIN}{}", rf.replace("1-93", "1-0"));
+        assert!(matches!(Config::parse(&bad), Err(ConfigError::Rf(_))));
     }
 
     #[test]

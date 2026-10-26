@@ -9,6 +9,8 @@
 //! (each AP's last acknowledged one kept on disk too), the runner's latest
 //! for each AP, which an AP that runs another is asked to take again, and the
 //! image rollouts with their health gate (the open ones kept on disk too).
+//! Each pair of snapshots also feeds the radios' hourly history the RF
+//! planner scores (`rf::history`).
 //!
 //! The state also sets each AP's tick and flow cadence. While a UI client
 //! watches an AP it reports every 2 s, otherwise at the 15 s scrape interval;
@@ -34,6 +36,7 @@ use u6e_proto::{PROTOCOL, mac};
 
 use crate::names::{self, Names};
 use crate::policy::{Blocked, ConfigId, Policy, SavedRollout};
+use crate::rf::history::{self, History};
 use crate::spectrum::{self, Limits, Scan, Stopped};
 
 /// Events kept per AP, newest last.
@@ -89,7 +92,7 @@ pub enum Change {
 /// One action on one AP (or on none, when no AP was connected to carry a
 /// block out), with what came of it: an operator's on a client (`mac`), or
 /// one of the deploy runner's (`apply`, `repush`, `rollout`) or an admin's
-/// (`upgrade`) on an AP.
+/// (`upgrade`, `rf-plan`: an RF plan committed to the site file) on an AP.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Action {
     pub at: SystemTime,
@@ -544,6 +547,8 @@ pub struct State {
     /// The policy changed since it was saved; the session that changed it
     /// saves it.
     policy_dirty: bool,
+    /// What each radio's snapshots said over the RF planner's window.
+    pub history: History,
 }
 
 impl State {
@@ -570,6 +575,7 @@ impl State {
             apply_counts: BTreeMap::new(),
             rollout_counts: BTreeMap::new(),
             policy_dirty: false,
+            history: History::new(history::WINDOW),
         }
     }
 
@@ -686,6 +692,12 @@ impl State {
     /// The state with its scans stopped after `spectrum`.
     pub fn with_spectrum(self, spectrum: Limits) -> Self {
         State { spectrum, ..self }
+    }
+
+    /// The state keeping `hours` of its radios' history.
+    pub fn with_history(self, hours: u64) -> Self {
+        let history = History::new(hours);
+        State { history, ..self }
     }
 
     /// Every configured AP by name, connected or not.
@@ -905,6 +917,13 @@ impl State {
             // A Pong only proves the agent is alive.
             _ => None,
         };
+        if let Some(Change::Snapshot(_)) = &change
+            && let Some(a) = self.aps.get(ap)
+            && let (Some((prev, then)), Some(now), Some(at)) =
+                (&a.previous, &a.snapshot, a.snapshot_at)
+        {
+            self.history.observe(ap, prev, *then, now, at);
+        }
         if let Some(c) = change {
             self.notify(c);
         }
