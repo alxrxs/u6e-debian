@@ -3,9 +3,11 @@
 // beside what is. The spectrum now and its highest since the scan began, with
 // the channel's 20 MHz parts and the primary one marked, over a waterfall of
 // the last minute. A scan takes a little of the radio's airtime, so only an
-// admin starts one; it runs while someone watches, 10 minutes at most.
+// admin starts one; it runs while someone watches, 10 minutes at most. Below
+// it, the RF plan (`rfplan`).
 
 import { h, icon, bandName, palette } from '../util.js';
+import { rfPlan } from './rfplan.js';
 
 const ADMIN_GROUP = 'wifi-admins';
 /** The radios that scan, by the names the image gives them, and their bands. */
@@ -387,7 +389,8 @@ export default {
       readings,
     ];
     const panel = h('section', { class: 'panel rf' }, ...parts);
-    root.append(h('div', { class: 'head' }, h('h1', {}, 'Spectrum'), sub), h('div', { class: 'tools' }, apPick, radioPick), panel);
+    const plan = rfPlan(store);
+    root.append(h('div', { class: 'head' }, h('h1', {}, 'Spectrum'), sub), h('div', { class: 'tools' }, apPick, radioPick), panel, plan.root);
 
     const wf = new Waterfall();
     /** The latest frame and when it came, the highest per bin since the
@@ -532,6 +535,7 @@ export default {
     let picks = '';
     const view = {
       update() {
+        plan.update();
         if (!store.keyed) {
           const [head, text] = store.waiting();
           panel.replaceChildren(h('div', { class: 'empty' }, h('strong', {}, head), h('p', {}, text)));
@@ -587,6 +591,7 @@ export default {
         draw();
       },
       unmount() {
+        plan.unmount();
         clearInterval(rows);
         clearInterval(countdown);
         store.spectrum.onFrame = null;

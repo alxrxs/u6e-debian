@@ -6,7 +6,8 @@
 // (one with a large connection table less often);
 // the client actions are POSTs, answered with their result. The socket also
 // watches the one radio whose spectrum is shown, if any: its scan's state
-// comes as JSON, its frames as binary messages straight to the view.
+// comes as JSON, its frames as binary messages straight to the view. The RF
+// plan shown beside it is fetched, and applied with a POST like an action.
 
 import { icon } from './util.js';
 import devices from './views/devices.js';
@@ -58,6 +59,8 @@ const store = {
   loadHistory,
   act,
   fullFlows,
+  rfPlan,
+  rfApply,
   watchSpectrum,
 };
 
@@ -139,11 +142,37 @@ async function post(path, body) {
   }
 }
 
-/** Takes `action` (kick, block, unblock, steer) on client `mac`. */
-async function act(mac, action, body = {}) {
-  const res = await post(`/api/clients/${encodeURIComponent(mac)}/${action}`, body);
+/** An admin's POST: a refusal for not being one is remembered, so the
+ * views stop offering what the user may not do. */
+async function adminPost(path, body) {
+  const res = await post(path, body);
   if (res.status === 403 && res.error === 'not an admin' && store.me) store.me.admin = false;
   return res;
+}
+
+/** Takes `action` (kick, block, unblock, steer) on client `mac`. */
+function act(mac, action, body = {}) {
+  return adminPost(`/api/clients/${encodeURIComponent(mac)}/${action}`, body);
+}
+
+/** The RF plan: `{ status, … }` as `/api/rf/plan` gives it; status 0 when
+ * the controller could not be reached. */
+async function rfPlan() {
+  try {
+    const r = await fetch('/api/rf/plan', { cache: 'no-store' });
+    let data = {};
+    try {
+      data = await r.json();
+    } catch {}
+    return { status: r.status, ...data };
+  } catch {
+    return { status: 0 };
+  }
+}
+
+/** Commits the proposals of `radios` (`<ap>/<radio>`) to the site file. */
+function rfApply(radios) {
+  return adminPost('/api/rf/apply', { radios });
 }
 
 /** Every connection `ap` forwards, which it is asked for: `{ status, at,

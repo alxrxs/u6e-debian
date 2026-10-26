@@ -193,6 +193,7 @@ main { padding: 22px 24px 48px; max-width: 1560px; }
 .chip[data-band="5"] { color: var(--b5); background: color-mix(in srgb, var(--b5) 12%, transparent); }
 .chip[data-band="6"] { color: var(--b6); background: color-mix(in srgb, var(--b6) 13%, transparent); }
 .chip.bad { color: var(--bad); background: color-mix(in srgb, var(--bad) 12%, transparent); border-color: transparent; }
+.chip.warn { color: var(--warn); background: color-mix(in srgb, var(--warn) 13%, transparent); border-color: transparent; }
 
 .btn {
   display: inline-flex;
@@ -592,6 +593,50 @@ table.conns { font-size: 12.5px; }
 .rf-key { display: inline-flex; align-items: center; gap: 8px; margin-left: auto; color: var(--ink-3); font-size: 12px; }
 .rf-scale { width: 150px; height: 10px; border-radius: 2px; }
 
+/* RF plan */
+
+.plan { margin-top: 18px; overflow: hidden; }
+.plan-top { display: flex; align-items: flex-start; gap: 10px 16px; padding: 16px 20px 12px; border-bottom: 1px solid var(--rule); }
+.plan-top > div { flex: 1; min-width: 0; }
+.plan-sub { margin: 2px 0 0; color: var(--ink-3); font-size: 13px; overflow-wrap: anywhere; }
+.plan-note { display: flex; gap: 8px; align-items: flex-start; margin: 0; padding: 10px 20px; border-bottom: 1px solid var(--rule-2); background: var(--sunken); color: var(--ink-2); font-size: 13px; }
+.plan-note svg { width: 15px; height: 15px; flex: none; margin-top: 2px; color: var(--ink-3); }
+.plan-note.warn, .plan-note.warn svg { color: var(--warn); }
+
+.plan-list { list-style: none; margin: 0; padding: 0; }
+.plan-radio {
+  --band: var(--ink-3);
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) minmax(0, 340px);
+  gap: 4px 16px;
+  padding: 14px 20px 14px 14px;
+  border-bottom: 1px solid var(--rule-2);
+  box-shadow: inset 4px 0 0 var(--band);
+}
+.plan-radio[data-band="2.4"] { --band: var(--b24); }
+.plan-radio[data-band="5"] { --band: var(--b5); }
+.plan-radio[data-band="6"] { --band: var(--b6); }
+.plan-radio[data-change="true"] { background: color-mix(in srgb, var(--accent) 5%, var(--surface)); }
+.plan-pick { padding-top: 1px; padding-left: 4px; }
+.plan-pick input { margin: 0; width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; }
+.plan-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; }
+.plan-head b { font-size: 15px; font-weight: 650; }
+.plan-set { margin: 6px 0 0; font-size: 15px; font-weight: 550; display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; }
+.plan-set > span { white-space: nowrap; }
+.plan-set .was { color: var(--ink-3); font-weight: 450; }
+.plan-set .to { color: var(--ink-3); }
+.plan-set.same { display: block; color: var(--ink-2); font-weight: 450; }
+.plan-set mark { padding: 0 3px; border-radius: 4px; background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--ink); }
+.plan-why { margin: 4px 0 0; color: var(--ink-2); font-size: 13px; overflow-wrap: anywhere; }
+.plan-effect { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px 14px; margin: 0; align-self: start; }
+.plan-effect dt { color: var(--ink-3); font-size: 12px; }
+.plan-effect dd { margin: 1px 0 0; font-weight: 600; white-space: nowrap; }
+.plan-effect dd small { display: block; color: var(--ink-3); font-size: 11.5px; font-weight: 450; white-space: normal; }
+.plan-list + .result, .plan .result { border-top: 0; border-bottom: 1px solid var(--rule-2); }
+.plan-foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; padding: 12px 20px 14px; font-size: 13px; }
+.plan-lock { padding: 12px 20px 14px; }
+.plan > .plan-body > .empty { padding: 36px 24px; }
+
 /* Events */
 
 .feed { list-style: none; margin: 0; padding: 0; }
@@ -675,4 +720,10 @@ table.conns { font-size: 12.5px; }
   .rf-spectrum { height: 200px; }
   .rf-waterfall { height: 260px; }
   .rf-scale { width: 90px; }
+  .plan-top { padding: 14px 14px 10px; }
+  .plan-note { padding: 10px 14px; }
+  .plan-radio { grid-template-columns: 24px minmax(0, 1fr); padding: 12px 14px 12px 10px; }
+  .plan-effect { grid-column: 2; margin-top: 6px; grid-template-columns: repeat(3, auto); justify-content: start; column-gap: 20px; }
+  .plan-foot, .plan-lock { padding: 12px 14px; }
+  .plan-foot .btn { width: 100%; justify-content: center; }
 }

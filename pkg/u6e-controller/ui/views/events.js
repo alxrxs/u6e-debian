@@ -13,11 +13,14 @@ function radioName(store, e) {
   return band ? `${e.phy} (${band} GHz)` : e.phy;
 }
 
+/** The actions on an AP an admin takes, rather than the deploy runner. */
+const ADMIN_ACTIONS = new Set(['upgrade', 'rf-plan']);
+
 /** An action's line: who did what to which client (or to the AP, for the
- * deploy runner's), and what came of it (hostapd's bare "OK" says nothing a
- * "done" does not). */
+ * deploy runner's and an admin's on an AP), and what came of it (hostapd's
+ * bare "OK" says nothing a "done" does not). */
 function actionText(e, what, showMac) {
-  const who = e.user || (e.mac ? 'Someone' : 'The deploy runner');
+  const who = e.user || (e.mac || ADMIN_ACTIONS.has(e.action) ? 'Someone' : 'The deploy runner');
   const result = e.ok
     ? h('span', { class: 'muted' }, ` · ${!e.detail || e.detail === 'OK' ? 'done' : e.detail}`)
     : `: failed, ${e.detail || 'no reason given'}`;

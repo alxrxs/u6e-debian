@@ -13,6 +13,9 @@
 //! A radio asked to scan sends eight spectra a second until it is told to stop
 //! or goes down (`spectrum`: Wi-Fi bursts, a narrowband sender on 5 GHz, a
 //! microwave oven and Bluetooth on 2.4 GHz, a quiet 6 GHz channel).
+//! The RF planner commits to a site repository of its own in the temporary
+//! directory, made afresh at each start, and the radios' history starts a
+//! day full (`rf`).
 //! The web listener adds what the sign-in proxy in front of a controller
 //! would: a user, a member of the admin group unless `--viewer` is given.
 //!
@@ -23,6 +26,7 @@
 mod flows;
 #[path = "../../tests/common/keys.rs"]
 mod keys;
+mod rf;
 mod spectrum;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -227,7 +231,7 @@ fn client(
 
 fn radios(channels: [(u16, u16); 3]) -> Vec<Radio> {
     let bands = [Band::B24, Band::B5, Band::B6];
-    let power = [2000, 2300, 1900];
+    let power = [2000, 2300, 1800];
     (0..3)
         .map(|i| Radio {
             phy: RADIOS[i].into(),
@@ -268,7 +272,7 @@ impl World {
                     "image:     20261024-213000-5f0c2a1-9e1d3b7-ap1\nkernel:    5f0c2a1 kernel: thermal and spectral\nbackports: 9e1d3b7 ath11k: radio hwmon\ndebian-ap: 58e88f8 prep-rootfs: image identity\nhostapd:   2:2.10-21",
                     "6.12.57-u6e",
                     3 * 86_400 + 4_310,
-                    [(11, 20), (36, 80), (37, 160)],
+                    [(6, 20), (36, 80), (37, 160)],
                     true,
                 ),
                 ap(
@@ -276,7 +280,7 @@ impl World {
                     "image:     20261019-090500-c41d77e-2b80f15-ap2\nkernel:    c41d77e kernel: nss qdisc\nbackports: 2b80f15 ath11k: firmware 2.9\ndebian-ap: 33fe039 prep-rootfs: lone AP image\nhostapd:   2:2.10-21",
                     "6.12.52-u6e",
                     9 * 3_600 + 1_200,
-                    [(1, 20), (149, 80), (69, 160)],
+                    [(6, 20), (149, 80), (69, 160)],
                     false,
                 ),
             ],
@@ -956,15 +960,25 @@ async fn main() -> io::Result<()> {
     let public = |pem| Identity::from_pem(pem).map(|i| mac::hex(&i.public_key()));
     // The actions' decisions, kept for the next replay like a controller's.
     let policy = std::env::temp_dir().join("u6e-replay-policy.json");
+    let (remote, clone) = rf::repository()?;
     // The controller's own web listener goes unused: the one below is its
-    // router behind what the sign-in proxy adds.
+    // router behind what the sign-in proxy adds. The planner's channel table
+    // is a made-up country's.
     let config = format!(
         "listen_agents = \"127.0.0.1:0\"\nlisten_http = \"127.0.0.1:0\"\nlisten_metrics = \"127.0.0.1:0\"\n\
          public_origin = \"http://{web}\"\npolicy_path = \"{}\"\n\
-         [aps.ap1]\npublic_key = \"{}\"\n[aps.ap2]\npublic_key = \"{}\"\n",
+         [aps.ap1]\npublic_key = \"{}\"\n[aps.ap2]\npublic_key = \"{}\"\n\
+         [rf]\nremote = \"{}\"\nrepo = \"{}\"\nfile = \"{}\"\n\
+         [rf.channels.KR]\n\"24\" = [{{ channels = \"1-13\", max_dbm = 23 }}]\n\
+         \"5\" = [{{ channels = \"36-48\", max_dbm = 23 }}, {{ channels = \"52-64\", max_dbm = 20, dfs = true }}, \
+         {{ channels = \"149-177\", max_dbm = 23 }}]\n\
+         \"6\" = [{{ channels = \"1-93\", max_dbm = 24 }}]\n",
         policy.display(),
         public(KEY_AP1).map_err(io::Error::other)?,
         public(KEY_AP2).map_err(io::Error::other)?,
+        remote.display(),
+        clone.display(),
+        rf::FILE,
     );
     let config = Config::parse(&config).map_err(io::Error::other)?;
     let identity = Identity::from_pem(KEY_CONTROLLER).map_err(io::Error::other)?;
@@ -996,7 +1010,9 @@ async fn main() -> io::Result<()> {
             eprintln!("replay: web listener: {e}");
         }
     });
-    let world = Arc::new(Mutex::new(World::new()));
+    let mut world = World::new();
+    rf::seed(&c.state, &mut world);
+    let world = Arc::new(Mutex::new(world));
     for (ap, pem) in [KEY_AP1, KEY_AP2].into_iter().enumerate() {
         let world = Arc::clone(&world);
         tokio::spawn(async move {

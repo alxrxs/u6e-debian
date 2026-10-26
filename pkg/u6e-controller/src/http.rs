@@ -92,7 +92,7 @@ macro_rules! asset {
     };
 }
 
-const FILES: [Asset; 12] = [
+const FILES: [Asset; 13] = [
     asset!("app.js", JS),
     asset!("charts.js", JS),
     asset!("theme.js", JS),
@@ -102,6 +102,7 @@ const FILES: [Asset; 12] = [
     asset!("views/devices.js", JS),
     asset!("views/events.js", JS),
     asset!("views/flows.js", JS),
+    asset!("views/rfplan.js", JS),
     asset!("views/spectrum.js", JS),
     asset!("style.css", CSS),
     asset!("icon.svg", SVG),

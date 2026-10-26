@@ -2,7 +2,7 @@
 // it, its largest connections, its signal, rates and traffic over the session
 // as this page has seen it, and its event history.
 
-import { h, icon, bandName, bits, bytes, DID, duration, hm, mbps, palette, pct, phy, quality, time } from '../util.js';
+import { h, icon, ask, bandName, bits, bytes, DID, duration, hm, mbps, palette, pct, phy, quality, time } from '../util.js';
 import { lineChart } from '../charts.js';
 import { feed } from './events.js';
 import { clientFlows, flowTable, offload, redraw, sampled, tick, topRows } from './flows.js';
@@ -65,31 +65,6 @@ function targets(store, c) {
     }
   }
   return out.sort((a, b) => a.ap.localeCompare(b.ap) || Number(a.band) - Number(b.band));
-}
-
-/** A modal question: resolves to what `pick` makes of the dialog (true
- * without one), or null when cancelled. `choices`, given the confirm button,
- * builds what there is to pick from. */
-function ask(root, { title, text, choices, confirm, danger, pick }) {
-  return new Promise((resolve) => {
-    const ok = h('button', { type: 'button', class: `btn ${danger ? 'danger' : 'primary'}` }, confirm);
-    const cancel = h('button', { type: 'button', class: 'btn', autofocus: !choices }, 'Cancel');
-    const dlg = h('dialog', { class: 'ask', 'aria-labelledby': 'ask-title' },
-      h('h2', { id: 'ask-title' }, title), h('p', {}, text), choices?.(ok),
-      h('div', { class: 'ask-buttons' }, cancel, ok));
-    let answer = null;
-    ok.addEventListener('click', () => {
-      answer = pick ? pick(dlg) : true;
-      dlg.close();
-    });
-    cancel.addEventListener('click', () => dlg.close());
-    dlg.addEventListener('close', () => {
-      dlg.remove();
-      resolve(answer);
-    });
-    root.append(dlg);
-    dlg.showModal();
-  });
 }
 
 /** The steer picker: one choice per BSS, with its band, channel and AP;

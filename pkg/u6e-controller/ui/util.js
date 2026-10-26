@@ -30,6 +30,31 @@ export function icon(d) {
   return svg;
 }
 
+/** A modal question: resolves to what `pick` makes of the dialog (true
+ * without one), or null when cancelled. `choices`, given the confirm button,
+ * builds what there is to pick from. */
+export function ask(root, { title, text, choices, confirm, danger, pick }) {
+  return new Promise((resolve) => {
+    const ok = h('button', { type: 'button', class: `btn ${danger ? 'danger' : 'primary'}` }, confirm);
+    const cancel = h('button', { type: 'button', class: 'btn', autofocus: !choices }, 'Cancel');
+    const dlg = h('dialog', { class: 'ask', 'aria-labelledby': 'ask-title' },
+      h('h2', { id: 'ask-title' }, title), h('p', {}, text), choices?.(ok),
+      h('div', { class: 'ask-buttons' }, cancel, ok));
+    let answer = null;
+    ok.addEventListener('click', () => {
+      answer = pick ? pick(dlg) : true;
+      dlg.close();
+    });
+    cancel.addEventListener('click', () => dlg.close());
+    dlg.addEventListener('close', () => {
+      dlg.remove();
+      resolve(answer);
+    });
+    root.append(dlg);
+    dlg.showModal();
+  });
+}
+
 export const BANDS = ['2.4', '5', '6'];
 
 export function bandName(b) {
@@ -145,6 +170,7 @@ export const DID = {
   repush: 'asked for the Wi-Fi configuration again',
   upgrade: 'asked for an image rollout',
   rollout: 'rolled an image out',
+  'rf-plan': 'applied an RF plan',
 };
 
 /** What an event says, as the feed and a client's history show it. */
