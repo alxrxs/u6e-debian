@@ -824,6 +824,7 @@ mod tests {
                 vlan: 0,
             }],
             config_sha256: None,
+            clock_synced: true,
         }
     }
 

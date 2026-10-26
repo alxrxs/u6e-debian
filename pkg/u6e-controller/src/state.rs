@@ -62,6 +62,9 @@ const OUTBOX_CAP: usize = 64;
 pub const ROLLOUTS_CAP: usize = 20;
 /// Lines of a rollout's log kept, newest last.
 pub const ROLLOUT_LOG_CAP: usize = 400;
+/// How long the runner has to take a rollout on before the controller closes
+/// it as not started.
+pub const ROLLOUT_START: Duration = Duration::from_secs(120);
 /// Longer than any rollout takes: staging, the gate, staging the previous
 /// image again.
 pub const ROLLOUT_STALE: Duration = Duration::from_secs(3 * 3600);
@@ -124,6 +127,19 @@ pub struct Runner {
     pub version: Option<String>,
     pub connected_since: Option<SystemTime>,
     session: Option<RunnerLive>,
+    /// The state files the runner set aside because it could not read them,
+    /// as its current (or last) session told them, and those its session
+    /// before told, which are not recorded again.
+    pub discarded: Vec<Discarded>,
+    discarded_before: Vec<Discarded>,
+}
+
+/// A state file of the runner's that it could not read and set aside.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Discarded {
+    pub file: String,
+    pub detail: String,
+    pub at_ms: u64,
 }
 
 impl Runner {
@@ -158,6 +174,8 @@ pub struct Rollout {
     pub previous: String,
     pub user: String,
     pub at: SystemTime,
+    /// The runner said it took it on ([`ROLLOUT_START`]).
+    pub started: bool,
     /// The AP's sessions numbered past this one are the AP coming back.
     after: u64,
     /// The radios the AP had up and the clients on every AP when it was
@@ -192,12 +210,21 @@ pub fn mechanism_name(m: Mechanism) -> &'static str {
 
 /// The outcomes, by the names the API, the metrics and the policy file
 /// spell them.
-const OUTCOMES: [(RolloutOutcome, &str); 4] = [
+const OUTCOMES: [(RolloutOutcome, &str); 5] = [
     (RolloutOutcome::Refused, "refused"),
     (RolloutOutcome::Done, "done"),
     (RolloutOutcome::RolledBack, "rolled_back"),
     (RolloutOutcome::Failed, "failed"),
+    (RolloutOutcome::NotStarted, "not_started"),
 ];
+
+/// Whether `o` is a rollout's failure, which raises its alert.
+pub fn is_failure(o: RolloutOutcome) -> bool {
+    matches!(
+        o,
+        RolloutOutcome::RolledBack | RolloutOutcome::Failed | RolloutOutcome::NotStarted
+    )
+}
 
 /// The name of a rollout's outcome.
 pub fn outcome_name(o: RolloutOutcome) -> &'static str {
@@ -508,6 +535,9 @@ pub struct State {
     /// The rollouts, newest last.
     pub rollouts: VecDeque<Rollout>,
     next_rollout: u64,
+    /// The last result the runner sent for a rollout not held here: its id,
+    /// outcome, what the runner said, and when it came (kept in the policy).
+    pub orphan: Option<(u64, RolloutOutcome, String, SystemTime)>,
     /// Configurations relayed and rollouts ended, by result, for the metrics.
     pub apply_counts: BTreeMap<&'static str, u64>,
     pub rollout_counts: BTreeMap<&'static str, u64>,
@@ -536,6 +566,7 @@ impl State {
             runner: Runner::default(),
             rollouts: VecDeque::new(),
             next_rollout: 0,
+            orphan: None,
             apply_counts: BTreeMap::new(),
             rollout_counts: BTreeMap::new(),
             policy_dirty: false,
@@ -564,6 +595,7 @@ impl State {
                 previous: r.previous,
                 user: r.user,
                 at: r.at,
+                started: r.started,
                 after: 0,
                 radios: r.radios,
                 clients: r.clients,
@@ -573,10 +605,14 @@ impl State {
                 log: VecDeque::new(),
             }
         });
+        let orphan = policy
+            .orphan
+            .and_then(|(id, outcome, detail, at)| Some((id, outcome_of(&outcome)?, detail, at)));
         State {
             blocked: policy.blocked,
             rollouts: rollouts.collect(),
             next_rollout: policy.next_rollout,
+            orphan,
             ..self
         }
     }
@@ -600,6 +636,7 @@ impl State {
             previous: r.previous.clone(),
             user: r.user.clone(),
             at: r.at,
+            started: r.started,
             radios: r.radios,
             clients: r.clients,
             gate: r.gate.clone(),
@@ -614,6 +651,9 @@ impl State {
             configs: acked.collect(),
             rollouts: rollouts.collect(),
             next_rollout: self.next_rollout,
+            orphan: self.orphan.clone().map(|(id, outcome, detail, at)| {
+                (id, outcome_name(outcome).to_owned(), detail, at)
+            }),
         }
     }
 
@@ -790,8 +830,15 @@ impl State {
                 if !delta::valid(&s) {
                     return Err(Gap);
                 }
+                // An AP whose clock was not synchronized refused every
+                // configuration; now it can take the latest.
+                let clock_came =
+                    s.clock_synced && entry.snapshot.as_ref().is_some_and(|p| !p.clock_synced);
                 entry.advance(s, now);
                 self.gate(ap);
+                if clock_came {
+                    self.check_installed(ap, id);
+                }
                 Some(Change::Snapshot(ap.to_owned()))
             }
             AgentMsg::Delta(d) => {
@@ -995,6 +1042,19 @@ impl State {
         });
     }
 
+    /// Records what went wrong with the runner itself, of no AP.
+    fn record_runner(&mut self, action: &'static str, detail: String) {
+        self.record(Action {
+            at: SystemTime::now(),
+            user: None,
+            action,
+            mac: None,
+            ap: None,
+            ok: false,
+            detail,
+        });
+    }
+
     /// Hands the runner's link to a new connection, which said it runs
     /// `version`; a connection already serving it is told to stop. The gate
     /// verdicts of the open rollouts go first: one sent while no runner was
@@ -1020,6 +1080,7 @@ impl State {
         });
         self.runner.version = Some(version);
         self.runner.connected_since = Some(SystemTime::now());
+        self.runner.discarded_before = std::mem::take(&mut self.runner.discarded);
         self.notify(Change::Deploy);
         RunnerRegistration { id, outbox, stop }
     }
@@ -1257,6 +1318,51 @@ impl State {
         }
     }
 
+    /// The runner took rollout `id` on.
+    pub fn rollout_started(&mut self, id: u64) {
+        if let Some(r) = self.rollouts.iter_mut().find(|r| r.id == id && !r.started) {
+            r.started = true;
+            self.policy_dirty = true;
+        }
+    }
+
+    /// Closes the open rollouts the runner has not taken on in `wait` since
+    /// they were asked for: lost with a session that ended, they would hold
+    /// up every other until [`ROLLOUT_STALE`]. The AP was not touched.
+    pub fn close_unstarted(&mut self, now: SystemTime, wait: Duration) {
+        let late = |r: &Rollout| now.duration_since(r.at).is_ok_and(|d| d >= wait);
+        let ids: Vec<u64> = self
+            .rollouts
+            .iter()
+            .filter(|r| r.is_open() && !r.started && late(r))
+            .map(|r| r.id)
+            .collect();
+        for id in ids {
+            self.rollout_result(RolloutResult {
+                id,
+                outcome: RolloutOutcome::NotStarted,
+                detail: format!("the runner did not take it on in {wait:?}"),
+            });
+        }
+    }
+
+    /// A state file the runner could not read and set aside, as its session
+    /// tells it: recorded once, unless its session before told it too.
+    pub fn state_discarded(&mut self, d: Discarded) {
+        if self.runner.discarded.contains(&d) {
+            return;
+        }
+        if !self.runner.discarded_before.contains(&d) {
+            let detail = format!(
+                "its state file {} could not be read ({}) and was set aside",
+                d.file, d.detail
+            );
+            self.record_runner("runner state", detail);
+        }
+        self.runner.discarded.push(d);
+        self.notify(Change::Deploy);
+    }
+
     /// Closes the rollouts the runner has not ended in [`ROLLOUT_STALE`]: a
     /// runner restarted meanwhile forgot them, and they would hold up every
     /// other.
@@ -1307,6 +1413,7 @@ impl State {
             previous,
             user: user.to_owned(),
             at: SystemTime::now(),
+            started: false,
             after: self.next_id,
             radios,
             clients,
@@ -1341,13 +1448,16 @@ impl State {
     /// The runner's last word on a rollout. The runner sends it until it is
     /// acknowledged, so it may come again, and is then recorded once.
     pub fn rollout_result(&mut self, res: RolloutResult) {
-        let Some(r) = self
-            .rollouts
-            .iter_mut()
-            .find(|r| r.id == res.id && r.is_open())
-        else {
-            return;
+        let Some(r) = self.rollouts.iter_mut().find(|r| r.id == res.id) else {
+            return self.orphan_result(res);
         };
+        // The runner's word on one closed as not started, which it took on
+        // late after all, stands over the controller's.
+        let not_started = matches!(r.result, Some((RolloutOutcome::NotStarted, _)));
+        if !r.is_open() && !(not_started && res.outcome != RolloutOutcome::NotStarted) {
+            return;
+        }
+        r.started |= res.outcome != RolloutOutcome::NotStarted;
         r.result = Some((res.outcome, res.detail.clone()));
         r.ended = Some(SystemTime::now());
         self.policy_dirty = true;
@@ -1364,6 +1474,23 @@ impl State {
         if let Some(id) = session.map(|s| s.id) {
             self.check_installed(&ap, id);
         }
+    }
+
+    /// The runner's result for rollout `id`, which this controller does not
+    /// hold (its policy file was lost, or the rollout left the ring): kept as
+    /// the orphan, whose time raises an alert, and recorded.
+    fn orphan_result(&mut self, res: RolloutResult) {
+        let outcome = outcome_name(res.outcome);
+        let detail = format!(
+            "rollout {}, which this controller does not hold: {}: {}",
+            res.id,
+            outcome.replace('_', " "),
+            res.detail
+        );
+        self.record_runner("rollout", detail);
+        self.orphan = Some((res.id, res.outcome, res.detail, SystemTime::now()));
+        self.policy_dirty = true;
+        self.notify(Change::Deploy);
     }
 
     /// The open rollout of `ap` whose gate has not spoken yet, if any.
@@ -1621,6 +1748,7 @@ mod tests {
             }],
             stations,
             config_sha256: None,
+            clock_synced: true,
         }
     }
 

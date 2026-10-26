@@ -20,17 +20,17 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use u6e_proto::PROTOCOL;
 use u6e_proto::mac;
-use u6e_proto::msg::{Radio, RolloutOutcome, Snapshot, Station};
+use u6e_proto::msg::{Radio, Snapshot, Station};
 
 use crate::spectrum::{RADIOS, Scan};
-use crate::state::{Ap, Shared, State};
+use crate::state::{Ap, Shared, State, is_failure};
 use crate::view::band;
 
 /// The operator's actions and their results, every pair always exported.
 const ACTIONS: [&str; 4] = ["kick", "block", "unblock", "steer"];
 const RESULTS: [&str; 3] = ["ok", "failed", "timeout"];
 /// How a rollout ended (`state::outcome_name`).
-const OUTCOMES: [&str; 4] = ["done", "rolled_back", "failed", "refused"];
+const OUTCOMES: [&str; 5] = ["done", "rolled_back", "failed", "refused", "not_started"];
 
 const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
@@ -476,21 +476,35 @@ fn deploy(m: &mut Text, state: &State, aps: &[(&str, &Ap)]) {
         m.sample(&[("outcome", outcome)], n.unwrap_or(0) as f64);
     }
     // From the rollouts the policy file keeps, so a restart loses no alert.
-    let failed = state.rollouts.iter().filter(|r| {
-        let outcome = r.result.as_ref().map(|(o, _)| *o);
-        matches!(
-            outcome,
-            Some(RolloutOutcome::RolledBack | RolloutOutcome::Failed)
-        )
+    let failed = state.rollouts.iter().filter_map(|r| {
+        let (outcome, _) = r.result.as_ref()?;
+        is_failure(*outcome).then_some(r.ended?)
     });
-    if let Some(last) = failed.filter_map(|r| r.ended).max() {
+    let orphan = state.orphan.as_ref();
+    let orphan_failed = orphan.filter(|(_, o, _, _)| is_failure(*o)).map(|o| o.3);
+    if let Some(last) = failed.chain(orphan_failed).max() {
         m.family(
             "wifi_rollout_last_failure_timestamp_seconds",
             GAUGE,
-            "When the last image rollout that ended rolled back or failed ended.",
+            "When the last image rollout that rolled back, failed or was never started ended.",
         );
-        let at = last.duration_since(UNIX_EPOCH).unwrap_or_default();
-        m.sample(&[], at.as_secs_f64());
+        m.sample(&[], unix_seconds(last));
+    }
+    if let Some((_, _, _, at)) = orphan {
+        m.family(
+            "wifi_rollout_orphan_result_timestamp_seconds",
+            GAUGE,
+            "When the runner last sent a result for a rollout this controller does not hold.",
+        );
+        m.sample(&[], unix_seconds(*at));
+    }
+    if state.runner.configured {
+        m.family(
+            "wifi_runner_state_discarded_files",
+            GAUGE,
+            "State files the deploy runner could not read and set aside, as it last told.",
+        );
+        m.sample(&[], state.runner.discarded.len() as f64);
     }
 }
 

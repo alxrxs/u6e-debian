@@ -20,7 +20,7 @@ until T=8 ap_stock -n true 2>/dev/null; do
 done
 T=120 ap_stock 'cat > /tmp/memdump && chmod 755 /tmp/memdump' < "$here/memdump"
 T=120 ap_stock "/tmp/memdump $ADDR $SIZE" < /dev/null > "$raw"
-python3 - "$raw" "${1:-60}" <<'PY'
+python3 -I - "$raw" "${1:-60}" <<'PY'
 import struct, sys, zlib
 b = open(sys.argv[1], 'rb').read()
 # Zones at their fixed offsets as the DTS sizes them (3 x 128K dump records,

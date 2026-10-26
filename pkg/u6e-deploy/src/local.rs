@@ -1,9 +1,10 @@
 //! The runner's local socket: what its local callers (the site's
-//! configuration play, an operator's shell) may ask, which is exactly two
-//! things: apply a rendered Wi-Fi configuration to an AP, and roll a kept
-//! image out to one. Only root and processes of the runner's group are
-//! served. A connection carries one request; the runner answers with lines
-//! as the work goes and a last word.
+//! configuration play, an operator's shell, the site's image deploy) may
+//! ask, which is exactly three things: apply a rendered Wi-Fi configuration
+//! to an AP, roll a kept image out to one, and, root alone, record a kept
+//! image the site's own deploy staged on one. Only root and processes of the
+//! runner's group are served. A connection carries one request; the runner
+//! answers with lines as the work goes and a last word.
 
 use std::fs;
 use std::io;
@@ -32,6 +33,8 @@ pub enum Request {
     },
     /// Roll the kept image out to the AP, through the controller's gate.
     Rollout { ap: String, image_id: String },
+    /// The site's deploy staged the kept image on the AP; root's alone.
+    Staged { ap: String, image_id: String },
 }
 
 /// What the runner answers, in order.
@@ -119,6 +122,21 @@ pub async fn rollout(
     }
 }
 
+/// Has the runner on `socket` record that `image_id` was staged on `ap`.
+pub async fn staged(socket: &Path, ap: &str, image_id: &str) -> Result<String, String> {
+    let req = Request::Staged {
+        ap: ap.into(),
+        image_id: image_id.into(),
+    };
+    let reply = async { frames::read(&mut ask(socket, &req).await?).await };
+    match reply.await {
+        Ok(Reply::Done { ok: true, detail }) => Ok(detail),
+        Ok(Reply::Done { ok: false, detail }) => Err(detail),
+        Ok(other) => Err(format!("the runner answered {other:?}")),
+        Err(e) => Err(format!("{}: {e}", socket.display())),
+    }
+}
+
 /// How long an apply's caller waits: past the controller's own wait for the
 /// AP (`Timing::apply`), whose answer then comes first.
 const APPLY_WAIT: Duration = Duration::from_secs(330);
@@ -170,6 +188,20 @@ async fn caller(runner: Arc<Runner>, mut conn: UnixStream, ours: u32) {
                         done(format!("no answer from the controller in {APPLY_WAIT:?}"))
                     }
                 },
+            };
+            let _ = frames::write(&mut conn, &reply).await;
+        }
+        Request::Staged { ap, image_id } => {
+            let reply = if cred.uid() != 0 {
+                done("only root may say what was staged".into())
+            } else {
+                match runner.staged(&ap, &image_id).await {
+                    Ok(()) => Reply::Done {
+                        ok: true,
+                        detail: format!("{ap} rolls back to {image_id}"),
+                    },
+                    Err(why) => done(why),
+                }
             };
             let _ = frames::write(&mut conn, &reply).await;
         }

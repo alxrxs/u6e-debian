@@ -683,6 +683,7 @@ impl World {
                 .collect(),
             stations,
             config_sha256: None,
+            clock_synced: true,
         }
     }
 }

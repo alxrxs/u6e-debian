@@ -60,6 +60,8 @@ pub struct Timing {
     /// and its undo as long again.
     pub apply: Duration,
     pub spectrum: Limits,
+    /// How long the runner has to take a rollout on.
+    pub start: Duration,
 }
 
 impl Default for Timing {
@@ -70,6 +72,7 @@ impl Default for Timing {
             command: Duration::from_secs(5),
             apply: Duration::from_secs(300),
             spectrum: Limits::default(),
+            start: crate::state::ROLLOUT_START,
         }
     }
 }

@@ -189,6 +189,7 @@ fn samples() -> Samples {
             .map(|(m, last)| station(last, m))
             .collect(),
         config_sha256: Some([0x81; 32]),
+        clock_synced: true,
     };
     let rec = |idx| RecDelta {
         idx,
@@ -337,6 +338,7 @@ fn samples() -> Samples {
         ("RolloutDone", rollout(RolloutOutcome::Done)),
         ("RolloutRolledBack", rollout(RolloutOutcome::RolledBack)),
         ("RolloutFailed", rollout(RolloutOutcome::Failed)),
+        ("RolloutNotStarted", rollout(RolloutOutcome::NotStarted)),
         (
             "RolloutAsk",
             RunnerMsg::RolloutAsk {
@@ -351,6 +353,15 @@ fn samples() -> Samples {
                 ap: "ap1".into(),
                 seq: (1 << 42) + 4,
                 sha256: [0x84; 32],
+            },
+        ),
+        ("RolloutStarted", RunnerMsg::RolloutStarted { id }),
+        (
+            "StateDiscarded",
+            RunnerMsg::StateDiscarded {
+                file: "rollout".into(),
+                detail: "not of format 1".into(),
+                at_ms: (1 << 42) + 5,
             },
         ),
     ];

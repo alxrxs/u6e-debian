@@ -93,6 +93,11 @@ pub async fn start(
         store: store.clone(),
     };
     tokio::spawn(agents::serve(agents, listener));
+    tokio::spawn(runner::supervise(
+        state.clone(),
+        store.clone(),
+        timing.start,
+    ));
     let access = Access::new(config, timing.command, store);
     let web = http::router(state.clone(), access);
     tokio::spawn(serve_http("http", http, web));

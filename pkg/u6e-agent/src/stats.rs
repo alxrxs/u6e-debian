@@ -49,6 +49,7 @@ mod tests {
             bsss: vec![],
             stations: vec![],
             config_sha256: None,
+            clock_synced: true,
         };
         let stations = [("wlan5".to_string(), 3), ("wlan24".to_string(), 0)];
         assert_eq!(

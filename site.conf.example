@@ -56,6 +56,9 @@ CONTROLLER_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 # digits, a plain value). The AP applies the live Wi-Fi configurations the
 # runner signs with it, and nothing else; unset, it applies none.
 RUNNER_KEY=fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210
+# Optional, with RUNNER_KEY: how deploy.sh tells the runner, as root, the
+# kept image it staged on an AP, the one a failed rollout goes back to.
+runner_staged() { u6e-deploy staged "$1" "$2"; }
 
 # Stock firmware SSH: the controller's "Device Authentication" user, and a
 # command printing its password.

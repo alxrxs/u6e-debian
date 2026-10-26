@@ -13,20 +13,36 @@
 //! rollouts admins and the runner's local callers ask for, and sends each its
 //! health gate; the runner's log lines and results of them end in the state's
 //! rollouts. A result is acknowledged once the policy file holds it, and the
-//! runner sends it until then.
+//! runner sends it until then; one for a rollout not held here is kept and
+//! recorded as an orphan. A rollout the runner does not say it took on in
+//! `Timing::start` is closed as not started ([`supervise`]). The state files
+//! the runner set aside, which it tells at each session, are recorded.
 
 use std::convert::Infallible;
 use std::io::{self, ErrorKind};
+use std::time::{Duration, SystemTime};
 
 use tokio::io::AsyncReadExt;
-use tokio::time::{Instant, interval_at, sleep_until};
+use tokio::time::{Instant, interval_at, sleep, sleep_until};
 use u6e_proto::PROTOCOL;
 use u6e_proto::frame::{decode_frame, zeroize};
 use u6e_proto::msg::{RunnerCtlMsg, RunnerHello, RunnerMsg};
 
 use crate::agents::{Conn, Timing, save_policy};
 use crate::policy::{ConfigId, Store};
-use crate::state::Shared;
+use crate::state::{Discarded, Shared};
+
+/// Closes the rollouts the runner did not take on in `wait`, for the life of
+/// the process, whether or not a runner is connected.
+pub(crate) async fn supervise(state: Shared, store: Store, wait: Duration) {
+    loop {
+        sleep((wait / 8).min(Duration::from_secs(15))).await;
+        state.write().close_unstarted(SystemTime::now(), wait);
+        if state.write().take_dirty() && !save_policy(store.clone(), state.clone()).await {
+            state.write().mark_dirty();
+        }
+    }
+}
 
 /// Serves the runner's connection from its version frame to its end.
 pub(crate) async fn serve(conn: Conn, state: Shared, timing: Timing, store: Store) {
@@ -144,6 +160,16 @@ impl Session {
                 RunnerMsg::RolloutAsk { ap, image_id, user } => {
                     state.rollout_ask(&ap, &image_id, &user);
                 }
+                RunnerMsg::RolloutStarted { id } => state.rollout_started(id),
+                RunnerMsg::StateDiscarded {
+                    file,
+                    detail,
+                    at_ms,
+                } => state.state_discarded(Discarded {
+                    file,
+                    detail,
+                    at_ms,
+                }),
                 // A Pong only proves the runner is alive, a second Hello
                 // says nothing new.
                 _ => {}
@@ -151,7 +177,7 @@ impl Session {
         }
         let dirty = self.state.write().take_dirty();
         if dirty && !save_policy(self.store.clone(), self.state.clone()).await {
-            // Unacknowledged, the results come again with the next frame.
+            // Unacknowledged, the results come again at the next session.
             self.state.write().mark_dirty();
             acks.clear();
         }

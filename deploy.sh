@@ -118,11 +118,13 @@ fi
 # (ap-image.sh's image_tree), the blobs, the site and the two source trees.
 tree=$(image_tree) || fail "image_tree: cannot read this checkout's image inputs"
 image=$tree/$(head_of "$BLOBS")/$(sha256sum < site.conf | cut -c1-16)/$(head_of linux-7.2.8)/$(head_of backports-7.2)
-# The deploy runner's stagings lock images/ too (u6e-deploy --stage-helper),
-# so a rollout and this loop never have two APs down at once.
+# The deploy runner holds the same lock on images/ for each rollout, its gate
+# and its way back included (u6e-deploy --stage-helper), so a rollout and
+# this loop never have two APs down at once: while one runs, this refuses.
 mkdir -p images
 exec {lock}<images
-flock -n "$lock" || { echo "waiting for the staging under way (images/ is locked)"; flock "$lock"; }
+flock -n "$lock" ||
+	fail "images/ is locked: a rollout of the deploy runner, or another deploy, is under way; run again once it is over"
 for ap in "$@"; do
 	export U6E_AP=$ap
 	ap_image "$ap" "$image" || continue
@@ -141,4 +143,9 @@ for ap in "$@"; do
 	[ "$up" = 3 ] || fail "$ap: Wi-Fi did not come up"
 	echo "$image" > "stamps/ap-$ap"
 	echo "$ap: Wi-Fi up on all three radios"
+	# The runner rolls an AP back to the image staged on it last.
+	if declare -F runner_staged > /dev/null; then
+		runner_staged "$ap" "${IMAGE##*/}" ||
+			fail "$ap: booted, but the deploy runner was not told it runs ${IMAGE##*/}"
+	fi
 done

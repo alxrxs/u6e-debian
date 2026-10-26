@@ -4,6 +4,7 @@
 //!   u6e-deploy [--config <path>]
 //!   u6e-deploy apply <ap> [--config <path>]       < <u6e-wifi script>
 //!   u6e-deploy rollout <ap> <image> [--config <path>]
+//!   u6e-deploy staged <ap> <image> [--config <path>]
 //!   u6e-deploy --stage-helper [--config <path>]
 //!
 //! Without a command it is the runner, until stopped. `apply` reads the
@@ -11,9 +12,11 @@
 //! its radios' configuration and the AP apply it, and exits 0 only when the
 //! AP applied exactly that configuration. `rollout` has the runner roll a
 //! kept image out to the AP, printing its log, and exits 0 only when the AP
-//! passed the health gate. `--stage-helper` is the root helper, answering the
-//! one connection systemd passes it (see `stage`). The default
-//! configuration is /etc/u6e-deploy/config.toml.
+//! passed the health gate. `staged`, root's alone, tells the runner that the
+//! site's own deploy (`deploy.sh`) staged a kept image on the AP, the one a
+//! failed gate rolls it back to from then on. `--stage-helper` is the root
+//! helper, answering the connection systemd passes it (see `stage`). The
+//! default configuration is /etc/u6e-deploy/config.toml.
 
 use std::fs;
 use std::future;
@@ -31,8 +34,8 @@ use u6e_proto::tls::Identity;
 
 const DEFAULT_CONFIG: &str = "/etc/u6e-deploy/config.toml";
 
-const USAGE: &str = "usage: u6e-deploy [apply <ap> | rollout <ap> <image> | --stage-helper] \
-                     [--config <path>]";
+const USAGE: &str = "usage: u6e-deploy [apply <ap> | rollout <ap> <image> | staged <ap> <image> \
+                     | --stage-helper] [--config <path>]";
 
 /// The command and its operands, and the configuration's path.
 fn args() -> Option<(Vec<String>, String)> {
@@ -68,7 +71,7 @@ fn main() -> ExitCode {
     let words: Vec<&str> = words.iter().map(String::as_str).collect();
     if !matches!(
         words.as_slice(),
-        [] | ["apply", _] | ["rollout", _, _] | ["--stage-helper"]
+        [] | ["apply", _] | ["rollout", _, _] | ["staged", _, _] | ["--stage-helper"]
     ) {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
@@ -76,6 +79,7 @@ fn main() -> ExitCode {
     let r = load(&path).and_then(|config| match words.as_slice() {
         ["apply", ap] => apply(&config, ap),
         ["rollout", ap, image] => rollout(&config, ap, image),
+        ["staged", ap, image] => staged(&config, ap, image),
         ["--stage-helper"] => stage_helper(config),
         _ => run(config),
     });
@@ -138,6 +142,14 @@ fn rollout(config: &Config, ap: &str, image: &str) -> Result<(), String> {
     let print = |l: &str| println!("{ap}: {l}");
     let done = rt.block_on(local::rollout(&config.socket, ap, image, print))?;
     println!("{ap}: {done}");
+    Ok(())
+}
+
+/// Tells the runner `image` was staged on `ap`.
+fn staged(config: &Config, ap: &str, image: &str) -> Result<(), String> {
+    let rt = runtime().map_err(|e| format!("runtime: {e}"))?;
+    let done = rt.block_on(local::staged(&config.socket, ap, image))?;
+    println!("{done}");
     Ok(())
 }
 

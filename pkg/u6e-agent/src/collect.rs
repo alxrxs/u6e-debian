@@ -347,6 +347,7 @@ impl Collector {
             bsss,
             stations,
             config_sha256: self.config.get(&self.paths.wifi),
+            clock_synced: root.join(&wificonf::SYNCHRONIZED[1..]).exists(),
         }
     }
 
@@ -1204,6 +1205,13 @@ mod tests {
         assert_eq!(c.snapshot(11).config_sha256, Some([0xcd; 32]));
         wificonf::write_hash(&paths.wifi, None).unwrap();
         assert_eq!(c.snapshot(12).config_sha256, None);
+
+        // The clock, synchronized once timesyncd says so.
+        assert!(!c.snapshot(13).clock_synced);
+        let synced = paths.root.join(&wificonf::SYNCHRONIZED[1..]);
+        fs::create_dir_all(synced.parent().unwrap()).unwrap();
+        fs::write(&synced, "").unwrap();
+        assert!(c.snapshot(14).clock_synced);
     }
 
     /// The flows come from the ECM device under the root; without it there

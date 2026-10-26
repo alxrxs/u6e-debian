@@ -110,7 +110,7 @@ const KEPT: [&str; 5] = [
 
 /// The staging script, `boot/stage.sh` of the site's root-owned tree: logs
 /// the AP and the image, takes its time for a slow one and fails a bad one.
-const STAGE: &str = "echo \"$U6E_AP ${1##*/}\" >> \"${1%/images/*}/staged\"; \
+const STAGE: &str = "echo \"$U6E_AP ${1##*/}\" >> @SITE@/staged; \
                      echo staging $U6E_AP; \
                      case $1 in *slow*) sleep 1.5 ;; *bad*) exit 1 ;; esac; echo staged";
 
@@ -319,7 +319,8 @@ fn tree(dir: &Path) {
     fs::create_dir_all(tree.join("boot")).unwrap();
     fs::create_dir_all(tree.join("log")).unwrap();
     fs::write(tree.join("site.conf"), "").unwrap();
-    fs::write(tree.join("boot/stage.sh"), format!("#!/bin/sh\n{STAGE}\n")).unwrap();
+    let script = STAGE.replace("@SITE@", &dir.display().to_string());
+    fs::write(tree.join("boot/stage.sh"), format!("#!/bin/sh\n{script}\n")).unwrap();
     for (p, mode) in [
         (dir.to_owned(), 0o755),
         (tree.clone(), 0o755),
@@ -510,6 +511,7 @@ fn snapshot(seq: u64, installed: [u8; 32]) -> Snapshot {
         }],
         stations: vec![station],
         config_sha256: Some(installed),
+        clock_synced: true,
     }
 }
 
@@ -1102,4 +1104,157 @@ fn the_controller_rolls_out_only_the_newest_image() {
         site.staged(),
         ["ap1 img-2-ap1", "ap1 img-slow-ap1", "ap1 img-2-ap1"]
     );
+}
+
+/// An image the site's own deploy staged (`deploy.sh`, which tells the
+/// runner as root) is the way back from then on: a failed gate after it
+/// stages that one again, not the one the runner staged before.
+#[test]
+fn a_staging_of_the_sites_deploy_is_the_way_back() {
+    let site = Site::new("deployed", Duration::from_secs(1));
+    wait_for("the runner", || site.runner_up());
+    let ap1 = fake_ap(&site, KEY_AP1, "u6e-ap1", "img-1-ap1", 1, image_config(1));
+    wait_for("ap1", || up(&site, "ap1"));
+    let asked = roll_out(&site, "ap1", "img-2-ap1");
+    wait_for("the staging", || site.staged().len() == 1);
+    drop(ap1);
+    let ap1 = fake_ap(&site, KEY_AP1, "u6e-ap1", "img-2-ap1", 2, image_config(2));
+    asked.join().unwrap().unwrap();
+
+    // deploy.sh boots img-slow on it, and says so.
+    drop(ap1);
+    let _ap1 = fake_ap(
+        &site,
+        KEY_AP1,
+        "u6e-ap1",
+        "img-slow-ap1",
+        3,
+        image_config(3),
+    );
+    let told = site.block_on(local::staged(&site.socket, "ap1", "img-slow-ap1"));
+    assert_eq!(told, Ok("ap1 rolls back to img-slow-ap1".into()));
+    let unknown = site.block_on(local::staged(&site.socket, "ap1", "img-9-ap1"));
+    assert_eq!(unknown, Err("no image img-9-ap1 is kept".into()));
+
+    let e = site
+        .block_on(local::rollout(&site.socket, "ap1", "img-bad-ap1", |_| {}))
+        .unwrap_err();
+    assert_eq!(
+        e,
+        "rolled back: the staging exited with 1; img-slow-ap1 is staged again"
+    );
+    assert_eq!(
+        site.staged(),
+        ["ap1 img-2-ap1", "ap1 img-bad-ap1", "ap1 img-slow-ap1"]
+    );
+}
+
+/// The kept images' lock is held from a rollout's staging to its end, its
+/// gate included, so the site's own deploy (which takes the same lock) and
+/// any other staging wait it out; the rollout is started on the controller's
+/// side, and the lock is free once it is over.
+#[test]
+fn a_rollout_holds_the_lock_through_its_gate() {
+    let site = Site::new("held", Duration::from_secs(30));
+    wait_for("the runner", || site.runner_up());
+    let ap1 = fake_ap(&site, KEY_AP1, "u6e-ap1", "img-1-ap1", 1, image_config(1));
+    wait_for("ap1", || up(&site, "ap1"));
+    let images = site.dir.0.join("images");
+    let asked = roll_out(&site, "ap1", "img-2-ap1");
+    wait_for("the gate awaited", || {
+        let state = site.controller.state.read();
+        let r = state.rollouts.back();
+        r.is_some_and(|r| r.started && r.log.iter().any(|l| l.starts_with("staged; waiting")))
+    });
+    // What deploy.sh does first: refused.
+    assert!(stage::lock(&images).unwrap().is_none());
+    drop(ap1);
+    let _ap1 = fake_ap(&site, KEY_AP1, "u6e-ap1", "img-2-ap1", 2, image_config(2));
+    asked.join().unwrap().unwrap();
+    wait_for("the lock free", || stage::lock(&images).unwrap().is_some());
+}
+
+/// A runner restarted while its staging runs waits for the staging (which
+/// its helper runs to its end, holding the lock) and gives the AP the whole
+/// gate from there: the AP back after the staging passes it, and nothing is
+/// staged again.
+#[test]
+fn a_runner_restarted_during_the_staging_waits_for_it() {
+    let mut site = Site::new("restart-staging", Duration::from_secs(1));
+    wait_for("the runner", || site.runner_up());
+    let ap1 = fake_ap(&site, KEY_AP1, "u6e-ap1", "img-1-ap1", 1, image_config(1));
+    wait_for("ap1", || up(&site, "ap1"));
+    let asked = roll_out(&site, "ap1", "img-slow-ap1");
+    wait_for("the staging", || site.staged().len() == 1);
+    let staging = Instant::now();
+    wait_for("the rollout kept", || site.state().join("rollout").exists());
+    site.restart_runner();
+    let gate = |site: &Site| {
+        let state = site.controller.state.read();
+        let r = state.rollouts.back().unwrap();
+        r.log.iter().any(|l| l.starts_with("staged; waiting up to"))
+    };
+    // The staging takes 1.5 s; its gate waits for it.
+    wait_for("the gate awaited", || gate(&site));
+    assert!(
+        staging.elapsed() >= Duration::from_millis(1400),
+        "the gate began {:?} into a 1.5 s staging",
+        staging.elapsed()
+    );
+    drop(ap1);
+    let _ap1 = fake_ap(
+        &site,
+        KEY_AP1,
+        "u6e-ap1",
+        "img-slow-ap1",
+        2,
+        image_config(2),
+    );
+    wait_for("the result counted", || ended(&site, "done") == Some(1));
+    assert_eq!(site.staged(), ["ap1 img-slow-ap1"]);
+    let state = site.controller.state.read();
+    let log = &state.rollouts.back().unwrap().log;
+    assert!(
+        log.contains(&"restarted during the staging: waiting for it to end".to_owned()),
+        "{log:?}"
+    );
+    drop(state);
+    assert!(asked.join().unwrap().is_err());
+}
+
+/// A state file the runner cannot read (another format, or garbage) is set
+/// aside and the runner starts without it; the controller is told, at every
+/// session, until someone removes it.
+#[test]
+fn an_unreadable_state_file_is_set_aside_and_told() {
+    let mut site = Site::new("corrupt", Duration::from_secs(1));
+    wait_for("the runner", || site.runner_up());
+    site.stop_runner();
+    fs::write(site.state().join("images"), b"not a state file").unwrap();
+    site.start_runner_again();
+    wait_for("told", || {
+        let state = site.controller.state.read();
+        state.runner.is_up() && state.runner.discarded.len() == 1
+    });
+    let aside: Vec<String> = fs::read_dir(site.state())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.starts_with("images.corrupt-"))
+        .collect();
+    assert_eq!(aside.len(), 1);
+    {
+        let state = site.controller.state.read();
+        let d = &state.runner.discarded[0];
+        assert_eq!(
+            (d.file.as_str(), d.detail.as_str()),
+            (aside[0].as_str(), "not of format 1")
+        );
+    }
+    // Removed: the next runner tells nothing.
+    fs::remove_file(site.state().join(&aside[0])).unwrap();
+    site.restart_runner();
+    wait_for("nothing told", || {
+        let state = site.controller.state.read();
+        state.runner.is_up() && state.runner.discarded.is_empty()
+    });
 }

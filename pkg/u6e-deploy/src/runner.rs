@@ -20,15 +20,21 @@
 //! controller hands an ask back as a rollout of the same AP, image and user,
 //! which is how its caller finds the rollout to follow; one the controller
 //! asks for itself may only roll out the AP's newest kept image. The image
-//! the runner staged on each AP is kept, and a failed gate rolls the AP back
-//! to it. The rollout under way is kept too, so a restarted runner goes on
-//! with it, and each result is sent until the controller acknowledges it.
+//! staged last on each AP is kept, by the runner's rollouts and by the
+//! site's own image deploys, which tell it (`staged`, a root caller's), and a
+//! failed gate rolls the AP back to it. The rollout under way is kept too, so
+//! a restarted runner goes on with it, and told to the controller as taken
+//! on, and each result is sent until the controller acknowledges it. A state
+//! file the runner cannot read is set aside and told to the controller at
+//! each session, until someone removes it.
 
 use std::collections::{BTreeMap, HashMap};
+use std::io;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use aws_lc_rs::signature::Ed25519KeyPair;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, watch};
 use u6e_proto::config::{self, config_sha256};
@@ -42,7 +48,7 @@ use crate::config::Config;
 use crate::local::Reply;
 use crate::rollout;
 use crate::stage::Helper;
-use crate::store::Store;
+use crate::store::{Store, Unreadable};
 
 /// Messages queued for the controller: a link down for long holds this
 /// many, then drops log lines (a result is kept on disk until acknowledged).
@@ -137,6 +143,27 @@ struct Inner {
     /// Local callers waiting for the controller to hand their rollout back,
     /// oldest first.
     asks: Vec<Ask>,
+    /// Why each state file this process set aside could not be read.
+    set_aside: HashMap<String, String>,
+}
+
+/// What `name` of `store` holds; a file that cannot be read is set aside,
+/// why noted in `notes`, and taken as empty.
+fn load<T: DeserializeOwned>(
+    store: &Store,
+    name: &str,
+    notes: &mut HashMap<String, String>,
+) -> io::Result<Option<T>> {
+    match store.load(name) {
+        Ok(v) => Ok(v),
+        Err(Unreadable::Io(e)) => Err(e),
+        Err(Unreadable::Corrupt(why)) => {
+            let aside = store.set_aside(name)?;
+            eprintln!("u6e-deploy: {name}: not read ({why}): set aside as {aside}");
+            notes.insert(aside, why);
+            Ok(None)
+        }
+    }
 }
 
 pub struct Runner {
@@ -183,15 +210,18 @@ impl Runner {
     ) -> std::io::Result<(Arc<Self>, Option<InFlight>, mpsc::Receiver<RunnerMsg>)> {
         let store = Store::open(&config.state)?;
         let mut inner = Inner::default();
+        let notes = &mut inner.set_aside;
+        let mut latest = HashMap::new();
         for hostname in config.aps.values() {
-            if let Some(l) = store.load::<Latest>(&latest_file(hostname))? {
-                inner.last_seq = inner.last_seq.max(l.seq);
-                inner.latest.insert(hostname.clone(), l);
+            if let Some(l) = load::<Latest>(&store, &latest_file(hostname), notes)? {
+                latest.insert(hostname.clone(), l);
             }
         }
-        inner.images = store.load(IMAGES)?.unwrap_or_default();
-        inner.unacked = store.load(RESULTS)?.unwrap_or_default();
-        let resumed = store.load::<InFlight>(ROLLOUT)?;
+        inner.images = load(&store, IMAGES, notes)?.unwrap_or_default();
+        inner.unacked = load(&store, RESULTS, notes)?.unwrap_or_default();
+        let resumed = load::<InFlight>(&store, ROLLOUT, notes)?;
+        inner.last_seq = latest.values().map(|l| l.seq).max().unwrap_or(0);
+        inner.latest = latest;
         let (outbox, rx) = mpsc::channel(OUTBOX_CAP);
         let helper = Helper {
             socket: config.rollout.helper.clone(),
@@ -220,8 +250,8 @@ impl Runner {
     }
 
     /// What a new session with the controller says first, after its Hello:
-    /// the latest configuration for each AP, and the results not yet
-    /// acknowledged.
+    /// the latest configuration for each AP, the rollout under way, the
+    /// results not yet acknowledged and the state files set aside.
     pub(crate) fn linked(&self) -> Vec<RunnerMsg> {
         let mut inner = self.lock();
         inner.linked_at = Some(Instant::now());
@@ -231,8 +261,40 @@ impl Runner {
             sha256: config_sha256(&l.radios),
         });
         let mut said: Vec<RunnerMsg> = latest.collect();
+        if let Some(r) = &inner.rollout {
+            said.push(RunnerMsg::RolloutStarted { id: r.id });
+        }
         said.extend(inner.unacked.iter().cloned().map(RunnerMsg::RolloutResult));
+        match self.store.set_aside_files() {
+            Ok(files) => said.extend(files.into_iter().map(|(file, at_ms)| {
+                let why = inner.set_aside.get(&file).cloned();
+                RunnerMsg::StateDiscarded {
+                    detail: why.unwrap_or_else(|| "set aside before the runner started".into()),
+                    file,
+                    at_ms,
+                }
+            })),
+            Err(e) => eprintln!("u6e-deploy: {}: {e}", self.config.state.display()),
+        }
         said
+    }
+
+    /// The site's own deploy staged `image` on `ap` (a root caller's word,
+    /// checked with the stage helper): the image a failed gate rolls the AP
+    /// back to from now on.
+    pub async fn staged(&self, ap: &str, image: &str) -> Result<(), String> {
+        if self.config.hostname(ap).is_none() {
+            return Err(format!("no AP {ap:.64} in the configuration"));
+        }
+        self.helper.check(ap, image).await?;
+        let mut inner = self.lock();
+        if inner.rollout.as_ref().is_some_and(|r| r.ap == ap) {
+            return Err(format!("{ap} is being rolled out to"));
+        }
+        inner.images.insert(ap.to_owned(), image.to_owned());
+        self.keep(IMAGES, &inner.images);
+        eprintln!("u6e-deploy: {ap}: {image} staged by the site's deploy");
+        Ok(())
     }
 
     /// The session ended: the configurations that waited for an answer have
@@ -486,6 +548,9 @@ impl Runner {
             phase: Phase::Checking,
         };
         let gate = self.current(&mut inner, &flight, follower);
+        let _ = self
+            .outbox
+            .try_send(RunnerMsg::RolloutStarted { id: flight.id });
         tokio::spawn(rollout::run(Arc::clone(self), flight, gate));
     }
 
@@ -596,7 +661,8 @@ impl Runner {
                 RolloutOutcome::Failed => {
                     inner.images.remove(&flight.ap);
                 }
-                RolloutOutcome::Refused => {}
+                // The controller's word alone, never the runner's.
+                RolloutOutcome::Refused | RolloutOutcome::NotStarted => {}
             }
             self.keep(IMAGES, &inner.images);
         }
@@ -608,6 +674,7 @@ impl Runner {
             RolloutOutcome::RolledBack => "rolled back",
             RolloutOutcome::Failed => "failed",
             RolloutOutcome::Refused => "refused",
+            RolloutOutcome::NotStarted => "not started",
         };
         eprintln!("u6e-deploy: {}: {}: {word}: {detail}", r.ap, r.image_id);
         let done = Reply::Done {

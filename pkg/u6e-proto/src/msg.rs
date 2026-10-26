@@ -139,6 +139,9 @@ pub struct Snapshot {
     /// The hash ([`crate::config::config_sha256`]) of the configuration
     /// installed for the radios; `None` while it cannot be read.
     pub config_sha256: Option<[u8; 32]>,
+    /// Whether the AP's clock is synchronized, which a signed configuration
+    /// needs before it applies.
+    pub clock_synced: bool,
 }
 
 /// On the wire: a change to it bumps [`crate::PROTOCOL`].
@@ -564,6 +567,18 @@ pub enum RunnerMsg {
         seq: u64,
         sha256: [u8; 32],
     },
+    /// The runner took rollout `id` on: sent when it does, and again at
+    /// each session while it runs. A rollout not taken on in a while is the
+    /// controller's to close.
+    RolloutStarted { id: u64 },
+    /// A file of the runner's state directory it could not read (`detail`
+    /// says why) was moved aside at `at_ms` and the runner went on without
+    /// it. Sent at each session of the runner's process.
+    StateDiscarded {
+        file: String,
+        detail: String,
+        at_ms: u64,
+    },
 }
 
 /// Everything the controller sends the deploy runner.
@@ -652,6 +667,8 @@ pub enum RolloutOutcome {
     RolledBack,
     /// Neither the image nor the way back could be staged.
     Failed,
+    /// The runner never took it on; the controller's own word.
+    NotStarted,
 }
 
 #[cfg(test)]

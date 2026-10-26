@@ -422,6 +422,7 @@ fn snapshot(seq: u64, bsss: Vec<Bss>, stations: Vec<Station>) -> Snapshot {
         bsss,
         stations,
         config_sha256: None,
+        clock_synced: true,
     }
 }
 
@@ -2431,6 +2432,7 @@ fn applied(sha256: [u8; 32], ok: bool, detail: &str) -> ConfigApplied {
 fn running_config(seq: u64, installed: [u8; 32]) -> Snapshot {
     Snapshot {
         config_sha256: Some(installed),
+        clock_synced: true,
         ..snapshot(seq, vec![bss("wlan5", "Guest")], vec![station(MAC, 0, -54)])
     }
 }
@@ -2953,4 +2955,187 @@ fn an_upgrade_is_gated_by_the_ap_coming_back() {
         }
         other => panic!("{other:?}"),
     }
+}
+
+/// An AP that came back before its clock was synchronized refused the
+/// runner's latest (it applies nothing until then): once it reports its clock
+/// synchronized, the runner is asked to sign that latest again, once.
+#[test]
+fn an_ap_whose_clock_comes_is_asked_again_for_the_latest() {
+    let r = controller(Timing::default());
+    let latest = signed("ap1", 1_000, 1).sha256;
+    let installed = signed("ap1", 1, 9).sha256;
+    let mut runner = Agent::runner(r.c.agents);
+    runner
+        .send_any(&RunnerMsg::Latest {
+            ap: "ap1".into(),
+            seq: 1_000,
+            sha256: latest,
+        })
+        .unwrap();
+    let older = "image: old\nbuilt_ms: 500\n";
+    let mut ap1 = Agent::running(r.c.agents, KEY_AP1, "ap1", older);
+    let unsynced = Snapshot {
+        clock_synced: false,
+        ..running_config(1, installed)
+    };
+    ap1.send(&AgentMsg::Key(unsynced.clone())).unwrap();
+    ap1.expect_sync();
+    let repush = RunnerCtlMsg::Repush {
+        ap: "ap1".into(),
+        installed: Some(installed),
+    };
+    assert_eq!(runner.expect_runner(), repush);
+    // Still unsynchronized: nothing new.
+    ap1.send(&AgentMsg::Key(Snapshot { seq: 2, ..unsynced }))
+        .unwrap();
+    runner.runner_hears_nothing(Duration::from_millis(300));
+    // Synchronized: asked again, and only then.
+    ap1.send(&AgentMsg::Key(running_config(3, installed)))
+        .unwrap();
+    assert_eq!(runner.expect_runner(), repush);
+    ap1.send(&AgentMsg::Key(running_config(4, installed)))
+        .unwrap();
+    runner.runner_hears_nothing(Duration::from_millis(300));
+}
+
+/// A rollout the runner never says it took on (lost with the session it was
+/// sent on) is closed as not started once `Timing::start` is up, which
+/// raises the failure alert and frees the next upgrade; one it took on is
+/// not. The runner's own word on one closed so, which it took on late,
+/// stands over the controller's.
+#[test]
+fn a_rollout_the_runner_never_takes_on_is_closed() {
+    let dir = TempDir::new("unstarted");
+    let timing = Timing {
+        start: Duration::from_millis(400),
+        ..Timing::default()
+    };
+    let r = controller_in(timing, &dir.0);
+    let admin = format!("{SAME_SITE}{ADMIN}");
+    let upgrade = "/api/aps/ap1/upgrade";
+    let mut runner = Agent::runner(r.c.agents);
+    wait_for("the runner", || r.c.state.read().runner.is_up());
+    let mut ap1 = Agent::running(r.c.agents, KEY_AP1, "ap1", "image: img-old\n");
+    let s = snapshot(1, vec![bss("wlan5", "Guest")], vec![station(MAC, 0, -54)]);
+    ap1.send(&AgentMsg::Key(s)).unwrap();
+    ap1.expect_sync();
+
+    let (status, v) = post(r.c.http, upgrade, &admin, r#"{"image_id": "img-a"}"#);
+    assert_eq!(status, 202, "{v}");
+    let lost = v["id"].as_u64().unwrap();
+    assert!(matches!(runner.expect_runner(), RunnerCtlMsg::Rollout(_)));
+    let outcome = |id: u64| json_get(r.c.http, "/api/rollouts")[id.to_string()]["result"].clone();
+    wait_for("closed as not started", || {
+        outcome(lost)["outcome"] == "not_started"
+    });
+    assert_eq!(
+        outcome(lost)["detail"],
+        "the runner did not take it on in 400ms"
+    );
+    assert!(
+        metrics_of(&r, "wifi_rollouts_total")
+            .contains(&"wifi_rollouts_total{outcome=\"not_started\"} 1".to_owned())
+    );
+    assert_eq!(
+        metrics_of(&r, "wifi_rollout_last_failure_timestamp_seconds").len(),
+        1
+    );
+
+    // Taken on at once: still open past the wait.
+    let (status, v) = post(r.c.http, upgrade, &admin, r#"{"image_id": "img-b"}"#);
+    assert_eq!(status, 202, "{v}");
+    let taken = v["id"].as_u64().unwrap();
+    assert!(matches!(runner.expect_runner(), RunnerCtlMsg::Rollout(_)));
+    runner
+        .send_any(&RunnerMsg::RolloutStarted { id: taken })
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(900));
+    assert_eq!(outcome(taken), Value::Null);
+
+    // The first came after all, and was refused: the runner's word stands.
+    runner
+        .send_any(&RunnerMsg::RolloutResult(RolloutResult {
+            id: lost,
+            outcome: RolloutOutcome::Refused,
+            detail: "the rollout of img-b to ap1 is not over".into(),
+        }))
+        .unwrap();
+    assert_eq!(
+        runner.expect_runner(),
+        RunnerCtlMsg::RolloutAck { id: lost }
+    );
+    assert_eq!(outcome(lost)["outcome"], "refused");
+}
+
+/// A result for a rollout this controller does not hold (its policy file
+/// was lost) is acknowledged only once it is kept as the orphan, with its
+/// time for the alert, and recorded; it outlives a restart.
+#[test]
+fn a_result_for_an_unknown_rollout_is_kept_and_raised() {
+    let dir = TempDir::new("orphan");
+    let r = controller_in(Timing::default(), &dir.0);
+    let mut runner = Agent::runner(r.c.agents);
+    runner
+        .send_any(&RunnerMsg::RolloutResult(RolloutResult {
+            id: 41,
+            outcome: RolloutOutcome::RolledBack,
+            detail: "img-a staged again".into(),
+        }))
+        .unwrap();
+    assert_eq!(runner.expect_runner(), RunnerCtlMsg::RolloutAck { id: 41 });
+    let events = http_get(r.c.http, "/api/events");
+    assert!(
+        events.contains(
+            "rollout 41, which this controller does not hold: rolled back: img-a staged again"
+        ),
+        "{events}"
+    );
+    for metric in [
+        "wifi_rollout_orphan_result_timestamp_seconds",
+        "wifi_rollout_last_failure_timestamp_seconds",
+    ] {
+        assert_eq!(metrics_of(&r, metric).len(), 1, "{metric}");
+    }
+    drop(runner);
+    drop(r);
+    let again = controller_in(Timing::default(), &dir.0);
+    assert_eq!(
+        metrics_of(&again, "wifi_rollout_orphan_result_timestamp_seconds").len(),
+        1
+    );
+}
+
+/// The state files the runner set aside are recorded once, though it tells
+/// them at each session, and counted while it tells them.
+#[test]
+fn the_runners_discarded_state_is_recorded_once() {
+    let r = controller(Timing::default());
+    let discarded = RunnerMsg::StateDiscarded {
+        file: "rollout.corrupt-1700000000000".into(),
+        detail: "not of format 1".into(),
+        at_ms: 1_700_000_000_000,
+    };
+    let count = || metrics_of(&r, "wifi_runner_state_discarded_files");
+    let mut runner = Agent::runner(r.c.agents);
+    runner.send_any(&discarded).unwrap();
+    wait_for("told", || {
+        count() == ["wifi_runner_state_discarded_files 1"]
+    });
+    drop(runner);
+    let mut runner = Agent::runner(r.c.agents);
+    runner.send_any(&discarded).unwrap();
+    wait_for("told again", || {
+        let s = r.c.state.read();
+        s.runner.is_up() && s.runner.discarded.len() == 1
+    });
+    let events = http_get(r.c.http, "/api/events");
+    let told = "its state file rollout.corrupt-1700000000000 could not be read";
+    assert_eq!(events.matches(told).count(), 1, "{events}");
+    // A session that tells none: the file was dealt with.
+    drop(runner);
+    let _runner = Agent::runner(r.c.agents);
+    wait_for("none", || {
+        count() == ["wifi_runner_state_discarded_files 0"]
+    });
 }

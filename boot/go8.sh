@@ -30,7 +30,7 @@ stage() { # <name> <file>: rewrite the chunks that differ, verify, map the exten
 	local n=$1 f=$2 size chunks i s len written=0 ino
 	size=$(stat -c %s "$f"); chunks=$(((size + CHUNK - 1) / CHUNK))
 	cp "$f" "$work/$n"; truncate -s $((chunks * CHUNK)) "$work/$n"
-	mapfile -t want < <(python3 -c 'import hashlib, sys
+	mapfile -t want < <(python3 -I -c 'import hashlib, sys
 d = open(sys.argv[1], "rb").read(); c = int(sys.argv[2])
 for o in range(0, len(d), c): print(hashlib.sha256(d[o:o + c]).hexdigest())' "$work/$n" $CHUNK)
 	ap -n "mkdir -p $STAGE"
@@ -50,13 +50,13 @@ for o in range(0, len(d), c): print(hashlib.sha256(d[o:o + c]).hexdigest())' "$w
 	mapfile -t have < <(staged_hashes "$n" "$chunks")
 	[ "${want[*]}" = "${have[*]}" ] || { echo "$n: verify failed"; exit 1; }
 	ino=$(ap -n "ls -i $STAGE/$n" | awk '{print $1}')
-	T=300 python3 "$here/ext4map.py" "$ino" "${STOCK_SSH[@]}" -n "$U6E_STOCK" > "$work/map_$n"
+	T=300 python3 -I "$here/ext4map.py" "$ino" "${STOCK_SSH[@]}" -n "$U6E_STOCK" > "$work/map_$n"
 	echo "$n: $((written * CHUNK / 1024)) of $((chunks * CHUNK / 1024)) KiB written, $(grep -c ^EXT "$work/map_$n") extent(s)"
 }
 stage u6e.zimg "$1"; stage u6e.dtb "$2"; stage u6e.initrd "$3"
 [ -n "${4:-}" ] && stage u6e.k64 "$4"
 
-python3 - "$work" "$1" "$2" "$3" "${4:-}" "$ZIMG_ADDR" "$DTB_ADDR" "$INITRD_ADDR" "$KERNEL64_ADDR" "$CRC_SCRATCH" <<'PY'
+python3 -I - "$work" "$1" "$2" "$3" "${4:-}" "$ZIMG_ADDR" "$DTB_ADDR" "$INITRD_ADDR" "$KERNEL64_ADDR" "$CRC_SCRATCH" <<'PY'
 import os, sys, zlib
 work, zimg, dtb, initrd, k64 = sys.argv[1:6]
 za, da, ia, ka, scratch = (int(x, 16) for x in sys.argv[6:11])

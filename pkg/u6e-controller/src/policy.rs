@@ -8,7 +8,8 @@
 //! gate's verdict and result, so a restart neither loses one nor numbers a new
 //! one as an old one: the gates of those not over go on, the runner's result,
 //! which it sends until it is acknowledged, finds them, and a failed one's
-//! time still raises its alert.
+//! time still raises its alert. So does the last result the runner sent for
+//! a rollout this controller did not hold (`orphan`).
 //!
 //! A save writes the whole file beside the old one, syncs it, renames it over
 //! the old one and syncs the directory: a crash at any point leaves either the
@@ -47,6 +48,9 @@ pub struct Policy {
     pub rollouts: Vec<SavedRollout>,
     /// The id the last rollout was given.
     pub next_rollout: u64,
+    /// The last result for a rollout not held here: its id, outcome (as the
+    /// metrics name it), what the runner said, and when it came.
+    pub orphan: Option<(u64, String, String, SystemTime)>,
 }
 
 /// A rollout as it outlives the controller.
@@ -58,6 +62,8 @@ pub struct SavedRollout {
     pub previous: String,
     pub user: String,
     pub at: SystemTime,
+    /// The runner said it took it on.
+    pub started: bool,
     /// The radios up on the AP and the site's clients when it was asked.
     pub radios: usize,
     pub clients: usize,
@@ -80,6 +86,18 @@ struct PolicyFile {
     rollouts: Vec<RolloutFile>,
     #[serde(default, skip_serializing_if = "is_zero")]
     next_rollout: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    orphan: Option<OrphanFile>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OrphanFile {
+    id: u64,
+    outcome: String,
+    detail: String,
+    /// Milliseconds since the Unix epoch.
+    at: u64,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -96,6 +114,8 @@ struct RolloutFile {
     user: String,
     /// Milliseconds since the Unix epoch.
     at: u64,
+    #[serde(default)]
+    started: bool,
     radios: usize,
     clients: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -192,6 +212,7 @@ pub fn load(path: &Path) -> io::Result<Policy> {
         previous: r.previous,
         user: r.user,
         at: time(r.at),
+        started: r.started,
         radios: r.radios,
         clients: r.clients,
         gate: r.gate.map(|g| (g.healthy, g.detail)),
@@ -202,6 +223,7 @@ pub fn load(path: &Path) -> io::Result<Policy> {
         configs,
         rollouts: rollouts.collect(),
         next_rollout: file.next_rollout,
+        orphan: file.orphan.map(|o| (o.id, o.outcome, o.detail, time(o.at))),
     })
 }
 
@@ -233,6 +255,7 @@ fn write_temp(path: &Path, policy: &Policy) -> io::Result<PathBuf> {
         previous: r.previous.clone(),
         user: r.user.clone(),
         at: millis(r.at),
+        started: r.started,
         radios: r.radios,
         clients: r.clients,
         gate: r
@@ -250,6 +273,15 @@ fn write_temp(path: &Path, policy: &Policy) -> io::Result<PathBuf> {
         configs: configs.collect(),
         rollouts: rollouts.collect(),
         next_rollout: policy.next_rollout,
+        orphan: policy
+            .orphan
+            .clone()
+            .map(|(id, outcome, detail, at)| OrphanFile {
+                id,
+                outcome,
+                detail,
+                at: millis(at),
+            }),
     };
     let mut body = serde_json::to_vec_pretty(&file).map_err(io::Error::other)?;
     body.push(b'\n');
@@ -310,12 +342,14 @@ mod tests {
             previous: "20261024-120000-abc-def-ap1".into(),
             user: "admin".into(),
             at: UNIX_EPOCH + Duration::from_millis(1_792_929_600_123),
+            started: true,
             radios: 3,
             clients: 9,
             gate: Some((true, "back".into())),
             result: Some(("done".into(), "back".into(), time(1_792_929_700_000))),
         });
         p.next_rollout = 7;
+        p.orphan = Some((5, "failed".into(), "gone".into(), time(1_792_929_800_000)));
         save(&path, &p).unwrap();
         assert_eq!(load(&path).unwrap(), p);
         let text = fs::read_to_string(&path).unwrap();
@@ -332,12 +366,14 @@ mod tests {
                     "previous": "20261024-120000-abc-def-ap1",
                     "user": "admin",
                     "at": 1_792_929_600_123u64,
+                    "started": true,
                     "radios": 3,
                     "clients": 9,
                     "gate": {"healthy": true, "detail": "back"},
                     "result": {"outcome": "done", "detail": "back", "at": 1_792_929_700_000u64},
                 }],
                 "next_rollout": 7,
+                "orphan": {"id": 5, "outcome": "failed", "detail": "gone", "at": 1_792_929_800_000u64},
             })
         );
         save(&path, &Policy::default()).unwrap();

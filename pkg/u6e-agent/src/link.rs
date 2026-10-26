@@ -780,6 +780,7 @@ mod tests {
             bsss: Vec::new(),
             stations: Vec::new(),
             config_sha256: None,
+            clock_synced: true,
         }
     }
 

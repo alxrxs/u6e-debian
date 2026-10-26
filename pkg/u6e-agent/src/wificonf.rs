@@ -41,7 +41,7 @@ const CTRL_GROUP: &str = "u6e-agent";
 const FILES: &str = "/run/hostapd-u6e/";
 /// Where systemd-timesyncd marks the clock synchronized: until it is, the
 /// clock may still be at the image's build date (the AP has no RTC).
-const SYNCHRONIZED: &str = "/run/systemd/timesync/synchronized";
+pub const SYNCHRONIZED: &str = "/run/systemd/timesync/synchronized";
 const TEXT_MAX: usize = 64 << 10;
 
 /// BSS settings hostapd reads from its configuration at each use, so a `SET`
