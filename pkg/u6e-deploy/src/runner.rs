@@ -120,6 +120,8 @@ pub(crate) struct Current {
     pub id: u64,
     pub ap: String,
     pub image_id: String,
+    /// What a failed gate rolls the AP back to.
+    pub previous: String,
     /// The controller's gate verdict, once it came: healthy, and what it saw.
     pub gate: watch::Sender<Option<(bool, String)>>,
     /// The local caller following it, when one asked for it.
@@ -277,6 +279,19 @@ impl Runner {
             Err(e) => eprintln!("u6e-deploy: {}: {e}", self.config.state.display()),
         }
         said
+    }
+
+    /// The kept images the runner needs, sorted: the one staged last on each
+    /// AP (its way back), and both of a rollout under way.
+    pub fn images(&self) -> Vec<String> {
+        let inner = self.lock();
+        let mut ids: Vec<String> = inner.images.values().cloned().collect();
+        if let Some(r) = &inner.rollout {
+            ids.extend([r.image_id.clone(), r.previous.clone()]);
+        }
+        ids.sort();
+        ids.dedup();
+        ids
     }
 
     /// The site's own deploy staged `image` on `ap` (a root caller's word,
@@ -580,6 +595,7 @@ impl Runner {
             id: flight.id,
             ap: flight.ap.clone(),
             image_id: flight.image_id.clone(),
+            previous: flight.previous.clone(),
             gate,
             follower,
         });

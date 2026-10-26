@@ -132,6 +132,9 @@ struct Site {
     runner_rt: Option<Runtime>,
     socket: PathBuf,
     gate: Duration,
+    /// The connections of the helpers serving now, by number, which a test
+    /// may cut as if each helper were stopped.
+    helpers: Arc<Mutex<Vec<(u32, std::os::unix::net::UnixStream)>>>,
 }
 
 impl Site {
@@ -146,6 +149,7 @@ impl Site {
             controller_rt: Some(rt),
             runner_rt: None,
             gate,
+            helpers: Arc::new(Mutex::new(Vec::new())),
         };
         fs::create_dir_all(site.dir.0.join("images")).unwrap();
         for id in KEPT {
@@ -159,10 +163,17 @@ impl Site {
         // SAFETY: getegid has no preconditions.
         let gid = unsafe { libc::getegid() };
         let served = Arc::new(config.clone());
+        let helpers = Arc::clone(&site.helpers);
         thread::spawn(move || {
-            for conn in helper.incoming() {
-                let served = Arc::clone(&served);
-                thread::spawn(move || stage::serve_peer(&served, conn.unwrap(), gid));
+            for (n, conn) in (0..).zip(helper.incoming()) {
+                let conn = conn.unwrap();
+                helpers.lock().unwrap().push((n, conn.try_clone().unwrap()));
+                let (served, helpers) = (Arc::clone(&served), Arc::clone(&helpers));
+                thread::spawn(move || {
+                    let _ = stage::serve_peer(&served, conn, gid);
+                    // Its copy goes too, or the caller never sees the end.
+                    helpers.lock().unwrap().retain(|(m, _)| *m != n);
+                });
             }
         });
         let rt = runtime();
@@ -245,6 +256,21 @@ impl Site {
             }
         };
         self.controller_rt = Some(rt);
+    }
+
+    /// Cuts every helper's connection, as if each helper were stopped (by
+    /// its unit's bound, say): a hold's helper lets the lock go.
+    fn cut_helpers(&self) {
+        for (_, conn) in self.helpers.lock().unwrap().iter() {
+            let _ = conn.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    /// The rollout under way's log has a line starting with `start`.
+    fn logged(&self, start: &str) -> bool {
+        let state = self.controller.state.read();
+        let r = state.rollouts.back();
+        r.is_some_and(|r| r.log.iter().any(|l| l.starts_with(start)))
     }
 
     /// What the staging script was asked, in order: `<ap> <image>` lines.
@@ -1296,5 +1322,58 @@ fn a_rollout_that_cannot_take_its_lock_back_fails_at_once() {
     );
     assert_eq!(site.staged(), ["ap1 img-2-ap1"]);
     drop(taken);
+    assert!(asked.join().unwrap().is_err());
+}
+
+/// A helper that lets the lock go during the gate (stopped by its unit's
+/// bound, say) is noticed at once: the runner takes the lock again and the
+/// gate goes on, so another staging stays out all along.
+#[test]
+fn a_lock_let_go_during_the_gate_is_taken_again() {
+    let site = Site::new("let-go", Duration::from_secs(30));
+    wait_for("the runner", || site.runner_up());
+    let ap1 = fake_ap(&site, KEY_AP1, "u6e-ap1", "img-1-ap1", 1, image_config(1));
+    wait_for("ap1", || up(&site, "ap1"));
+    let images = site.dir.0.join("images");
+    let asked = roll_out(&site, "ap1", "img-2-ap1");
+    wait_for("the gate awaited", || site.logged("staged; waiting"));
+    site.cut_helpers();
+    wait_for("the lock taken again", || {
+        site.logged("the kept images' lock went")
+    });
+    wait_for("held again", || stage::lock(&images).unwrap().is_none());
+    drop(ap1);
+    let _ap1 = fake_ap(&site, KEY_AP1, "u6e-ap1", "img-2-ap1", 2, image_config(2));
+    let done = asked.join().unwrap().unwrap();
+    assert!(done.starts_with("done: back with img-2-ap1"), "{done}");
+    assert_eq!(site.staged(), ["ap1 img-2-ap1"]);
+}
+
+/// A runner restarted during the gate waits a moment for the lock, which
+/// another held briefly, and goes on with the gate once it has it.
+#[test]
+fn a_lock_held_a_moment_at_resume_is_waited_for() {
+    let mut site = Site::new("retake", Duration::from_secs(30));
+    wait_for("the runner", || site.runner_up());
+    let ap1 = fake_ap(&site, KEY_AP1, "u6e-ap1", "img-1-ap1", 1, image_config(1));
+    wait_for("ap1", || up(&site, "ap1"));
+    let images = site.dir.0.join("images");
+    let asked = roll_out(&site, "ap1", "img-2-ap1");
+    wait_for("the gate awaited", || site.logged("staged; waiting"));
+    site.stop_runner();
+    let mut taken = None;
+    wait_for("the lock taken by another", || {
+        taken = stage::lock(&images).unwrap();
+        taken.is_some()
+    });
+    site.start_runner_again();
+    thread::sleep(Duration::from_millis(1500));
+    drop(taken);
+    wait_for("held again", || stage::lock(&images).unwrap().is_none());
+    drop(ap1);
+    let _ap1 = fake_ap(&site, KEY_AP1, "u6e-ap1", "img-2-ap1", 2, image_config(2));
+    wait_for("the result counted", || ended(&site, "done") == Some(1));
+    assert_eq!(ended(&site, "failed"), None);
+    assert_eq!(site.staged(), ["ap1 img-2-ap1"]);
     assert!(asked.join().unwrap().is_err());
 }

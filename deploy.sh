@@ -17,9 +17,10 @@
 # inputs (stamps/ap-<ap>) gets its image of the current inputs (ap-image.sh:
 # the one an earlier run kept under images/, else a new one from
 # prep-rootfs.sh), boots it (boot/stage.sh) and must bring its radios up by
-# itself; FORCE=1 boots it even on an AP that already runs it. Sources and
-# trees are built as the checkout's owner, the packages and images as root.
-# Logs go to log/.
+# itself; FORCE=1 boots it even on an AP that already runs it. Last, the kept
+# images no AP and no rollback needs go (ap-image.sh's prune_images). Sources
+# and trees are built as the checkout's owner, the packages and images as
+# root. Nothing runs with less than MIN_FREE_GIB free. Logs go to log/.
 set -uo pipefail
 cd "$(dirname "$0")" || exit 1
 . ./site.conf
@@ -28,6 +29,11 @@ cd "$(dirname "$0")" || exit 1
 L=$PWD/log
 mkdir -p "$L"
 fail() { echo "$*" >&2; exit 1; }
+# A build needs room: with less than MIN_FREE_GIB (site.conf, default 15)
+# free on this tree's filesystem, nothing is built.
+free=$(df -B1G --output=avail . | tail -1 | tr -d ' ')
+[ "$free" -ge "${MIN_FREE_GIB:-15}" ] ||
+	fail "only $free GiB free on $(df --output=target . | tail -1 | tr -d ' '), less than the ${MIN_FREE_GIB:-15} GiB a build may take; free some first (python3 -I prune-images.py images --dry-run lists the kept images the retention rule would remove)"
 as_owner() { sudo -u "$(stat -c %U .)" "$@"; }
 head_of() { git -c safe.directory='*' -C "$1" rev-parse "${2:-HEAD}"; }
 # step <name> <inputs> <command>...: run the command unless stamps/<name>
@@ -133,3 +139,5 @@ for ap in "$@"; do
 	export U6E_AP=$ap
 	boot_ap "$ap" "$image"
 done
+# Only once every AP went through: the images no one needs go.
+prune_images

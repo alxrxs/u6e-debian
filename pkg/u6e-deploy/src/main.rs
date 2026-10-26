@@ -5,6 +5,7 @@
 //!   u6e-deploy apply <ap> [--config <path>]       < <u6e-wifi script>
 //!   u6e-deploy rollout <ap> <image> [--config <path>]
 //!   u6e-deploy staged <ap> <image> [--config <path>]
+//!   u6e-deploy images [--config <path>]
 //!   u6e-deploy --stage-helper [--config <path>]
 //!
 //! Without a command it is the runner, until stopped. `apply` reads the
@@ -14,7 +15,9 @@
 //! kept image out to the AP, printing its log, and exits 0 only when the AP
 //! passed the health gate. `staged`, root's alone, tells the runner that the
 //! site's own deploy (`deploy.sh`) staged a kept image on the AP, the one a
-//! failed gate rolls it back to from then on. `--stage-helper` is the root
+//! failed gate rolls it back to from then on. `images` prints the kept
+//! images the runner needs, one a line, which the site's deploy keeps when
+//! it prunes the others (`prune-images.py`). `--stage-helper` is the root
 //! helper, answering the connection systemd passes it (see `stage`). The
 //! default configuration is /etc/u6e-deploy/config.toml.
 
@@ -35,7 +38,7 @@ use u6e_proto::tls::Identity;
 const DEFAULT_CONFIG: &str = "/etc/u6e-deploy/config.toml";
 
 const USAGE: &str = "usage: u6e-deploy [apply <ap> | rollout <ap> <image> | staged <ap> <image> \
-                     | --stage-helper] [--config <path>]";
+                     | images | --stage-helper] [--config <path>]";
 
 /// The command and its operands, and the configuration's path.
 fn args() -> Option<(Vec<String>, String)> {
@@ -71,7 +74,7 @@ fn main() -> ExitCode {
     let words: Vec<&str> = words.iter().map(String::as_str).collect();
     if !matches!(
         words.as_slice(),
-        [] | ["apply", _] | ["rollout", _, _] | ["staged", _, _] | ["--stage-helper"]
+        [] | ["apply", _] | ["rollout", _, _] | ["staged", _, _] | ["images"] | ["--stage-helper"]
     ) {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
@@ -80,6 +83,7 @@ fn main() -> ExitCode {
         ["apply", ap] => apply(&config, ap),
         ["rollout", ap, image] => rollout(&config, ap, image),
         ["staged", ap, image] => staged(&config, ap, image),
+        ["images"] => images(&config),
         ["--stage-helper"] => stage_helper(config),
         _ => run(config),
     });
@@ -150,6 +154,15 @@ fn staged(config: &Config, ap: &str, image: &str) -> Result<(), String> {
     let rt = runtime().map_err(|e| format!("runtime: {e}"))?;
     let done = rt.block_on(local::staged(&config.socket, ap, image))?;
     println!("{done}");
+    Ok(())
+}
+
+/// Prints the kept images the runner needs, one a line.
+fn images(config: &Config) -> Result<(), String> {
+    let rt = runtime().map_err(|e| format!("runtime: {e}"))?;
+    for id in rt.block_on(local::images(&config.socket))? {
+        println!("{id}");
+    }
     Ok(())
 }
 

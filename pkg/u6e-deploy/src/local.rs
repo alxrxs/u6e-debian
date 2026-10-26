@@ -1,10 +1,11 @@
 //! The runner's local socket: what its local callers (the site's
 //! configuration play, an operator's shell, the site's image deploy) may
-//! ask, which is exactly three things: apply a rendered Wi-Fi configuration
-//! to an AP, roll a kept image out to one, and, root alone, record a kept
-//! image the site's own deploy staged on one. Only root and processes of the
-//! runner's group are served. A connection carries one request; the runner
-//! answers with lines as the work goes and a last word.
+//! ask, which is exactly four things: apply a rendered Wi-Fi configuration
+//! to an AP, roll a kept image out to one, name the kept images it needs
+//! (for the site's deploy, which prunes the others), and, root alone, record
+//! a kept image the site's own deploy staged on one. Only root and processes
+//! of the runner's group are served. A connection carries one request; the
+//! runner answers with lines as the work goes and a last word.
 
 use std::fs;
 use std::io;
@@ -35,6 +36,9 @@ pub enum Request {
     Rollout { ap: String, image_id: String },
     /// The site's deploy staged the kept image on the AP; root's alone.
     Staged { ap: String, image_id: String },
+    /// The kept images the runner needs: what it staged on each AP, and the
+    /// two of a rollout under way. One `Line` each, then `Done`.
+    Images,
 }
 
 /// What the runner answers, in order.
@@ -137,6 +141,23 @@ pub async fn staged(socket: &Path, ap: &str, image_id: &str) -> Result<String, S
     }
 }
 
+/// The kept images the runner on `socket` needs.
+pub async fn images(socket: &Path) -> Result<Vec<String>, String> {
+    let mut conn = ask(socket, &Request::Images)
+        .await
+        .map_err(|e| format!("{}: {e}", socket.display()))?;
+    let mut ids = Vec::new();
+    loop {
+        match frames::read(&mut conn).await {
+            Ok(Reply::Line(id)) => ids.push(id),
+            Ok(Reply::Done { ok: true, .. }) => return Ok(ids),
+            Ok(Reply::Done { ok: false, detail }) => return Err(detail),
+            Ok(other) => return Err(format!("the runner answered {other:?}")),
+            Err(e) => return Err(format!("the runner: {e}")),
+        }
+    }
+}
+
 /// How long an apply's caller waits: past the controller's own wait for the
 /// AP (`Timing::apply`), whose answer then comes first.
 const APPLY_WAIT: Duration = Duration::from_secs(330);
@@ -204,6 +225,18 @@ async fn caller(runner: Arc<Runner>, mut conn: UnixStream, ours: u32) {
                 }
             };
             let _ = frames::write(&mut conn, &reply).await;
+        }
+        Request::Images => {
+            for id in runner.images() {
+                if frames::write(&mut conn, &Reply::Line(id)).await.is_err() {
+                    return;
+                }
+            }
+            let last = Reply::Done {
+                ok: true,
+                detail: String::new(),
+            };
+            let _ = frames::write(&mut conn, &last).await;
         }
         Request::Rollout { ap, image_id } => {
             let (tx, mut rx) = mpsc::channel(256);

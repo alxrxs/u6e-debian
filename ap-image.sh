@@ -84,6 +84,7 @@ boot_ap() {
 		return 0
 	fi
 	boot/stage.sh "$IMAGE" || fail "$ap: did not boot $IMAGE"
+	echo "${IMAGE##*/}" > "stamps/running-$ap"
 	if declare -F runner_staged > /dev/null; then
 		runner_staged "$ap" "${IMAGE##*/}" ||
 			fail "$ap: booted $IMAGE, but the deploy runner was not told; run again"
@@ -97,4 +98,35 @@ boot_ap() {
 	[ "$up" = 3 ] || fail "$ap: Wi-Fi did not come up"
 	echo "$key" > "stamps/ap-$ap"
 	echo "$ap: Wi-Fi up on all three radios"
+}
+
+# prune_images: remove the kept images nothing needs (prune-images.py). Kept
+# are each AP's running image (stamps/running-<ap>, which boot_ap writes as
+# it stages one), its image of the current inputs (stamps/built-<ap>), the
+# images the deploy runner needs (site.conf's runner_images: what it staged
+# on each AP, both of a rollout under way), and the newest KEEP_IMAGES
+# (default 3) of each AP. Nothing is pruned while an AP's running image is
+# not known, or the runner does not say which it needs.
+prune_images() {
+	local keep=() aps ap built ids id
+	read -ra aps <<< "$U6E_APS"
+	for ap in "${aps[@]}"; do
+		built=$(cat "stamps/built-$ap" 2> /dev/null) && keep+=(--keep "${built##*/}")
+		if [ -s "stamps/running-$ap" ]; then
+			keep+=(--keep "$(cat "stamps/running-$ap")")
+		elif [ -e "stamps/ap-$ap" ] && [ "$(cat "stamps/ap-$ap")" != "${built%% *}" ]; then
+			echo "images: what $ap runs is not known (no stamps/running-$ap); none pruned"
+			return 0
+		fi
+	done
+	if declare -F runner_images > /dev/null; then
+		ids=$(runner_images) || {
+			echo "images: the deploy runner did not say which images it needs; none pruned"
+			return 0
+		}
+		for id in $ids; do
+			keep+=(--keep "$id")
+		done
+	fi
+	python3 -I ./prune-images.py images --newest "${KEEP_IMAGES:-3}" "${keep[@]}"
 }
