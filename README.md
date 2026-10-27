@@ -91,7 +91,7 @@ Wi-Fi starts by itself on every boot (`u6e-wifi.service`), with nothing else on 
 - Optional 6 GHz Multiple BSSID: all 6 GHz networks share one beacon.
 
 **Roaming and client help**
-- Fast roaming between radios and access points (802.11r).
+- Fast roaming between radios and access points (802.11r). The access point a client leaves drops it as soon as the other one's Layer 2 Update frame for it arrives over the wire, unless the client still transmits to it within two seconds (our hostapd patch `pkg/hostapd/roam-prune.patch`, `prune_roamed_sta`). Otherwise a client that still acknowledges some frames on the old channel, as Apple devices visiting it for AWDL do, stays associated there, and the NSS keeps sending that access point's traffic for it into the air (a HomePod stereo pair's second speaker is silent while its partner's audio for it goes there).
 - Roaming advice for clients (802.11k and 802.11v). The access points send each other lists of their networks every 10 seconds (`u6e-agent`, a single small process that changes hostapd's lists only when they differ), so clients are told about the others.
 - Optimized Connectivity (OCE), Agile Multiband (MBO) and Wi-Fi QoS Management, which help clients pick the best band and mark their traffic correctly.
 - Beacon protection on 5 GHz and 6 GHz, which stops forged beacons.
