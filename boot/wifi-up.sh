@@ -55,6 +55,7 @@ bss_transition=1
 wnm_sleep_mode=1
 multicast_to_unicast=1
 bridge_hairpin=1
+prune_roamed_sta=1
 wpa_deny_ptk0_rekey=2
 bss_load_update_period=50
 esp=1
@@ -76,6 +77,10 @@ qos_map_set=8,1,18,3,20,3,22,3,24,4,26,4,28,4,30,4,32,4,34,4,36,4,38,4,40,5,44,6
 # proxy_arp: it needs ap_isolate. No wpa_strict_rekey: a group rekey on every
 # departure (dozens an hour) has to wake every client, and sleeping phones
 # that miss hostapd's ~3.5 s of retries are disconnected.
+# prune_roamed_sta (pkg/hostapd/roam-prune.patch): a client that roamed to
+# the other AP is dropped here when that AP's Layer 2 Update frame arrives;
+# otherwise one that still ACKs some frames on this channel (Apple devices
+# on AWDL) stays a ghost the NSS forwards its BSS neighbours' traffic to.
 # wpa_deny_ptk0_rekey=2: never rekey a client's pairwise key in place (the
 # driver can't replace it safely: traffic stops until the client is dropped);
 # a client asking for one is disconnected and reconnects instead.

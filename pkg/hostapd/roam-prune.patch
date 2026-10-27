@@ -1,0 +1,464 @@
+From b99bce1c20872c92d0a3a3b1e60bdcbca0a97727 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Tue, 27 Oct 2026 21:51:46 +0200
+Subject: [PATCH] AP: Remove a STA that associated with another AP of the ESS
+
+A STA that reassociates to another AP of the ESS does not tell the AP it
+leaves (with FT, it never talks to it again), and that AP keeps it
+associated until the inactivity timer or excessive missing ACKs remove
+it. Neither happens while the STA still acknowledges some of the frames
+sent to it on the old AP's channel, as a STA that visits the channel for
+peer-to-peer links does: the AP keeps transmitting to it what is
+addressed to it, its other STAs' frames and group frames sent as
+unicast, every success resets the inactivity, and the failures never run
+long enough for a kickout. The frames are lost, for as long as anything
+is addressed to the STA. Seen with HomePods of a stereo pair, which
+visit the old AP's channel for AWDL: one speaker's audio went to its
+partner's stale association on the old AP.
+
+The new AP's kernel sends a Layer 2 Update frame for each association
+(cfg80211_send_layer2_update()), so that bridges and switches learn
+where the STA is; the old AP receives it from the distribution system.
+Add prune_roamed_sta: on a Layer 2 Update frame received on a wired
+bridge port for one of its associated STAs, the AP removes the STA
+unless it receives a frame from it within two seconds, which a STA that
+left does not send and one still here does. A forged frame therefore
+cannot remove an active STA; an idle one reassociates when it next
+transmits. The STA is not sent a Deauthentication frame.
+
+The frame is read on an ETH_P_ALL packet socket that ignores outgoing
+frames, with a filter that passes only the Layer 2 Update frame: a
+socket for one protocol gets a frame received on a bridge port only as
+received on the bridge, once the bridge has consumed it on the port.
+
+Tested with mac80211_hwsim: two APs on different channels whose bridges
+are joined by a veth pair and a STA roaming between them. The old AP
+removes the STA two seconds after it roams and keeps it with the option
+off; the new AP ignores its own frame; a forged frame for an active STA
+is refused, and one for an idle STA removes it until it reassociates.
+
+Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
+---
+ hostapd/Makefile      |   5 ++
+ hostapd/config_file.c |   2 +
+ hostapd/defconfig     |   4 +
+ hostapd/hostapd.conf  |   9 ++
+ src/ap/ap_config.h    |   1 +
+ src/ap/hostapd.c      |   9 ++
+ src/ap/hostapd.h      |   1 +
+ src/ap/roam_prune.c   | 197 ++++++++++++++++++++++++++++++++++++++++++
+ src/ap/roam_prune.h   |  35 ++++++++
+ src/ap/sta_info.c     |   2 +
+ src/ap/sta_info.h     |   1 +
+ 11 files changed, 266 insertions(+)
+ create mode 100644 src/ap/roam_prune.c
+ create mode 100644 src/ap/roam_prune.h
+
+diff --git a/hostapd/Makefile b/hostapd/Makefile
+index 1ecafdc..9c06e0f 100644
+--- a/hostapd/Makefile
++++ b/hostapd/Makefile
+@@ -1302,6 +1302,11 @@ OBJS += ../src/common/gas.o
+ OBJS += ../src/ap/gas_serv.o
+ endif
+ 
++ifdef CONFIG_ROAM_PRUNE
++CFLAGS += -DCONFIG_ROAM_PRUNE
++OBJS += ../src/ap/roam_prune.o
++endif
++
+ ifdef CONFIG_PROXYARP
+ CFLAGS += -DCONFIG_PROXYARP
+ OBJS += ../src/ap/x_snoop.o
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index f386deb..e9b704e 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -4220,6 +4220,8 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ #endif /* CONFIG_P2P_MANAGER */
+ 	} else if (os_strcmp(buf, "disassoc_low_ack") == 0) {
+ 		bss->disassoc_low_ack = atoi(pos);
++	} else if (os_strcmp(buf, "prune_roamed_sta") == 0) {
++		bss->prune_roamed_sta = atoi(pos);
+ 	} else if (os_strcmp(buf, "tdls_prohibit") == 0) {
+ 		if (atoi(pos))
+ 			bss->tdls |= TDLS_PROHIBIT;
+diff --git a/hostapd/defconfig b/hostapd/defconfig
+index cecfc7c..92fc360 100644
+--- a/hostapd/defconfig
++++ b/hostapd/defconfig
+@@ -356,6 +356,10 @@ CONFIG_IPV6=y
+ #
+ #CONFIG_ACS=y
+ 
++# Removal of STAs that associated with another AP of the ESS, on the Layer 2
++# Update frame that AP sends for them (prune_roamed_sta, Linux only)
++#CONFIG_ROAM_PRUNE=y
++
+ # Multiband Operation support
+ # These extensions facilitate efficient use of multiple frequency bands
+ # available to the AP and the devices that may associate with it.
+diff --git a/hostapd/hostapd.conf b/hostapd/hostapd.conf
+index a004718..bf4e814 100644
+--- a/hostapd/hostapd.conf
++++ b/hostapd/hostapd.conf
+@@ -555,6 +555,15 @@ wmm_ac_vo_acm=0
+ # may not be available with all drivers.
+ #disassoc_low_ack=1
+ 
++# Remove a STA that associated with another AP of the ESS, as the Layer 2
++# Update frame that AP sends for it shows when it arrives from the
++# distribution system (on a wired port of a bridge), unless the STA still
++# transmits here within two seconds. Without it, such a STA stays associated
++# until the inactivity timer or excessive missing ACKs remove it, which a STA
++# that still acknowledges some frames here (one visiting this channel for
++# peer-to-peer links) can postpone indefinitely. Requires CONFIG_ROAM_PRUNE.
++#prune_roamed_sta=0
++
+ # Maximum allowed Listen Interval (how many Beacon periods STAs are allowed to
+ # remain asleep). Default: 65535 (no limit apart from field size)
+ #max_listen_interval=100
+diff --git a/src/ap/ap_config.h b/src/ap/ap_config.h
+index c9152d2..9b18b58 100644
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -572,6 +572,7 @@ struct hostapd_bss_config {
+ #endif /* CONFIG_P2P */
+ 
+ 	int disassoc_low_ack;
++	int prune_roamed_sta;
+ 	int skip_inactivity_poll;
+ 
+ #define TDLS_PROHIBIT BIT(0)
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index a4394f7..7e4f3fd 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -48,6 +48,7 @@
+ #include "bss_load.h"
+ #include "x_snoop.h"
+ #include "dhcp_snoop.h"
++#include "roam_prune.h"
+ #include "ndisc_snoop.h"
+ #include "neighbor_db.h"
+ #include "rrm.h"
+@@ -612,6 +613,7 @@ void hostapd_free_hapd_data(struct hostapd_data *hapd)
+ 	ndisc_snoop_deinit(hapd);
+ 	dhcp_snoop_deinit(hapd);
+ 	x_snoop_deinit(hapd);
++	roam_prune_deinit(hapd);
+ 
+ #ifdef CONFIG_SQLITE
+ 	bin_clear_free(hapd->tmp_eap_user.identity,
+@@ -1811,6 +1813,12 @@ setup_mld:
+ 		return -1;
+ 	}
+ 
++	if (conf->prune_roamed_sta && roam_prune_init(hapd)) {
++		wpa_printf(MSG_ERROR,
++			   "Roamed STA removal initialization failed");
++		return -1;
++	}
++
+ 	if (start_beacon && hostapd_start_beacon(hapd, flush_old_stations) < 0)
+ 		return -1;
+ 
+@@ -3047,6 +3055,7 @@ hostapd_alloc_bss_data(struct hostapd_iface *hapd_iface,
+ 	dl_list_init(&hapd->ctrl_dst);
+ 	dl_list_init(&hapd->nr_db);
+ 	hapd->dhcp_sock = -1;
++	hapd->roam_prune_sock = -1;
+ #ifdef CONFIG_IEEE80211R_AP
+ 	dl_list_init(&hapd->l2_queue);
+ 	dl_list_init(&hapd->l2_oui_queue);
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index 7e67ac7..d9284b0 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -442,6 +442,7 @@ struct hostapd_data {
+ 	unsigned int link_mesr_req_active:1;
+ 
+ 	int dhcp_sock; /* UDP socket used with the DHCP server */
++	int roam_prune_sock; /* Layer 2 Update frames, see roam_prune.c */
+ 
+ 	struct ptksa_cache *ptksa;
+ 
+diff --git a/src/ap/roam_prune.c b/src/ap/roam_prune.c
+new file mode 100644
+index 0000000..442db6f
+--- /dev/null
++++ b/src/ap/roam_prune.c
+@@ -0,0 +1,197 @@
++/*
++ * Removal of STAs that reassociated to another AP of the ESS
++ *
++ * This software may be distributed under the terms of the BSD license.
++ * See README for more details.
++ *
++ * A STA that reassociates to another AP does not tell the AP it leaves, and
++ * that AP keeps it associated until the inactivity timer or excessive
++ * missing ACKs remove it. Neither happens while the STA still acknowledges
++ * some of the frames sent to it on this AP's channel (it visits the channel
++ * for peer-to-peer links, say), and meanwhile this AP keeps sending it what
++ * is addressed to it: its other STAs' frames, group frames sent as unicast.
++ *
++ * The AP that the STA associated with sends a Layer 2 Update frame with the
++ * STA's address as the source, so that bridges and switches learn where the
++ * STA is (IEEE Std 802.11F-2003; the kernel sends it on every association).
++ * Received from the distribution system - on a wired port of a bridge - it
++ * shows that the STA associated elsewhere. The STA is then removed unless it
++ * transmits to this AP within ROAM_PRUNE_CHECK_SEC, which a STA still here
++ * does and one that left does not, so that a forged frame cannot remove an
++ * active STA. The STA is not sent a Deauthentication frame: it is not here.
++ */
++
++#include "utils/includes.h"
++#include <sys/socket.h>
++#include <net/if.h>
++#include <linux/if_packet.h>
++#include <linux/if_ether.h>
++#include <linux/filter.h>
++
++#include "utils/common.h"
++#include "utils/eloop.h"
++#include "common/ieee802_11_defs.h"
++#include "hostapd.h"
++#include "ap_drv_ops.h"
++#include "sta_info.h"
++#include "roam_prune.h"
++
++#define ROAM_PRUNE_CHECK_SEC 2
++
++/*
++ * The Layer 2 Update frame: DA broadcast, an IEEE 802.3 length of 6, and an
++ * LLC XID response (DSAP 0x00, SSAP 0x01, control 0xaf, XID information
++ * 0x81 0x01 0x00). Anything else is dropped in the kernel.
++ */
++static struct sock_filter l2_update_filter[] = {
++	BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 0),
++	BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0xffffffff, 0, 9),
++	BPF_STMT(BPF_LD | BPF_H | BPF_ABS, 4),
++	BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0xffff, 0, 7),
++	BPF_STMT(BPF_LD | BPF_H | BPF_ABS, 12),
++	BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0x0006, 0, 5),
++	BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 14),
++	BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0x0001af81, 0, 3),
++	BPF_STMT(BPF_LD | BPF_H | BPF_ABS, 18),
++	BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0x0100, 0, 1),
++	BPF_STMT(BPF_RET | BPF_K, 20),
++	BPF_STMT(BPF_RET | BPF_K, 0),
++};
++
++
++/* Whether netdev ifname is a bridge port that is not a wireless interface:
++ * a frame received on it comes from the distribution system. */
++static bool from_ds_port(const char *ifname)
++{
++	char path[128];
++
++	os_snprintf(path, sizeof(path), "/sys/class/net/%s/phy80211", ifname);
++	if (access(path, F_OK) == 0)
++		return false;
++	os_snprintf(path, sizeof(path), "/sys/class/net/%s/brport", ifname);
++	return access(path, F_OK) == 0;
++}
++
++
++static int read_rx_packets(struct hostapd_data *hapd, struct sta_info *sta,
++			   unsigned long *rx_packets)
++{
++	struct hostap_sta_driver_data data;
++
++	os_memset(&data, 0, sizeof(data));
++	if (hostapd_drv_read_sta_data(hapd, &data, sta->addr) < 0)
++		return -1;
++	*rx_packets = data.rx_packets;
++	return 0;
++}
++
++
++static void roam_prune_check(void *eloop_ctx, void *timeout_ctx)
++{
++	struct hostapd_data *hapd = eloop_ctx;
++	struct sta_info *sta = timeout_ctx;
++	unsigned long rx_packets;
++
++	if (!(sta->flags & WLAN_STA_ASSOC))
++		return;
++	if (read_rx_packets(hapd, sta, &rx_packets) < 0 ||
++	    rx_packets != sta->roam_prune_rx_packets) {
++		hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
++			       HOSTAPD_LEVEL_INFO,
++			       "Layer 2 Update frame from the distribution system, but the STA is still here; not removed");
++		return;
++	}
++
++	hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
++		       HOSTAPD_LEVEL_INFO,
++		       "associated with another AP of the ESS (Layer 2 Update frame from the distribution system); removed");
++	ap_sta_deauthenticate(hapd, sta, WLAN_REASON_PREV_AUTH_NOT_VALID);
++}
++
++
++static void roam_prune_receive(int sock, void *eloop_ctx, void *sock_ctx)
++{
++	struct hostapd_data *hapd = eloop_ctx;
++	struct sockaddr_ll ll;
++	socklen_t fromlen = sizeof(ll);
++	char ifname[IF_NAMESIZE];
++	u8 buf[20];
++	struct sta_info *sta;
++	ssize_t len;
++
++	len = recvfrom(sock, buf, sizeof(buf), 0, (struct sockaddr *) &ll,
++		       &fromlen);
++	if (len < (ssize_t) sizeof(buf)) {
++		if (len < 0)
++			wpa_printf(MSG_DEBUG, "roam_prune: recvfrom: %s",
++				   strerror(errno));
++		return;
++	}
++	if (!if_indextoname(ll.sll_ifindex, ifname) || !from_ds_port(ifname))
++		return;
++
++	sta = ap_get_sta(hapd, &buf[ETH_ALEN]);
++	if (!sta || !(sta->flags & WLAN_STA_ASSOC) ||
++	    eloop_is_timeout_registered(roam_prune_check, hapd, sta))
++		return;
++	if (read_rx_packets(hapd, sta, &sta->roam_prune_rx_packets) < 0)
++		return;
++
++	wpa_printf(MSG_DEBUG,
++		   "%s: Layer 2 Update frame for STA " MACSTR " on %s",
++		   hapd->conf->iface, MAC2STR(sta->addr), ifname);
++	eloop_register_timeout(ROAM_PRUNE_CHECK_SEC, 0, roam_prune_check,
++			       hapd, sta);
++}
++
++
++int roam_prune_init(struct hostapd_data *hapd)
++{
++	struct sock_fprog prog = {
++		.len = ARRAY_SIZE(l2_update_filter),
++		.filter = l2_update_filter,
++	};
++	int sock, one = 1;
++
++	/* ETH_P_ALL: a socket for one protocol gets a frame received on a
++	 * bridge port only once the bridge passes it up, as received on the
++	 * bridge, and that hides the port. Outgoing frames are not cloned to
++	 * it, and the filter drops all but the Layer 2 Update frame. */
++	sock = socket(PF_PACKET, SOCK_RAW | SOCK_CLOEXEC, htons(ETH_P_ALL));
++	if (sock < 0) {
++		wpa_printf(MSG_ERROR, "roam_prune: socket: %s",
++			   strerror(errno));
++		return -1;
++	}
++	if (setsockopt(sock, SOL_SOCKET, SO_ATTACH_FILTER, &prog,
++		       sizeof(prog)) < 0 ||
++	    setsockopt(sock, SOL_PACKET, PACKET_IGNORE_OUTGOING, &one,
++		       sizeof(one)) < 0) {
++		wpa_printf(MSG_ERROR, "roam_prune: setsockopt: %s",
++			   strerror(errno));
++		close(sock);
++		return -1;
++	}
++	if (eloop_register_read_sock(sock, roam_prune_receive, hapd, NULL)) {
++		close(sock);
++		return -1;
++	}
++	hapd->roam_prune_sock = sock;
++	return 0;
++}
++
++
++void roam_prune_deinit(struct hostapd_data *hapd)
++{
++	if (hapd->roam_prune_sock < 0)
++		return;
++	eloop_unregister_read_sock(hapd->roam_prune_sock);
++	close(hapd->roam_prune_sock);
++	hapd->roam_prune_sock = -1;
++}
++
++
++void roam_prune_sta_free(struct hostapd_data *hapd, struct sta_info *sta)
++{
++	eloop_cancel_timeout(roam_prune_check, hapd, sta);
++}
+diff --git a/src/ap/roam_prune.h b/src/ap/roam_prune.h
+new file mode 100644
+index 0000000..ea0c1ee
+--- /dev/null
++++ b/src/ap/roam_prune.h
+@@ -0,0 +1,35 @@
++/*
++ * Removal of STAs that reassociated to another AP of the ESS
++ *
++ * This software may be distributed under the terms of the BSD license.
++ * See README for more details.
++ */
++
++#ifndef ROAM_PRUNE_H
++#define ROAM_PRUNE_H
++
++#ifdef CONFIG_ROAM_PRUNE
++
++int roam_prune_init(struct hostapd_data *hapd);
++void roam_prune_deinit(struct hostapd_data *hapd);
++void roam_prune_sta_free(struct hostapd_data *hapd, struct sta_info *sta);
++
++#else /* CONFIG_ROAM_PRUNE */
++
++static inline int roam_prune_init(struct hostapd_data *hapd)
++{
++	return 0;
++}
++
++static inline void roam_prune_deinit(struct hostapd_data *hapd)
++{
++}
++
++static inline void roam_prune_sta_free(struct hostapd_data *hapd,
++				       struct sta_info *sta)
++{
++}
++
++#endif /* CONFIG_ROAM_PRUNE */
++
++#endif /* ROAM_PRUNE_H */
+diff --git a/src/ap/sta_info.c b/src/ap/sta_info.c
+index dd8181e..52bfa66 100644
+--- a/src/ap/sta_info.c
++++ b/src/ap/sta_info.c
+@@ -36,6 +36,7 @@
+ #include "wnm_ap.h"
+ #include "mbo_ap.h"
+ #include "ndisc_snoop.h"
++#include "roam_prune.h"
+ #include "sta_info.h"
+ #include "vlan.h"
+ #include "wps_hostapd.h"
+@@ -431,6 +432,7 @@ void ap_free_sta(struct hostapd_data *hapd, struct sta_info *sta)
+ 	eloop_cancel_timeout(ap_handle_timer, hapd, sta);
+ 	eloop_cancel_timeout(ap_handle_session_timer, hapd, sta);
+ 	eloop_cancel_timeout(ap_handle_session_warning_timer, hapd, sta);
++	roam_prune_sta_free(hapd, sta);
+ 	ap_sta_clear_disconnect_timeouts(hapd, sta);
+ 	ap_sta_clear_assoc_timeout(hapd, sta);
+ 	sae_clear_retransmit_timer(hapd, sta);
+diff --git a/src/ap/sta_info.h b/src/ap/sta_info.h
+index 1204eed..a223007 100644
+--- a/src/ap/sta_info.h
++++ b/src/ap/sta_info.h
+@@ -254,6 +254,7 @@ struct sta_info {
+ #endif /* CONFIG_FST */
+ 
+ 	struct os_reltime connected_time;
++	unsigned long roam_prune_rx_packets; /* see roam_prune.c */
+ 
+ #ifdef CONFIG_SAE
+ 	struct sae_data *sae;
+-- 
+2.47.3
+
