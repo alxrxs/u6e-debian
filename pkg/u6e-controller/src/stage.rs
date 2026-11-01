@@ -70,6 +70,14 @@ pub trait Stage: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Staged> + Send + 'a>>;
 }
 
+/// What an AP answers a login as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answer {
+    As(System),
+    PasswordRefused,
+    Nothing,
+}
+
 /// The credentials a staging logs in with, each a file of the controller's
 /// user alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,10 +182,16 @@ impl Ssh {
     async fn staged(&self, t: &Target, image: &Kept, wait: Duration, log: Log<'_>) -> Staged {
         let started = Instant::now();
         let now = loop {
-            match self.system(t).await {
-                Some(s) => break s,
-                None if started.elapsed() < wait => sleep(self.waits.poll).await,
-                None => {
+            match self.answer(t).await {
+                Answer::As(s) => break s,
+                Answer::PasswordRefused => {
+                    return Staged::Untouched(format!(
+                        "{}: the stock firmware refused the password",
+                        t.ap
+                    ));
+                }
+                Answer::Nothing if started.elapsed() < wait => sleep(self.waits.poll).await,
+                Answer::Nothing => {
                     let waited = if wait.is_zero() {
                         String::new()
                     } else {
@@ -212,14 +226,21 @@ impl Ssh {
         }
     }
 
-    /// The system the AP answers as, if any.
-    async fn system(&self, t: &Target) -> Option<System> {
-        for s in [System::Image, System::Stock] {
-            if self.run(t, s, "true", None, secs(10)).await.is_ok() {
-                return Some(s);
-            }
+    /// What the AP answers as: one of its systems, stock refusing the
+    /// password (sshpass's exit status 5), or nothing.
+    async fn answer(&self, t: &Target) -> Answer {
+        if self
+            .run(t, System::Image, "true", None, secs(10))
+            .await
+            .is_ok()
+        {
+            return Answer::As(System::Image);
         }
-        None
+        match self.run(t, System::Stock, "true", None, secs(10)).await {
+            Ok(_) => Answer::As(System::Stock),
+            Err(e) if e.starts_with("exit status: 5:") => Answer::PasswordRefused,
+            Err(_) => Answer::Nothing,
+        }
     }
 
     async fn wait_for(
@@ -237,10 +258,18 @@ impl Ssh {
             },
         );
         loop {
-            if self.system(t).await == Some(want) {
-                let s = started.elapsed().as_secs();
-                log(format!("{}: in {what} after {s} s", t.ap));
-                return Ok(());
+            match self.answer(t).await {
+                Answer::As(s) if s == want => {
+                    let s = started.elapsed().as_secs();
+                    log(format!("{}: in {what} after {s} s", t.ap));
+                    return Ok(());
+                }
+                // The UniFi controller changed it: the copy the controller
+                // stages with (wifi/keys.yml's) is stale.
+                Answer::PasswordRefused if want == System::Stock => {
+                    return Err(format!("{}: the stock firmware refused the password", t.ap));
+                }
+                _ => {}
             }
             if started.elapsed() >= within {
                 return Err(format!(
@@ -943,7 +972,10 @@ exec sh -c "$cmd"
         let sshpass = dir.join("sshpass");
         fs::write(
             &sshpass,
-            "#!/bin/bash\nshift 2\nexec env FAKE_SYSTEM=stock \"$@\"\n",
+            format!(
+                "#!/bin/bash\n[ -e {d}/refuse ] && grep -qx stock {d}/state && exit 5\n\
+                 shift 2\nexec env FAKE_SYSTEM=stock \"$@\"\n"
+            ),
         )
         .unwrap();
         for p in [&ssh, &sshpass] {
@@ -1099,5 +1131,16 @@ exec sh -c "$cmd"
             Staged::Done
         );
         up.join().unwrap();
+
+        // Stock refusing the password says so, apart from an AP away.
+        fs::write(ap.join("refuse"), "").unwrap();
+        assert_eq!(
+            rt.block_on(stager.stage(&target, &kept, Duration::ZERO, &log)),
+            Staged::Failed("ap1: the stock firmware refused the password".into())
+        );
+        assert_eq!(
+            rt.block_on(stager.stage(&target, &kept, Duration::ZERO, &log)),
+            Staged::Untouched("ap1: the stock firmware refused the password".into())
+        );
     }
 }
