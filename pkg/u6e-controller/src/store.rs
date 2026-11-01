@@ -20,7 +20,7 @@ use u6e_proto::frame::{read_frame, write_frame, zeroize};
 /// What every file starts with: a mark, and the format of what follows,
 /// raised with every change to what the files hold.
 const MARK: &[u8; 4] = b"U6CS";
-pub const FORMAT: u16 = 1;
+pub const FORMAT: u16 = 2;
 /// What a file set aside is named after: `<name>.corrupt-<ms>`.
 const ASIDE: &str = ".corrupt-";
 
@@ -159,9 +159,9 @@ mod tests {
             Err(Unreadable::Corrupt(why)) => why,
             other => panic!("{other:?}"),
         };
-        assert_eq!(why(&s), "of format 9, not 1");
+        assert_eq!(why(&s), format!("of format 9, not {FORMAT}"));
         fs::write(&path, b"garbage").unwrap();
-        assert_eq!(why(&s), "not of format 1");
+        assert_eq!(why(&s), format!("not of format {FORMAT}"));
         // An older file of the same format whose frame no longer decodes.
         s.save("x", &7u8).unwrap();
         assert!(matches!(

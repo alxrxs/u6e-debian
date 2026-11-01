@@ -363,14 +363,15 @@ impl Ap {
     }
 
     /// Whether it runs another configuration than the latest one signed for
-    /// it, while connected. An image built after that one was signed carries
-    /// a newer configuration of its own, which stands.
+    /// it, while connected. An image built after that one's radios were
+    /// first signed carries a newer configuration of its own, which stands,
+    /// however often they were signed again since.
     pub fn drifts(&self) -> bool {
         let (Some(latest), Some(snap), Some(hello)) = (self.latest, &self.snapshot, &self.hello)
         else {
             return false;
         };
-        snap.config_sha256 != Some(latest.sha256) && hello.built_ms() < latest.seq
+        snap.config_sha256 != Some(latest.sha256) && hello.built_ms() < latest.signed_ms
     }
 
     pub fn is_up(&self) -> bool {
@@ -1108,15 +1109,11 @@ impl State {
         let (Some(signer), Some(entry)) = (self.signer.as_mut(), self.aps.get_mut(ap)) else {
             return Err("live configuration is off".into());
         };
-        let config = match radios {
+        let (config, signed) = match radios {
             Some(r) => signer.sign(&entry.hostname, r),
             None => signer
                 .resign(&entry.hostname)
                 .ok_or_else(|| format!("nothing was signed for {ap}"))?,
-        };
-        let signed = ConfigId {
-            sha256: config.sha256,
-            seq: config.seq,
         };
         entry.latest = Some(signed);
         let Some(live) = &entry.session else {

@@ -31,12 +31,15 @@ use u6e_proto::mac;
 /// The clients blocked, by MAC.
 pub type Blocked = BTreeSet<[u8; 6]>;
 
-/// A configuration as the controller signed it: its hash and sequence
-/// number.
+/// A configuration as the controller signed it: its hash, its sequence
+/// number, and when its radios were first signed (the same time, but for a
+/// configuration signed again), which is what an image's build time is
+/// compared with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConfigId {
     pub sha256: [u8; 32],
     pub seq: u64,
+    pub signed_ms: u64,
 }
 
 /// Everything the file holds.
@@ -170,6 +173,7 @@ struct GateFile {
 struct ConfigFile {
     sha256: String,
     seq: u64,
+    signed_ms: u64,
 }
 
 /// The file, saved one save at a time.
@@ -218,7 +222,15 @@ pub fn load(path: &Path) -> io::Result<Policy> {
         .map(|(ap, c)| {
             let sha256 = mac::unhex(&c.sha256)
                 .ok_or_else(|| invalid(format!("configs.{ap}.sha256 is not 64 hex digits")))?;
-            Ok((ap, ConfigId { sha256, seq: c.seq }))
+            let (seq, signed_ms) = (c.seq, c.signed_ms);
+            Ok((
+                ap,
+                ConfigId {
+                    sha256,
+                    seq,
+                    signed_ms,
+                },
+            ))
         })
         .collect::<io::Result<_>>()?;
     let rollouts = file.rollouts.into_iter().map(|r| SavedRollout {
@@ -261,6 +273,7 @@ fn write_temp(path: &Path, policy: &Policy) -> io::Result<PathBuf> {
         let file = ConfigFile {
             sha256: mac::hex(&c.sha256),
             seq: c.seq,
+            signed_ms: c.signed_ms,
         };
         (ap.clone(), file)
     });
@@ -341,6 +354,7 @@ mod tests {
         let c = ConfigId {
             sha256: [0xab; 32],
             seq: 1_792_929_600_000,
+            signed_ms: 1_792_929_500_000,
         };
         p.configs.insert("ap1".into(), c);
         let running = Some("20261024-120000-abc-def-ap1".into());
@@ -373,7 +387,11 @@ mod tests {
             v,
             serde_json::json!({
                 "blocked": ["02:00:00:00:00:01", "02:00:00:00:00:02"],
-                "configs": {"ap1": {"sha256": "ab".repeat(32), "seq": 1_792_929_600_000u64}},
+                "configs": {"ap1": {
+                    "sha256": "ab".repeat(32),
+                    "seq": 1_792_929_600_000u64,
+                    "signed_ms": 1_792_929_500_000u64,
+                }},
                 "images": {"ap1": {"running": "20261024-120000-abc-def-ap1"}},
                 "rollouts": [{
                     "id": 7,

@@ -94,10 +94,12 @@ pub(crate) fn unix_ms() -> u64 {
     since.map_or(0, |d| d.as_millis() as u64)
 }
 
-/// The latest configuration signed for an AP.
+/// The latest configuration signed for an AP: its sequence number, and when
+/// its radios were first signed, which a signing again keeps.
 #[derive(Serialize, Deserialize)]
 struct Latest {
     seq: u64,
+    signed_ms: u64,
     radios: Vec<RadioConfig>,
 }
 
@@ -106,6 +108,7 @@ impl Latest {
         ConfigId {
             sha256: config::config_sha256(&self.radios),
             seq: self.seq,
+            signed_ms: self.signed_ms,
         }
     }
 }
@@ -174,24 +177,41 @@ impl Signer {
     }
 
     /// `radios`, signed for the AP of `hostname` under the next sequence
-    /// number, and kept as its latest.
-    pub fn sign(&mut self, hostname: &str, radios: Vec<RadioConfig>) -> SignedConfig {
-        self.last_seq = unix_ms().max(self.last_seq + 1);
-        let seq = self.last_seq;
-        let signed = config::sign(&self.key, hostname, seq, radios.clone());
-        let latest = Latest { seq, radios };
-        if let Err(e) = self.store.save(&file_of(hostname), &latest) {
-            eprintln!("u6e-controller: {hostname}: the latest configuration was not kept: {e}");
-        }
-        self.latest.insert(hostname.to_owned(), latest);
-        signed
+    /// number, and kept as its latest; with what it is kept as.
+    pub fn sign(&mut self, hostname: &str, radios: Vec<RadioConfig>) -> (SignedConfig, ConfigId) {
+        self.sign_as(hostname, radios, None)
     }
 
     /// The latest configuration of the AP of `hostname`, signed again under
-    /// a new sequence number: the old one is a replay to the AP.
-    pub fn resign(&mut self, hostname: &str) -> Option<SignedConfig> {
-        let radios = self.latest.get(hostname)?.radios.clone();
-        Some(self.sign(hostname, radios))
+    /// a new sequence number (the old one is a replay to the AP), still of
+    /// the time its radios were first signed: an image built since carries
+    /// a newer configuration than this one.
+    pub fn resign(&mut self, hostname: &str) -> Option<(SignedConfig, ConfigId)> {
+        let latest = self.latest.get(hostname)?;
+        let (radios, signed_ms) = (latest.radios.clone(), latest.signed_ms);
+        Some(self.sign_as(hostname, radios, Some(signed_ms)))
+    }
+
+    fn sign_as(
+        &mut self,
+        hostname: &str,
+        radios: Vec<RadioConfig>,
+        signed_ms: Option<u64>,
+    ) -> (SignedConfig, ConfigId) {
+        self.last_seq = unix_ms().max(self.last_seq + 1);
+        let seq = self.last_seq;
+        let signed = config::sign(&self.key, hostname, seq, radios.clone());
+        let latest = Latest {
+            seq,
+            signed_ms: signed_ms.unwrap_or(seq),
+            radios,
+        };
+        if let Err(e) = self.store.save(&file_of(hostname), &latest) {
+            eprintln!("u6e-controller: {hostname}: the latest configuration was not kept: {e}");
+        }
+        let id = latest.id();
+        self.latest.insert(hostname.to_owned(), latest);
+        (signed, id)
     }
 }
 
@@ -232,7 +252,8 @@ mod tests {
     }
 
     /// Each one is newer than the last, the latest is kept (0600) across a
-    /// restart, and signing it again makes a newer one of the same radios.
+    /// restart, and signing it again makes a newer one of the same radios,
+    /// still of the time they were first signed.
     #[test]
     fn signed_newer_each_time_and_kept() {
         let t = TestDir::new();
@@ -244,9 +265,10 @@ mod tests {
         let public = k.public_key().as_ref().to_vec();
         let (mut s, aside) = Signer::open(&settings, k, ["ap1"]).unwrap();
         assert!(aside.is_empty());
-        let a = s.sign("ap1", radios(1));
-        let b = s.sign("ap1", radios(2));
+        let (a, _) = s.sign("ap1", radios(1));
+        let (b, b_id) = s.sign("ap1", radios(2));
         assert!(b.seq > a.seq && a.seq + 10 * 60 * 1000 == a.not_after);
+        assert_eq!((b_id.seq, b_id.signed_ms), (b.seq, b.seq));
         let pk: [u8; 32] = public.try_into().unwrap();
         assert_eq!(config::verify(&pk, "ap1", &b), Ok(()));
         let mode = fs::metadata(t.path().join("configs/latest-ap1"))
@@ -256,11 +278,15 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600);
         drop(s);
         let (mut s, _) = Signer::open(&settings, key(), ["ap1", "ap2"]).unwrap();
-        assert_eq!(s.latest("ap1").map(|l| l.seq), Some(b.seq));
+        assert_eq!(s.latest("ap1"), Some(b_id));
         assert_eq!(s.latest("ap2"), None);
-        let c = s.resign("ap1").unwrap();
+        let (c, c_id) = s.resign("ap1").unwrap();
         assert!(c.seq > b.seq);
         assert_eq!(c.sha256, b.sha256);
+        assert_eq!((c_id.seq, c_id.signed_ms), (c.seq, b.seq));
+        drop(s);
+        let (mut s, _) = Signer::open(&settings, key(), ["ap1"]).unwrap();
+        assert_eq!(s.latest("ap1"), Some(c_id));
         assert!(s.resign("ap2").is_none());
     }
 

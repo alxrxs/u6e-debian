@@ -136,7 +136,7 @@ pub async fn converge(
                 continue;
             }
             let Some(fetched) = fetched else { continue };
-            let newer = latest.is_some_and(|l| l.seq > unix_ms(fetched));
+            let newer = latest.is_some_and(|l| l.signed_ms > unix_ms(fetched));
             let recent = entry.tried.is_some_and(|t| t.elapsed() < RETRY);
             let kinds = commands(p);
             if newer || (recent && !force) || !free || kinds.is_empty() {

@@ -2751,6 +2751,53 @@ fn configurations_are_never_replayed_not_even_across_a_reboot() {
     );
 }
 
+/// Signing a configuration again keeps when its radios were first signed: an
+/// image built between the two carries a newer configuration of its own,
+/// which stands. As when a rollback puts the AP back on its older image,
+/// whose configuration is signed again, and the newer image then rolls out
+/// once more.
+#[test]
+fn a_configuration_signed_again_never_overwrites_a_newer_image() {
+    let r = controller(Timing::default());
+    let built = now_ms() - 60_000;
+    let mut ap1 = ap_on(&r, KEY_AP1, "ap1", "img-1-ap1", built, image_config(1));
+    let mut judge = Judge {
+        ap: "ap1",
+        last: 0,
+        built,
+    };
+    let asked = apply_in_thread(&r, "ap1", radios(1));
+    let (first, verdict) = judge.answer(&mut ap1);
+    assert_eq!(verdict, Ok(()));
+    asked.join().unwrap().unwrap();
+
+    // The newer image is built; then the AP is back on the older one, and
+    // the latest is signed again, after that build.
+    thread::sleep(Duration::from_millis(5));
+    let rebuilt = now_ms();
+    thread::sleep(Duration::from_millis(5));
+    let mut ap1 = ap_on(&r, KEY_AP1, "ap1", "img-1-ap1", built, image_config(1));
+    let mut back = Judge {
+        ap: "ap1",
+        last: 0,
+        built,
+    };
+    let (again, verdict) = back.answer(&mut ap1);
+    assert_eq!((again.sha256, verdict), (first.sha256, Ok(())));
+    assert!(again.seq > rebuilt, "{} after {rebuilt}", again.seq);
+    let latest = r.c.state.read().ap("ap1").unwrap().latest.unwrap();
+    assert_eq!((latest.seq, latest.signed_ms), (again.seq, first.seq));
+
+    // The newer image again: its own configuration stands.
+    let mut ap1 = ap_on(&r, KEY_AP1, "ap1", "img-2-ap1", rebuilt, image_config(2));
+    ap1.hears_nothing(Duration::from_millis(400));
+    assert!(!r.c.state.read().ap("ap1").unwrap().drifts());
+    assert_eq!(
+        metrics_of(&r, "wifi_config_drift"),
+        ["wifi_config_drift{ap=\"ap1\"} 0"]
+    );
+}
+
 /// Only the latest configuration signed for an AP is signed again, whatever
 /// the AP acknowledged: one that refused the latest is offered it again,
 /// never the older one it applied.
