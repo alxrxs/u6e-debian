@@ -3021,6 +3021,15 @@ fn step_of(r: &Running, id: u64) -> Value {
     json_get(r.c.http, "/api/rollouts")[id.to_string()]["phase"]["step"].clone()
 }
 
+/// Waits until the policy file in `dir` holds the first rollout at its gate.
+fn gate_kept(dir: &Path) {
+    wait_for("the gate kept", || {
+        let text = fs::read_to_string(dir.join("policy.json")).unwrap();
+        let policy: Value = serde_json::from_str(&text).unwrap();
+        policy["rollouts"][0]["phase"]["gate"].is_object()
+    });
+}
+
 /// The Upgrade rolls out the AP's newest kept image, and only that: staged
 /// once, then done once the AP is back with it, its radios up and its
 /// clients back; the AP runs it from then on.
@@ -3058,11 +3067,7 @@ fn an_upgrade_rolls_out_the_newest_image_and_its_gate_ends_it() {
         (409, &json!("the rollout of img-2-ap1 to ap1 is not over"))
     );
     // Kept on disk at the step it is at.
-    wait_for("the gate kept", || {
-        let text = fs::read_to_string(dir.0.join("policy.json")).unwrap();
-        let policy: Value = serde_json::from_str(&text).unwrap();
-        policy["rollouts"][0]["phase"]["gate"].is_object()
-    });
+    gate_kept(&dir.0);
 
     // Back with the image and its radio, but no client yet: not yet.
     let manifest = "image:     img-2-ap1\nbuilt_ms:  2\n";
@@ -3223,7 +3228,7 @@ fn a_restarted_controller_goes_on_with_the_rollout() {
     let mut ap1 = ap_on(&r, KEY_AP1, "ap1", "img-1-ap1", 1, image_config(1));
     ap1.expect_sync();
     let id = upgrade(&r, "ap1", "img-2-ap1").1["id"].as_u64().unwrap();
-    wait_for("the gate", || step_of(&r, id) == "gate");
+    gate_kept(&dir.0);
     drop(ap1);
     drop(r);
     let r = managed(Timing::default(), &dir.0, 420, Arc::clone(&stage));
@@ -3291,7 +3296,7 @@ fn a_gate_resumed_with_no_ap_back_is_rolled_back() {
     let mut ap1 = ap_on(&r, KEY_AP1, "ap1", "img-1-ap1", 1, image_config(1));
     ap1.expect_sync();
     let id = upgrade(&r, "ap1", "img-2-ap1").1["id"].as_u64().unwrap();
-    wait_for("the gate", || step_of(&r, id) == "gate");
+    gate_kept(&dir.0);
     drop(ap1);
     drop(r);
     // Its gate long past, as after a long time down.
