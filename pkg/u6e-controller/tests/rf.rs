@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio::runtime::{Builder, Runtime};
@@ -35,33 +35,16 @@ use u6e_proto::tls::Identity;
 #[allow(dead_code)]
 #[path = "common/keys.rs"]
 mod keys;
+#[path = "common/tempdir.rs"]
+mod tempdir;
+
+use tempdir::TempDir;
 
 use keys::{KEY_AP1, KEY_AP2, KEY_CONTROLLER};
 
 const SITE: &str = include_str!("fixtures/site.yml");
 const FILE: &str = "wifi/site.yml";
 const WAIT: Duration = Duration::from_secs(20);
-
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(name: &str) -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("{name}-{}-{nanos}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        TempDir(dir)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 /// What `git` prints in `dir`, which must succeed.
 fn git_in(dir: &Path, args: &[&str]) -> String {

@@ -46,6 +46,10 @@ use u6e_proto::{mac, version};
 
 #[path = "common/keys.rs"]
 mod keys;
+#[path = "common/tempdir.rs"]
+mod tempdir;
+
+use tempdir::TempDir;
 
 use keys::{KEY_AP1, KEY_AP2, KEY_CONTROLLER, KEY_SIGNING};
 
@@ -617,28 +621,6 @@ impl Drop for Proc {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
-    }
-}
-
-/// A directory of the test's own, removed when it ends.
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(name: &str) -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("{name}-{}-{nanos}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        TempDir(dir)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
     }
 }
 
