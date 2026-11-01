@@ -31,7 +31,7 @@ use u6e_controller::local;
 use u6e_controller::names::Resolve;
 use u6e_controller::spectrum::Limits;
 use u6e_controller::stage::{Log, Stage, Staged, Target};
-use u6e_controller::state::{FLOWS_IDLE, FLOWS_WATCHED, TICK_IDLE, TICK_WATCHED};
+use u6e_controller::state::{FLOWS_IDLE, FLOWS_WATCHED, TICK_IDLE, TICK_WATCHED, Waiter};
 use u6e_controller::{Controller, start};
 use u6e_proto::PROTOCOL;
 use u6e_proto::config::{self, config_sha256};
@@ -2715,6 +2715,47 @@ fn a_configuration_is_signed_sent_and_kept_by_its_hash_alone() {
             "wifi_config_applies_total{result=\"timeout\"} 1",
         ]
     );
+}
+
+/// A configuration waits while a channel switch or a power change to the
+/// AP is unanswered, then goes: the two never interleave on a radio.
+#[test]
+fn a_configuration_waits_out_a_radio_command() {
+    let r = controller(Timing::default());
+    let mut ap1 = ap_on(&r, KEY_AP1, "ap1", "img-1-ap1", 1, image_config(1));
+    assert_eq!(ap1.expect_sync(), Vec::<[u8; 6]>::new());
+    let (tx, _rx) = tokio::sync::oneshot::channel();
+    let power = CommandKind::TxPower {
+        radio: Band::B5,
+        dbm: 20,
+    };
+    let id =
+        r.c.state
+            .write()
+            .command("ap1", power, Waiter::Reply(tx))
+            .unwrap();
+    let CtlMsg::Command(c) = ap1.expect() else {
+        panic!("no command");
+    };
+    assert_eq!(c.id, id);
+    let asked = apply_in_thread(&r, "ap1", radios(1));
+    ap1.hears_nothing(Duration::from_millis(400));
+    ap1.send(&AgentMsg::Result(CommandResult {
+        id,
+        ok: true,
+        detail: "wlan5: 20 dBm".into(),
+    }))
+    .unwrap();
+    let CtlMsg::ApplyConfig(c) = ap1.expect() else {
+        panic!("no configuration");
+    };
+    ap1.send(&AgentMsg::ConfigApplied(applied(
+        c.sha256,
+        true,
+        "set in place",
+    )))
+    .unwrap();
+    assert!(asked.join().unwrap().is_ok());
 }
 
 /// No configuration is ever applied twice: after a reboot onto the same

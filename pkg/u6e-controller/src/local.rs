@@ -11,7 +11,7 @@
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::net::{UnixListener, UnixStream};
@@ -121,6 +121,11 @@ async fn caller(local: Local, mut conn: UnixStream, ours: u32) {
     };
     let reply = match req {
         Request::Apply { ap, radios } => {
+            // A channel switch or power change under way is waited out.
+            let until = Instant::now() + local.apply_wait;
+            while local.state.read().radio_pending(&ap) && Instant::now() < until {
+                sleep(Duration::from_millis(50)).await;
+            }
             let asked = local.state.write().apply_config(&ap, radios);
             match asked {
                 Err(why) => done(false, why),

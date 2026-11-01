@@ -266,6 +266,9 @@ pub enum Waiter {
 struct Pending {
     ap: String,
     waiter: Waiter,
+    /// A channel switch or a power change, which a configuration waits out:
+    /// its channel switch announcement and beacon updates would interleave.
+    radio: bool,
 }
 
 /// A client's addresses as its flows last showed them.
@@ -951,9 +954,18 @@ impl State {
         if self.pending.get(&r.id).is_none_or(|p| p.ap != ap) {
             return;
         }
-        let Some(Pending { waiter, .. }) = self.pending.remove(&r.id) else {
+        let Some(Pending { waiter, radio, .. }) = self.pending.remove(&r.id) else {
             return;
         };
+        // A repush it held off goes now.
+        let session = self
+            .aps
+            .get(ap)
+            .and_then(|a| a.session.as_ref())
+            .map(|s| s.id);
+        if let Some(id) = session.filter(|_| radio) {
+            self.check_installed(ap, id);
+        }
         match waiter {
             Waiter::Reply(tx) => {
                 let _ = tx.send(r);
@@ -972,13 +984,17 @@ impl State {
     /// the command's id, or `None` when no session serves the AP or it is
     /// too far behind to take one.
     pub fn command(&mut self, ap: &str, kind: CommandKind, waiter: Waiter) -> Option<u64> {
+        let radio = matches!(
+            kind,
+            CommandKind::ChannelSwitch { .. } | CommandKind::TxPower { .. }
+        );
         let live = self.aps.get(ap)?.session.as_ref()?;
         let id = self.next_command + 1;
         let msg = CtlMsg::Command(Command { id, kind });
         live.outbox.try_send(msg).ok()?;
         self.next_command = id;
         let ap = ap.to_owned();
-        self.pending.insert(id, Pending { ap, waiter });
+        self.pending.insert(id, Pending { ap, waiter, radio });
         Some(id)
     }
 
@@ -1001,6 +1017,7 @@ impl State {
         let pending = Pending {
             ap: ap.to_owned(),
             waiter: Waiter::Resent,
+            radio: false,
         };
         self.pending.insert(cmd.id, pending);
         Some(CtlMsg::Command(cmd))
@@ -1093,7 +1110,15 @@ impl State {
         if entry.relay.is_some() {
             return Err(format!("a configuration for {ap} is on its way already"));
         }
+        if self.radio_pending(ap) {
+            return Err(format!("a channel or power command to {ap} is on its way"));
+        }
         Ok(())
+    }
+
+    /// Whether a channel switch or a power change to `ap` is unanswered.
+    pub fn radio_pending(&self, ap: &str) -> bool {
+        self.pending.values().any(|p| p.ap == ap && p.radio)
     }
 
     /// A local caller's configuration for `ap`: signed under the next
