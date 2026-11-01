@@ -15,7 +15,10 @@
 //! own publishes as the DHCP nodes' do; their addresses have DNS names, as do
 //! most far ends of their connections. Clients with an odd last byte have a
 //! universally administered MAC (RFC 7042's documentation block, whose vendor
-//! is IANA), the others a made-up private one.
+//! is IANA), the others a made-up private one. Each AP's client guards bind
+//! the leases the controller seeds them with, and twice a cycle a client
+//! breaks a guard's rule (an ARP for another client's address, a router
+//! advertisement).
 //! A radio asked to scan sends eight spectra a second until it is told to stop
 //! or goes down (`spectrum`: Wi-Fi bursts, a narrowband sender on 5 GHz, a
 //! microwave oven and Bluetooth on 2.4 GHz, a quiet 6 GHz channel).
@@ -62,8 +65,8 @@ use u6e_controller::stage::Stage;
 use u6e_proto::frame::{decode_frame, frame_body, write_frame};
 use u6e_proto::msg::{
     AgentMsg, Band, Bss, CommandKind, CommandResult, ConfigApplied, CtlMsg, Event, EventKind,
-    Flows, Hello, Mechanism, PowerLimit, Radio, RadioApplied, RateMode, Snapshot, SpectrumFrame,
-    Station, Temp,
+    Flows, Guard, Hello, Mechanism, PowerLimit, Radio, RadioApplied, RateMode, Snapshot,
+    SpectrumFrame, Station, Temp, Violation,
 };
 use u6e_proto::tls::{self, Identity};
 use u6e_proto::{PROTOCOL, delta, mac, version};
@@ -240,16 +243,20 @@ enum Act {
     RadioUp(usize, usize),
     /// The AP's link drops for so many seconds.
     LinkDown(usize, f64),
+    /// A client on an AP breaks a client guard's rule.
+    Violation(u8, usize, Guard),
 }
 
 /// The script, by second of the cycle; clients by the last byte of their MAC,
 /// APs and BSSs by index. A join of a client already somewhere is a roam.
-const SCRIPT: [(f64, Act); 12] = [
+const SCRIPT: [(f64, Act); 14] = [
     (20.0, Act::Join(3, 1, 1, -58.0)),
     (35.0, Act::Leave(7)),
+    (45.0, Act::Violation(9, 0, Guard::Arp)),
     (50.0, Act::EapFail(10, 1, 1)),
     (53.0, Act::Join(10, 1, 1, -67.0)),
     (60.0, Act::RadioDown(1, 2)),
+    (70.0, Act::Violation(2, 0, Guard::Ra)),
     (61.0, Act::Join(8, 1, 1, -61.0)),
     (75.0, Act::Join(7, 1, 0, -74.0)),
     (80.0, Act::RadioUp(1, 2)),
@@ -493,6 +500,32 @@ impl World {
                 self.aps[ap].radios[radio].up = true;
                 let phy = RADIOS[radio].into();
                 self.event(ap, EventKind::RadioUp { phy });
+            }
+            Act::Violation(last, ap, guard) => {
+                let at = find(self, last).and_then(|i| self.clients[i].at);
+                let (ifname, _, _, vlan) = BSSS[at.map_or(1, |(_, b)| b)];
+                let (ip, detail) = match guard {
+                    Guard::Arp => (
+                        Some(IpAddr::from([192, 0, 2, 13])),
+                        "uses 192.0.2.13, bound to 00:00:5e:ef:10:03".to_owned(),
+                    ),
+                    _ => (
+                        None,
+                        "advertises itself as a router: a default route for 1800 s, the prefix 2001:db8:66::/64"
+                            .to_owned(),
+                    ),
+                };
+                let v = Violation {
+                    guard,
+                    mac: World::mac(last),
+                    ifname: ifname.into(),
+                    vlan,
+                    ip,
+                    detail,
+                    dropped: false,
+                    repeats: 2,
+                };
+                self.event(ap, EventKind::GuardViolation(v));
             }
         }
     }
@@ -1015,6 +1048,8 @@ async fn agent(addr: SocketAddr, ap: usize, pem: &str, world: Arc<Mutex<World>>)
                     };
                     send(&mut wr, &state).await?;
                 }
+                // The guards bind what they are seeded with.
+                CtlMsg::SeedBindings(b) => send(&mut wr, &AgentMsg::Bindings(b)).await?,
                 // Taken as is, in place: the AP reports it installed.
                 CtlMsg::ApplyConfig(c) => {
                     let radios = c.radios.iter().map(|r| RadioApplied {

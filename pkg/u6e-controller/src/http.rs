@@ -561,7 +561,9 @@ async fn live(mut ws: WebSocket, state: Shared, user: Option<String>, scans: Gat
                 let ev = s.ap(&ap).and_then(|a| view::event(&ap, a, &ev));
                 (true, ev.map(|e| json!({ "events": [e] })))
             }
-            Ok(Change::Up(ap) | Change::Down(ap) | Change::Snapshot(ap)) => (wanted(&ap), None),
+            Ok(Change::Up(ap) | Change::Down(ap) | Change::Snapshot(ap) | Change::Bindings(ap)) => {
+                (wanted(&ap), None)
+            }
             Ok(Change::Flows(ap)) => (flows && wanted(&ap), None),
             Ok(Change::Names | Change::Deploy) => (true, None),
             // A block or an unblock changes the list of clients blocked.

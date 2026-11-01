@@ -130,7 +130,8 @@ pub async fn start(
         .with_policy(saved)
         .with_spectrum(timing.spectrum)
         .with_history(window)
-        .with_leases(&config.leases);
+        .with_leases(&config.leases)
+        .with_guards(config.guards.clone());
     let mut set_aside = Vec::new();
     if let Some((s, aside)) = signer(config, identity)? {
         state = state.with_signer(s);

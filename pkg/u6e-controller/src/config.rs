@@ -7,9 +7,11 @@
 //! reach it on (`local`); in `[configs]`, the signing of live Wi-Fi
 //! configurations (`configs`), and in `[rollouts]`, the kept images and their
 //! rollouts (`rollout`), each off without its section; in `[rf]`, the RF
-//! planner's (`rf::config`), without which it is off; and, in `[leases]`, the
+//! planner's (`rf::config`), without which it is off; in `[leases]`, the
 //! DHCP nodes' node exporters the clients' leases are read from (`leases`),
-//! none without it.
+//! none without it; and, in `[guards]`, the VLANs the APs' client guards
+//! enforce on and the clients with a static address, the guards only
+//! reporting without it.
 //!
 //! ```toml
 //! listen_agents = "[::]:8443"
@@ -36,15 +38,20 @@
 //!
 //! [leases]
 //! exporters = ["dhcp1.example.org:9100", "[2001:db8::53]:9100"]
+//!
+//! [guards]
+//! enforce = [42]
+//! static = [{ mac = "02:00:00:00:00:01", ip = "192.0.2.5" }]
 //! ```
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
 use serde::Deserialize;
 use u6e_proto::mac;
+use u6e_proto::msg::{Binding, GuardConfig};
 
 use crate::{configs, rf, rollout};
 
@@ -82,6 +89,8 @@ pub struct Config {
     pub rf: Option<rf::config::Settings>,
     /// The node exporters (`host:port`) that publish the DHCP leases.
     pub leases: Vec<String>,
+    /// How the APs' client guards run.
+    pub guards: GuardConfig,
 }
 
 #[derive(Deserialize)]
@@ -108,6 +117,23 @@ struct File {
     rollouts: Option<rollout::File>,
     rf: Option<rf::config::File>,
     leases: Option<LeasesFile>,
+    guards: Option<GuardsFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GuardsFile {
+    #[serde(default)]
+    enforce: Vec<u16>,
+    #[serde(default, rename = "static")]
+    statics: Vec<StaticFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StaticFile {
+    mac: String,
+    ip: Ipv4Addr,
 }
 
 #[derive(Deserialize)]
@@ -179,6 +205,8 @@ pub enum ConfigError {
     Rf(String),
     /// A `[leases]` exporter is not `host:port`.
     BadExporter(String),
+    /// `[guards]` names no VLAN, or no client's MAC: which.
+    Guards(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -197,6 +225,7 @@ impl fmt::Display for ConfigError {
             Self::NoAdminGroup => f.write_str("admin_group is empty"),
             Self::Section(e) | Self::Rf(e) => f.write_str(e),
             Self::BadExporter(e) => write!(f, "leases.exporters: {e:?} is not host:port"),
+            Self::Guards(e) => write!(f, "guards: {e}"),
         }
     }
 }
@@ -251,6 +280,9 @@ impl Config {
         if let Some(bad) = leases.iter().find(|e| !is_exporter(e)) {
             return Err(ConfigError::BadExporter(bad.clone()));
         }
+        let guards = file
+            .guards
+            .map_or_else(|| Ok(GuardConfig::default()), guards)?;
         Ok(Config {
             listen_agents: file.listen_agents,
             listen_http: file.listen_http,
@@ -267,8 +299,34 @@ impl Config {
             rollouts: rollouts.map_err(ConfigError::Section)?,
             rf,
             leases,
+            guards,
         })
     }
+}
+
+/// The guards' section, checked: real VLANs, each once, and unicast MACs.
+fn guards(file: GuardsFile) -> Result<GuardConfig, ConfigError> {
+    let mut enforce = file.enforce;
+    if let Some(v) = enforce.iter().find(|v| !(1..=4094).contains(*v)) {
+        return Err(ConfigError::Guards(format!("enforce: {v} is no VLAN")));
+    }
+    enforce.sort_unstable();
+    enforce.dedup();
+    let statics = file.statics.into_iter().map(|s| {
+        let mac = mac::parse(&s.mac).filter(|m| m[0] & 1 == 0);
+        let mac = mac.ok_or_else(|| {
+            ConfigError::Guards(format!("static: {:?} is no client's MAC", s.mac))
+        })?;
+        Ok(Binding {
+            mac,
+            ip: s.ip,
+            expires_ms: None,
+        })
+    });
+    Ok(GuardConfig {
+        enforce,
+        statics: statics.collect::<Result<_, _>>()?,
+    })
 }
 
 /// Whether `s` is `host:port`: a name or IPv4 address, or an IPv6 one in
@@ -518,6 +576,44 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn the_guards_report_only_unless_told_where_to_enforce() {
+        assert_eq!(
+            Config::parse(ORIGIN).unwrap().guards,
+            GuardConfig::default()
+        );
+        let text = format!(
+            "{ORIGIN}[guards]\nenforce = [43, 42, 43]\n\
+             static = [{{ mac = \"02:00:00:00:00:01\", ip = \"192.0.2.5\" }}]\n"
+        );
+        let g = Config::parse(&text).unwrap().guards;
+        assert_eq!(g.enforce, [42, 43]);
+        assert_eq!(
+            g.statics,
+            [Binding {
+                mac: [2, 0, 0, 0, 0, 1],
+                ip: Ipv4Addr::new(192, 0, 2, 5),
+                expires_ms: None
+            }]
+        );
+        for bad in [
+            "enforce = [0]",
+            "enforce = [4095]",
+            "static = [{ mac = \"x\", ip = \"192.0.2.5\" }]",
+            "static = [{ mac = \"01:00:5e:00:00:01\", ip = \"192.0.2.5\" }]",
+        ] {
+            let text = format!("{ORIGIN}[guards]\n{bad}\n");
+            assert!(
+                matches!(Config::parse(&text), Err(ConfigError::Guards(_))),
+                "{bad}"
+            );
+        }
+        let v6 = format!(
+            "{ORIGIN}[guards]\nstatic = [{{ mac = \"02:00:00:00:00:01\", ip = \"2001:db8::5\" }}]\n"
+        );
+        assert!(matches!(Config::parse(&v6), Err(ConfigError::Syntax(_))));
     }
 
     #[test]

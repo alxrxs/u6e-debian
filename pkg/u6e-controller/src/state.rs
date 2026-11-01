@@ -5,7 +5,10 @@
 //! on disk by `policy`), the commands waiting for their results, the actions
 //! taken; what names the clients (`identity`): the DHCP servers' leases
 //! (`leases`), the reverse DNS of the clients' addresses and of the far ends
-//! of the flows a UI watches (`names`); the live Wi-Fi
+//! of the flows a UI watches (`names`); the client guards' mode, given each
+//! AP after its first key frame with the leases they are seeded with (seeded
+//! again whenever the leases change), and each AP's bindings and violations;
+//! the live Wi-Fi
 //! configurations, signed here (`configs`) for the AP whose configured host
 //! name they name and known here by hash only once sent (each AP's last
 //! acknowledged one kept on disk too), the latest one of each AP signed again
@@ -30,8 +33,8 @@ use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
 use u6e_proto::delta::{self, Gap};
 use u6e_proto::msg::{
-    AgentMsg, Command, CommandKind, CommandResult, ConfigApplied, CtlMsg, Event, EventKind, Flows,
-    Hello, Mechanism, RadioConfig, Snapshot, Station,
+    AgentMsg, Binding, Command, CommandKind, CommandResult, ConfigApplied, CtlMsg, Event,
+    EventKind, Flows, Guard, GuardConfig, Hello, Mechanism, RadioConfig, Snapshot, Station,
 };
 use u6e_proto::{PROTOCOL, mac};
 
@@ -92,6 +95,8 @@ pub enum Change {
     Spectrum(String, String),
     /// A configuration, a rollout or the kept images changed.
     Deploy,
+    /// The AP's client guards' bindings changed.
+    Bindings(String),
 }
 
 /// One action on one AP (or on none, when no AP was connected to carry a
@@ -310,6 +315,11 @@ pub struct Ap {
     pub crashes: BTreeMap<String, u64>,
     /// Its clients' latest flows and when they came, only while connected.
     pub flows: Option<(Flows, SystemTime)>,
+    /// Its client guards' bindings, only while connected.
+    pub bindings: Vec<Binding>,
+    /// Its client guards' violations by guard and VLAN, repeats included,
+    /// since the controller started.
+    pub violations: BTreeMap<(Guard, u16), u64>,
     rx_bytes: Arc<AtomicU64>,
     watchers: usize,
     tick: watch::Sender<u16>,
@@ -354,6 +364,8 @@ impl Ap {
             events: VecDeque::new(),
             crashes: BTreeMap::new(),
             flows: None,
+            bindings: Vec::new(),
+            violations: BTreeMap::new(),
             rx_bytes: Arc::new(AtomicU64::new(0)),
             watchers: 0,
             tick: watch::Sender::new(TICK_IDLE),
@@ -426,6 +438,7 @@ impl Ap {
         self.previous = None;
         self.connected_since = None;
         self.flows = None;
+        self.bindings.clear();
         self.full.clear();
         let scans = self.scans.iter_mut();
         let ended =
@@ -520,6 +533,8 @@ pub struct State {
     addresses: HashMap<[u8; 6], Addresses>,
     /// The DHCP servers' leases, as their exporters last gave them.
     pub leases: Leases,
+    /// How the APs' client guards run.
+    pub guards: GuardConfig,
     /// When the scans stop.
     pub spectrum: Limits,
     /// Wakes `spectrum::supervise` when a scan's deadline may have moved.
@@ -564,6 +579,7 @@ impl State {
             names: Names::default(),
             addresses: HashMap::new(),
             leases: Leases::default(),
+            guards: GuardConfig::default(),
             spectrum: Limits::default(),
             wake: Arc::new(Notify::new()),
             signer: None,
@@ -713,6 +729,12 @@ impl State {
     /// The state reading the leases of the exporters `exporters`.
     pub fn with_leases(mut self, exporters: &[String]) -> Self {
         self.leases = Leases::new(exporters);
+        self
+    }
+
+    /// The state running the APs' client guards as `guards` says.
+    pub fn with_guards(mut self, guards: GuardConfig) -> Self {
+        self.guards = guards;
         self
     }
 
@@ -894,8 +916,15 @@ impl State {
                 Some(Change::Snapshot(ap.to_owned()))
             }
             AgentMsg::Event(ev) => {
-                if let EventKind::FwCrash { phy } = &ev.kind {
-                    *entry.crashes.entry(phy.clone()).or_default() += 1;
+                match &ev.kind {
+                    EventKind::FwCrash { phy } => {
+                        *entry.crashes.entry(phy.clone()).or_default() += 1
+                    }
+                    EventKind::GuardViolation(v) => {
+                        let n = entry.violations.entry((v.guard, v.vlan)).or_default();
+                        *n += 1 + u64::from(v.repeats);
+                    }
+                    _ => {}
                 }
                 entry.push_event(ev.clone());
                 Some(Change::Event(ap.to_owned(), ev))
@@ -947,6 +976,10 @@ impl State {
             AgentMsg::ConfigApplied(c) => {
                 self.applied(ap, c);
                 None
+            }
+            AgentMsg::Bindings(b) => {
+                entry.bindings = b;
+                Some(Change::Bindings(ap.to_owned()))
             }
             // A Pong only proves the agent is alive.
             _ => None,
@@ -1037,6 +1070,39 @@ impl State {
         };
         self.pending.insert(cmd.id, pending);
         Some(CtlMsg::Command(cmd))
+    }
+
+    /// What a reconnected AP's client guards are told, for its session
+    /// `id` to send: their mode, and the leases they are seeded with.
+    pub fn guard_setup(&mut self, ap: &str, id: u64) -> Vec<CtlMsg> {
+        if self.live(ap, id).is_none() {
+            return Vec::new();
+        }
+        vec![
+            CtlMsg::Guards(self.guards.clone()),
+            CtlMsg::SeedBindings(self.seed()),
+        ]
+    }
+
+    /// Every client's leased IPv4 addresses, as the guards are seeded.
+    pub fn seed(&self) -> Vec<Binding> {
+        let leased = self.leases.all(SystemTime::now());
+        let mut seed: Vec<Binding> = leased
+            .flat_map(|(mac, l)| {
+                l.addresses
+                    .into_iter()
+                    .filter_map(move |(ip, expires)| match ip {
+                        IpAddr::V4(ip) => Some(Binding {
+                            mac,
+                            ip,
+                            expires_ms: Some(expires.saturating_mul(1000)),
+                        }),
+                        IpAddr::V6(_) => None,
+                    })
+            })
+            .collect();
+        seed.sort();
+        seed
     }
 
     /// The APs a session serves.
@@ -1642,16 +1708,23 @@ impl State {
         }
     }
 
-    /// Takes a read of the leases of `exporter`.
+    /// Takes a read of the leases of `exporter`; a change goes to every
+    /// connected AP's client guards as their new seed.
     pub fn take_leases(
         &mut self,
         exporter: &str,
         read: Result<Vec<Lease>, String>,
         now: SystemTime,
     ) {
-        if self.leases.take(exporter, read, now) {
-            self.notify(Change::Names);
+        if !self.leases.take(exporter, read, now) {
+            return;
         }
+        let seed = self.seed();
+        for live in self.aps.values().filter_map(|a| a.session.as_ref()) {
+            // A session that far behind is stalled; its next one is seeded.
+            let _ = live.outbox.try_send(CtlMsg::SeedBindings(seed.clone()));
+        }
+        self.notify(Change::Names);
     }
 
     /// The DNS name of `ip`, as last looked up.

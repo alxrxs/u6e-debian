@@ -175,6 +175,9 @@ export const DID = {
   'rf-plan': 'applied an RF plan',
 };
 
+/** The client guards, by the name the controller gives them. */
+export const GUARDS = { arp: 'ARP inspection', dhcp: 'Rogue DHCP guard', ra: 'RA guard', source: 'IP source guard' };
+
 /** What an event says, as the feed and a client's history show it. */
 export function describe(ev) {
   const on = ev.ssid ? ` ${ev.ssid}` : '';
@@ -188,6 +191,11 @@ export function describe(ev) {
     case 'radio-down': return { text: `${ev.phy} went down`, tone: 'bad', group: 'radio' };
     case 'fw-crash': return { text: `${ev.phy} firmware crashed`, tone: 'bad', group: 'radio' };
     case 'action': return { text: DID[ev.action] || ev.action, tone: ev.ok ? 'ok' : 'bad', group: 'action' };
+    case 'guard': {
+      const more = ev.repeats ? `, ${ev.repeats} more times since the last report` : '';
+      const fate = ev.dropped ? ' Dropped.' : '';
+      return { text: `broke the ${GUARDS[ev.guard] || ev.guard}: ${ev.detail}${more}.${fate}`, tone: 'bad', group: 'guard' };
+    }
     default: return { text: ev.kind, tone: '', group: 'other' };
   }
 }

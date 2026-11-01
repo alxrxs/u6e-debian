@@ -37,9 +37,10 @@ use u6e_proto::PROTOCOL;
 use u6e_proto::config::{self, config_sha256};
 use u6e_proto::frame::{decode_frame, frame_body, write_frame};
 use u6e_proto::msg::{
-    AgentMsg, Band, Bss, ClientFlows, CommandKind, CommandResult, ConfigApplied, CtlMsg, Event,
-    EventKind, FieldDelta, Flow, Flows, Hello, Mechanism, Radio, RadioApplied, RadioConfig,
-    RateMode, SignedConfig, Snapshot, SnapshotDelta, SpectrumFrame, Station, Temp,
+    AgentMsg, Band, Binding, Bss, ClientFlows, CommandKind, CommandResult, ConfigApplied, CtlMsg,
+    Event, EventKind, FieldDelta, Flow, Flows, Guard, GuardConfig, Hello, Mechanism, Radio,
+    RadioApplied, RadioConfig, RateMode, SignedConfig, Snapshot, SnapshotDelta, SpectrumFrame,
+    Station, Temp, Violation,
 };
 use u6e_proto::tls::{self, Identity};
 use u6e_proto::{mac, version};
@@ -266,6 +267,8 @@ struct Agent {
     buf: Vec<u8>,
     /// The blocks each sync the controller sent set, answered.
     syncs: Vec<Vec<[u8; 6]>>,
+    /// The client guards' modes and seeds the controller sent.
+    guards: Vec<CtlMsg>,
 }
 
 impl Agent {
@@ -285,6 +288,7 @@ impl Agent {
             sock,
             buf: Vec::new(),
             syncs: Vec::new(),
+            guards: Vec::new(),
         })
     }
 
@@ -324,7 +328,8 @@ impl Agent {
         self.send_bytes(&out)
     }
 
-    /// Asserts the agent is sent nothing but pings and syncs for `wait`.
+    /// Asserts the agent is sent nothing but pings, syncs and the client
+    /// guards' setup for `wait`.
     fn hears_nothing(&mut self, wait: Duration) {
         self.sock.set_read_timeout(Some(wait)).unwrap();
         let start = Instant::now();
@@ -335,6 +340,7 @@ impl Agent {
                     id,
                     kind: CommandKind::SyncBlocks { .. },
                 })) => self.reply(id, true, "synced"),
+                Ok(msg @ (CtlMsg::Guards(_) | CtlMsg::SeedBindings(_))) => self.guards.push(msg),
                 Ok(msg) => panic!("the agent was sent {msg:?}"),
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(e) => panic!("{e}"),
@@ -382,16 +388,22 @@ impl Agent {
     }
 
     /// Asserts that the controller ends the session, and does not merely
-    /// keep quiet.
+    /// keep quiet (the client guards' setup aside, which follows the sync).
     fn ends(&mut self) {
-        match self.recv_body() {
-            Err(e) => assert_eq!(e.kind(), ErrorKind::UnexpectedEof, "{e}"),
-            Ok(body) => panic!("a frame of {} B, not the end", body.len()),
+        loop {
+            match self.recv_body() {
+                Err(e) => return assert_eq!(e.kind(), ErrorKind::UnexpectedEof, "{e}"),
+                Ok(body) => match ctl_of(&body) {
+                    Some(CtlMsg::Guards(_) | CtlMsg::SeedBindings(_)) => {}
+                    _ => panic!("a frame of {} B, not the end", body.len()),
+                },
+            }
         }
     }
 
     /// The next message other than a ping or a sync of the blocks, which
-    /// are answered (the sync's list kept in `syncs`).
+    /// are answered (the sync's list kept in `syncs`), or the client guards'
+    /// setup (kept in `guards`).
     fn expect(&mut self) -> CtlMsg {
         let start = Instant::now();
         loop {
@@ -406,6 +418,7 @@ impl Agent {
                     }
                     kind => return CtlMsg::Command(u6e_proto::msg::Command { id: c.id, kind }),
                 },
+                msg @ (CtlMsg::Guards(_) | CtlMsg::SeedBindings(_)) => self.guards.push(msg),
                 msg => return msg,
             }
         }
@@ -426,6 +439,7 @@ impl Agent {
                     self.reply(id, true, "synced");
                     return macs;
                 }
+                msg @ (CtlMsg::Guards(_) | CtlMsg::SeedBindings(_)) => self.guards.push(msg),
                 other => panic!("{other:?} before the sync of the blocks"),
             }
         }
@@ -771,7 +785,7 @@ fn second_connection_replaces_first() {
     // The first connection is closed, whatever it still sends.
     loop {
         match first.recv() {
-            Ok(CtlMsg::Ping(_)) => {}
+            Ok(CtlMsg::Ping(_) | CtlMsg::Guards(_) | CtlMsg::SeedBindings(_)) => {}
             Ok(other) => panic!("unexpected {other:?}"),
             Err(_) => break,
         }
@@ -3792,6 +3806,13 @@ fn the_local_commands_reach_the_running_controller() {
     assert!(!ok && usage.starts_with("usage:"), "{usage}");
 }
 
+/// The controller's message in a frame's body, if it is one.
+fn ctl_of(body: &[u8]) -> Option<CtlMsg> {
+    let mut frame = (body.len() as u32).to_le_bytes().to_vec();
+    frame.extend(body);
+    decode_frame::<CtlMsg>(&frame).ok()?.map(|(m, _)| m)
+}
+
 /// A node exporter on loopback that answers every scrape with `text`.
 fn exporter(text: &'static str) -> SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3905,4 +3926,111 @@ fn the_far_ends_of_watched_flows_are_named() {
         }
     }
     assert!(r.dns.asked.lock().unwrap().contains(&remote));
+}
+
+/// After its first key frame an AP's client guards are given the mode the
+/// configuration sets and the IPv4 leases, which are seeded again when the
+/// leases come or change.
+#[test]
+fn the_guards_are_set_up_and_seeded() {
+    let leases = exporter(
+        "kea_lease_expiry_timestamp_seconds{device=\"\",family=\"ipv4\",hostname=\"tablet\",\
+         ip=\"192.0.2.10\",mac=\"02:00:00:00:00:01\",subnet_id=\"1\"} 4.1e+09\n\
+         kea_lease_expiry_timestamp_seconds{device=\"\",family=\"ipv6\",hostname=\"tablet\",\
+         ip=\"2001:db8::10\",mac=\"02:00:00:00:00:01\",subnet_id=\"2\"} 4.1e+09\n",
+    );
+    let dir = TempDir::new("guards");
+    let extra = format!(
+        "[leases]\nexporters = [\"{leases}\"]\n[guards]\nenforce = [42]\n\
+         static = [{{ mac = \"02:00:00:00:00:09\", ip = \"192.0.2.9\" }}]\n"
+    );
+    let r = configured(Timing::default(), &dir.0, 420, Arc::default(), &extra);
+    let mut a = ap_with_client(&r, KEY_AP1, "ap1", &[]);
+    let leased = Binding {
+        mac: MAC,
+        ip: "192.0.2.10".parse().unwrap(),
+        expires_ms: Some(4_100_000_000_000),
+    };
+    // The seed of the lease read at the start: at once, or after the read.
+    wait_for("the seed of the lease", || {
+        a.hears_nothing(Duration::from_millis(100));
+        a.guards.contains(&CtlMsg::SeedBindings(vec![leased]))
+    });
+    let mode = GuardConfig {
+        enforce: vec![42],
+        statics: vec![Binding {
+            mac: [2, 0, 0, 0, 0, 9],
+            ip: "192.0.2.9".parse().unwrap(),
+            expires_ms: None,
+        }],
+    };
+    assert_eq!(a.guards[0], CtlMsg::Guards(mode));
+    let manage = json_get(r.c.http, "/api/manage");
+    assert_eq!(manage["guards"], json!({"enforce": [42], "statics": 1}));
+}
+
+/// An AP's bindings show on its clients, and its guards' violations are
+/// events and counted.
+#[test]
+fn violations_are_events_and_counted() {
+    let r = controller(Timing::default());
+    let mut a = ap_with_client(&r, KEY_AP1, "ap1", &[]);
+    let bound = Binding {
+        mac: MAC,
+        ip: "192.0.2.10".parse().unwrap(),
+        expires_ms: Some(4_100_000_000_000),
+    };
+    a.send(&AgentMsg::Bindings(vec![bound])).unwrap();
+    let v = Violation {
+        guard: Guard::Arp,
+        mac: MAC,
+        ifname: "wlan5".into(),
+        vlan: 42,
+        ip: Some("192.0.2.66".parse().unwrap()),
+        detail: "uses 192.0.2.66, bound to no client".into(),
+        dropped: false,
+        repeats: 2,
+    };
+    let ev = Event {
+        at_ms: 1_800_000_000_000,
+        kind: EventKind::GuardViolation(v),
+    };
+    a.send(&AgentMsg::Event(ev)).unwrap();
+    wait_for("the violation", || {
+        let events = json_get(r.c.http, "/api/events");
+        events
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == "guard")
+    });
+    let events = json_get(r.c.http, "/api/events");
+    let e = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "guard")
+        .unwrap();
+    assert_eq!(
+        *e,
+        json!({
+            "ap": "ap1", "at": 1_800_000_000_000u64, "kind": "guard", "guard": "arp",
+            "mac": "02:00:00:00:00:01", "bss": "wlan5", "vlan": 42, "ip": "192.0.2.66",
+            "detail": "uses 192.0.2.66, bound to no client", "dropped": false, "repeats": 2,
+        })
+    );
+    let c = &json_get(r.c.http, "/api/clients")["02:00:00:00:00:01"];
+    assert_eq!(
+        c["bound"],
+        json!([{"ip": "192.0.2.10", "expires": 4_100_000_000_000u64}])
+    );
+    assert_eq!(
+        metrics_of(&r, "wifi_guard_violations_total{"),
+        ["wifi_guard_violations_total{ap=\"ap1\",guard=\"arp\",vlan=\"42\"} 3"]
+    );
+    assert_eq!(
+        metrics_of(&r, "wifi_guard_bindings{"),
+        ["wifi_guard_bindings{ap=\"ap1\"} 1"]
+    );
+    assert!(promtool_accepts(&http_get(r.c.metrics, "/metrics")));
 }

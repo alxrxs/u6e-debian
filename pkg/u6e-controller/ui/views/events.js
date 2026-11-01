@@ -5,7 +5,7 @@
 import { h, dayOf, describe, time } from '../util.js';
 
 const PAGE = 300;
-const GROUPS = [['', 'All'], ['conn', 'Joins and leaves'], ['auth', 'Sign-ins'], ['radio', 'Radios'], ['action', 'Actions']];
+const GROUPS = [['', 'All'], ['conn', 'Joins and leaves'], ['auth', 'Sign-ins'], ['radio', 'Radios'], ['guard', 'Guards'], ['action', 'Actions']];
 
 /** The radio an event names, with its band where the AP still lists it. */
 function radioName(store, e) {
@@ -45,7 +45,7 @@ export function feed(store, list, { seen, since = Infinity, showMac = true } = {
       lastDay = d;
     }
     const what = describe(e.phy ? { ...e, phy: radioName(store, e) } : e);
-    const key = `${e.ap}|${e.at}|${e.kind}|${e.action || ''}|${e.mac || e.phy}`;
+    const key = `${e.ap}|${e.at}|${e.kind}|${e.action || e.guard || ''}|${e.mac || e.phy}`;
     const fresh = seen && !seen.has(key) && e.at > since;
     seen?.add(key);
     out.push(h('li', { class: [what.tone, fresh ? 'fresh' : ''].join(' ').trim() || null },

@@ -81,7 +81,7 @@ function merge(target, patch) {
 }
 
 function eventKey(e) {
-  return `${e.ap}|${e.at}|${e.kind}|${e.action || ''}|${e.mac || e.phy || ''}`;
+  return `${e.ap}|${e.at}|${e.kind}|${e.action || e.guard || ''}|${e.mac || e.phy || ''}`;
 }
 
 function addEvents(list) {

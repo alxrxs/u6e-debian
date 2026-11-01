@@ -10,7 +10,8 @@
 //! file keeps, so that its alert outlives a restart. The sessions refused for
 //! naming another AP are counted per AP, and a radio not as the site file
 //! plans it is timed from when it was found so. The lease exporters' series
-//! exist only when the leases are read.
+//! exist only when the leases are read. The client guards' violations are
+//! counted per AP, guard and VLAN from the first of each, repeats included.
 
 use std::collections::BTreeSet;
 use std::fmt::Write;
@@ -27,7 +28,7 @@ use u6e_proto::msg::{Radio, Snapshot, Station};
 
 use crate::spectrum::{RADIOS, Scan};
 use crate::state::{Ap, OUTCOMES, Shared, State, is_failure};
-use crate::view::band;
+use crate::view::{band, guard_name};
 
 /// The operator's actions and their results, every pair always exported.
 const ACTIONS: [&str; 4] = ["kick", "block", "unblock", "steer"];
@@ -418,6 +419,7 @@ pub fn render(state: &State) -> String {
     rollouts(&mut m, state);
     not_as_planned(&mut m, state);
     leases(&mut m, state);
+    guards(&mut m, &aps);
     m.family(
         "wifi_blocked_clients",
         GAUGE,
@@ -475,6 +477,37 @@ fn leases(m: &mut Text, state: &State) {
         "Clients with an active lease, over every DHCP node.",
     );
     m.sample(&[], state.leases.all(SystemTime::now()).count() as f64);
+}
+
+/// The client guards: each AP's bindings while connected, and its
+/// violations.
+fn guards(m: &mut Text, aps: &[(&str, &Ap)]) {
+    m.family(
+        "wifi_guard_bindings",
+        GAUGE,
+        "Addresses the AP's client guards bind to its clients' MACs.",
+    );
+    for &(ap, a) in aps {
+        if a.is_up() {
+            m.sample(&[("ap", ap)], a.bindings.len() as f64);
+        }
+    }
+    m.family(
+        "wifi_guard_violations_total",
+        COUNTER,
+        "Frames of the AP's clients that broke a client guard's rule (arp, dhcp, ra, source), by VLAN.",
+    );
+    for &(ap, a) in aps {
+        for ((guard, vlan), n) in &a.violations {
+            let vlan = vlan.to_string();
+            let labels = [
+                ("ap", ap),
+                ("guard", guard_name(*guard)),
+                ("vlan", vlan.as_str()),
+            ];
+            m.sample(&labels, *n as f64);
+        }
+    }
 }
 
 /// The APs' configurations, when the controller signs them.

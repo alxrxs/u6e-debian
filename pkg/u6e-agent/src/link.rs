@@ -10,7 +10,9 @@
 //! hand and answered in turn, starts and stops radios' spectrum scans, whose
 //! frames leave as they come (see `spectrum`), and sends configurations,
 //! applied away from the link and answered once applied, in this session or
-//! the next (see `apply`); a silent or broken connection
+//! the next (see `apply`), and the client guards' mode and the leases they
+//! are seeded with, whose bindings and violations leave each tick (see
+//! `guards`); a silent or broken connection
 //! is dropped, its scans with it, and dialed again. The wait before a redial
 //! doubles from 1 s to 30 s until a session is useful (the controller said
 //! something in it), so a controller that takes each session and drops it is
@@ -47,6 +49,7 @@ use u6e_proto::msg::{
 use u6e_proto::tls::{self, Identity};
 use u6e_proto::{PROTOCOL, delta, version};
 
+use crate::guards::Guards;
 use crate::spectrum::{self, Spectrum};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -89,6 +92,8 @@ pub struct Config {
     /// The spectrum helper's socket, and how long a scan may run.
     pub spectrum: PathBuf,
     pub spectrum_limit: Duration,
+    /// The client guards' socket.
+    pub guards: PathBuf,
 }
 
 impl Config {
@@ -107,6 +112,7 @@ impl Config {
             backoff: BACKOFF_MIN..=BACKOFF_MAX,
             spectrum: spectrum::SOCKET.into(),
             spectrum_limit: spectrum::LIMIT,
+            guards: u6e_proto::guard::SOCKET.into(),
         }
     }
 }
@@ -165,6 +171,7 @@ fn run_with(
     mut relay: impl FnMut() -> io::Result<Arc<Ring>>,
 ) -> ! {
     let client = tls::client_config(&cfg.identity, cfg.controller_key);
+    let mut guards = Guards::new(cfg.guards.clone());
     let mut ring = None;
     let mut backoff = *cfg.backoff.start();
     // A failure that repeats is logged once, not at every attempt.
@@ -190,6 +197,7 @@ fn run_with(
                     &mut flows,
                     &mut command,
                     &mut applier,
+                    &mut guards,
                 );
                 if s.heard {
                     eprintln!("u6e-agent: link to {} down: {e}", cfg.controller);
@@ -423,6 +431,7 @@ impl Session {
 
     /// Serves the connection until it fails; without a ring, the snapshots
     /// and flows alone.
+    #[allow(clippy::too_many_arguments)]
     fn serve(
         &mut self,
         cfg: &Config,
@@ -431,9 +440,11 @@ impl Session {
         flows: &mut impl FlowSource,
         command: &mut impl CommandRunner,
         applier: &mut impl ConfigApplier,
+        guards: &mut Guards,
     ) -> io::Result<Infallible> {
         let mut out = Vec::new();
         write_frame(&mut out, &AgentMsg::Hello(cfg.hello.clone()))?;
+        guards.session();
         let mut up = false;
         loop {
             if let Some(r) = ring {
@@ -443,6 +454,7 @@ impl Session {
             let ticked = now >= self.due;
             if ticked {
                 self.snapshot_into(&mut out, now, snapshot)?;
+                guards.read_into(&mut out)?;
             }
             if now >= self.flows_due {
                 self.flows_into(&mut out, now, flows)?;
@@ -462,9 +474,9 @@ impl Session {
                 out.clear();
             }
             // On the first pass, what came with the version frame.
-            self.process(command, applier)?;
+            self.process(command, applier, guards)?;
             if self.wait(ring, applier.fd(), cfg.silence) {
-                self.receive(command, applier)?;
+                self.receive(command, applier, guards)?;
             }
             if self.heard && !up {
                 up = true;
@@ -585,10 +597,11 @@ impl Session {
         &mut self,
         command: &mut impl CommandRunner,
         applier: &mut impl ConfigApplier,
+        guards: &mut Guards,
     ) -> io::Result<()> {
         self.read_records()?;
         let closed = self.take_plaintext()?;
-        self.process(command, applier)?;
+        self.process(command, applier, guards)?;
         if closed {
             return Err(ErrorKind::UnexpectedEof.into());
         }
@@ -620,13 +633,14 @@ impl Session {
         &mut self,
         command: &mut impl CommandRunner,
         applier: &mut impl ConfigApplier,
+        guards: &mut Guards,
     ) -> io::Result<()> {
         let mut used = 0;
         while let Some((msg, n)) = decode_frame::<CtlMsg>(&self.inbuf[used..])? {
             used += n;
             self.last_rx = Instant::now();
             self.heard = true;
-            self.handle(msg, command, applier)?;
+            self.handle(msg, command, applier, guards)?;
         }
         consume(&mut self.inbuf, used);
         Ok(())
@@ -637,6 +651,7 @@ impl Session {
         msg: CtlMsg,
         command: &mut impl CommandRunner,
         applier: &mut impl ConfigApplier,
+        guards: &mut Guards,
     ) -> io::Result<()> {
         match msg {
             CtlMsg::SetTick { secs } => {
@@ -674,6 +689,8 @@ impl Session {
                     self.send_msg(&AgentMsg::ConfigApplied(answer))?;
                 }
             }
+            CtlMsg::Guards(config) => guards.configure(config),
+            CtlMsg::SeedBindings(leases) => guards.seed(leases),
             // A newer controller's messages mean nothing to this agent.
             _ => {}
         }
@@ -726,6 +743,7 @@ mod tests {
     use std::os::unix::net::UnixListener;
 
     use rustls::{ServerConfig, ServerConnection};
+    use u6e_proto::guard::Request;
     use u6e_proto::msg::{
         Bss, Command, CommandKind, EventKind, RateMode, SpectrumFrame, Station, Temp,
     };
@@ -1288,6 +1306,33 @@ mod tests {
         agent.events.send(event(5)).unwrap();
         assert_eq!(p.recv(), AgentMsg::Event(event(5)));
         assert!(sent.elapsed() < Duration::from_secs(3));
+    }
+
+    /// The client guards' bindings and violations leave with the first
+    /// tick; the mode and seed the controller sends reach them.
+    #[test]
+    fn the_client_guards_are_heard_and_told() {
+        use crate::guards::tests::{Fake as FakeGuards, violation};
+        let dir = TestDir::new();
+        let guards = FakeGuards::start(&dir);
+        guards.state.lock().unwrap().violations = vec![violation(1)];
+        let socket = guards.socket.clone();
+        let fake = Fake::new();
+        let _agent = Agent::spawn_with(&fake, 0, move |c| c.guards = socket, blank);
+        let mut p = fake.accept();
+        p.start();
+        assert_eq!(p.recv(), AgentMsg::Bindings(vec![]));
+        assert_eq!(p.recv(), AgentMsg::Event(violation(1).1));
+        let mode = u6e_proto::msg::GuardConfig {
+            enforce: vec![42],
+            statics: vec![],
+        };
+        p.send(CtlMsg::Guards(mode.clone()));
+        p.send(CtlMsg::SeedBindings(vec![]));
+        p.send(CtlMsg::Ping(7));
+        assert_eq!(p.recv(), AgentMsg::Pong(7));
+        let asked = guards.asked.lock().unwrap().clone();
+        assert!(asked.contains(&Request::Mode(mode)) && asked.contains(&Request::Seed(vec![])));
     }
 
     /// A command is carried out against the snapshot sent last and answered

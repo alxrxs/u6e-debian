@@ -31,6 +31,7 @@ mod collect;
 mod command;
 mod ecm;
 mod events;
+mod guards;
 mod helper;
 mod kmsg;
 mod link;

@@ -39,6 +39,7 @@ function identityFacts(c) {
     c.hostname ? fact('Host name', c.hostname, 'as it asked for its lease') : null,
     c.dns ? fact('DNS name', c.dns) : null,
     c.addresses?.length ? fact('Addresses', c.addresses.map((a) => h('span', { class: 'mono addr' }, a))) : null,
+    c.bound?.length ? fact('Guards bind', c.bound.map((b) => h('span', { class: 'mono addr' }, b.ip)), `on ${c.ap}`) : null,
     c.lease_expires ? fact('Lease', c.lease_expires > Date.now() ? `expires in ${duration((c.lease_expires - Date.now()) / 1000)}` : 'expired', until(c.lease_expires)) : null,
   ];
 }

@@ -9,8 +9,9 @@
 //! and flow cadence from the AP's watchers, and passes on what the state
 //! queues for it (commands, requests for flows, signed configurations). After
 //! the first key frame of every connection it gives the AP the policy's
-//! blocks, all of them, since the AP keeps them in RAM only, and checks that
-//! it runs the latest configuration signed for it.
+//! blocks, all of them, since the AP keeps them in RAM only, its client
+//! guards' mode and the leases they are seeded with, and checks that it runs
+//! the latest configuration signed for it.
 //!
 //! Received bytes collect in a buffer and are cut into frames only when whole,
 //! so a read cancelled by another branch of the session's `select!` never
@@ -386,6 +387,7 @@ impl Session {
         let mut used = 0;
         let mut want_key = false;
         let mut sync = None;
+        let mut setup = Vec::new();
         let mut flows = false;
         while let Some((msg, n)) = decode_frame::<AgentMsg>(&self.conn.inbuf[used..])? {
             used += n;
@@ -405,6 +407,7 @@ impl Session {
             if key && !gap && !self.synced {
                 self.synced = true;
                 sync = state.sync_blocks(&self.name, self.id);
+                setup = state.guard_setup(&self.name, self.id);
                 state.check_installed(&self.name, self.id);
             }
             drop(state);
@@ -421,6 +424,9 @@ impl Session {
             self.send(&CtlMsg::WantKey).await?;
         }
         if let Some(msg) = &sync {
+            self.send(msg).await?;
+        }
+        for msg in &setup {
             self.send(msg).await?;
         }
         if flows {

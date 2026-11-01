@@ -7,7 +7,8 @@
 //! it, the host name of its lease, or the reverse DNS of its addresses; the
 //! UI shows its MAC without one), each of those, its `vendor`, `addresses`
 //! and `lease_expires`. A flow's far end carries its DNS name
-//! (`remote_name`) once one was looked up. The clients the policy blocks are
+//! (`remote_name`) once one was looked up, and the addresses its AP's client
+//! guards bind to it (`bound`). The clients the policy blocks are
 //! listed whole (`blocked`), associated or not, so that one kept off every AP
 //! can still be found and unblocked; an associated client says it too.
 //!
@@ -15,8 +16,9 @@
 //! reports installed, the one it last acknowledged, the latest one signed for
 //! it and the one sent to it last, whether it drifts (runs another than the
 //! latest), and how the last one went. Beside the APs are what the
-//! controller manages (`manage`: whether it signs configurations, and, when it
-//! rolls images out, each AP's kept images and those it runs) and the image
+//! controller manages (`manage`: whether it signs configurations, the VLANs
+//! the client guards enforce on and their static clients, and, when it rolls
+//! images out, each AP's kept images and those it runs) and the image
 //! rollouts with their step, gate, result and log (`rollouts`).
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -24,7 +26,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Map, Value, json};
 use u6e_proto::PROTOCOL;
 use u6e_proto::mac;
-use u6e_proto::msg::{Band, Event, EventKind, Flow, Flows, Radio, RateMode, Snapshot, Station};
+use u6e_proto::msg::{
+    Band, Event, EventKind, Flow, Flows, Guard, Radio, RateMode, Snapshot, Station, Violation,
+};
 
 use crate::names;
 use crate::policy::{ConfigId, Phase};
@@ -120,7 +124,11 @@ fn flow(state: &State, f: &Flow) -> Value {
 /// it rolls images out, each AP's kept images (oldest first) and the image it
 /// runs (and the other it may run, after a rollout that failed part way).
 pub fn manage(state: &State) -> Value {
-    let mut o = json!({ "configs": state.signer.is_some() });
+    let guards = &state.guards;
+    let mut o = json!({
+        "configs": state.signer.is_some(),
+        "guards": { "enforce": guards.enforce, "statics": guards.statics.len() },
+    });
     if let Some(kept) = &state.kept {
         let aps = state.aps().map(|(name, _)| {
             let runs = state.images.get(name);
@@ -308,6 +316,10 @@ pub fn event(ap_name: &str, ap: &Ap, ev: &Event) -> Option<Value> {
         EventKind::RadioUp { phy } => ("radio-up", Err(phy)),
         EventKind::RadioDown { phy } => ("radio-down", Err(phy)),
         EventKind::FwCrash { phy } => ("fw-crash", Err(phy)),
+        EventKind::GuardViolation(v) => {
+            o.extend(violation(v));
+            return Some(Value::Object(o));
+        }
         _ => return None,
     };
     o.insert("kind".into(), kind.into());
@@ -355,6 +367,33 @@ pub fn diff(old: &Value, new: &Value) -> Option<Value> {
         patch.insert(k.clone(), Value::Null);
     }
     (!patch.is_empty()).then_some(Value::Object(patch))
+}
+
+/// A client guard by the name the UI and the metrics give it.
+pub fn guard_name(g: Guard) -> &'static str {
+    match g {
+        Guard::Arp => "arp",
+        Guard::Dhcp => "dhcp",
+        Guard::Ra => "ra",
+        Guard::Source => "source",
+    }
+}
+
+/// A violation's fields in an event.
+fn violation(v: &Violation) -> Map<String, Value> {
+    let mut o = Map::new();
+    o.insert("kind".into(), "guard".into());
+    o.insert("guard".into(), guard_name(v.guard).into());
+    o.insert("mac".into(), mac::format(v.mac).into());
+    o.insert("bss".into(), v.ifname.clone().into());
+    o.insert("vlan".into(), v.vlan.into());
+    if let Some(ip) = v.ip {
+        o.insert("ip".into(), ip.to_string().into());
+    }
+    o.insert("detail".into(), v.detail.clone().into());
+    o.insert("dropped".into(), v.dropped.into());
+    o.insert("repeats".into(), v.repeats.into());
+    o
 }
 
 pub fn band(b: Band) -> &'static str {
@@ -559,6 +598,19 @@ fn client_view(state: &State, c: &ClientView) -> Value {
     }
     if let Value::Object(o) = &mut o {
         o.extend(state.identity(&st.mac).fields());
+    }
+    let bound = ap
+        .into_iter()
+        .flat_map(|a| &a.bindings)
+        .filter(|b| b.mac == st.mac);
+    let bound: Vec<Value> = bound
+        .map(|b| match b.expires_ms {
+            Some(ms) => json!({ "ip": b.ip.to_string(), "expires": ms }),
+            None => json!({ "ip": b.ip.to_string() }),
+        })
+        .collect();
+    if !bound.is_empty() {
+        o["bound"] = bound.into();
     }
     let rates = ap.and_then(|a| {
         let (prev, then) = a.previous.as_ref()?;
