@@ -1,0 +1,50 @@
+From 9ab82000ba9c7a396a4db5ed09964e7671022908 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Sun, 1 Nov 2026 16:26:50 +0200
+Subject: [PATCH] AP: Deny a PTK0 rekey only when a PTK is installed
+
+With wpa_deny_ptk0_rekey, WPA_REAUTH and WPA_REAUTH_EAPOL disconnect the
+STA as soon as its state machine has started, whether or not it has a
+PTK. hostapd_new_assoc_sta() sends WPA_REAUTH for a reassociation, and
+the deny check runs before the PTK of the old association is cleared, so
+a STA that reassociates before completing a 4-way handshake is
+disconnected as a "PTK0 rekey" although there is no key to rekey.
+
+Windows with an Intel adapter on an IEEE 802.1X network (WPA3-Enterprise,
+PMF required) hits this on every attempt: it joins with a Reassociation
+Request, the 802.1X authenticator starts, the AP disconnects it, and it
+retries the next BSS within a second while the previous entry is still
+there, so it never gets past EAP and reports "roaming too often":
+
+  wlan6: STA 20:bd:1d:c2:94:c1 IEEE 802.11: associated (aid 7)
+  wlan6: CTRL-EVENT-EAP-STARTED 20:bd:1d:c2:94:c1
+  WPA: PTK0 rekey not allowed, disconnect 20:bd:1d:c2:94:c1
+
+Apply the deny only when PTK_valid is set. A rekey of an installed PTK is
+still refused; a STA without one goes on to a normal 4-way handshake.
+
+Assisted-by: LLM
+Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
+---
+ src/ap/wpa_auth.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/ap/wpa_auth.c b/src/ap/wpa_auth.c
+index eadcbfa..0609b21 100644
+--- a/src/ap/wpa_auth.c
++++ b/src/ap/wpa_auth.c
+@@ -2619,7 +2619,10 @@ int wpa_auth_sm_event(struct wpa_state_machine *sm, enum wpa_event event)
+ 			break;
+ 		}
+ 
+-		if (!sm->use_ext_key_id &&
++		/* Only a PTK that is installed can be rekeyed in place; a STA
++		 * that (re)associates before completing a 4-way handshake has
++		 * none, so there is nothing to protect. */
++		if (!sm->use_ext_key_id && sm->PTK_valid &&
+ 		    sm->wpa_auth->conf.wpa_deny_ptk0_rekey) {
+ 			wpa_printf(MSG_INFO,
+ 				   "WPA: PTK0 rekey not allowed, disconnect "
+-- 
+2.47.3
+

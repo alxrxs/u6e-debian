@@ -1,4 +1,4 @@
-From 64f9dd7874eae9b6ff58c3279abed12ad994e577 Mon Sep 17 00:00:00 2001
+From 06eae2f75744b70f573459657ca27e35f618469a Mon Sep 17 00:00:00 2001
 From: Andrei-Alexandru Bleortu <me@andrei-z.com>
 Date: Tue, 27 Oct 2026 21:51:46 +0200
 Subject: [PATCH] AP: Remove a STA that associated with another AP of the ESS
@@ -51,11 +51,11 @@ Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
  src/ap/ap_config.h    |   1 +
  src/ap/hostapd.c      |   9 ++
  src/ap/hostapd.h      |   1 +
- src/ap/roam_prune.c   | 218 ++++++++++++++++++++++++++++++++++++++++++
+ src/ap/roam_prune.c   | 225 ++++++++++++++++++++++++++++++++++++++++++
  src/ap/roam_prune.h   |  35 +++++++
  src/ap/sta_info.c     |   2 +
  src/ap/sta_info.h     |   1 +
- 11 files changed, 289 insertions(+)
+ 11 files changed, 296 insertions(+)
  create mode 100644 src/ap/roam_prune.c
  create mode 100644 src/ap/roam_prune.h
 
@@ -192,10 +192,10 @@ index 7e67ac7..d9284b0 100644
  
 diff --git a/src/ap/roam_prune.c b/src/ap/roam_prune.c
 new file mode 100644
-index 0000000..6ee49c6
+index 0000000..46c8c15
 --- /dev/null
 +++ b/src/ap/roam_prune.c
-@@ -0,0 +1,218 @@
+@@ -0,0 +1,225 @@
 +/*
 + * Removal of STAs that reassociated to another AP of the ESS
 + *
@@ -298,7 +298,14 @@ index 0000000..6ee49c6
 +		return;
 +	if (read_rx_packets(hapd, sta, &rx_packets) < 0)
 +		return;
-+	if (rx_packets != sta->roam_prune_rx_packets) {
++	if (rx_packets < sta->roam_prune_rx_packets) {
++		/* The driver entry was replaced: the STA associated again. */
++		hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
++			       HOSTAPD_LEVEL_INFO,
++			       "Layer 2 Update frame from the distribution system, but the STA associated here again; not removed");
++		return;
++	}
++	if (rx_packets > sta->roam_prune_rx_packets) {
 +		hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
 +			       HOSTAPD_LEVEL_INFO,
 +			       "Layer 2 Update frame from the distribution system, but the STA is still here (%lu frames received in %d s); not removed",
