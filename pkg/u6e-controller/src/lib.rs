@@ -11,7 +11,9 @@
 //! AP onto its newest one when an admin asks, health-gated and rolled back
 //! when the AP does not come back healthy (`rollout`). The RF planner (`rf`)
 //! proposes the radios' channels, widths and powers from their history, and
-//! commits a proposal an admin applies to the site file.
+//! commits a proposal an admin applies to the site file. Clients are named
+//! from the DHCP servers' leases, the reverse DNS of their addresses and
+//! their MACs' vendors (`identity`, `leases`, `names`, `oui`).
 
 pub mod actions;
 pub mod agents;
@@ -19,10 +21,13 @@ pub mod config;
 pub mod configs;
 mod frames;
 pub mod http;
+pub mod identity;
 pub mod images;
+pub mod leases;
 pub mod local;
 pub mod metrics;
 pub mod names;
+pub mod oui;
 pub mod policy;
 pub mod rf;
 pub mod rollout;
@@ -124,7 +129,8 @@ pub async fn start(
     let mut state = State::new(config.hostnames.clone())
         .with_policy(saved)
         .with_spectrum(timing.spectrum)
-        .with_history(window);
+        .with_history(window)
+        .with_leases(&config.leases);
     let mut set_aside = Vec::new();
     if let Some((s, aside)) = signer(config, identity)? {
         state = state.with_signer(s);
@@ -202,6 +208,9 @@ pub async fn start(
     };
     tokio::spawn(agents::serve(agents, listener));
     tokio::spawn(expire(state.clone(), timing));
+    if !config.leases.is_empty() {
+        tokio::spawn(leases::supervise(state.clone(), config.leases.clone()));
+    }
     let mut access = Access::new(config, timing.command, store);
     if let Some(e) = &engine {
         e.resume();

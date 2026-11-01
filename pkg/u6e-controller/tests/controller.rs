@@ -209,6 +209,17 @@ fn controller_in(timing: Timing, dir: &Path) -> Running {
 /// A controller with its files in `dir`, its gates `gate_secs` long, its
 /// images staged by `stage`.
 fn managed(timing: Timing, dir: &Path, gate_secs: u64, stage: Arc<FakeStage>) -> Running {
+    configured(timing, dir, gate_secs, stage, "")
+}
+
+/// The same, with `extra` at the end of its configuration.
+fn configured(
+    timing: Timing,
+    dir: &Path,
+    gate_secs: u64,
+    stage: Arc<FakeStage>,
+    extra: &str,
+) -> Running {
     // Two workers are plenty, and a worker per core in every test of eight
     // test processes at once runs into the threads a cgroup allows.
     let rt = Builder::new_multi_thread()
@@ -216,7 +227,8 @@ fn managed(timing: Timing, dir: &Path, gate_secs: u64, stage: Arc<FakeStage>) ->
         .enable_all()
         .build()
         .unwrap();
-    let config = Config::parse(&config_text("unused.pem", true, dir, gate_secs)).unwrap();
+    let text = config_text("unused.pem", true, dir, gate_secs) + extra;
+    let config = Config::parse(&text).unwrap();
     let dns = Arc::new(FakeDns::default());
     let resolver: Arc<dyn Resolve> = dns.clone();
     let stager: Arc<dyn Stage> = stage;
@@ -2063,7 +2075,7 @@ fn a_flow_opened_from_outside_names_the_client() {
     a.send(&AgentMsg::Flows(flows(1, vec![inbound], 1)))
         .unwrap();
     wait_for("the client's name", || {
-        r.c.state.read().name_of(&MAC) == Some("printer.lan.example")
+        r.c.state.read().identity(&MAC).name() == Some("printer.lan.example")
     });
     assert_eq!(*r.dns.asked.lock().unwrap(), [client]);
 }
@@ -3778,4 +3790,119 @@ fn the_local_commands_reach_the_running_controller() {
     assert!(dir.0.join("images/img-1-ap1/MANIFEST").exists());
     let (ok, _, usage) = command(&["image"], "");
     assert!(!ok && usage.starts_with("usage:"), "{usage}");
+}
+
+/// A node exporter on loopback that answers every scrape with `text`.
+fn exporter(text: &'static str) -> SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for mut s in listener.incoming().flatten() {
+            let mut ask = [0; 1024];
+            let _ = s.read(&mut ask);
+            let _ = write!(
+                s,
+                "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\n{text}"
+            );
+        }
+    });
+    addr
+}
+
+/// A client is named by the DHCP server's device for it before its lease's
+/// host name and its DNS name, and shows its addresses, lease and vendor.
+#[test]
+fn clients_are_named_by_their_leases() {
+    let leases = exporter(
+        "# TYPE kea_lease_expiry_timestamp_seconds gauge\n\
+         kea_lease_expiry_timestamp_seconds{device=\"Kitchen tablet\",family=\"ipv4\",\
+         hostname=\"tablet\",ip=\"192.0.2.10\",mac=\"02:00:00:00:00:01\",subnet_id=\"1\"} 4.1e+09\n\
+         kea_lease_expiry_timestamp_seconds{device=\"\",family=\"ipv4\",hostname=\"gone\",\
+         ip=\"192.0.2.11\",mac=\"02:00:00:00:00:02\",subnet_id=\"1\"} 1e+09\n",
+    );
+    let dir = TempDir::new("leases");
+    let extra = format!("[leases]\nexporters = [\"{leases}\"]\n");
+    let r = configured(Timing::default(), &dir.0, 420, Arc::default(), &extra);
+    r.dns
+        .names
+        .lock()
+        .unwrap()
+        .insert("2001:db8::10".parse().unwrap(), "tab.lan.example".into());
+    let mut a = ap_with_client(&r, KEY_AP1, "ap1", &[]);
+    let top = vec![flow("2001:db8::10", "2001:db8:1::1", 10, true)];
+    a.send(&AgentMsg::Flows(flows(1, top, 1))).unwrap();
+    wait_for("the lease and the DNS name", || {
+        let c = &json_get(r.c.http, "/api/clients")["02:00:00:00:00:01"];
+        c.get("device").is_some() && c.get("dns").is_some()
+    });
+    let c = &json_get(r.c.http, "/api/clients")["02:00:00:00:00:01"];
+    let keys = [
+        "name",
+        "device",
+        "hostname",
+        "dns",
+        "vendor",
+        "addresses",
+        "lease_expires",
+    ];
+    let identity: serde_json::Map<String, Value> = keys
+        .iter()
+        .map(|k| (k.to_string(), c[*k].clone()))
+        .collect();
+    assert_eq!(
+        Value::Object(identity),
+        json!({
+            "name": "Kitchen tablet",
+            "device": "Kitchen tablet",
+            "hostname": "tablet",
+            "dns": "tab.lan.example",
+            // A locally administered MAC, as the tests' are.
+            "vendor": "Private address",
+            // The leased address first, then what only the flows show.
+            "addresses": ["192.0.2.10", "2001:db8::10"],
+            "lease_expires": 4_100_000_000_000u64,
+        })
+    );
+    let up = format!("wifi_leases_exporter_up{{exporter=\"{leases}\"}} 1");
+    assert_eq!(metrics_of(&r, "wifi_leases_exporter_up"), [up]);
+    // The expired lease is not counted.
+    assert_eq!(
+        metrics_of(&r, "wifi_leases_active "),
+        ["wifi_leases_active 1"]
+    );
+    assert!(promtool_accepts(&http_get(r.c.metrics, "/metrics")));
+}
+
+/// The far ends of a client's flows are looked up only while a page shows
+/// its AP's flows, and their names come with the flows.
+#[test]
+fn the_far_ends_of_watched_flows_are_named() {
+    let r = controller(Timing::default());
+    let mut a = ap_with_client(&r, KEY_AP1, "ap1", &[]);
+    let remote: IpAddr = "198.51.100.7".parse().unwrap();
+    r.dns
+        .names
+        .lock()
+        .unwrap()
+        .insert(remote, "cdn.example.net".into());
+    let top = vec![flow("192.0.2.10", "198.51.100.7", 10, true)];
+    a.send(&AgentMsg::Flows(flows(1, top.clone(), 1))).unwrap();
+    wait_for("the client's address looked up", || {
+        r.dns.asked.lock().unwrap().len() == 1
+    });
+    assert!(!r.dns.asked.lock().unwrap().contains(&remote));
+    let mut ui = Ui::subscribe(r.c.http, json!(["ap1"]));
+    ui.recv();
+    ui.send(&json!({"flows": true}));
+    // The flows come with the patch that answers it: the page watches them.
+    while ui.recv()["patch"].get("flows").is_none() {}
+    a.send(&AgentMsg::Flows(flows(2, top, 1))).unwrap();
+    loop {
+        let msg = ui.recv();
+        let client = &msg["patch"]["flows"]["ap1"]["clients"]["02:00:00:00:00:01"];
+        if client["top"][0]["remote_name"] == "cdn.example.net" {
+            break;
+        }
+    }
+    assert!(r.dns.asked.lock().unwrap().contains(&remote));
 }

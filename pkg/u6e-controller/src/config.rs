@@ -6,8 +6,10 @@
 //! to act, and where the decisions are kept; the local socket root's commands
 //! reach it on (`local`); in `[configs]`, the signing of live Wi-Fi
 //! configurations (`configs`), and in `[rollouts]`, the kept images and their
-//! rollouts (`rollout`), each off without its section; and, in `[rf]`, the RF
-//! planner's (`rf::config`), without which it is off.
+//! rollouts (`rollout`), each off without its section; in `[rf]`, the RF
+//! planner's (`rf::config`), without which it is off; and, in `[leases]`, the
+//! DHCP nodes' node exporters the clients' leases are read from (`leases`),
+//! none without it.
 //!
 //! ```toml
 //! listen_agents = "[::]:8443"
@@ -31,6 +33,9 @@
 //! root_key = "/etc/wifi-controller/ap-root-key"
 //! stock_password = "/etc/wifi-controller/ap-stock-password"
 //! known_hosts = "/etc/wifi-controller/ap-known-hosts"
+//!
+//! [leases]
+//! exporters = ["dhcp1.example.org:9100", "[2001:db8::53]:9100"]
 //! ```
 
 use std::collections::{BTreeMap, HashMap};
@@ -75,6 +80,8 @@ pub struct Config {
     pub rollouts: Option<rollout::Settings>,
     /// The RF planner's settings, if it is on.
     pub rf: Option<rf::config::Settings>,
+    /// The node exporters (`host:port`) that publish the DHCP leases.
+    pub leases: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -100,6 +107,13 @@ struct File {
     configs: Option<configs::File>,
     rollouts: Option<rollout::File>,
     rf: Option<rf::config::File>,
+    leases: Option<LeasesFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LeasesFile {
+    exporters: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -163,6 +177,8 @@ pub enum ConfigError {
     Section(String),
     /// `[rf]` is not a planner's configuration: why.
     Rf(String),
+    /// A `[leases]` exporter is not `host:port`.
+    BadExporter(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -180,6 +196,7 @@ impl fmt::Display for ConfigError {
             ),
             Self::NoAdminGroup => f.write_str("admin_group is empty"),
             Self::Section(e) | Self::Rf(e) => f.write_str(e),
+            Self::BadExporter(e) => write!(f, "leases.exporters: {e:?} is not host:port"),
         }
     }
 }
@@ -230,6 +247,10 @@ impl Config {
             .map(rf::config::File::check)
             .transpose()
             .map_err(ConfigError::Rf)?;
+        let leases = file.leases.map_or_else(Vec::new, |l| l.exporters);
+        if let Some(bad) = leases.iter().find(|e| !is_exporter(e)) {
+            return Err(ConfigError::BadExporter(bad.clone()));
+        }
         Ok(Config {
             listen_agents: file.listen_agents,
             listen_http: file.listen_http,
@@ -245,8 +266,22 @@ impl Config {
             configs: configs.map_err(ConfigError::Section)?,
             rollouts: rollouts.map_err(ConfigError::Section)?,
             rf,
+            leases,
         })
     }
+}
+
+/// Whether `s` is `host:port`: a name or IPv4 address, or an IPv6 one in
+/// brackets, and a port.
+fn is_exporter(s: &str) -> bool {
+    let Some((host, port)) = s.rsplit_once(':') else {
+        return false;
+    };
+    let host = match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        Some(v6) => v6.parse::<std::net::Ipv6Addr>().is_ok(),
+        None => !host.contains(':') && is_address(host),
+    };
+    host && port.parse::<u16>().is_ok_and(|p| p > 0)
 }
 
 /// Whether `s` is spelled as a browser sends `Origin`: an http(s) scheme and
@@ -459,6 +494,30 @@ mod tests {
         assert_eq!(s.rules.countries["KR"][2][0].hi, 93);
         let bad = format!("{ORIGIN}{}", rf.replace("1-93", "1-0"));
         assert!(matches!(Config::parse(&bad), Err(ConfigError::Rf(_))));
+    }
+
+    #[test]
+    fn the_lease_exporters_are_host_and_port() {
+        let leases =
+            |list: &str| Config::parse(&format!("{ORIGIN}[leases]\nexporters = [{list}]\n"));
+        let c = leases("\"dhcp1.example.org:9100\", \"192.0.2.53:9100\", \"[2001:db8::53]:9100\"")
+            .unwrap();
+        assert_eq!(c.leases.len(), 3);
+        assert!(Config::parse(ORIGIN).unwrap().leases.is_empty());
+        for bad in [
+            "dhcp1.example.org",
+            "2001:db8::53:9100",
+            "x:0",
+            "-o:1",
+            "[x]:9100",
+            "a b:9100",
+        ] {
+            assert_eq!(
+                leases(&format!("\"{bad}\"")),
+                Err(ConfigError::BadExporter(bad.into())),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

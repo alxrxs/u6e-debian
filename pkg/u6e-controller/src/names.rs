@@ -1,12 +1,15 @@
-//! Client names: the reverse DNS of the addresses a client's flows show it
-//! at, through the system resolver, so a client is named by whatever its
-//! address is registered under (a DHCP server's PTR, typically) with no data
-//! source of the controller's own.
+//! Reverse DNS, through the system resolver, of two kinds of addresses: a
+//! client's own, as its flows show them, which name it when neither the DHCP
+//! server's device nor the client's own host name does (a static client's
+//! PTR, typically); and the far ends of the flows a UI watches, shown under
+//! each address.
 //!
-//! Each address is looked up at most once at a time. A name found is kept for
-//! [`FOUND_TTL`], the lack of one for [`MISSING_TTL`]; past that the next flows
-//! that show the address look it up again, and the old name is shown until
-//! the answer comes.
+//! Each address is looked up at most once at a time, [`LOOKUPS`] at most at
+//! once. A name found is kept for [`FOUND_TTL`], the lack of one for
+//! [`MISSING_TTL`]; past that the next flows that show the address look it up
+//! again, and the old name is shown until the answer comes. At most
+//! [`CAPACITY`] addresses are known, the one whose answer goes stale first
+//! forgotten for a new one.
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::CStr;
@@ -17,10 +20,12 @@ use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use u6e_proto::msg::Flow;
 
-pub const FOUND_TTL: Duration = Duration::from_secs(600);
-pub const MISSING_TTL: Duration = Duration::from_secs(120);
+pub const FOUND_TTL: Duration = Duration::from_secs(3600);
+pub const MISSING_TTL: Duration = Duration::from_secs(600);
 /// Lookups at once: a resolver that does not answer holds each for seconds.
-const LOOKUPS: usize = 8;
+pub const LOOKUPS: usize = 8;
+/// The addresses known at once.
+pub const CAPACITY: usize = 4096;
 /// The longest a DNS name is.
 const NAME_MAX: usize = 253;
 
@@ -92,7 +97,7 @@ impl Resolve for System {
 
 /// `name` without its root dot, if it is a host name. A client may register
 /// whatever it likes, so nothing else is shown.
-fn clean(name: &str) -> Option<String> {
+pub(crate) fn clean(name: &str) -> Option<String> {
     let name = name.strip_suffix('.').unwrap_or(name);
     let ok = |c: char| c.is_ascii_alphanumeric() || "-_.".contains(c);
     (!name.is_empty() && name.len() <= NAME_MAX && name.chars().all(ok)).then(|| name.to_owned())
@@ -120,6 +125,9 @@ impl Names {
     pub fn due(&mut self, wanted: impl IntoIterator<Item = IpAddr>, now: Instant) -> Vec<IpAddr> {
         let mut out = Vec::new();
         for ip in wanted {
+            if !self.entries.contains_key(&ip) && self.entries.len() >= CAPACITY {
+                self.evict();
+            }
             let e = self.entries.entry(ip).or_insert(Entry {
                 name: None,
                 until: now,
@@ -150,6 +158,15 @@ impl Names {
         let changed = e.name != name;
         e.name = name;
         changed
+    }
+
+    /// Forgets the address whose answer goes stale first, of those not
+    /// being looked up.
+    fn evict(&mut self) {
+        let idle = self.entries.iter().filter(|(_, e)| !e.pending);
+        if let Some(ip) = idle.min_by_key(|(_, e)| e.until).map(|(ip, _)| *ip) {
+            self.entries.remove(&ip);
+        }
     }
 
     pub fn get(&self, ip: &IpAddr) -> Option<&str> {
@@ -187,6 +204,11 @@ impl Lookups {
             .ok()
             .flatten()
     }
+}
+
+/// The far end of a flow: the end that is not the client's.
+pub fn remote(f: &Flow) -> IpAddr {
+    if f.client_is_src { f.dst } else { f.src }
 }
 
 /// A client's own addresses as its flows show them (the end each flow says
@@ -257,25 +279,48 @@ mod tests {
         assert!(n.answer(a, Some("host-a.example".into()), t0));
         assert!(!n.answer(b, None, t0));
         assert_eq!((n.get(&a), n.get(&b)), (Some("host-a.example"), None));
-        // The missing name is asked again after two minutes, the found one
-        // after ten, and stays shown meanwhile.
+        // The missing name is asked again after ten minutes, the found one
+        // after an hour, and stays shown meanwhile.
         let later = |s| t0 + Duration::from_secs(s);
-        assert!(n.due([a, b], later(119)).is_empty());
-        assert_eq!(n.due([a, b], later(120)), [b]);
         assert!(n.due([a, b], later(599)).is_empty());
-        assert_eq!(n.due([a, b], later(600)), [a]);
+        assert_eq!(n.due([a, b], later(600)), [b]);
+        assert!(n.due([a, b], later(3599)).is_empty());
+        assert_eq!(n.due([a, b], later(3600)), [a]);
         assert_eq!(n.get(&a), Some("host-a.example"));
-        assert!(!n.answer(a, Some("host-a.example".into()), later(600)));
-        assert!(n.answer(a, Some("renamed.example".into()), later(600)));
+        assert!(!n.answer(a, Some("host-a.example".into()), later(3600)));
+        assert!(n.answer(a, Some("renamed.example".into()), later(3600)));
         // Not seen for a while: forgotten, unless a lookup is out (b's
-        // since 120 s, c's).
+        // since 600 s, c's).
         let c = ip("192.0.2.3");
-        assert_eq!(n.due([c], later(1500)), [c]);
-        n.prune(later(2400));
+        assert_eq!(n.due([c], later(9000)), [c]);
+        n.prune(later(14400));
         assert_eq!(n.get(&a), None);
         let mut kept: Vec<_> = n.entries.keys().copied().collect();
         kept.sort();
         assert_eq!(kept, [b, c]);
+    }
+
+    #[test]
+    fn the_cache_forgets_what_goes_stale_first() {
+        let mut n = Names::default();
+        let t0 = Instant::now();
+        let v4 = |i: usize| IpAddr::from([10, (i >> 16) as u8, (i >> 8) as u8, i as u8]);
+        let all: Vec<IpAddr> = (0..CAPACITY).map(v4).collect();
+        assert_eq!(n.due(all.iter().copied(), t0).len(), CAPACITY);
+        // Answered one second apart: the first answered goes stale first.
+        for (i, ip) in all.iter().enumerate() {
+            n.answer(*ip, None, t0 + Duration::from_secs(i as u64));
+        }
+        let new = ip("192.0.2.1");
+        assert_eq!(n.due([new], t0), [new]);
+        assert_eq!(n.entries.len(), CAPACITY);
+        assert!(!n.entries.contains_key(&all[0]) && n.entries.contains_key(&all[1]));
+        // Lookups out are never forgotten: with all of them out, the cache
+        // grows past its size rather than lose one.
+        let mut busy = Names::default();
+        busy.due(all.iter().copied(), t0);
+        busy.due([new], t0);
+        assert_eq!(busy.entries.len(), CAPACITY + 1);
     }
 
     #[test]

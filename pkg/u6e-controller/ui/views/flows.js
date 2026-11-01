@@ -1,8 +1,9 @@
 // Flows: the connections each AP forwards for its clients, as the NSS
 // connection manager tracks them: per client how many, how many the hardware
 // offloads past the CPU, the bytes each way and their rate; a client's largest
-// connections on demand, and an AP's whole table when asked for. A client's
-// page shows its own with the table built here.
+// connections on demand, and an AP's whole table when asked for, each far end
+// with its DNS name in grey beneath once the controller has looked it up. A
+// client's page shows its own with the table built here.
 
 import { h, icon, bits, bytes, duration, time } from '../util.js';
 
@@ -45,7 +46,9 @@ export function flowTable(rows, { of } = {}) {
       return h('tr', {},
         of ? h('td', { class: 'c-client' }, of(mac)) : null,
         h('td', { class: 'c-proto' }, protoName(f.proto)),
-        h('td', { class: 'c-remote' }, h('span', { class: 'mono' }, endpoint(rip, rport, f.proto)), inbound ? h('small', {}, 'opened by the remote end') : null),
+        h('td', { class: 'c-remote' }, h('span', { class: 'mono' }, endpoint(rip, rport, f.proto)),
+          f.remote_name ? h('small', { class: 'rname' }, f.remote_name) : null,
+          inbound ? h('small', {}, 'opened by the remote end') : null),
         h('td', { class: 'c-port mono', 'data-label': 'port' }, PORTS.has(f.proto) ? String(lport) : '–'),
         h('td', { class: 'c-down num', 'data-label': '↓' }, bytes(f.rx_bytes)),
         h('td', { class: 'c-up num', 'data-label': '↑' }, bytes(f.tx_bytes)),
@@ -122,14 +125,14 @@ function fullPanel(store, ap, view) {
   for (const cf of st.clients) {
     const name = cf.name || '';
     for (const flow of cf.top) {
-      if (q && ![cf.mac, name, flow.src, flow.dst, String(flow.sport), String(flow.dport), protoName(flow.proto)]
+      if (q && ![cf.mac, name, flow.src, flow.dst, flow.remote_name || '', String(flow.sport), String(flow.dport), protoName(flow.proto)]
         .some((v) => v.toLowerCase().includes(q))) continue;
       rows.push({ flow, mac: cf.mac });
     }
   }
   rows.sort((a, b) => b.flow.rx_bytes + b.flow.tx_bytes - (a.flow.rx_bytes + a.flow.tx_bytes));
   const total = st.clients.reduce((n, c) => n + c.top.length, 0);
-  const search = h('input', { type: 'search', placeholder: 'Filter by client, address, port or protocol', 'aria-label': `Filter ${ap}’s connections`, value: st.q || '', 'data-focus': `q/${ap}` });
+  const search = h('input', { type: 'search', placeholder: 'Filter by client, address, name, port or protocol', 'aria-label': `Filter ${ap}’s connections`, value: st.q || '', 'data-focus': `q/${ap}` });
   search.addEventListener('input', () => {
     st.q = search.value;
     st.limit = PAGE;
@@ -170,7 +173,7 @@ export default {
     const f = (store.ui.flowFilter ||= { q: '', ap: '' });
     const open = (store.ui.flowOpen ||= new Set());
     const sub = h('p');
-    const search = h('input', { type: 'search', placeholder: 'Filter by name, MAC or address', 'aria-label': 'Filter flows', value: f.q });
+    const search = h('input', { type: 'search', placeholder: 'Filter by name, MAC, address or remote name', 'aria-label': 'Filter flows', value: f.q });
     search.addEventListener('input', () => {
       f.q = search.value;
       view.update();
@@ -190,7 +193,7 @@ export default {
       const q = f.q.trim().toLowerCase();
       const name = cf.name || '';
       return !q || [mac, name].some((v) => v.toLowerCase().includes(q))
-        || cf.top.some((x) => x.src.includes(q) || x.dst.includes(q));
+        || cf.top.some((x) => x.src.includes(q) || x.dst.includes(q) || x.remote_name?.toLowerCase().includes(q));
     }
 
     function clientRows(ap, cfs) {

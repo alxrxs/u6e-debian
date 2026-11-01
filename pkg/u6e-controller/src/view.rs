@@ -2,9 +2,12 @@
 //! clients by MAC, temperatures by zone), so that a change goes out as a JSON
 //! merge patch (RFC 7386) of only the fields that changed. Rates, utilization
 //! and retry ratios are worked out here from the counters of the AP's last two
-//! snapshots, and rounded so that a steady value is not resent. A client is
-//! named (`name`) when the reverse DNS of an address its flows show has a
-//! name; the UI shows its MAC otherwise. The clients the policy blocks are
+//! snapshots, and rounded so that a steady value is not resent. A client
+//! carries who it is (`identity`): its `name` (the DHCP server's device for
+//! it, the host name of its lease, or the reverse DNS of its addresses; the
+//! UI shows its MAC without one), each of those, its `vendor`, `addresses`
+//! and `lease_expires`. A flow's far end carries its DNS name
+//! (`remote_name`) once one was looked up. The clients the policy blocks are
 //! listed whole (`blocked`), associated or not, so that one kept off every AP
 //! can still be found and unblocked; an associated client says it too.
 //!
@@ -23,6 +26,7 @@ use u6e_proto::PROTOCOL;
 use u6e_proto::mac;
 use u6e_proto::msg::{Band, Event, EventKind, Flow, Flows, Radio, RateMode, Snapshot, Station};
 
+use crate::names;
 use crate::policy::{ConfigId, Phase};
 use crate::state::{Action, Ap, ClientView, Rollout, State, mechanism_name, outcome_name};
 
@@ -74,9 +78,9 @@ pub fn flows_of(state: &State, f: &Flows, at: SystemTime, client: Option<[u8; 6]
                 "rx_bytes": c.rx_bytes,
                 "tx_packets": c.tx_packets,
                 "rx_packets": c.rx_packets,
-                "top": c.top.iter().map(flow).collect::<Vec<_>>(),
+                "top": c.top.iter().map(|f| flow(state, f)).collect::<Vec<_>>(),
             });
-            if let Some(name) = state.name_of(&c.mac) {
+            if let Some(name) = state.identity(&c.mac).name() {
                 o["name"] = name.into();
             }
             (mac::format(c.mac), o)
@@ -91,8 +95,8 @@ pub fn flows_of(state: &State, f: &Flows, at: SystemTime, client: Option<[u8; 6]
 
 /// One connection; `src` opened it, the client is the end
 /// `client_is_src` says, and tx/rx are the client's.
-fn flow(f: &Flow) -> Value {
-    json!({
+fn flow(state: &State, f: &Flow) -> Value {
+    let mut o = json!({
         "proto": f.proto,
         "src": f.src.to_string(),
         "sport": f.sport,
@@ -105,7 +109,11 @@ fn flow(f: &Flow) -> Value {
         "offloaded": f.offloaded,
         "age": f.age_s,
         "client_is_src": f.client_is_src,
-    })
+    });
+    if let Some(name) = state.dns_name(&names::remote(f)) {
+        o["remote_name"] = name.into();
+    }
+    o
 }
 
 /// What the controller manages: whether it signs configurations, and, when
@@ -549,8 +557,8 @@ fn client_view(state: &State, c: &ClientView) -> Value {
     if let Some(b) = band {
         o["band"] = b.into();
     }
-    if let Some(name) = state.name_of(&st.mac) {
-        o["name"] = name.into();
+    if let Value::Object(o) = &mut o {
+        o.extend(state.identity(&st.mac).fields());
     }
     let rates = ap.and_then(|a| {
         let (prev, then) = a.previous.as_ref()?;

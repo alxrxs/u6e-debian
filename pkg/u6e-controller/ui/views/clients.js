@@ -1,6 +1,8 @@
-// Clients: every associated client, sortable and filterable, with its signal
-// over the session as a sparkline; and the blocked ones no AP lets on, each a
-// link to its page, where it can be unblocked.
+// Clients: every associated client, sortable and filterable, by its name
+// (the DHCP server's device, its lease's host name or its DNS name) with its
+// MAC and vendor beneath, and its signal over the session as a sparkline; and
+// the blocked ones no AP lets on, each a link to its page, where it can be
+// unblocked.
 
 import { h, BANDS, bits, duration, mbps, palette, pct, phy, quality } from '../util.js';
 import { sparkline } from '../charts.js';
@@ -25,11 +27,14 @@ const COLUMNS = [
 
 const sparks = [];
 
-/** The client by its name, its MAC beneath; by its MAC when it has none. */
+/** The client by its name, its MAC and vendor beneath; by its MAC when it
+ * has none. */
 function clientCell(m, c) {
   const link = h('a', { class: c.name ? null : 'mono', href: `#/client/${m}` }, c.name || m);
+  const under = [c.name ? h('span', { class: 'mono' }, m) : null, c.vendor || null].filter(Boolean);
   return h('td', {}, h('div', { class: 'who', 'data-band': c.band },
-    h('div', { class: 'id' }, link, c.name ? h('small', { class: 'mono' }, m) : null)));
+    h('div', { class: 'id' }, link, under.length ? h('small', { title: [c.name ? m : null, c.vendor].filter(Boolean).join(' · ') },
+      under.flatMap((x, i) => (i ? [' · ', x] : [x]))) : null)));
 }
 
 function signalCell(m, c) {
@@ -42,7 +47,8 @@ function matches(f, m, c) {
   if (f.band && c.band !== f.band) return false;
   if (f.ap && c.ap !== f.ap) return false;
   const q = f.q.trim().toLowerCase();
-  return !q || [m, c.name || '', c.ap, c.bss, c.ssid, String(c.vlan)].some((v) => v.toLowerCase().includes(q));
+  const who = [c.name, c.device, c.hostname, c.dns, c.vendor, ...(c.addresses || [])];
+  return !q || [m, ...who.filter(Boolean), c.ap, c.bss, c.ssid, String(c.vlan)].some((v) => v.toLowerCase().includes(q));
 }
 
 export default {
@@ -50,7 +56,7 @@ export default {
     const f = (store.ui.clientFilter ||= { q: '', band: '', ap: '' });
     const sort = (store.ui.clientSort ||= { key: 'mac', dir: 1 });
     const sub = h('p');
-    const search = h('input', { type: 'search', placeholder: 'Filter by name, MAC, AP, SSID or VLAN', 'aria-label': 'Filter clients', value: f.q });
+    const search = h('input', { type: 'search', placeholder: 'Filter by name, MAC, vendor or address', 'aria-label': 'Filter clients', value: f.q });
     search.addEventListener('input', () => {
       f.q = search.value;
       view.update();

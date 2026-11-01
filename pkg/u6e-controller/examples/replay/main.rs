@@ -10,7 +10,12 @@
 //! later, a blocked one stays away until it is unblocked, a steered one moves
 //! to its target, a radio switches channel or power at once, a configuration
 //! is taken in place, and the thermostat (`02:00:00:00:00:06`) never answers
-//! a kick, for the timeout. Each client's addresses have a DNS name, but one's.
+//! a kick, for the timeout. Each client but one has a DHCP lease with its
+//! host name, three a device name too, which a node exporter of the replay's
+//! own publishes as the DHCP nodes' do; their addresses have DNS names, as do
+//! most far ends of their connections. Clients with an odd last byte have a
+//! universally administered MAC (RFC 7042's documentation block, whose vendor
+//! is IANA), the others a made-up private one.
 //! A radio asked to scan sends eight spectra a second until it is told to stop
 //! or goes down (`spectrum`: Wi-Fi bursts, a narrowband sender on 5 GHz, a
 //! microwave oven and Bluetooth on 2.4 GHz, a quiet 6 GHz channel).
@@ -113,7 +118,16 @@ const PROFILES: [(Option<&str>, u32); 10] = [
     (Some("doorbell.home.arpa"), 9),
     (None, 22),
 ];
-/// The reverse DNS of the clients' addresses (`flows`): their profiles' names.
+/// The devices the DHCP server knows three of the clients as, by the last
+/// byte of their MAC.
+const DEVICES: [(u8, &str); 3] = [
+    (4, "Living room TV"),
+    (6, "Bedroom thermostat"),
+    (7, "Office printer"),
+];
+
+/// The reverse DNS (`flows`): of the clients' addresses, their profiles'
+/// names; of the far ends, made-up names, but for every seventh address.
 struct Names;
 
 impl Resolve for Names {
@@ -123,11 +137,64 @@ impl Resolve for Names {
             IpAddr::V6(v6) if v6.segments()[..3] == [0x2001, 0xdb8, 0x10] => {
                 u8::try_from(v6.segments()[7]).ok()?
             }
+            IpAddr::V4(v4) if v4.octets()[3] == 53 => return Some("resolver.example.net".into()),
+            IpAddr::V4(v4) if v4.octets()[3] % 7 != 0 => {
+                let o = v4.octets();
+                return Some(format!("edge-{}-{}.cdn.example.com", o[2], o[3]));
+            }
+            IpAddr::V6(v6) if v6.segments()[7] % 7 != 0 => {
+                return Some(format!("host-{:x}.example.org", v6.segments()[7]));
+            }
             _ => return None,
         };
         let (name, _) = PROFILES.get(usize::from(last).checked_sub(1)?)?;
         name.map(str::to_owned)
     }
+}
+
+/// The DHCP leases, as a DHCP node's exporter publishes them: each client
+/// with a name has its address leased under its host name (and its device,
+/// for those that have one), expiring some hours from now.
+fn leases() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let mut out = String::from("# TYPE kea_lease_expiry_timestamp_seconds gauge\n");
+    for (i, (name, _)) in PROFILES.iter().enumerate() {
+        let Some(name) = name else { continue };
+        let last = i as u8 + 1;
+        let host = name.split('.').next().unwrap_or(name);
+        let device = DEVICES
+            .iter()
+            .find(|(l, _)| *l == last)
+            .map_or("", |(_, d)| d);
+        let expires = now + 3600 * (2 + u64::from(last));
+        out.push_str(&format!(
+            "kea_lease_expiry_timestamp_seconds{{device=\"{device}\",family=\"ipv4\",hostname=\"{host}\",\
+             ip=\"192.0.2.{}\",mac=\"{}\",subnet_id=\"1\"}} {expires}\n",
+            10 + last,
+            mac::format(World::mac(last)),
+        ));
+    }
+    out
+}
+
+/// The replay's DHCP node exporter: every scrape gets the leases as they are.
+fn exporter() -> io::Result<SocketAddr> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?;
+    std::thread::spawn(move || {
+        for mut s in listener.incoming().flatten() {
+            let mut ask = [0; 1024];
+            let _ = std::io::Read::read(&mut s, &mut ask);
+            let answer = format!(
+                "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\n{}",
+                leases()
+            );
+            let _ = std::io::Write::write_all(&mut s, answer.as_bytes());
+        }
+    });
+    Ok(addr)
 }
 
 /// Frames an AP sends a client each second however idle it is (keepalives,
@@ -350,7 +417,11 @@ impl World {
     }
 
     fn mac(last: u8) -> [u8; 6] {
-        [0x02, 0, 0, 0, 0, last]
+        if last % 2 == 1 {
+            [0x00, 0x00, 0x5e, 0xef, 0x10, last]
+        } else {
+            [0x02, 0, 0, 0, 0, last]
+        }
     }
 
     fn announce_join(&mut self, i: usize, ap: usize, bss: usize) {
@@ -1052,7 +1123,8 @@ async fn main() -> io::Result<()> {
          [rf.channels.ZZ]\n\"24\" = [{{ channels = \"1-13\" }}]\n\
          \"5\" = [{{ channels = \"36-48\" }}, {{ channels = \"52-64\", dfs = true }}, \
          {{ channels = \"149-177\" }}]\n\
-         \"6\" = [{{ channels = \"1-93\" }}]\n",
+         \"6\" = [{{ channels = \"1-93\" }}]\n\
+         [leases]\nexporters = [\"{}\"]\n",
         policy.display(),
         managed.join("sock").display(),
         public(KEY_AP1).map_err(io::Error::other)?,
@@ -1061,6 +1133,7 @@ async fn main() -> io::Result<()> {
         remote.display(),
         clone.display(),
         rf::FILE,
+        exporter()?,
     );
     let config = Config::parse(&config).map_err(io::Error::other)?;
     let identity = Identity::from_pem(KEY_CONTROLLER).map_err(io::Error::other)?;

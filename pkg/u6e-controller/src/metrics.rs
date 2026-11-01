@@ -9,7 +9,8 @@
 //! and the last rollout that failed is timed from the rollouts the policy
 //! file keeps, so that its alert outlives a restart. The sessions refused for
 //! naming another AP are counted per AP, and a radio not as the site file
-//! plans it is timed from when it was found so.
+//! plans it is timed from when it was found so. The lease exporters' series
+//! exist only when the leases are read.
 
 use std::collections::BTreeSet;
 use std::fmt::Write;
@@ -416,6 +417,7 @@ pub fn render(state: &State) -> String {
     configs(&mut m, state, &aps);
     rollouts(&mut m, state);
     not_as_planned(&mut m, state);
+    leases(&mut m, state);
     m.family(
         "wifi_blocked_clients",
         GAUGE,
@@ -437,6 +439,42 @@ pub fn render(state: &State) -> String {
         }
     }
     m.out
+}
+
+/// The lease exporters, when the leases are read: whether each answered its
+/// last read and when one last worked, and the clients with a lease.
+fn leases(m: &mut Text, state: &State) {
+    let exporters = &state.leases.exporters;
+    if exporters.is_empty() {
+        return;
+    }
+    m.family(
+        "wifi_leases_exporter_up",
+        GAUGE,
+        "Whether the DHCP node's exporter answered the controller's last read of its leases.",
+    );
+    for (name, e) in exporters {
+        m.sample(
+            &[("exporter", name)],
+            f64::from(u8::from(e.up == Some(true))),
+        );
+    }
+    m.family(
+        "wifi_leases_exporter_last_success_timestamp_seconds",
+        GAUGE,
+        "When the controller last read the DHCP node's leases.",
+    );
+    for (name, e) in exporters {
+        if let Some(t) = e.last_ok {
+            m.sample(&[("exporter", name)], unix_seconds(t));
+        }
+    }
+    m.family(
+        "wifi_leases_active",
+        GAUGE,
+        "Clients with an active lease, over every DHCP node.",
+    );
+    m.sample(&[], state.leases.all(SystemTime::now()).count() as f64);
 }
 
 /// The APs' configurations, when the controller signs them.

@@ -428,6 +428,8 @@ td small { display: block; color: var(--ink-3); font-size: 11.5px; line-height: 
 .client-head h1 { font-size: 21px; overflow-wrap: anywhere; }
 .client-head h1.mono { font-size: 21px; letter-spacing: -0.02em; }
 .ident { min-width: 0; }
+.client-facts { margin: 0; padding: 0 20px 16px; }
+.client-facts .addr { display: block; font-weight: 450; }
 .id-sub { display: flex; gap: 8px; align-items: center; margin-top: 2px; color: var(--ink-3); font-size: 13px; }
 .client-head .where { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; color: var(--ink-2); }
 .client-head .where:empty { display: none; }
@@ -510,7 +512,7 @@ table.flow-clients { table-layout: fixed; }
 .flow-clients td:first-child { overflow: hidden; }
 .who .id { min-width: 0; }
 .who .id a { display: block; max-width: 30ch; overflow: hidden; text-overflow: ellipsis; }
-.who .id small { font-size: 11.5px; }
+.who .id small { font-size: 11.5px; max-width: 38ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .expand {
   display: grid;
   place-items: center;
@@ -700,6 +702,7 @@ table.conns { font-size: 12.5px; }
   .absent { padding: 12px 16px; }
   .flows-top { padding: 12px 14px 10px 16px; }
   .who .id a { max-width: 17ch; }
+  .who .id small { max-width: 22ch; }
   tr.sub > td { padding-left: 8px; }
   .full { padding: 12px 12px 14px; }
   /* A connection is two lines: its remote end and path, then the rest. */

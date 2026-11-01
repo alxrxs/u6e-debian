@@ -1,8 +1,10 @@
-// One client: where it is, its readings now, the actions an admin can take on
-// it, its largest connections, its signal, rates and traffic over the session
-// as this page has seen it, and its event history.
+// One client: who it is (its MAC's vendor, the DHCP server's device for it,
+// its lease's host name, its DNS name, its addresses and lease), where it is,
+// its readings now, the actions an admin can take on it, its largest
+// connections, its signal, rates and traffic over the session as this page
+// has seen it, and its event history.
 
-import { h, icon, ask, bandName, bits, bytes, DID, duration, hm, mbps, palette, pct, phy, quality, time } from '../util.js';
+import { h, icon, ask, bandName, bits, bytes, dayOf, DID, duration, hm, mbps, palette, pct, phy, quality, time } from '../util.js';
 import { lineChart } from '../charts.js';
 import { feed } from './events.js';
 import { clientFlows, flowTable, offload, redraw, sampled, tick, topRows } from './flows.js';
@@ -26,6 +28,19 @@ function fill(el, ...kids) {
 
 function reading(label, value, detail, cls) {
   return h('div', {}, h('dt', {}, label), h('dd', { class: cls }, value, detail ? h('small', {}, detail) : null));
+}
+
+/** What names the client, each source of it that it has. */
+function identityFacts(c) {
+  const fact = (label, value, detail) => h('div', {}, h('dt', {}, label), h('dd', {}, value, detail ? h('small', {}, ` ${detail}`) : null));
+  const until = (ms) => (dayOf(ms) === 'Today' ? `until ${hm(ms)}` : `until ${dayOf(ms)}, ${hm(ms)}`);
+  return [
+    c.device ? fact('Device', c.device, 'as the DHCP server knows it') : null,
+    c.hostname ? fact('Host name', c.hostname, 'as it asked for its lease') : null,
+    c.dns ? fact('DNS name', c.dns) : null,
+    c.addresses?.length ? fact('Addresses', c.addresses.map((a) => h('span', { class: 'mono addr' }, a))) : null,
+    c.lease_expires ? fact('Lease', c.lease_expires > Date.now() ? `expires in ${duration((c.lease_expires - Date.now()) / 1000)}` : 'expired', until(c.lease_expires)) : null,
+  ];
 }
 
 /** A chart panel: its canvas is kept across updates, so a pointer on it stays. */
@@ -157,12 +172,13 @@ export default {
     const actions = h('div', { class: 'actions', role: 'group', 'aria-label': 'Actions' }, Object.values(buttons));
     const result = h('p', { class: 'result', role: 'status', hidden: true });
     const readings = h('dl', { class: 'readings' });
+    const identity = h('dl', { class: 'facts client-facts' });
     const absent = h('p', { class: 'absent' });
     const head = h('div', { class: 'panel clip' },
       h('div', { class: 'client-head' },
         h('div', { class: 'ident' }, title, sub), where,
         h('div', { class: 'act' }, actions, lock)),
-      result, readings, absent);
+      identity, result, readings, absent);
     const charts = [chartPanel('Signal'), chartPanel('Rates'), chartPanel('Throughput')];
     const chartsEl = h('div', { class: 'charts' }, charts.map((c) => c.el));
     const flowSub = h('p');
@@ -245,7 +261,10 @@ export default {
       title.textContent = name || mac;
       title.className = name ? '' : 'mono';
       fill(sub, name ? h('span', { class: 'mono' }, mac) : null,
+        c?.vendor ? h('span', {}, c.vendor) : null,
         blocked ? h('span', { class: 'chip bad' }, 'Blocked') : null);
+      fill(identity, ...(c ? identityFacts(c) : []));
+      identity.hidden = !identity.childNodes.length;
       sub.hidden = !sub.childNodes.length;
       buttons.block.hidden = blocked;
       buttons.unblock.hidden = !blocked;

@@ -3,7 +3,9 @@
 //! events. All of that is in RAM; an AP sends it all again when it
 //! reconnects. Beside it are the operator's side: the clients blocked (kept
 //! on disk by `policy`), the commands waiting for their results, the actions
-//! taken, and the names of the clients' addresses; the live Wi-Fi
+//! taken; what names the clients (`identity`): the DHCP servers' leases
+//! (`leases`), the reverse DNS of the clients' addresses and of the far ends
+//! of the flows a UI watches (`names`); the live Wi-Fi
 //! configurations, signed here (`configs`) for the AP whose configured host
 //! name they name and known here by hash only once sent (each AP's last
 //! acknowledged one kept on disk too), the latest one of each AP signed again
@@ -35,7 +37,10 @@ use u6e_proto::{PROTOCOL, mac};
 
 use crate::configs::Signer;
 use crate::configs::unix_ms;
+use crate::identity::Identity;
+use crate::leases::{Lease, Leases};
 use crate::names::{self, Names};
+use crate::oui;
 use crate::policy::{ApImages, Blocked, ConfigId, Hold, Phase, Policy, SavedRollout};
 use crate::rf::history::{self, History};
 use crate::spectrum::{self, Limits, Scan, Stopped};
@@ -79,7 +84,8 @@ pub enum Change {
     Snapshot(String),
     Event(String, Event),
     Flows(String),
-    /// A client's name came or changed.
+    /// What names a client (its lease, a DNS name) or a flow's far end
+    /// came or changed.
     Names,
     Action(Action),
     /// The scan of a radio (AP, radio) started, stopped or was joined.
@@ -512,6 +518,8 @@ pub struct State {
     pub action_counts: BTreeMap<(&'static str, &'static str), u64>,
     names: Names,
     addresses: HashMap<[u8; 6], Addresses>,
+    /// The DHCP servers' leases, as their exporters last gave them.
+    pub leases: Leases,
     /// When the scans stop.
     pub spectrum: Limits,
     /// Wakes `spectrum::supervise` when a scan's deadline may have moved.
@@ -555,6 +563,7 @@ impl State {
             action_counts: BTreeMap::new(),
             names: Names::default(),
             addresses: HashMap::new(),
+            leases: Leases::default(),
             spectrum: Limits::default(),
             wake: Arc::new(Notify::new()),
             signer: None,
@@ -701,6 +710,12 @@ impl State {
     }
 
     /// The state keeping `hours` of its radios' history.
+    /// The state reading the leases of the exporters `exporters`.
+    pub fn with_leases(mut self, exporters: &[String]) -> Self {
+        self.leases = Leases::new(exporters);
+        self
+    }
+
     pub fn with_history(self, hours: u64) -> Self {
         let history = History::new(hours);
         State { history, ..self }
@@ -1607,11 +1622,17 @@ impl State {
         self.addresses.retain(|_, a| kept(a));
     }
 
-    /// The addresses of the clients to look up now, marked as in flight.
+    /// The addresses to look up now, marked as in flight: the clients' own,
+    /// and the far ends of the flows of every AP whose flows a UI watches.
     pub fn names_due(&mut self, now: Instant) -> Vec<IpAddr> {
         self.names.prune(now);
-        let wanted = self.addresses.values().flat_map(|a| a.ips.iter().copied());
-        self.names.due(wanted, now)
+        let own = self.addresses.values().flat_map(|a| a.ips.iter().copied());
+        let watched = self.aps.values().filter(|a| a.flow_watchers > 0);
+        let flows = watched
+            .filter_map(|a| a.flows.as_ref())
+            .flat_map(|(f, _)| &f.clients);
+        let remote = flows.flat_map(|c| c.top.iter().map(names::remote));
+        self.names.due(own.chain(remote).collect::<Vec<_>>(), now)
     }
 
     /// Takes the answer of a lookup of `ip`.
@@ -1621,10 +1642,44 @@ impl State {
         }
     }
 
-    /// The client's name: that of the first of its addresses that has one.
-    pub fn name_of(&self, mac: &[u8; 6]) -> Option<&str> {
-        let ips = &self.addresses.get(mac)?.ips;
-        ips.iter().find_map(|ip| self.names.get(ip))
+    /// Takes a read of the leases of `exporter`.
+    pub fn take_leases(
+        &mut self,
+        exporter: &str,
+        read: Result<Vec<Lease>, String>,
+        now: SystemTime,
+    ) {
+        if self.leases.take(exporter, read, now) {
+            self.notify(Change::Names);
+        }
+    }
+
+    /// The DNS name of `ip`, as last looked up.
+    pub fn dns_name(&self, ip: &IpAddr) -> Option<&str> {
+        self.names.get(ip)
+    }
+
+    /// Who the client `mac` is, as of now.
+    pub fn identity(&self, mac: &[u8; 6]) -> Identity {
+        let leased = self.leases.of(mac, SystemTime::now()).unwrap_or_default();
+        let seen = self.addresses.get(mac).map_or(&[][..], |a| &a.ips[..]);
+        let mut addresses: Vec<IpAddr> = leased.addresses.iter().map(|&(ip, _)| ip).collect();
+        addresses.extend(
+            seen.iter()
+                .filter(|ip| !addresses.contains(ip))
+                .collect::<Vec<_>>(),
+        );
+        Identity {
+            dns: seen
+                .iter()
+                .find_map(|ip| self.names.get(ip))
+                .map(str::to_owned),
+            vendor: oui::vendor(mac),
+            lease_expires: leased.expires(),
+            device: leased.device,
+            hostname: leased.hostname,
+            addresses,
+        }
     }
 
     /// Every associated client, sorted by MAC. A MAC in two snapshots (a roam
