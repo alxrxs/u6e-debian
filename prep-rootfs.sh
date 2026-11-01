@@ -519,6 +519,90 @@ SystemCallFilter=@system-service
 SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @raw-io @reboot @resources @swap memfd_create
 UNIT
 
+# u6e-guard (pkg/u6e-guard): the client guards on the Wi-Fi ports (ARP
+# inspection, rogue DHCP, RA guard, IP source guard). They read the frames
+# that bear on them as they reach the host through a packet socket, bind each
+# client's MAC to its DHCP-acknowledged addresses (and those the controller
+# seeds from the DHCP servers' leases, or makes static), and report each
+# violation to the agent on a socket only its group may open; on the VLANs the
+# controller says to enforce on they drop the offending frames with tc ingress
+# flower filters, which nothing else on the Wi-Fi ports uses. Started at boot
+# (and by its socket), it runs as root for the packet socket and tc alone
+# (CAP_NET_RAW, CAP_NET_ADMIN); its last step removes every Wi-Fi port's
+# ingress qdisc, so a guard that is not running drops nothing. tc's modules
+# are loaded at boot, as the sandbox loads none. Every sandbox setting is at
+# its most restrictive but where a comment says what the guards need instead.
+install -m0755 target/aarch64-unknown-linux-musl/release/u6e-guard $RF/usr/local/sbin/
+printf 'd /run/u6e-guard 0750 root u6e-agent -\n' > $RF/usr/lib/tmpfiles.d/u6e-guard.conf
+install -d $RF/etc/modules-load.d
+printf 'sch_ingress\ncls_flower\nact_gact\n' > $RF/etc/modules-load.d/u6e-guard.conf
+cat > $RF/etc/systemd/system/u6e-guard.socket <<'UNIT'
+[Unit]
+Description=U6E client guards socket, for u6e-agent
+
+[Socket]
+ListenStream=/run/u6e-guard/sock
+SocketUser=root
+SocketGroup=u6e-agent
+SocketMode=0660
+
+[Install]
+WantedBy=sockets.target
+UNIT
+ln -sf /etc/systemd/system/u6e-guard.socket $RF/etc/systemd/system/sockets.target.wants/u6e-guard.socket
+cat > $RF/etc/systemd/system/u6e-guard.service <<'UNIT'
+[Unit]
+Description=U6E client guards: ARP inspection, rogue DHCP, RA guard and IP source guard on the Wi-Fi ports
+Requires=u6e-guard.socket
+After=u6e-guard.socket u6e-wifi.service
+
+[Service]
+ExecStart=/usr/local/sbin/u6e-guard serve
+ExecStopPost=/usr/local/sbin/u6e-guard clear
+Restart=always
+RestartSec=5
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+AmbientCapabilities=
+NoNewPrivileges=yes
+UMask=0077
+KeyringMode=private
+RemoveIPC=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectProc=invisible
+# tc reads its clock's rate from /proc/net/psched.
+ProcSubset=all
+PrivateDevices=yes
+DevicePolicy=closed
+# The packet socket and tc act on the AP's own interfaces; no address is
+# ever sent to.
+IPAddressDeny=any
+PrivateIPC=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=strict
+PrivateMounts=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# The agent's socket (UNIX), the frames (PACKET), tc (NETLINK).
+RestrictAddressFamilies=AF_UNIX AF_PACKET AF_NETLINK
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+SystemCallFilter=@system-service
+SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @privileged @raw-io @reboot @resources @swap memfd_create
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+ln -sf /etc/systemd/system/u6e-guard.service $W/u6e-guard.service
+
 # The boot that brought this image up was one-shot: U-Boot disarmed it before
 # starting us. u6e-arm re-arms it from the steps go8.sh staged, or with "disarm"
 # hands the next boot to stock; fw_setenv writes only the U-Boot env (mtd6).
@@ -668,7 +752,7 @@ ln -sf /lib/firmware/regulatory.db.p7s-upstream $RF/etc/alternatives/regulatory.
 rm -rf modstage $RF/usr/lib/modules/*
 make -s -C $K ARCH=arm64 CROSS_COMPILE=$X INSTALL_MOD_PATH=$PWD/modstage INSTALL_MOD_STRIP=1 modules_install
 M=$PWD/modstage/lib/modules/$R
-WANT="netconsole qcom_q6v5_mpd qcom_q6v5_wcss_sec qrtr-smd qcrypto st_accel_i2c qrtr qrtr-mhi vxlan macsec bridge 8021q nf_tables nft_ct nft_chain_nat nft_nat nft_masq nft_reject_inet nft_fib_inet nft_log nft_limit nf_conntrack tun wireguard sch_htb sch_tbf sch_fq_codel sch_prio sch_ingress cls_u32 cls_fw cls_matchall cls_flower act_police act_skbedit act_connmark act_mirred ifb btqcomipc"
+WANT="netconsole qcom_q6v5_mpd qcom_q6v5_wcss_sec qrtr-smd qcrypto st_accel_i2c qrtr qrtr-mhi vxlan macsec bridge 8021q nf_tables nft_ct nft_chain_nat nft_nat nft_masq nft_reject_inet nft_fib_inet nft_log nft_limit nf_conntrack tun wireguard sch_htb sch_tbf sch_fq_codel sch_prio sch_ingress cls_u32 cls_fw cls_matchall cls_flower act_gact act_police act_skbedit act_connmark act_mirred ifb btqcomipc"
 install -d "$M/updates"
 cp nss/out/$R/*.ko "$M/updates/"
 find nss/src/backports -name '*.ko' -print0 | while IFS= read -r -d '' f; do

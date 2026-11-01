@@ -24,13 +24,13 @@ mod testdir;
 
 use std::fs;
 use std::io::{self, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::net::UnixListener;
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use std::{env, mem, process, ptr};
+use std::{env, mem, process};
 
 use u6e_proto::frame::write_frame;
+use u6e_proto::local;
 use u6e_proto::msg::AgentMsg;
 
 /// The group whose members are served: the agent's.
@@ -65,55 +65,15 @@ fn usage() -> ! {
 }
 
 fn serve() -> io::Result<()> {
-    let stop = signals()?;
-    let gid = group_id(&fs::read_to_string("/etc/group")?, AGENT_GROUP)
+    let stop = local::signals()?;
+    let gid = local::group_id(&fs::read_to_string("/etc/group")?, AGENT_GROUP)
         .ok_or_else(|| io::Error::other(format!("no group {AGENT_GROUP}")))?;
     let cfg = serve::Config {
         root: radio::DEBUGFS.into(),
         gid,
         idle: IDLE,
     };
-    serve::run(listener()?, &cfg, stop.as_raw_fd())
-}
-
-/// The one socket systemd passes (`LISTEN_FDS`, from fd 3).
-fn listener() -> io::Result<UnixListener> {
-    let ours = env::var("LISTEN_PID").ok() == Some(process::id().to_string());
-    if !ours || env::var("LISTEN_FDS").ok().as_deref() != Some("1") {
-        return Err(io::Error::other("not started by its socket unit"));
-    }
-    // SAFETY: systemd passed fd 3, a listening socket, to this process alone.
-    Ok(unsafe { UnixListener::from_raw_fd(3) })
-}
-
-/// The id of group `name` in an /etc/group.
-fn group_id(etc_group: &str, name: &str) -> Option<u32> {
-    etc_group.lines().find_map(|l| {
-        let mut f = l.split(':');
-        (f.next() == Some(name)).then(|| f.nth(1)?.parse().ok())?
-    })
-}
-
-/// A descriptor readable once SIGTERM, SIGINT or SIGHUP arrives; they no
-/// longer end the process, so the scans are stopped on the way out.
-fn signals() -> io::Result<OwnedFd> {
-    // SAFETY: a zeroed sigset_t is valid for sigemptyset to initialise, and
-    // the calls are given valid pointers.
-    unsafe {
-        let mut set: libc::sigset_t = mem::zeroed();
-        libc::sigemptyset(&mut set);
-        for s in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
-            libc::sigaddset(&mut set, s);
-        }
-        if libc::pthread_sigmask(libc::SIG_BLOCK, &set, ptr::null_mut()) != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let fd = libc::signalfd(-1, &set, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK);
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(OwnedFd::from_raw_fd(fd))
-    }
+    serve::run(local::listener()?, &cfg, stop.as_raw_fd())
 }
 
 /// Waits up to `wait` for `fd`; true when it became readable.
@@ -141,7 +101,7 @@ fn cpu() -> Duration {
 
 /// Scans `radio` for `secs` as `serve` would, the raw samples to stdout.
 fn record(radio: &'static str, secs: Duration) -> io::Result<()> {
-    let stop = signals()?;
+    let stop = local::signals()?;
     let root = Path::new(radio::DEBUGFS);
     let mut scan = radio::Scan::start(root, radio)?;
     let (used, start) = (cpu(), Instant::now());
@@ -229,18 +189,5 @@ impl Seen {
         self.rssi = Some((rssi.0 as i16, rssi.1 as i16));
         self.noise = Some(span(self.noise, s.noise));
         self.max_exp = self.max_exp.max(s.max_exp);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_group_is_found_by_name() {
-        let etc = "root:x:0:\nu6e-agentx:x:5:\nu6e-agent:x:988:\n";
-        assert_eq!(group_id(etc, "u6e-agent"), Some(988));
-        assert_eq!(group_id(etc, "u6e"), None);
-        assert_eq!(group_id("u6e-agent:x:\n", "u6e-agent"), None);
     }
 }

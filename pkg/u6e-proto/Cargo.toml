@@ -6,6 +6,7 @@ license = "GPL-2.0-only"
 publish = false
 
 [dependencies]
+libc = "0.2"
 postcard = { version = "1.1.3", features = ["use-std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 aws-lc-rs = { version = "1.18", default-features = false, features = ["alloc", "aws-lc-sys"], optional = true }

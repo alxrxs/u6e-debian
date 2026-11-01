@@ -4,7 +4,8 @@
 //! the MAC and hex text they read and write, (feature `digest`) the hash a
 //! Wi-Fi configuration is known by and the controller's signature over it,
 //! and (feature `tls`, which includes `digest`) the post-quantum, key-pinned
-//! TLS configuration of the link.
+//! TLS configuration of the link. `guard` is the AP's own socket between the
+//! agent and its client guards.
 //! Each end opens with the frozen version frame of `version`, so ends of
 //! different protocols tell so before either decodes a message.
 
@@ -14,6 +15,8 @@ pub mod delta;
 pub mod frame;
 #[cfg(test)]
 mod golden;
+pub mod guard;
+pub mod local;
 pub mod mac;
 pub mod msg;
 #[cfg(feature = "tls")]

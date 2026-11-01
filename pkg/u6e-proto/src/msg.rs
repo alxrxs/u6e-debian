@@ -2,7 +2,7 @@
 //! without a schema, so every change to their layout (a field, a variant, an
 //! order) bumps [`crate::PROTOCOL`].
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use serde::{Deserialize, Serialize};
 
@@ -38,6 +38,9 @@ pub enum AgentMsg {
     },
     /// The outcome of a [`CtlMsg::ApplyConfig`].
     ConfigApplied(ConfigApplied),
+    /// The bindings the AP's client guards hold, whole, whenever they change
+    /// (at most every tick) and at the start of each session.
+    Bindings(Vec<Binding>),
 }
 
 /// Everything the controller sends.
@@ -78,6 +81,14 @@ pub enum CtlMsg {
     /// same `sha256`. Signed with the controller's configuration key, which
     /// the AP's image pins, apart from the key of the link.
     ApplyConfig(SignedConfig),
+    /// How the client guards run: the VLANs they enforce on and the static
+    /// clients; sent after each session's first key frame and when it
+    /// changes. Without it they only report.
+    Guards(GuardConfig),
+    /// Every client's leased addresses, as the DHCP servers hold them, which
+    /// replace the ones seeded before: a client whose DHCP exchange this AP
+    /// did not see (it roamed in, or the AP restarted) is bound all the same.
+    SeedBindings(Vec<Binding>),
 }
 
 /// What the AP is running, sent once per connection. `manifest` is the
@@ -306,13 +317,94 @@ pub struct Event {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum EventKind {
-    Assoc { mac: [u8; 6], bss: u16 },
-    Disassoc { mac: [u8; 6], bss: u16 },
-    EapOk { mac: [u8; 6], bss: u16 },
-    EapFail { mac: [u8; 6], bss: u16 },
-    RadioUp { phy: String },
-    RadioDown { phy: String },
-    FwCrash { phy: String },
+    Assoc {
+        mac: [u8; 6],
+        bss: u16,
+    },
+    Disassoc {
+        mac: [u8; 6],
+        bss: u16,
+    },
+    EapOk {
+        mac: [u8; 6],
+        bss: u16,
+    },
+    EapFail {
+        mac: [u8; 6],
+        bss: u16,
+    },
+    RadioUp {
+        phy: String,
+    },
+    RadioDown {
+        phy: String,
+    },
+    FwCrash {
+        phy: String,
+    },
+    /// A client broke one of the client guards' rules.
+    GuardViolation(Violation),
+}
+
+/// An address the client guards admit for a MAC: one its DHCP server
+/// acknowledged, one the controller seeded from the leases, or a static one.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct Binding {
+    pub mac: [u8; 6],
+    pub ip: Ipv4Addr,
+    /// When it expires, Unix milliseconds; never, for a static one.
+    pub expires_ms: Option<u64>,
+}
+
+/// The client guards.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum Guard {
+    /// ARP inspection: a client's ARP may name only its own bound address.
+    Arp,
+    /// Rogue DHCP: no client answers as a DHCP or DHCPv6 server.
+    Dhcp,
+    /// RA guard: no client advertises itself as a router or a prefix.
+    Ra,
+    /// IP source guard: a client's new connections come from its bound
+    /// address.
+    Source,
+}
+
+/// A client breaking a guard's rule, at most once a minute per client and
+/// guard, the repeats in between counted.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Violation {
+    pub guard: Guard,
+    /// The frame's source MAC.
+    pub mac: [u8; 6],
+    /// The interface it came in on and that interface's VLAN.
+    pub ifname: String,
+    pub vlan: u16,
+    /// The address it claimed or offered, when there is one.
+    pub ip: Option<IpAddr>,
+    pub detail: String,
+    /// Whether the guard enforces on that VLAN, so the frame was dropped.
+    pub dropped: bool,
+    /// Violations of the same client and guard since the last one reported.
+    pub repeats: u32,
+}
+
+/// How the client guards run.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuardConfig {
+    /// The VLANs whose offending frames are dropped; on the others the
+    /// guards only report.
+    pub enforce: Vec<u16>,
+    /// The clients with a static address, bound for good.
+    pub statics: Vec<Binding>,
 }
 
 /// The connections the AP forwards, per client, as the NSS connection

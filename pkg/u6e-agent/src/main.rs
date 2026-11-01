@@ -204,7 +204,7 @@ fn config_helper() -> ! {
     };
     let gid = fs::read_to_string("/etc/group")
         .ok()
-        .and_then(|g| group_id(&g, "u6e-agent"));
+        .and_then(|g| u6e_proto::local::group_id(&g, "u6e-agent"));
     let Some(gid) = gid else {
         eprintln!("u6e-agent: no group u6e-agent");
         process::exit(1);
@@ -224,14 +224,6 @@ fn config_helper() -> ! {
         process::exit(1);
     }
     process::exit(0);
-}
-
-/// The id of group `name` in an /etc/group.
-fn group_id(etc_group: &str, name: &str) -> Option<u32> {
-    etc_group.lines().find_map(|l| {
-        let mut f = l.split(':');
-        (f.next() == Some(name)).then(|| f.nth(1)?.parse().ok())?
-    })
 }
 
 /// Starts a thread for a duty the 802.11k exchange and the network check do

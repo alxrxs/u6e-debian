@@ -24,10 +24,10 @@ use crate::PROTOCOL;
 use crate::config::{config_sha256, payload};
 use crate::mac::hex;
 use crate::msg::{
-    AgentMsg, Band, Bss, ClientFlows, Command, CommandKind, CommandResult, ConfigApplied, CtlMsg,
-    Event, EventKind, FieldDelta, Flow, Flows, Hello, Mechanism, PowerLimit, Radio, RadioApplied,
-    RadioConfig, RateMode, RecDelta, SignedConfig, Snapshot, SnapshotDelta, SpectrumFrame, Station,
-    Temp,
+    AgentMsg, Band, Binding, Bss, ClientFlows, Command, CommandKind, CommandResult, ConfigApplied,
+    CtlMsg, Event, EventKind, FieldDelta, Flow, Flows, Guard, GuardConfig, Hello, Mechanism,
+    PowerLimit, Radio, RadioApplied, RadioConfig, RateMode, RecDelta, SignedConfig, Snapshot,
+    SnapshotDelta, SpectrumFrame, Station, Temp, Violation,
 };
 
 const HOW: &str = "bump u6e_proto::PROTOCOL (pkg/u6e-proto/src/version.rs) and write the \
@@ -165,6 +165,36 @@ fn config_applied() -> ConfigApplied {
     }
 }
 
+/// A static binding and a leased one.
+fn bindings() -> Vec<Binding> {
+    let mac = [0x02, 0, 0, 0, 0, 1];
+    vec![
+        Binding {
+            mac,
+            ip: Ipv4Addr::new(192, 0, 2, 1),
+            expires_ms: None,
+        },
+        Binding {
+            mac,
+            ip: Ipv4Addr::new(192, 0, 2, 2),
+            expires_ms: Some(1 << 41),
+        },
+    ]
+}
+
+fn violation(guard: Guard) -> Violation {
+    Violation {
+        guard,
+        mac: [0x02, 0, 0, 0, 0, 1],
+        ifname: "wlan5.300".into(),
+        vlan: 300,
+        ip: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 3))),
+        detail: "192.0.2.3 is not bound to 02:00:00:00:00:01".into(),
+        dropped: true,
+        repeats: 70_009,
+    }
+}
+
 fn samples() -> Samples {
     let snapshot = Snapshot {
         seq: 1 << 40,
@@ -224,6 +254,22 @@ fn samples() -> Samples {
         ("RadioUp", EventKind::RadioUp { phy: phy() }),
         ("RadioDown", EventKind::RadioDown { phy: phy() }),
         ("FwCrash", EventKind::FwCrash { phy: phy() }),
+        (
+            "GuardViolationArp",
+            EventKind::GuardViolation(violation(Guard::Arp)),
+        ),
+        (
+            "GuardViolationDhcp",
+            EventKind::GuardViolation(violation(Guard::Dhcp)),
+        ),
+        (
+            "GuardViolationRa",
+            EventKind::GuardViolation(violation(Guard::Ra)),
+        ),
+        (
+            "GuardViolationSource",
+            EventKind::GuardViolation(violation(Guard::Source)),
+        ),
     ];
     let mut agent = vec![
         (
@@ -275,6 +321,7 @@ fn samples() -> Samples {
         },
     ));
     agent.push(("ConfigApplied", AgentMsg::ConfigApplied(config_applied())));
+    agent.push(("Bindings", AgentMsg::Bindings(bindings())));
     let mut ctl = vec![
         ("SetTick", CtlMsg::SetTick { secs: 300 }),
         ("WantKey", CtlMsg::WantKey),
@@ -325,6 +372,14 @@ fn samples() -> Samples {
     ctl.push(("SpectrumStart", CtlMsg::SpectrumStart { radio: radio() }));
     ctl.push(("SpectrumStop", CtlMsg::SpectrumStop { radio: radio() }));
     ctl.push(("ApplyConfig", CtlMsg::ApplyConfig(signed_config())));
+    ctl.push((
+        "Guards",
+        CtlMsg::Guards(GuardConfig {
+            enforce: vec![300, 4094],
+            statics: bindings(),
+        }),
+    ));
+    ctl.push(("SeedBindings", CtlMsg::SeedBindings(bindings())));
     Samples { agent, ctl }
 }
 
@@ -396,9 +451,15 @@ fn every_variant_has_an_instance() {
     let mut events = Vec::new();
     let (mut bands, mut modes, mut addrs) = (Vec::new(), Vec::new(), Vec::new());
     let mut mechanisms = Vec::new();
+    let mut guards = Vec::new();
     for m in &agent {
         match m {
-            AgentMsg::Event(e) => events.push(e.kind.clone()),
+            AgentMsg::Event(e) => {
+                if let EventKind::GuardViolation(v) = &e.kind {
+                    guards.push(v.guard);
+                }
+                events.push(e.kind.clone());
+            }
             AgentMsg::Key(s) => {
                 bands.extend(s.radios.iter().map(|r| r.band));
                 modes.extend(s.stations.iter().map(|st| st.tx_mode));
@@ -426,6 +487,7 @@ fn every_variant_has_an_instance() {
     assert_every_variant("IpAddr", &addrs);
     assert_every_variant("CommandKind", &commands);
     assert_every_variant("Mechanism", &mechanisms);
+    assert_every_variant("Guard", &guards);
 }
 
 #[test]

@@ -12,7 +12,7 @@ IMAGE_PATHS=(deploy.sh ap-image.sh prep-rootfs.sh mkrootfs.sh config-u6e.sh u6e-
 	boot/wifi-up.sh boot/lib.sh kernel backports nss fw shim pkg/hostapd pkg/iproute2-nss pkg/netlogd
 	Cargo.toml .cargo rust-toolchain.toml toolchain.env
 	pkg/u6e-agent/Cargo.toml pkg/u6e-agent/src pkg/u6e-spectral/Cargo.toml pkg/u6e-spectral/src
-	pkg/u6e-proto/Cargo.toml pkg/u6e-proto/src)
+	pkg/u6e-guard/Cargo.toml pkg/u6e-guard/src pkg/u6e-proto/Cargo.toml pkg/u6e-proto/src)
 
 # image_tree [<rev>]: the key of IMAGE_PATHS and of agent_lock at <rev>
 # (default HEAD).
@@ -23,9 +23,9 @@ image_tree() {
 		sha256sum | cut -c1-16
 }
 
-# agent_lock <rev>: the Cargo.lock entries of the AP's binaries, u6e-agent and
-# u6e-spectral, and of every package they depend on, at <rev>; a dependency of
-# the controller alone is left out.
+# agent_lock <rev>: the Cargo.lock entries of the AP's binaries, u6e-agent,
+# u6e-spectral and u6e-guard, and of every package they depend on, at <rev>; a
+# dependency of the controller alone is left out.
 agent_lock() {
 	git -c safe.directory='*' show "$1:Cargo.lock" | python3 -c '
 import sys, tomllib
@@ -33,7 +33,7 @@ pkgs = tomllib.loads(sys.stdin.read())["package"]
 def find(dep):  # "name", "name version" or "name version (source)"
     name, *rest = dep.split(" ")
     return next(p for p in pkgs if p["name"] == name and (not rest or p["version"] == rest[0]))
-todo, seen = [find("u6e-agent"), find("u6e-spectral")], {}
+todo, seen = [find("u6e-agent"), find("u6e-spectral"), find("u6e-guard")], {}
 while todo:
     p = todo.pop()
     if (p["name"], p["version"]) not in seen:

@@ -13,13 +13,13 @@
 //! one `poll`: nothing here blocks.
 
 use std::io::{self, ErrorKind, Read, Write};
-use std::mem;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use u6e_proto::frame::write_frame;
+use u6e_proto::local;
 use u6e_proto::msg::AgentMsg;
 
 use crate::hold::Hold;
@@ -174,7 +174,7 @@ impl Server<'_> {
                 gone: false,
             };
             self.next_id += 1;
-            let refused = if !member(&c.sock, self.cfg.gid) {
+            let refused = if !local::member(&c.sock, self.cfg.gid) {
                 Some("refused: not in the agent's group")
             } else if self.clients.len() >= CLIENTS_MAX {
                 Some("refused: too many clients")
@@ -346,45 +346,6 @@ impl Client {
         self.tokens = self.tokens.saturating_sub(1);
         ok
     }
-}
-
-/// Whether the process at the other end of `sock` is a member of `gid`, as
-/// its primary group or one of the others.
-fn member(sock: &UnixStream, gid: u32) -> bool {
-    let fd = sock.as_raw_fd();
-    // SAFETY: a zeroed ucred is a valid one for getsockopt to fill.
-    let mut cred: libc::ucred = unsafe { mem::zeroed() };
-    let mut len = mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // SAFETY: `cred` and `len` describe a buffer of the size the call takes.
-    let r = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&raw mut cred).cast(),
-            &mut len,
-        )
-    };
-    if r != 0 {
-        return false;
-    }
-    if cred.gid == gid {
-        return true;
-    }
-    let mut groups = [0 as libc::gid_t; 64];
-    let mut len = mem::size_of_val(&groups) as libc::socklen_t;
-    // SAFETY: `groups` and `len` describe a buffer of the size the call takes.
-    let r = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_PEERGROUPS,
-            groups.as_mut_ptr().cast(),
-            &mut len,
-        )
-    };
-    let n = len as usize / mem::size_of::<libc::gid_t>();
-    r == 0 && groups[..n.min(groups.len())].contains(&gid)
 }
 
 #[cfg(test)]

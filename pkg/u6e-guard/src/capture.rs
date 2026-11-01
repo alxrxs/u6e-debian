@@ -1,0 +1,386 @@
+//! The frames the guards read: one packet socket on every interface,
+//! receiving only (outgoing frames are not even copied), behind a classic
+//! BPF program that lets through just the frames of interest. ARP, DHCP and
+//! router advertisements never ride the NSS fast path, so they always reach
+//! the host; a client's connections reach it only until the connection is
+//! offloaded, which is when its first packets are seen. The socket taps the
+//! ports before the bridge, and before any `tc` filter that drops a frame.
+//!
+//! From a Wi-Fi port it takes ARP, IPv4 TCP SYNs and UDP datagrams (DHCP
+//! whole, the rest their headers), DHCPv6 from the servers' port, and router
+//! advertisements; from an uplink port, DHCP servers' answers. The program
+//! names the ports' interface indices, so it is made again when they change.
+
+use std::io;
+use std::mem;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+
+use crate::ports::Port;
+
+const ETH_P_ALL: u16 = 0x0003;
+const SOL_PACKET: libc::c_int = 263;
+const PACKET_IGNORE_OUTGOING: libc::c_int = 23;
+
+/// What a frame of interest keeps: the headers alone, or a DHCP message or
+/// router advertisement whole.
+const SHORT: u32 = 96;
+const WHOLE: u32 = 1600;
+
+// Classic BPF (linux/filter.h).
+const LD: u16 = 0x00;
+const LDX: u16 = 0x01;
+const ALU: u16 = 0x04;
+const JMP: u16 = 0x05;
+const RET: u16 = 0x06;
+const H: u16 = 0x08;
+const B: u16 = 0x10;
+const ABS: u16 = 0x20;
+const IND: u16 = 0x40;
+const MSH: u16 = 0xa0;
+const AND: u16 = 0x50;
+const JEQ: u16 = 0x10;
+const JSET: u16 = 0x40;
+/// The interface a frame came in on, as an absolute load (SKF_AD_IFINDEX).
+const IFINDEX: u32 = 0xffff_f000 + 8;
+
+/// One instruction, its jump (if any) to a label, or a label.
+enum Ins {
+    Op(u16, u32),
+    Jump(u16, u32, &'static str),
+    Label(&'static str),
+}
+
+use Ins::{Jump, Label, Op};
+
+/// Resolves the labels of `prog` into relative jumps.
+fn assemble(prog: &[Ins]) -> Vec<libc::sock_filter> {
+    let mut at = std::collections::HashMap::new();
+    let mut n = 0;
+    for i in prog {
+        match i {
+            Label(l) => {
+                at.insert(*l, n);
+            }
+            _ => n += 1,
+        }
+    }
+    let mut out = Vec::with_capacity(n);
+    for i in prog {
+        let (code, k, jt) = match i {
+            Label(_) => continue,
+            Op(code, k) => (*code, *k, 0),
+            Jump(code, k, label) => {
+                let off = at[label] - out.len() - 1;
+                (*code, *k, u8::try_from(off).expect("a jump within 255"))
+            }
+        };
+        out.push(libc::sock_filter { code, jt, jf: 0, k });
+    }
+    out
+}
+
+/// The ports a program names at most, so its first jumps stay within the
+/// 255 instructions a classic BPF jump can skip; an AP has a few dozen.
+pub const MAX_PORTS: usize = 160;
+
+/// The program for `ports` (the first [`MAX_PORTS`] of them).
+pub fn program(ports: &[Port]) -> Vec<libc::sock_filter> {
+    let mut p = vec![Op(LD | ABS, IFINDEX)];
+    for port in ports.iter().take(MAX_PORTS) {
+        let to = if port.wifi { "wifi" } else { "uplink" };
+        p.push(Jump(JMP | JEQ, port.ifindex as u32, to));
+    }
+    p.extend([
+        Op(RET, 0),
+        Label("wifi"),
+        Op(LD | H | ABS, 12),
+        Jump(JMP | JEQ, 0x0806, "short"),
+        Jump(JMP | JEQ, 0x0800, "wifi4"),
+        Jump(JMP | JEQ, 0x86dd, "wifi6"),
+        Op(RET, 0),
+        Label("wifi4"),
+        Op(LD | H | ABS, 20),
+        Jump(JMP | JSET, 0x1fff, "drop"),
+        Op(LDX | B | MSH, 14),
+        Op(LD | B | ABS, 23),
+        Jump(JMP | JEQ, 6, "tcp"),
+        Jump(JMP | JEQ, 17, "udp"),
+        Op(RET, 0),
+        Label("tcp"),
+        Op(LD | B | IND, 14 + 13),
+        Op(ALU | AND, 0x12),
+        Jump(JMP | JEQ, 0x02, "short"),
+        Op(RET, 0),
+        Label("udp"),
+        Op(LD | H | IND, 14),
+        Jump(JMP | JEQ, 67, "whole"),
+        Jump(JMP | JEQ, 68, "whole"),
+        Op(RET, SHORT),
+        Label("wifi6"),
+        Op(LD | B | ABS, 20),
+        Jump(JMP | JEQ, 58, "icmp6"),
+        Jump(JMP | JEQ, 17, "udp6"),
+        Op(RET, 0),
+        Label("icmp6"),
+        Op(LD | B | ABS, 54),
+        Jump(JMP | JEQ, 134, "whole"),
+        Op(RET, 0),
+        Label("udp6"),
+        Op(LD | H | ABS, 54),
+        Jump(JMP | JEQ, 547, "short"),
+        Op(RET, 0),
+        Label("uplink"),
+        Op(LD | H | ABS, 12),
+        Jump(JMP | JEQ, 0x0800, "uplink4"),
+        Op(RET, 0),
+        Label("uplink4"),
+        Op(LD | B | ABS, 23),
+        Jump(JMP | JEQ, 17, "uplink_udp"),
+        Op(RET, 0),
+        Label("uplink_udp"),
+        Op(LD | H | ABS, 20),
+        Jump(JMP | JSET, 0x1fff, "drop"),
+        Op(LDX | B | MSH, 14),
+        Op(LD | H | IND, 14),
+        Jump(JMP | JEQ, 67, "whole"),
+        Op(RET, 0),
+        Label("short"),
+        Op(RET, SHORT),
+        Label("whole"),
+        Op(RET, WHOLE),
+        Label("drop"),
+        Op(RET, 0),
+    ]);
+    assemble(&p)
+}
+
+/// The packet socket.
+pub struct Capture {
+    fd: OwnedFd,
+}
+
+impl Capture {
+    /// A socket on every interface that keeps nothing until [`Capture::watch`].
+    pub fn open() -> io::Result<Self> {
+        // SAFETY: plain socket creation; the descriptor is owned at once.
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_PACKET,
+                libc::SOCK_RAW | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                i32::from(ETH_P_ALL.to_be()),
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a fresh descriptor this process owns.
+        let c = Capture {
+            fd: unsafe { OwnedFd::from_raw_fd(fd) },
+        };
+        c.option(SOL_PACKET, PACKET_IGNORE_OUTGOING, &1i32)?;
+        c.attach(&[libc::sock_filter {
+            code: RET,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        }])?;
+        // What arrived before the filter was in place passed none.
+        let mut buf = [0; 64];
+        while c.recv(&mut buf)?.is_some() {}
+        Ok(c)
+    }
+
+    fn option<T>(&self, level: libc::c_int, name: libc::c_int, value: &T) -> io::Result<()> {
+        // SAFETY: `value` is a valid T of the size passed.
+        let r = unsafe {
+            libc::setsockopt(
+                self.fd.as_raw_fd(),
+                level,
+                name,
+                (value as *const T).cast(),
+                mem::size_of::<T>() as libc::socklen_t,
+            )
+        };
+        if r != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn attach(&self, prog: &[libc::sock_filter]) -> io::Result<()> {
+        let fprog = libc::sock_fprog {
+            len: u16::try_from(prog.len()).map_err(io::Error::other)?,
+            filter: prog.as_ptr().cast_mut(),
+        };
+        self.option(libc::SOL_SOCKET, libc::SO_ATTACH_FILTER, &fprog)
+    }
+
+    /// Keeps the frames of interest of `ports` from now on.
+    pub fn watch(&self, ports: &[Port]) -> io::Result<()> {
+        self.attach(&program(ports))
+    }
+
+    /// The next frame into `buf`: its length and the interface it came in
+    /// on; `None` when none is waiting.
+    pub fn recv(&self, buf: &mut [u8]) -> io::Result<Option<(usize, i32)>> {
+        // SAFETY: a zeroed sockaddr_ll is a valid one for recvfrom to fill.
+        let mut from: libc::sockaddr_ll = unsafe { mem::zeroed() };
+        let mut len = mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t;
+        // SAFETY: `buf` and `from` are valid for the sizes passed.
+        let n = unsafe {
+            libc::recvfrom(
+                self.fd.as_raw_fd(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                0,
+                (&raw mut from).cast(),
+                &mut len,
+            )
+        };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            return match e.kind() {
+                io::ErrorKind::WouldBlock => Ok(None),
+                _ => Err(e),
+            };
+        }
+        Ok(Some((n as usize, from.sll_ifindex)))
+    }
+
+    pub fn fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+
+    /// A capture that never has a frame, for tests that need none.
+    #[cfg(test)]
+    pub fn closed() -> Self {
+        let s = std::os::unix::net::UnixDatagram::unbound().unwrap();
+        s.set_nonblocking(true).unwrap();
+        Capture { fd: s.into() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame::tests::*;
+
+    /// Runs `prog` on `pkt` arriving on `ifindex`, as the kernel does: what
+    /// it keeps of the frame (0: drops it).
+    fn run(prog: &[libc::sock_filter], pkt: &[u8], ifindex: u32) -> u32 {
+        let (mut a, mut x, mut pc) = (0u32, 0u32, 0usize);
+        let load = |at: usize, n: usize| -> Option<u32> {
+            Some(
+                pkt.get(at..at + n)?
+                    .iter()
+                    .fold(0, |v, b| v << 8 | u32::from(*b)),
+            )
+        };
+        loop {
+            let i = prog[pc];
+            pc += 1;
+            let size = match i.code & 0x18 {
+                H => 2,
+                B => 1,
+                _ => 4,
+            };
+            match i.code & 0x07 {
+                LD if i.k == IFINDEX => a = ifindex,
+                LD => {
+                    let at = if i.code & 0xe0 == IND { x + i.k } else { i.k };
+                    let Some(v) = load(at as usize, size) else {
+                        return 0;
+                    };
+                    a = v;
+                }
+                LDX => {
+                    let Some(v) = load(i.k as usize, 1) else {
+                        return 0;
+                    };
+                    x = (v & 0x0f) * 4;
+                }
+                ALU => a &= i.k,
+                JMP => {
+                    let hit = match i.code & 0xf0 {
+                        JEQ => a == i.k,
+                        JSET => a & i.k != 0,
+                        c => panic!("jump {c:#x}"),
+                    };
+                    pc += usize::from(if hit { i.jt } else { i.jf });
+                }
+                RET => return i.k,
+                c => panic!("class {c:#x}"),
+            }
+        }
+    }
+
+    fn ports() -> Vec<Port> {
+        let port = |ifindex, wifi| Port {
+            ifindex,
+            name: format!("if{ifindex}"),
+            vlan: 42,
+            wifi,
+        };
+        vec![port(10, true), port(21, true), port(7, false)]
+    }
+
+    #[test]
+    fn the_program_keeps_the_frames_of_interest() {
+        let prog = program(&ports());
+        let dhcp = crate::dhcp::tests::message(2, 5, [192, 0, 2, 10], Some(60));
+        let ack = ipv4_frame(CLIENT, [192, 0, 2, 1], 17, &udp(67, 68, &dhcp));
+        let ra = ipv6_frame(CLIENT, 58, &ra_body(0, &[]));
+        let ns = ipv6_frame(CLIENT, 58, &[135, 0, 0, 0, 0, 0, 0, 0]);
+        let cases = [
+            (arp_frame(CLIENT, CLIENT, [192, 0, 2, 10], 1), [SHORT, 0]),
+            (
+                ipv4_frame(CLIENT, [192, 0, 2, 10], 6, &tcp(0x02)),
+                [SHORT, 0],
+            ),
+            (ipv4_frame(CLIENT, [192, 0, 2, 10], 6, &tcp(0x12)), [0, 0]),
+            (ipv4_frame(CLIENT, [192, 0, 2, 10], 6, &tcp(0x18)), [0, 0]),
+            (
+                ipv4_frame(CLIENT, [192, 0, 2, 10], 17, &udp(5000, 53, &[])),
+                [SHORT, 0],
+            ),
+            (
+                ipv4_frame(CLIENT, [192, 0, 2, 10], 1, &[8, 0, 0, 0]),
+                [0, 0],
+            ),
+            (ack, [WHOLE, WHOLE]),
+            (ra, [WHOLE, 0]),
+            (ns, [0, 0]),
+            (ipv6_frame(CLIENT, 17, &udp(547, 546, &[7])), [SHORT, 0]),
+            (ipv6_frame(CLIENT, 17, &udp(546, 547, &[1])), [0, 0]),
+        ];
+        for (i, (pkt, [wifi, uplink])) in cases.iter().enumerate() {
+            assert_eq!(run(&prog, pkt, 21), *wifi, "case {i} on a Wi-Fi port");
+            assert_eq!(run(&prog, pkt, 7), *uplink, "case {i} on the uplink");
+            assert_eq!(run(&prog, pkt, 99), 0, "case {i} elsewhere");
+        }
+        let mut fragment = ipv4_frame(CLIENT, [192, 0, 2, 10], 17, &udp(5000, 53, &[]));
+        fragment[20] = 0x01;
+        assert_eq!(run(&prog, &fragment, 10), 0);
+        // A header shorter than the program reads: dropped, as the kernel does.
+        assert_eq!(
+            run(&prog, &arp_frame(CLIENT, CLIENT, [0; 4], 1)[..13], 10),
+            0
+        );
+    }
+
+    #[test]
+    fn many_ports_still_fit_the_jumps() {
+        let many: Vec<Port> = (0..MAX_PORTS as i32 + 40)
+            .map(|i| Port {
+                ifindex: i,
+                name: format!("p{i}"),
+                vlan: 42,
+                wifi: i % 2 == 0,
+            })
+            .collect();
+        let prog = program(&many);
+        let arp = arp_frame(CLIENT, CLIENT, [0; 4], 1);
+        assert_eq!(run(&prog, &arp, 0), SHORT);
+        assert_eq!(run(&prog, &arp, MAX_PORTS as u32 + 2), 0, "past the cap");
+    }
+}
