@@ -187,7 +187,10 @@ struct GateFile {
 struct ConfigFile {
     sha256: String,
     seq: u64,
-    signed_ms: u64,
+    // Absent in a file from before it was kept: the sequence number, which
+    // it was then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signed_ms: Option<u64>,
 }
 
 /// The file, saved one save at a time.
@@ -236,7 +239,7 @@ pub fn load(path: &Path) -> io::Result<Policy> {
         .map(|(ap, c)| {
             let sha256 = mac::unhex(&c.sha256)
                 .ok_or_else(|| invalid(format!("configs.{ap}.sha256 is not 64 hex digits")))?;
-            let (seq, signed_ms) = (c.seq, c.signed_ms);
+            let (seq, signed_ms) = (c.seq, c.signed_ms.unwrap_or(c.seq));
             Ok((
                 ap,
                 ConfigId {
@@ -288,7 +291,7 @@ fn write_temp(path: &Path, policy: &Policy) -> io::Result<PathBuf> {
         let file = ConfigFile {
             sha256: mac::hex(&c.sha256),
             seq: c.seq,
-            signed_ms: c.signed_ms,
+            signed_ms: Some(c.signed_ms),
         };
         (ap.clone(), file)
     });
@@ -436,6 +439,20 @@ mod tests {
         let path = dir.0.join("policy.json");
         fs::write(&path, r#"{"blocked": ["02:00:00:00:00:01"]}"#).unwrap();
         assert_eq!(load(&path).unwrap(), blocked(&[1]));
+    }
+
+    /// A file whose acknowledged configurations were written before their
+    /// first signing time was kept: that time is their sequence number.
+    #[test]
+    fn a_file_without_first_signing_times_loads() {
+        let dir = Dir::new("no-signed");
+        let path = dir.0.join("policy.json");
+        let sha = "ab".repeat(32);
+        let text =
+            format!(r#"{{"blocked": [], "configs": {{"ap1": {{"sha256": "{sha}", "seq": 7}}}}}}"#);
+        fs::write(&path, text).unwrap();
+        let c = load(&path).unwrap().configs["ap1"];
+        assert_eq!((c.seq, c.signed_ms), (7, 7));
     }
 
     /// A crash after the new file is written, before it is renamed: the old
