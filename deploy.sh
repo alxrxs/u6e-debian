@@ -92,11 +92,11 @@ iproute2=$(pkg_version iproute2-nss VER)-$(pkg_version iproute2-nss DEB)+nss1
 netlogd=$(pkg_version netlogd VER)-$(pkg_version netlogd DEB)+u6e1
 [ -n "$hostapd" ] && [ "$iproute2" != -+nss1 ] && [ "$netlogd" != -+u6e1 ] || fail "no package versions in pkg/*/build.sh"
 deb=pkg/hostapd/out/hostapd_${hostapd}_arm64.deb
-[ -f "$deb" ] || step hostapd "$hostapd" arm64 "$deb" 'rm -rf pkg/hostapd/work && pkg/hostapd/build.sh' pkg/hostapd
+[ -f "$deb" ] || step hostapd "$hostapd" arm64 "$deb" 'rm -rf pkg/hostapd/work && pkg/hostapd/build.sh' pkg/hostapd pkg/fetch-debian.sh
 deb=pkg/iproute2-nss/out/iproute2_${iproute2}_arm64.deb
-[ -f "$deb" ] || step iproute2 "$iproute2" arm64 "$deb" 'rm -rf pkg/iproute2-nss/work && pkg/iproute2-nss/build.sh' pkg/iproute2-nss
+[ -f "$deb" ] || step iproute2 "$iproute2" arm64 "$deb" 'rm -rf pkg/iproute2-nss/work && pkg/iproute2-nss/build.sh' pkg/iproute2-nss pkg/fetch-debian.sh
 deb=pkg/netlogd/out/systemd-netlogd_${netlogd}_arm64.deb
-[ -f "$deb" ] || step netlogd "$netlogd" arm64 "$deb" 'rm -rf pkg/netlogd/work && pkg/netlogd/build.sh' pkg/netlogd
+[ -f "$deb" ] || step netlogd "$netlogd" arm64 "$deb" 'rm -rf pkg/netlogd/work && pkg/netlogd/build.sh' pkg/netlogd pkg/fetch-debian.sh
 step rootfs "$hostapd/$iproute2/$netlogd/$(head_of . HEAD:mkrootfs.sh)" arm64 rootfs 'rm -rf rootfs && ./mkrootfs.sh' \
 	mkrootfs.sh pkg/hostapd/out pkg/iproute2-nss/out pkg/netlogd/out
 # u6e-agent and u6e-spectral: static arm64 binaries from the cargo workspace,
