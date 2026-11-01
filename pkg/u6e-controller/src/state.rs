@@ -56,11 +56,12 @@ pub const FLOWS_IDLE: u16 = 60;
 /// The least time between two requests to an AP for its whole flow table:
 /// each costs the AP a dump of every connection.
 pub const FULL_INTERVAL: Duration = Duration::from_secs(10);
+/// How long a hold lasts unless it is released or taken again (its holder
+/// takes it again while it needs it), so a lost caller holds nothing for
+/// good.
+pub const HOLD_TTL: Duration = Duration::from_secs(30 * 60);
 /// How long a client's addresses are remembered after its flows last showed
 /// them, so that a client quiet for a while keeps its name.
-/// How long a hold lasts unless it is released or taken again: past the
-/// longest boot a hold covers, so a lost caller holds nothing for good.
-pub const HOLD_TTL: Duration = Duration::from_secs(30 * 60);
 const ADDRESSES_KEPT: Duration = Duration::from_secs(3600);
 const CHANGES_CAP: usize = 256;
 /// Messages queued for a session; a session that far behind is stalled.
