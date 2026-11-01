@@ -8,14 +8,17 @@
 //! The agents keep to the tick and flow cadence the controller sets, as real
 //! ones do, and carry out its commands: a kicked client rejoins a few seconds
 //! later, a blocked one stays away until it is unblocked, a steered one moves
-//! to its target, and the thermostat (`02:00:00:00:00:06`) never answers a
-//! kick, for the timeout. Each client's addresses have a DNS name, but one's.
+//! to its target, a radio switches channel or power at once, a configuration
+//! is taken in place, and the thermostat (`02:00:00:00:00:06`) never answers
+//! a kick, for the timeout. Each client's addresses have a DNS name, but one's.
 //! A radio asked to scan sends eight spectra a second until it is told to stop
 //! or goes down (`spectrum`: Wi-Fi bursts, a narrowband sender on 5 GHz, a
 //! microwave oven and Bluetooth on 2.4 GHz, a quiet 6 GHz channel).
 //! The RF planner commits to a site repository of its own in the temporary
 //! directory, made afresh at each start, and the radios' history starts a
-//! day full (`rf`).
+//! day full (`rf`). The controller signs configurations (`u6e-controller
+//! apply` reaches it on the socket in the temporary directory) and keeps
+//! images of each AP, whose staging is made up (`manage`).
 //! The web listener adds what the sign-in proxy in front of a controller
 //! would: a user, a member of the admin group unless `--viewer` is given.
 //!
@@ -26,6 +29,7 @@
 mod flows;
 #[path = "../../tests/common/keys.rs"]
 mod keys;
+mod manage;
 mod rf;
 mod spectrum;
 
@@ -49,10 +53,11 @@ use u6e_controller::agents::Timing;
 use u6e_controller::config::Config;
 use u6e_controller::http;
 use u6e_controller::names::Resolve;
+use u6e_controller::stage::Stage;
 use u6e_proto::frame::{decode_frame, frame_body, write_frame};
 use u6e_proto::msg::{
-    AgentMsg, Band, Bss, CommandKind, CommandResult, CtlMsg, Event, EventKind, Flows, Hello, Radio,
-    RateMode, Snapshot, SpectrumFrame, Station, Temp,
+    AgentMsg, Band, Bss, CommandKind, CommandResult, ConfigApplied, CtlMsg, Event, EventKind,
+    Flows, Hello, Mechanism, Radio, RadioApplied, RateMode, Snapshot, SpectrumFrame, Station, Temp,
 };
 use u6e_proto::tls::{self, Identity};
 use u6e_proto::{PROTOCOL, delta, mac, version};
@@ -68,7 +73,8 @@ const FOREIGN_BUSY: [f64; 3] = [24.0, 5.0, 0.8];
 /// One AP of the simulation: its radios and BSSs.
 struct ApSim {
     name: &'static str,
-    manifest: &'static str,
+    /// Its `/etc/u6e-image`, which a staging changes.
+    manifest: String,
     kernel: &'static str,
     /// Uptime when the replay starts.
     booted_s: u32,
@@ -78,6 +84,8 @@ struct ApSim {
     events: Vec<Event>,
     /// Until when (seconds since the start) its link is down.
     away_until: f64,
+    /// The hash of the Wi-Fi configuration it was sent last.
+    installed: Option<[u8; 32]>,
 }
 
 /// (interface, SSID, radio index, VLAN), the same on both APs.
@@ -250,15 +258,16 @@ fn radios(channels: [(u16, u16); 3]) -> Vec<Radio> {
 
 impl World {
     fn new() -> World {
-        let ap = |name, manifest, kernel, booted_s, channels, radio_temps| ApSim {
+        let ap = |name, manifest: &str, kernel, booted_s, channels, radio_temps| ApSim {
             name,
-            manifest,
+            manifest: manifest.to_owned(),
             kernel,
             booted_s,
             radio_temps,
             radios: radios(channels),
             events: Vec::new(),
             away_until: 0.0,
+            installed: None,
         };
         let mut w = World {
             start: Instant::now(),
@@ -643,6 +652,20 @@ impl World {
         }))
     }
 
+    /// The AP of `name` reboots, its link down for `secs`, onto `image`
+    /// unless the image is a bad one, which leaves it on what it ran.
+    fn reboot(&mut self, name: &str, image: &str, secs: f64) {
+        self.advance();
+        let Some(a) = self.aps.iter_mut().find(|a| a.name == name) else {
+            return;
+        };
+        a.away_until = self.t + secs;
+        if !image.contains("-bad-") {
+            let rest: Vec<&str> = a.manifest.lines().skip(1).collect();
+            a.manifest = format!("image:     {image}\n{}", rest.join("\n"));
+        }
+    }
+
     /// Whether the AP's link is down by the script.
     fn away(&mut self, ap: usize) -> bool {
         self.advance();
@@ -703,7 +726,7 @@ impl World {
                 })
                 .collect(),
             stations,
-            config_sha256: None,
+            config_sha256: self.aps[ap].installed,
             clock_synced: true,
         }
     }
@@ -822,7 +845,7 @@ async fn agent(addr: SocketAddr, ap: usize, pem: &str, world: Arc<Mutex<World>>)
         let a = &w.aps[ap];
         Hello {
             ap: a.name.into(),
-            manifest: a.manifest.into(),
+            manifest: a.manifest.clone(),
             kernel: a.kernel.into(),
             hostapd: "2:2.10-21".into(),
             agent: env!("CARGO_PKG_VERSION").into(),
@@ -902,6 +925,22 @@ async fn agent(addr: SocketAddr, ap: usize, pem: &str, world: Arc<Mutex<World>>)
                     };
                     send(&mut wr, &state).await?;
                 }
+                // Taken as is, in place: the AP reports it installed.
+                CtlMsg::ApplyConfig(c) => {
+                    let radios = c.radios.iter().map(|r| RadioApplied {
+                        radio: r.radio,
+                        mechanism: Mechanism::InPlace,
+                    });
+                    let applied = ConfigApplied {
+                        sha256: c.sha256,
+                        ok: true,
+                        radios: radios.collect(),
+                        detail: "set in place".into(),
+                    };
+                    world.lock().unwrap_or_else(|e| e.into_inner()).aps[ap].installed =
+                        Some(c.sha256);
+                    send(&mut wr, &AgentMsg::ConfigApplied(applied)).await?;
+                }
                 _ => {}
             }
         }
@@ -978,21 +1017,28 @@ async fn main() -> io::Result<()> {
     // The actions' decisions, kept for the next replay like a controller's.
     let policy = std::env::temp_dir().join("u6e-replay-policy.json");
     let (remote, clone) = rf::repository()?;
+    // Its signing key and kept images, the staging of one made up.
+    let managed = std::env::temp_dir().join("u6e-replay-manage");
+    let world = Arc::new(Mutex::new(World::new()));
+    let stager: Arc<dyn Stage> = Arc::new(manage::SimStage(Arc::clone(&world)));
     // The controller's own web listener goes unused: the one below is its
     // router behind what the sign-in proxy adds. The planner's channel table
     // is a made-up country's.
     let config = format!(
         "listen_agents = \"127.0.0.1:0\"\nlisten_http = \"127.0.0.1:0\"\nlisten_metrics = \"127.0.0.1:0\"\n\
-         public_origin = \"http://{web}\"\npolicy_path = \"{}\"\n\
-         [aps.ap1]\npublic_key = \"{}\"\n[aps.ap2]\npublic_key = \"{}\"\n\
+         public_origin = \"http://{web}\"\npolicy_path = \"{}\"\nsocket = \"{}\"\n\
+         [aps.ap1]\npublic_key = \"{}\"\naddress = \"192.0.2.16\"\n\
+         [aps.ap2]\npublic_key = \"{}\"\naddress = \"192.0.2.17\"\n{}\
          [rf]\nremote = \"{}\"\nrepo = \"{}\"\nfile = \"{}\"\n\
          [rf.channels.ZZ]\n\"24\" = [{{ channels = \"1-13\", max_dbm = 23 }}]\n\
          \"5\" = [{{ channels = \"36-48\", max_dbm = 23 }}, {{ channels = \"52-64\", max_dbm = 20, dfs = true }}, \
          {{ channels = \"149-177\", max_dbm = 23 }}]\n\
          \"6\" = [{{ channels = \"1-93\", max_dbm = 24 }}]\n",
         policy.display(),
+        managed.join("sock").display(),
         public(KEY_AP1).map_err(io::Error::other)?,
         public(KEY_AP2).map_err(io::Error::other)?,
+        manage::sections(&managed)?,
         remote.display(),
         clone.display(),
         rf::FILE,
@@ -1000,7 +1046,8 @@ async fn main() -> io::Result<()> {
     let config = Config::parse(&config).map_err(io::Error::other)?;
     let identity = Identity::from_pem(KEY_CONTROLLER).map_err(io::Error::other)?;
     let timing = Timing::default();
-    let c = u6e_controller::start(&config, &identity, timing, Arc::new(Names), None).await?;
+    let c =
+        u6e_controller::start(&config, &identity, timing, Arc::new(Names), Some(stager)).await?;
     let user = HeaderValue::from_static(if admin { "operator" } else { "viewer" });
     let groups = HeaderValue::from_str(&config.admin_group).map_err(io::Error::other)?;
     let signed_in = move |mut req: Request| {
@@ -1026,9 +1073,10 @@ async fn main() -> io::Result<()> {
             eprintln!("replay: web listener: {e}");
         }
     });
-    let mut world = World::new();
-    rf::seed(&c.state, &mut world);
-    let world = Arc::new(Mutex::new(world));
+    rf::seed(
+        &c.state,
+        &mut world.lock().unwrap_or_else(|e| e.into_inner()),
+    );
     for (ap, pem) in [KEY_AP1, KEY_AP2].into_iter().enumerate() {
         let world = Arc::clone(&world);
         tokio::spawn(async move {

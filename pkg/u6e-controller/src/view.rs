@@ -33,6 +33,7 @@ pub fn view(state: &State, wanted: impl Fn(&str) -> bool, flows: bool) -> Value 
         "aps": aps(state, &wanted),
         "clients": clients(state, &wanted),
         "blocked": blocked(state),
+        "config": config(state),
         "manage": manage(state),
         "rollouts": rollouts(state, LIVE_LOG),
     });

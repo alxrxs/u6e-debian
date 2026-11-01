@@ -7,12 +7,14 @@
 // the client actions are POSTs, answered with their result. The socket also
 // watches the one radio whose spectrum is shown, if any: its scan's state
 // comes as JSON, its frames as binary messages straight to the view. The RF
-// plan shown beside it is fetched, and applied with a POST like an action.
+// plan shown beside it is fetched, and applied with a POST like an action,
+// as is an AP's upgrade, which the Config view follows from the state.
 
 import { icon } from './util.js';
 import devices from './views/devices.js';
 import clients from './views/clients.js';
 import client from './views/client.js';
+import config from './views/config.js';
 import events from './views/events.js';
 import flows from './views/flows.js';
 import spectrum, { decodeFrame } from './views/spectrum.js';
@@ -61,10 +63,11 @@ const store = {
   fullFlows,
   rfPlan,
   rfApply,
+  upgrade,
   watchSpectrum,
 };
 
-const views = { devices, clients, client, flows, events, spectrum };
+const views = { devices, clients, client, flows, events, spectrum, config };
 let current = null;
 let currentName = '';
 
@@ -168,6 +171,11 @@ async function rfPlan() {
   } catch {
     return { status: 0 };
   }
+}
+
+/** Rolls `ap` onto its newest kept image, `image`, as the admin saw it. */
+function upgrade(ap, image) {
+  return adminPost(`/api/aps/${encodeURIComponent(ap)}/upgrade`, { image_id: image });
 }
 
 /** Commits the proposals confirmed (`{ plan, radios }`, each radio with the
@@ -387,7 +395,7 @@ function render() {
       ? `Live updates stopped: the controller cannot be reached. Trying again in ${s} s; the figures shown are the last received.`
       : `The controller cannot be reached. Trying again in ${s} s.`;
   }
-  const title = { devices: 'Devices', clients: 'Clients', client: 'Client', flows: 'Flows', spectrum: 'Spectrum', events: 'Events' }[currentName];
+  const title = { devices: 'Devices', clients: 'Clients', client: 'Client', flows: 'Flows', spectrum: 'Spectrum', config: 'Config', events: 'Events' }[currentName];
   document.title = `${title} – Wi-Fi`;
   current?.update();
 }

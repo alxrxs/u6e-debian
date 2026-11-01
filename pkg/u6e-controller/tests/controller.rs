@@ -47,12 +47,10 @@ use u6e_proto::{mac, version};
 #[path = "common/keys.rs"]
 mod keys;
 
-use keys::{KEY_AP1, KEY_AP2, KEY_CONTROLLER};
+use keys::{KEY_AP1, KEY_AP2, KEY_CONTROLLER, KEY_SIGNING};
 
-// Throwaway, like the keys of `keys`: an AP that is not enrolled, and the
-// key the controller signs configurations with.
+// Throwaway, like the keys of `keys`: an AP that is not enrolled.
 const KEY_STRANGER: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIIN98nA5U+8ay1kTe7TR4rEzYomCSC7d4p/BpYYuf1qw\n-----END PRIVATE KEY-----\n";
-const KEY_SIGNING: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEINAqUTkY6FWIuFA8ryg9VCageTDEsBn8b3MW/ZMra3Ny\n-----END PRIVATE KEY-----\n";
 
 /// How long a test waits for something that should happen, before failing.
 const WAIT: Duration = Duration::from_secs(20);

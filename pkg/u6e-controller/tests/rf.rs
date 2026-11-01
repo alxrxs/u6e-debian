@@ -31,6 +31,8 @@ use u6e_proto::msg::{
 };
 use u6e_proto::tls::Identity;
 
+// The tests' keys, the signing one not used here.
+#[allow(dead_code)]
 #[path = "common/keys.rs"]
 mod keys;
 

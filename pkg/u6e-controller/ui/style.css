@@ -672,8 +672,8 @@ table.conns { font-size: 12.5px; }
 @media (max-width: 720px) {
   .bar { gap: 10px; padding: 0 12px; height: auto; min-height: 52px; flex-wrap: wrap; }
   .brand span { display: none; }
-  .tabs { order: 3; width: calc(100% + 24px); height: 40px; margin: 0 -12px; padding: 0 4px; border-top: 1px solid var(--rule-2); }
-  .tabs a { flex: 1; justify-content: center; padding: 0 4px; font-size: 13px; }
+  .tabs { order: 3; width: calc(100% + 24px); height: 40px; margin: 0 -12px; padding: 0 4px; gap: 0; border-top: 1px solid var(--rule-2); overflow-x: auto; scrollbar-width: none; }
+  .tabs a { flex: 1 0 auto; justify-content: center; padding: 0 5px; font-size: 13px; }
   .session { gap: 10px; }
   .user { max-width: 12ch; }
   .banner { padding: 9px 16px; }
@@ -733,3 +733,21 @@ table.conns { font-size: 12.5px; }
   .plan-foot, .plan-lock { padding: 12px 14px; }
   .plan-foot .btn { width: 100%; justify-content: center; }
 }
+
+/* Config: each AP's configuration and image, and its rollout. */
+.chip.ok { color: var(--ok); background: color-mix(in srgb, var(--ok) 11%, transparent); border-color: transparent; }
+.cfg > div + div { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--rule-2); }
+.cfg .ap-top + div { margin-top: 14px; }
+.cfg-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.cfg-head h3 { margin: 0; font-size: 15px; }
+.cfg .facts code, .cfg .result code { font-size: 12px; }
+.cfg .result { margin: 12px 0 0; }
+.cfg-action { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 14px; }
+.cfg-action .btn[disabled] { opacity: .45; cursor: not-allowed; }
+.cfg-action .btn.primary svg { color: currentColor; }
+.cfg-action .btn { height: auto; min-height: 32px; padding: 6px 12px; white-space: normal; text-align: left; }
+.cfg-action .btn span { overflow-wrap: anywhere; }
+.cfg .lock { margin-top: 14px; }
+.kept { display: inline-flex; flex-wrap: wrap; gap: 4px 10px; font-weight: 400; }
+.kept code.newest { font-weight: 650; }
+.rollout .manifest { margin-top: 8px; }
