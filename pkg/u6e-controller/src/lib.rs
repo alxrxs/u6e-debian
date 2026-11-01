@@ -186,6 +186,7 @@ pub async fn start(
     if config.configs.is_some() || engine.is_some() {
         let local = Local {
             state: state.clone(),
+            policy: store.clone(),
             rollouts: engine.clone(),
             apply_wait: timing.apply + timing.ping * 2,
         };

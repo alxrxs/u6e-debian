@@ -3278,6 +3278,97 @@ fn rollouts_run_one_at_a_time() {
     );
 }
 
+fn hold(r: &Running, ap: &str, reason: Option<&str>) -> Result<String, String> {
+    r._rt.block_on(local::hold(&r.dir.join("sock"), ap, reason))
+}
+
+/// Root's hold, before something else reboots an AP: no rollout of any AP
+/// starts and no configuration goes to the held one while it lasts, across
+/// a restart too; it ends when released, or when its time is up. A hold is
+/// refused while a rollout runs.
+#[test]
+fn a_held_ap_is_left_alone_and_a_rollout_refuses_a_hold() {
+    let dir = TempDir::new("hold");
+    let stage = Arc::new(FakeStage::default());
+    let r = managed(Timing::default(), &dir.0, 1, Arc::clone(&stage));
+    for (id, ap) in [
+        ("img-1-ap1", "ap1"),
+        ("img-2-slow-ap1", "ap1"),
+        ("img-1-ap2", "ap2"),
+        ("img-2-ap2", "ap2"),
+    ] {
+        keep(&r, id, ap).unwrap();
+    }
+    let mut ap1 = ap_on(&r, KEY_AP1, "ap1", "img-1-ap1", 1, image_config(1));
+    let mut ap2 = ap_on(&r, KEY_AP2, "ap2", "img-1-ap2", 1, image_config(1));
+    ap1.expect_sync();
+    ap2.expect_sync();
+
+    assert_eq!(
+        hold(&r, "ap2", Some("wifi.yml boots it")),
+        Ok("ap2 held for 30 min: wifi.yml boots it".into())
+    );
+    let refused = |r: &Running, ap| {
+        let (status, v) = upgrade(
+            r,
+            ap,
+            if ap == "ap1" {
+                "img-2-slow-ap1"
+            } else {
+                "img-2-ap2"
+            },
+        );
+        (status, v["error"].clone())
+    };
+    let held = json!("ap2 is held: wifi.yml boots it");
+    assert_eq!(refused(&r, "ap1"), (409, held.clone()));
+    assert_eq!(refused(&r, "ap2"), (409, held.clone()));
+    assert_eq!(
+        apply_now(&r, "ap2", radios(1)),
+        Err("ap2 is held: wifi.yml boots it".into())
+    );
+    assert_eq!(hold(&r, "ap9", Some("x")), Err("no AP ap9".into()));
+    assert!(hold(&r, "ap1", Some("")).is_err());
+
+    // Kept across a restart.
+    drop((ap1, ap2));
+    drop(r);
+    let r = managed(Timing::default(), &dir.0, 1, Arc::clone(&stage));
+    let mut ap1 = ap_on(&r, KEY_AP1, "ap1", "img-1-ap1", 1, image_config(1));
+    ap1.expect_sync();
+    assert_eq!(refused(&r, "ap1"), (409, held));
+    assert_eq!(
+        hold(&r, "ap2", None),
+        Ok("ap2 released (wifi.yml boots it)".into())
+    );
+
+    // A rollout under way refuses a hold of any AP.
+    let (status, v) = upgrade(&r, "ap1", "img-2-slow-ap1");
+    assert_eq!(status, 202, "{v}");
+    let id = v["id"].as_u64().unwrap();
+    wait_for("the slow staging", || {
+        stage.staged.lock().unwrap().len() == 1
+    });
+    assert_eq!(
+        hold(&r, "ap2", Some("wifi.yml boots it")),
+        Err("a rollout of img-2-slow-ap1 to ap1 is under way".into())
+    );
+    wait_result(&r, id);
+    drop(ap1);
+    drop(r);
+
+    // A hold past its time holds nothing.
+    let path = dir.0.join("policy.json");
+    let mut v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    v["holds"] = json!({"ap2": {"reason": "lost", "until_ms": 1}});
+    fs::write(&path, serde_json::to_string(&v).unwrap()).unwrap();
+    let r = managed(Timing::default(), &dir.0, 1, Arc::clone(&stage));
+    let mut ap1 = ap_on(&r, KEY_AP1, "ap1", "img-1-ap1", 1, image_config(1));
+    ap1.expect_sync();
+    let (status, v) = upgrade(&r, "ap1", "img-2-slow-ap1");
+    assert_eq!(status, 202, "{v}");
+}
+
 /// A controller restarted during a rollout's gate goes on with it from the
 /// policy file: the AP back healthy is done, never staged again nor rolled
 /// back; one restarted during the staging stages again, the staging that

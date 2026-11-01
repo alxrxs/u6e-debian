@@ -54,6 +54,18 @@ pub struct Policy {
     pub rollouts: Vec<SavedRollout>,
     /// The id the last rollout was given.
     pub next_rollout: u64,
+    /// The holds on APs, by AP.
+    pub holds: BTreeMap<String, Hold>,
+}
+
+/// A hold on an AP (root's `hold`, before something else reboots it): no
+/// rollout starts and no live configuration or radio command goes to it
+/// while it lasts. Why, and until when.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Hold {
+    pub reason: String,
+    pub until_ms: u64,
 }
 
 /// The kept images an AP runs, as far as the controller knows.
@@ -118,6 +130,8 @@ struct PolicyFile {
     rollouts: Vec<RolloutFile>,
     #[serde(default, skip_serializing_if = "is_zero")]
     next_rollout: u64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    holds: BTreeMap<String, Hold>,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -252,6 +266,7 @@ pub fn load(path: &Path) -> io::Result<Policy> {
         images: file.images,
         rollouts: rollouts.collect(),
         next_rollout: file.next_rollout,
+        holds: file.holds,
     })
 }
 
@@ -303,6 +318,7 @@ fn write_temp(path: &Path, policy: &Policy) -> io::Result<PathBuf> {
         images: policy.images.clone(),
         rollouts: rollouts.collect(),
         next_rollout: policy.next_rollout,
+        holds: policy.holds.clone(),
     };
     let mut body = serde_json::to_vec_pretty(&file).map_err(io::Error::other)?;
     body.push(b'\n');

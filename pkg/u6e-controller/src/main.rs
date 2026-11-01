@@ -3,6 +3,8 @@
 //!   u6e-controller [--config <path>]
 //!   u6e-controller apply <ap> [--config <path>]       < <u6e-wifi script>
 //!   u6e-controller image add <dir> [--config <path>]
+//!   u6e-controller hold <ap> <reason> [--config <path>]
+//!   u6e-controller release <ap> [--config <path>]
 //!
 //! Without a command it is the controller, until stopped. `apply` reads the
 //! script `boot/wifi-up.sh --print` renders for the AP, has the controller
@@ -10,7 +12,10 @@
 //! applied exactly that configuration, printing how each radio took it.
 //! `image add` hands the controller the image in `<dir>` (an image as the
 //! build keeps it, `images/<id>/`), which it keeps under the directory's
-//! name once every file is the one its `MANIFEST` lists. Both reach the
+//! name once every file is the one its `MANIFEST` lists. `hold` keeps the
+//! controller off `ap` for 30 minutes (no rollout of any AP, no live
+//! configuration or radio command to it) while something else reboots it,
+//! refused while a rollout runs; `release` ends that. Each reaches the
 //! running controller on its local socket. The default configuration is
 //! /etc/wifi-controller/config.toml.
 
@@ -30,7 +35,8 @@ use u6e_proto::tls::Identity;
 
 const DEFAULT_CONFIG: &str = "/etc/wifi-controller/config.toml";
 
-const USAGE: &str = "usage: u6e-controller [apply <ap> | image add <dir>] [--config <path>]";
+const USAGE: &str = "usage: u6e-controller [apply <ap> | image add <dir> | hold <ap> <reason> | \
+                     release <ap>] [--config <path>]";
 
 /// The command's words and the configuration's path.
 fn args() -> Option<(Vec<String>, String)> {
@@ -65,13 +71,18 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     let words: Vec<&str> = words.iter().map(String::as_str).collect();
-    if !matches!(words.as_slice(), [] | ["apply", _] | ["image", "add", _]) {
+    if !matches!(
+        words.as_slice(),
+        [] | ["apply", _] | ["image", "add", _] | ["hold", _, _] | ["release", _]
+    ) {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     }
     let r = load(&path).and_then(|config| match words.as_slice() {
         ["apply", ap] => apply(&config, ap),
         ["image", "add", dir] => image_add(&config, Path::new(dir)),
+        ["hold", ap, reason] => hold(&config, ap, Some(reason)),
+        ["release", ap] => hold(&config, ap, None),
         _ => run(&config),
     });
     match r {
@@ -131,6 +142,13 @@ fn apply(config: &Config, ap: &str) -> Result<(), String> {
     zeroize(unsafe { text.as_mut_vec() });
     let radios = radios?;
     let done = runtime()?.block_on(local::apply(&config.socket, ap, radios))?;
+    println!("{done}");
+    Ok(())
+}
+
+/// Holds `ap` for `reason`, or releases it.
+fn hold(config: &Config, ap: &str, reason: Option<&str>) -> Result<(), String> {
+    let done = runtime()?.block_on(local::hold(&config.socket, ap, reason))?;
     println!("{done}");
     Ok(())
 }

@@ -83,8 +83,11 @@ function rolloutPanel(r) {
     log);
 }
 
-function imagePanel(store, name, imgs, rollouts) {
+function imagePanel(store, name, all, rollouts) {
+  const imgs = all[name] || {};
   const kept = imgs.kept || [];
+  // A hold on any AP holds every rollout: one AP down at a time.
+  const held = Object.entries(all).find(([, i]) => i.held);
   const newest = kept[kept.length - 1];
   const mine = rollouts.filter((r) => r.ap === name).sort((a, b) => b.id - a.id);
   const busy = rollouts.find((r) => !r.result);
@@ -97,6 +100,7 @@ function imagePanel(store, name, imgs, rollouts) {
     const why = !newest ? 'No image is kept for it.'
       : newest === imgs.running ? 'It runs its newest kept image.'
         : busy ? `The rollout of ${busy.image} to ${busy.ap} is not over.`
+          : held ? `${held[0]} is held until ${hm(held[1].held.until)}: ${held[1].held.reason}.`
           : !imgs.running ? 'What it runs is not known, so it could not be rolled back.'
             : null;
     const btn = h('button', { type: 'button', class: 'btn primary', disabled: !!why }, icon(UP), h('span', {}, newest ? `Upgrade to ${newest}` : 'Upgrade'));
@@ -126,7 +130,7 @@ function apPanel(store, name, ap) {
   const parts = [h('div', { class: 'ap-top' }, h('h2', {}, name),
     h('span', { class: `state ${ap.up ? 'ok' : 'bad'}` }, ap.up ? 'Connected' : 'Offline'))];
   if (manage.configs) parts.push(configPanel(s.config?.[name] || {}));
-  if (manage.images) parts.push(imagePanel(store, name, manage.images[name] || {}, Object.values(s.rollouts || {})));
+  if (manage.images) parts.push(imagePanel(store, name, manage.images, Object.values(s.rollouts || {})));
   return h('section', { class: 'panel ap cfg' }, ...parts);
 }
 

@@ -123,6 +123,9 @@ pub fn manage(state: &State) -> Value {
             if let Some(e) = runs.and_then(|i| i.either.as_ref()) {
                 ap["either"] = e.clone().into();
             }
+            if let Some(h) = state.held(name) {
+                ap["held"] = json!({ "reason": h.reason, "until": h.until_ms });
+            }
             (name.to_owned(), ap)
         });
         o["images"] = Value::Object(aps.collect());

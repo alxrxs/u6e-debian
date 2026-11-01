@@ -34,8 +34,9 @@ use u6e_proto::msg::{
 use u6e_proto::{PROTOCOL, mac};
 
 use crate::configs::Signer;
+use crate::configs::unix_ms;
 use crate::names::{self, Names};
-use crate::policy::{ApImages, Blocked, ConfigId, Phase, Policy, SavedRollout};
+use crate::policy::{ApImages, Blocked, ConfigId, Hold, Phase, Policy, SavedRollout};
 use crate::rf::history::{self, History};
 use crate::spectrum::{self, Limits, Scan, Stopped};
 
@@ -57,6 +58,9 @@ pub const FLOWS_IDLE: u16 = 60;
 pub const FULL_INTERVAL: Duration = Duration::from_secs(10);
 /// How long a client's addresses are remembered after its flows last showed
 /// them, so that a client quiet for a while keeps its name.
+/// How long a hold lasts unless it is released or taken again: past the
+/// longest boot a hold covers, so a lost caller holds nothing for good.
+pub const HOLD_TTL: Duration = Duration::from_secs(30 * 60);
 const ADDRESSES_KEPT: Duration = Duration::from_secs(3600);
 const CHANGES_CAP: usize = 256;
 /// Messages queued for a session; a session that far behind is stalled.
@@ -516,6 +520,9 @@ pub struct State {
     pub images: BTreeMap<String, ApImages>,
     /// The rollouts, newest last.
     pub rollouts: VecDeque<Rollout>,
+    /// The holds on APs, as saved in the policy file; one past its time
+    /// holds nothing.
+    pub holds: BTreeMap<String, Hold>,
     next_rollout: u64,
     /// The radios not as the site file plans them, by key (`ap/radio`).
     pub not_as_planned: BTreeMap<String, NotAsPlanned>,
@@ -551,6 +558,7 @@ impl State {
             images: BTreeMap::new(),
             rollouts: VecDeque::new(),
             next_rollout: 0,
+            holds: BTreeMap::new(),
             not_as_planned: BTreeMap::new(),
             apply_counts: BTreeMap::new(),
             rollout_counts: BTreeMap::new(),
@@ -593,9 +601,12 @@ impl State {
         });
         let mut images = policy.images;
         images.retain(|ap, _| self.aps.contains_key(ap));
+        let mut holds = policy.holds;
+        holds.retain(|ap, _| self.aps.contains_key(ap));
         State {
             blocked: policy.blocked,
             images,
+            holds,
             rollouts: rollouts.collect(),
             next_rollout: policy.next_rollout,
             ..self
@@ -650,6 +661,7 @@ impl State {
             images: self.images.clone(),
             rollouts: rollouts.collect(),
             next_rollout: self.next_rollout,
+            holds: self.holds.clone(),
         }
     }
 
@@ -1069,6 +1081,9 @@ impl State {
     /// a rollout.
     pub(crate) fn sendable(&self, ap: &str) -> Result<(), String> {
         let entry = self.aps.get(ap).ok_or_else(|| format!("no AP {ap:.64}"))?;
+        if let Some(h) = self.held(ap) {
+            return Err(format!("{ap} is held: {}", h.reason));
+        }
         if self.rollouts.iter().any(|r| r.ap == ap && r.is_open()) {
             return Err(format!("{ap} is being rolled out to"));
         }
@@ -1254,6 +1269,11 @@ impl State {
             .kept
             .as_ref()
             .ok_or("rollouts are off: the controller has no [rollouts]")?;
+        // One AP down at a time: none while another is being rebooted.
+        let now = unix_ms();
+        if let Some((held, h)) = self.holds.iter().find(|(_, h)| h.until_ms > now) {
+            return Err(format!("{held} is held: {}", h.reason));
+        }
         let entry = self.aps.get(ap).ok_or_else(|| format!("no AP {ap:.64}"))?;
         let mine = kept.get(ap).map(Vec::as_slice).unwrap_or_default();
         let Some(newest) = mine.last() else {
@@ -1392,6 +1412,55 @@ impl State {
         if let Some(id) = session.map(|s| s.id) {
             self.check_installed(&ap, id);
         }
+    }
+
+    /// The hold on `ap`, while it lasts.
+    pub fn held(&self, ap: &str) -> Option<&Hold> {
+        let now = unix_ms();
+        self.holds.get(ap).filter(|h| h.until_ms > now)
+    }
+
+    /// Holds `ap` for [`HOLD_TTL`] (again, if it is held), as root asks
+    /// before something else reboots it; refused while any rollout runs,
+    /// which would take a second AP down.
+    pub fn hold(&mut self, ap: &str, reason: &str) -> Result<String, String> {
+        if !self.aps.contains_key(ap) {
+            return Err(format!("no AP {ap:.64}"));
+        }
+        let plain = |c: char| !c.is_control();
+        if reason.trim().is_empty() || reason.len() > 200 || !reason.chars().all(plain) {
+            return Err("a hold needs a reason of one line, at most 200 bytes".into());
+        }
+        if let Some(r) = self.rollouts.iter().find(|r| r.is_open()) {
+            return Err(format!(
+                "a rollout of {} to {} is under way",
+                r.image_id, r.ap
+            ));
+        }
+        let ttl = u64::try_from(HOLD_TTL.as_millis()).unwrap_or(u64::MAX);
+        let hold = Hold {
+            reason: reason.to_owned(),
+            until_ms: unix_ms().saturating_add(ttl),
+        };
+        self.holds.insert(ap.to_owned(), hold);
+        self.policy_dirty = true;
+        let detail = format!("{ap} held for {} min: {reason}", HOLD_TTL.as_secs() / 60);
+        self.record_deploy("hold", Some(ap), Some("root".into()), true, detail.clone());
+        Ok(detail)
+    }
+
+    /// Ends the hold on `ap`, if it has one.
+    pub fn release(&mut self, ap: &str) -> Result<String, String> {
+        if !self.aps.contains_key(ap) {
+            return Err(format!("no AP {ap:.64}"));
+        }
+        let detail = match self.holds.remove(ap) {
+            Some(h) => format!("{ap} released ({})", h.reason),
+            None => format!("{ap} was not held"),
+        };
+        self.policy_dirty = true;
+        self.record_deploy("hold", Some(ap), Some("root".into()), true, detail.clone());
+        Ok(detail)
     }
 
     /// The kept images that must stay: what each AP runs or may run, and

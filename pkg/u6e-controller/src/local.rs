@@ -1,7 +1,9 @@
 //! The controller's local socket (`socket`, 0600, its own user's): what
-//! root's commands on the controller's host ask of it, which is two things,
-//! applying a rendered Wi-Fi configuration to an AP (`u6e-controller apply`)
-//! and adding an image to the kept ones (`u6e-controller image add`). Only
+//! root's commands on the controller's host ask of it: applying a rendered
+//! Wi-Fi configuration to an AP (`u6e-controller apply`), adding an image to
+//! the kept ones (`u6e-controller image add`), and holding an AP while
+//! something else reboots it, or releasing it (`u6e-controller hold`,
+//! `release`; `State::hold`). Only
 //! root and the controller's own user are served, by the peer's credentials:
 //! whoever may ask holds the site's configuration anyway. A connection
 //! carries one request, answered with a last word.
@@ -18,8 +20,10 @@ use u6e_proto::config::config_sha256;
 use u6e_proto::mac;
 use u6e_proto::msg::{ConfigApplied, RadioConfig};
 
+use crate::agents::save_policy;
 use crate::frames;
 use crate::images::{self, MANIFEST_MAX, image_name};
+use crate::policy::Store;
 use crate::rollout::Engine;
 use crate::state::{Shared, mechanism_name};
 use crate::view::band;
@@ -38,6 +42,10 @@ pub enum Request {
     /// A part of the file being sent; an empty one ends it. The files come
     /// in their `MANIFEST`'s order.
     Chunk(Vec<u8>),
+    /// Hold the AP, for this reason.
+    Hold { ap: String, reason: String },
+    /// End the AP's hold.
+    Release { ap: String },
 }
 
 /// What the controller answers.
@@ -65,6 +73,8 @@ fn allowed(uid: u32, ours: u32) -> bool {
 #[derive(Clone)]
 pub struct Local {
     pub state: Shared,
+    /// Where a hold is kept.
+    pub policy: Store,
     pub rollouts: Option<Engine>,
     /// How long an apply waits for the AP: past the controller's own wait
     /// (`Timing::apply`), whose answer then comes first.
@@ -128,8 +138,36 @@ async fn caller(local: Local, mut conn: UnixStream, ours: u32) {
             Some(engine) => add(engine, &mut conn, &id, &manifest).await,
         },
         Request::Chunk(_) => done(false, "a chunk of no image".into()),
+        Request::Hold { ap, reason } => {
+            let held = local.state.write().hold(&ap, &reason);
+            kept(&local, held).await
+        }
+        Request::Release { ap } => {
+            let released = local.state.write().release(&ap);
+            kept(&local, released).await
+        }
     };
     let _ = frames::write(&mut conn, &reply).await;
+}
+
+/// The answer to a hold or a release, once the policy file keeps it: a
+/// hold a restart would forget holds nothing.
+async fn kept(local: &Local, r: Result<String, String>) -> Reply {
+    match r {
+        Err(why) => done(false, why),
+        Ok(detail) => {
+            local.state.write().take_dirty();
+            if save_policy(local.policy.clone(), local.state.clone()).await {
+                done(true, detail)
+            } else {
+                local.state.write().mark_dirty();
+                done(
+                    false,
+                    format!("{detail}, but the policy file was not saved"),
+                )
+            }
+        }
+    }
 }
 
 /// Takes image `id` of `manifest` from the caller, then keeps it.
@@ -204,6 +242,28 @@ pub async fn apply(socket: &Path, ap: &str, radios: Vec<RadioConfig>) -> Result<
         }
         Reply::Done { detail, .. } => Err(detail),
         Reply::Send => Err("the controller answered out of turn".into()),
+    }
+}
+
+/// Has the controller on `socket` hold `ap` for `reason`, or release it
+/// with `None`; what it said.
+pub async fn hold(socket: &Path, ap: &str, reason: Option<&str>) -> Result<String, String> {
+    let req = match reason {
+        Some(reason) => Request::Hold {
+            ap: ap.into(),
+            reason: reason.into(),
+        },
+        None => Request::Release { ap: ap.into() },
+    };
+    let mut conn = connect(socket).await?;
+    let reply = async {
+        frames::write(&mut conn, &req).await?;
+        frames::read(&mut conn).await
+    };
+    match reply.await.map_err(|e| format!("the controller: {e}"))? {
+        Reply::Done { ok: true, detail } => Ok(detail),
+        Reply::Done { detail, .. } => Err(detail),
+        other => Err(format!("the controller answered {other:?}")),
     }
 }
 
