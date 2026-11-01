@@ -2,9 +2,10 @@
 // channel, width and power the controller proposes from what the last hours
 // measured, what it predicts the change does and why. Nothing changes until
 // an admin applies chosen proposals, exactly as shown (the controller refuses
-// them once the plan changed), which commits them to the site file; the
-// next configuration rendered from it takes them to the access points.
-// Proposals that free each other's spectrum are chosen together.
+// them once the plan changed), which commits them to the site file and moves
+// the radios there live; a radio that runs otherwise than the site file
+// plans is shown so, and moved back by the controller. Proposals that free
+// each other's spectrum are chosen together.
 
 import { h, icon, ask, ago, bandName } from '../util.js';
 
@@ -54,10 +55,14 @@ function move(from, to) {
  * `others` the keys of its group's others. */
 function row(r, pick, others) {
   const chips = [];
-  if (r.pending) chips.push(h('span', { class: 'chip wait' }, 'Pending deploy'));
+  if (r.pending) {
+    const off = r.not_as_planned;
+    const long = off && Date.now() - off.since > 30 * 60_000;
+    chips.push(h('span', { class: `chip ${long ? 'bad' : 'wait'}`, title: off?.detail || r.reason }, 'Not as planned'));
+  }
   else if (r.kept) chips.push(h('span', { class: 'chip' }, 'Kept'));
   else if (r.change && !r.measured) chips.push(h('span', { class: 'chip warn' }, 'Unmeasured'));
-  if (r.restart) chips.push(h('span', { class: 'chip warn', title: r.restart }, 'Restarts Wi-Fi'));
+  if (r.restart) chips.push(h('span', { class: 'chip warn', title: r.restart }, 'Needs a radar check'));
   if (others.length) chips.push(h('span', { class: 'chip', title: 'Applied together or not at all' }, `With ${others.join(', ')}`));
   let setting;
   if (r.pending && r.runs) setting = move(r.runs, r.current);
@@ -136,12 +141,12 @@ export function rfPlan(store) {
     const n = picked.length;
     const restarts = picked.filter((r) => r.restart).length;
     const restart = restarts
-      ? ` ${restarts === 1 ? 'One of them restarts' : `${restarts} of them restart`} the AP’s Wi-Fi for a radar check of about a minute.`
+      ? ` ${restarts === 1 ? 'One of them needs' : `${restarts} of them need`} a radar check, which a live switch cannot run: the next configuration push takes ${restarts === 1 ? 'it' : 'them'} there.`
       : '';
     const yes = await ask(document.body, {
       title: `Apply ${n} ${n === 1 ? 'change' : 'changes'}?`,
       text: `The controller commits ${n === 1 ? 'it' : 'them'} to ${plan.site?.file || 'the site file'} as wifi-controller, naming you, ` +
-        'and the next configuration rendered from it takes the change to the access points: a channel switch announcement moves their clients along, without a reboot.' + restart,
+        'and moves the radios there live: a channel switch announcement moves their clients along, without a reboot.' + restart,
       confirm: 'Commit',
     });
     if (!yes) return;
@@ -151,8 +156,12 @@ export function rfPlan(store) {
     const radios = picked.map((r) => ({ key: r.key, ...r.proposed }));
     const res = await store.rfApply({ plan: plan.hash, radios });
     applying = false;
+    const notMoved = (res.live || []).filter((l) => !l.ok);
+    const moved = notMoved.length
+      ? ` Not moved yet: ${notMoved.map((l) => `${l.key}, ${l.detail}`).join('; ')}.`
+      : ' The radios were moved live.';
     result = res.ok
-      ? ['ok', `Committed ${res.commit.slice(0, 12)} to ${plan.site?.file || 'the site file'}.`]
+      ? [notMoved.length ? 'warn' : 'ok', `Committed ${res.commit.slice(0, 12)} to ${plan.site?.file || 'the site file'}.${moved}`]
       : ['bad', `Not applied: ${res.error || 'the controller could not be reached'}.`];
     await load();
   }

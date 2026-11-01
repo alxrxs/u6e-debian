@@ -3,8 +3,9 @@
 //! best within the site's constraints, with the effect it predicts.
 //!
 //! - **Constraints.** A setting is one of the country's channels in the
-//!   configured table (DFS ones only when allowed, and then applied by a
-//!   restart with a radar check), at a configured width, on a 6 GHz
+//!   configured table (DFS ones only when allowed, and then taken there by
+//!   the next configuration push, which runs the radar check a live switch
+//!   cannot), at a configured width, on a 6 GHz
 //!   preferred scanning channel (PSC), sharing no spectrum with a radio of
 //!   another AP of the site, with the primary of any 20/40 MHz network of
 //!   others the AP hears in its block (802.11 20/40 coexistence), and at no
@@ -101,7 +102,7 @@ const GAP_DB: f64 = 6.0;
 const CAP_BITS: f64 = 8.3;
 /// A transmit power the radio reports this far from the file's is not yet
 /// the file's, dB.
-const POWER_SLACK: i32 = 2;
+pub(crate) const POWER_SLACK: i32 = 2;
 
 fn band_index(b: Band) -> usize {
     BANDS.iter().position(|x| *x == b).expect("a band")
@@ -277,9 +278,15 @@ pub struct Proposal {
     pub measured: bool,
     /// Why its channel stays, if something keeps it.
     pub kept: Option<String>,
-    /// It runs other than the site file says: a change not deployed yet.
+    /// It runs other than the site file says: a change not taken to it yet.
     pub pending: bool,
-    /// How applying it takes the radio off the air, when it does.
+    /// What the site file says it runs, as the radio would take it: its
+    /// power no more than its primary channel allows (the driver's limit),
+    /// and whether its block needs a radar check (DFS).
+    pub planned_power: Option<i32>,
+    pub planned_dfs: bool,
+    /// Why it is not moved live (a block that needs a radar check), when it
+    /// is not.
     pub restart: Option<String>,
     /// The proposals it is applied with or not at all, by group number.
     pub group: Option<u32>,
@@ -312,6 +319,10 @@ struct Item<'a> {
     /// Why its channel stays.
     kept: Option<String>,
     pending: bool,
+    /// The site file's power as the radio would take it, and whether its
+    /// block needs DFS.
+    planned_power: Option<i32>,
+    planned_dfs: bool,
     /// Whether its power stays.
     power_kept: bool,
 }
@@ -501,11 +512,13 @@ pub fn plan(inputs: &Inputs) -> Plan {
             // runs other than the file says.
             let on = radio.map_or((sr.channel, width), |r| (r.channel, r.width_mhz));
             let measure = measure(hours.filter(|h| (h.channel, h.width) == on));
-            // A power above the limit is the limit (the driver's doing).
-            let limit = channels::block(sr.band, sr.channel, width)
-                .and_then(|b| ctx.limits(sr.band, &b).ok())
-                .map(|(max, _)| max);
+            // A power above the limit is the limit: the driver's doing, by
+            // the primary channel's.
+            let limit = ctx.limits(sr.band, &[sr.channel]).ok().map(|(max, _)| max);
             let stated = sr.power.map(|p| limit.map_or(p, |m| p.min(m)));
+            let dfs = channels::block(sr.band, sr.channel, width)
+                .and_then(|b| ctx.limits(sr.band, &b).ok())
+                .is_some_and(|(_, dfs)| dfs);
             let mut pending = false;
             // What keeps the whole radio as it is.
             let whole = match (snap, radio) {
@@ -519,7 +532,7 @@ pub fn plan(inputs: &Inputs) -> Plan {
                 (_, Some(r)) if (r.channel, r.width_mhz) != (sr.channel, width) => {
                     pending = true;
                     Some(format!(
-                        "waiting for the deploy: it runs channel {} at {} MHz, the site file says \
+                        "not as planned: it runs channel {} at {} MHz, the site file says \
                          channel {} at {width} MHz",
                         r.channel, r.width_mhz, sr.channel
                     ))
@@ -531,7 +544,7 @@ pub fn plan(inputs: &Inputs) -> Plan {
                 {
                     pending = true;
                     Some(format!(
-                        "waiting for the deploy: it sends at {} dBm, the site file says {} dBm",
+                        "not as planned: it sends at {} dBm, the site file says {} dBm",
                         runs(r).power.unwrap_or_default(),
                         stated.unwrap_or_default()
                     ))
@@ -552,6 +565,8 @@ pub fn plan(inputs: &Inputs) -> Plan {
                 measure,
                 kept,
                 pending,
+                planned_power: stated,
+                planned_dfs: dfs,
                 power_kept,
             });
         }
@@ -825,6 +840,8 @@ fn decide(ctx: &Ctx, item: &Item) -> Proposal {
         measured: m.is_some(),
         kept: item.kept.clone(),
         pending: item.pending,
+        planned_power: item.planned_power,
+        planned_dfs: item.planned_dfs,
         restart: None,
         group: None,
         reason: String::new(),
@@ -847,8 +864,8 @@ fn decide(ctx: &Ctx, item: &Item) -> Proposal {
         let moves = block_of(sr.band, &p.proposed) != block_of(sr.band, &current);
         if c.dfs && moves {
             p.restart = Some(
-                "a DFS channel: applied by restarting the AP's Wi-Fi, after a radar check (CAC) \
-                 of about a minute on that radio"
+                "a DFS channel: it needs a radar check (CAC), which a live channel switch cannot \
+                 run, so it takes effect with the next configuration push"
                     .into(),
             );
         }
@@ -1387,7 +1404,7 @@ mod tests {
         assert_eq!(
             r5.kept.as_deref(),
             Some(
-                "waiting for the deploy: it runs channel 44 at 80 MHz, the site file says channel 36 at 80 MHz"
+                "not as planned: it runs channel 44 at 80 MHz, the site file says channel 36 at 80 MHz"
             )
         );
         assert_eq!(r5.runs.map(|s| s.channel), Some(44));
@@ -1403,7 +1420,7 @@ mod tests {
         assert!(r6.pending);
         assert_eq!(
             r6.kept.as_deref(),
-            Some("waiting for the deploy: it sends at 12 dBm, the site file says 18 dBm")
+            Some("not as planned: it sends at 12 dBm, the site file says 18 dBm")
         );
         // ap2 away: its spectrum is kept, so ap1 moves off its 2.4 GHz channel.
         let (_, a) = snapshots(&fixture("ap1"));
@@ -1441,5 +1458,25 @@ mod tests {
         let spread: Vec<_> = (0..10).map(|i| (f64::from(i) * 5.0, 1.0)).collect();
         assert_eq!(tenth(&spread), 0.0);
         assert_eq!(tenth(&[(12.0, 9.0), (40.0, 1.0)]), 12.0);
+    }
+
+    /// The power a radio sends at is limited by its primary channel's
+    /// limit, which is what the driver applies: a block whose other channels
+    /// allow less does not make a radio at the site file's power out of step.
+    #[test]
+    fn the_power_in_step_is_by_the_primary_channels_limit() {
+        let h = History::new(24);
+        let mut split = rules();
+        split.countries.get_mut("ZZ").unwrap()[1] = vec![
+            allowed(36, 40, 23, false),
+            allowed(44, 48, 17, false),
+            allowed(149, 177, 23, false),
+        ];
+        let (_, a) = snapshots(&fixture("ap1"));
+        let (_, b) = snapshots(&fixture("ap2"));
+        let p = run(SITE, &[("ap1", Some(&a)), ("ap2", Some(&b))], &h, &split);
+        let r5 = of(&p, "ap1/radio5");
+        assert!(!r5.pending, "{:?}", r5.kept);
+        assert_eq!(r5.planned_power, Some(23));
     }
 }

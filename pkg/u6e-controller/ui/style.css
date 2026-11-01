@@ -442,6 +442,8 @@ td small { display: block; color: var(--ink-3); font-size: 11.5px; line-height: 
 .result[data-tone="ok"] svg { color: var(--ok); }
 .result[data-tone="bad"] { background: color-mix(in srgb, var(--bad) 9%, var(--surface)); }
 .result[data-tone="bad"] svg { color: var(--bad); }
+.result[data-tone="warn"] { background: color-mix(in srgb, var(--warn) 10%, var(--surface)); }
+.result[data-tone="warn"] svg { color: var(--warn); }
 .absent { margin: 0; padding: 14px 20px; border-top: 1px solid var(--rule-2); color: var(--ink-2); }
 
 dialog.ask {

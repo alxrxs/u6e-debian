@@ -158,6 +158,60 @@ fn ask(h: &mut Hostapd, iface: &str, cmd: &str) -> Result<String, String> {
     }
 }
 
+/// The controller's radio commands, as a radio runs: a channel switch,
+/// announced to its clients, or a transmit power, which the root helper sets
+/// (nl80211 wants CAP_NET_ADMIN). Each is checked first against what nl80211
+/// says the radio and the regulatory domain allow now, as an apply's are; a
+/// target that needs a radar check (CAC) first is refused, since a switch
+/// cannot run one. Neither changes the installed configuration.
+pub struct Radios {
+    pub hostapd: Hostapd,
+    pub helper: helper::Client,
+    pub phy: Box<dyn Phy>,
+    pub switch_wait: Duration,
+}
+
+impl Radios {
+    /// The radios of the AP, by their sockets and nl80211.
+    pub fn open(run: &std::path::Path, ctrl: &std::path::Path) -> io::Result<Radios> {
+        Ok(Radios {
+            hostapd: Hostapd::bind(run, "radio", ctrl)?,
+            helper: helper::Client::new(),
+            phy: Box::new(NlPhy::default()),
+            switch_wait: SWITCH_WAIT,
+        })
+    }
+
+    /// Moves the radio of `band` to `to`.
+    pub fn switch(&mut self, band: Band, to: regdomain::Target) -> Result<String, String> {
+        let name = wificonf::iface(band);
+        let now = self.phy.radio(band)?;
+        let s = regdomain::check_switch(band, &now, to).map_err(|e| format!("{name}: {e}"))?;
+        if s.cac {
+            return Err(format!(
+                "{name}: channel {} needs a radar check (CAC) first, which a channel switch \
+                 cannot run",
+                to.channel
+            ));
+        }
+        if now.runs(&s) {
+            return Ok(format!("{name}: on {} MHz already", s.freq_mhz));
+        }
+        switch(&mut self.hostapd, band, &s, self.switch_wait)
+    }
+
+    /// Sets the transmit power of the radio of `band` to `dbm`.
+    pub fn power(&mut self, band: Band, dbm: i8) -> Result<String, String> {
+        let name = wificonf::iface(band);
+        let now = self.phy.radio(band)?;
+        regdomain::check_power(&now, dbm).map_err(|e| format!("{name}: {e}"))?;
+        match self.helper.ask(&Request::Power { band, dbm })? {
+            Reply::Done(d) => Ok(d),
+            _ => Err("the config helper answered something else".into()),
+        }
+    }
+}
+
 /// One radio's part of an apply, checked.
 struct Step {
     band: Band,
@@ -1244,5 +1298,80 @@ mod tests {
         // Free again.
         assert_eq!(w.submit(signed(3, fixture()), None), None);
         go.send(()).unwrap();
+    }
+
+    /// The radio commands of the rig's AP.
+    fn radios(r: &Rig) -> Radios {
+        Radios {
+            hostapd: Hostapd::bind(
+                &r._t.path().join("run"),
+                "radio",
+                &r._t.path().join("hostapd"),
+            )
+            .unwrap(),
+            helper: r.apply.helper.clone(),
+            phy: Box::new(FakePhy),
+            switch_wait: Duration::from_secs(2),
+        }
+    }
+
+    fn to(channel: u16, width_mhz: u16, center_channel: u16) -> regdomain::Target {
+        regdomain::Target {
+            channel,
+            width_mhz,
+            center_channel,
+        }
+    }
+
+    /// A commanded channel switch is checked against the radio and the
+    /// regulatory domain, and announced through hostapd; one onto channels
+    /// that need a radar check is refused, as is one onto no block. The
+    /// installed configuration stays as it was.
+    #[test]
+    fn a_commanded_switch_is_checked_and_announced() {
+        let r = Rig::new();
+        let before = r.installed();
+        let mut radios = radios(&r);
+        assert_eq!(
+            radios.switch(Band::B5, to(149, 80, 155)),
+            Ok("wlan5: on 5745 MHz already".into())
+        );
+        assert_eq!(
+            radios.switch(Band::B5, to(36, 80, 42)),
+            Ok("wlan5: on 5180 MHz".into())
+        );
+        assert_eq!(
+            r.requests(),
+            [
+                "wlan5 CHAN_SWITCH 5 5180 sec_channel_offset=1 center_freq1=5210 bandwidth=80 ht vht he"
+            ]
+        );
+        assert_eq!(
+            radios.switch(Band::B5, to(52, 80, 58)),
+            Err(
+                "wlan5: channel 52 needs a radar check (CAC) first, which a channel switch \
+                 cannot run"
+                    .into()
+            )
+        );
+        assert_eq!(
+            radios.switch(Band::B5, to(36, 80, 50)),
+            Err("wlan5: channel 50 is no 80 MHz block's centre".into())
+        );
+        assert_eq!(r.requests().len(), 1);
+        assert_eq!(r.installed(), before);
+    }
+
+    /// A commanded power is checked against the radio's channels and set by
+    /// the helper.
+    #[test]
+    fn a_commanded_power_is_checked_and_set_by_the_helper() {
+        let r = Rig::new();
+        let mut radios = radios(&r);
+        assert_eq!(radios.power(Band::B5, 20), Ok("wlan5: 20 dBm".into()));
+        assert_eq!(r.helper(), "iw dev wlan5 set txpower fixed 2000\n");
+        let e = radios.power(Band::B5, 31).unwrap_err();
+        assert!(e.starts_with("wlan5: 31 dBm is above the 30 dBm"), "{e}");
+        assert_eq!(r.helper().lines().count(), 1);
     }
 }

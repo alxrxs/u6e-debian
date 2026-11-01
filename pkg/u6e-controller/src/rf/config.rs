@@ -26,7 +26,8 @@
 //!
 //! A range holds every channel of its band from its first to its last;
 //! `dfs = true` marks those the planner leaves alone unless `dfs` allows them
-//! (a move onto one is then applied by a restart with a radar check).
+//! (a move onto one then takes the next configuration push, which runs the
+//! radar check a live switch cannot).
 //! `ssh_key` and `known_hosts` go together, as plain absolute paths (letters,
 //! digits and `/._-`), and the key must be its owner's alone (checked at
 //! start). `client_dbm` is the power a client is taken to send at, from which

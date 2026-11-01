@@ -151,7 +151,7 @@ pub struct Temp {
 }
 
 /// On the wire: a change to it bumps [`crate::PROTOCOL`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Band {
     B24,
     B5,
@@ -359,8 +359,10 @@ pub struct Command {
 
 /// The closed set of actions. None carries free-form text, and the set is
 /// exhaustive, so a new action is a compile error at every end that must
-/// carry it out. None changes the radios' configuration: only a signed
-/// [`CtlMsg::ApplyConfig`] does, so its hash always says what runs.
+/// carry it out. None changes the radios' installed configuration: only a
+/// signed [`CtlMsg::ApplyConfig`] does, so its hash always says what was
+/// installed; a channel switch or a power set moves the radio as it runs, and
+/// the snapshot says where it is.
 ///
 /// On the wire: a change to it bumps [`crate::PROTOCOL`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -390,6 +392,22 @@ pub enum CommandKind {
     /// unblocked while the AP could not be told is let on there too.
     SyncBlocks {
         macs: Vec<[u8; 6]>,
+    },
+    /// Move the radio of `radio` to primary `channel` of a `width_mhz` block
+    /// centred on channel `center1`, by a channel switch announcement the
+    /// clients follow; refused when the radio, the regulatory domain or a
+    /// radar check (CAC) the target needs would not allow it.
+    ChannelSwitch {
+        radio: Band,
+        channel: u16,
+        width_mhz: u16,
+        center1: u16,
+    },
+    /// Set the transmit power of the radio of `radio`; refused above what
+    /// its channels allow.
+    TxPower {
+        radio: Band,
+        dbm: i8,
     },
 }
 

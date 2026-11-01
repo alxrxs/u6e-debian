@@ -44,12 +44,11 @@ use tokio::net::TcpStream;
 use tokio::time::{MissedTickBehavior, interval, sleep, sleep_until};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::ServerName;
-use u6e_controller::actions::{Access, GROUPS_HEADER, USER_HEADER};
+use u6e_controller::actions::{GROUPS_HEADER, USER_HEADER};
 use u6e_controller::agents::Timing;
 use u6e_controller::config::Config;
 use u6e_controller::http;
 use u6e_controller::names::Resolve;
-use u6e_controller::policy::Store;
 use u6e_proto::frame::{decode_frame, frame_body, write_frame};
 use u6e_proto::msg::{
     AgentMsg, Band, Bss, CommandKind, CommandResult, CtlMsg, Event, EventKind, Flows, Hello, Radio,
@@ -541,6 +540,22 @@ impl World {
                 }
                 return Some((true, "OK".into()));
             }
+            // The radio moves at once, as a switch its clients follow.
+            CommandKind::ChannelSwitch {
+                radio,
+                channel,
+                width_mhz,
+                ..
+            } => {
+                let r = self.aps[ap].radios.iter_mut().find(|r| r.band == *radio)?;
+                (r.channel, r.width_mhz) = (*channel, *width_mhz);
+                return Some((true, format!("on channel {channel}")));
+            }
+            CommandKind::TxPower { radio, dbm } => {
+                let r = self.aps[ap].radios.iter_mut().find(|r| r.band == *radio)?;
+                r.txpower_mbm = i32::from(*dbm) * 100;
+                return Some((true, format!("{dbm} dBm")));
+            }
         };
         let i = self.clients.iter().position(|c| World::mac(c.last) == mac);
         let here = i.and_then(|i| {
@@ -567,7 +582,9 @@ impl World {
                 }
                 ok
             }
-            CommandKind::SyncBlocks { .. } => unreachable!("answered above"),
+            CommandKind::SyncBlocks { .. }
+            | CommandKind::ChannelSwitch { .. }
+            | CommandKind::TxPower { .. } => unreachable!("answered above"),
             _ if here.is_none() => Some((false, "not associated here".into())),
             CommandKind::Kick { .. } if mac[5] == SILENT => None,
             CommandKind::Kick { .. } => {
@@ -996,9 +1013,8 @@ async fn main() -> io::Result<()> {
         }
         async move { req }
     };
-    let store = Store::new(config.policy_path.clone());
-    let web_router = http::router(c.state.clone(), Access::new(&config, timing.command, store))
-        .layer(middleware::map_request(signed_in));
+    let web_router =
+        http::router(c.state.clone(), c.access.clone()).layer(middleware::map_request(signed_in));
     let listener = tokio::net::TcpListener::bind(web).await?;
     eprintln!(
         "replay: the UI is on http://{}/, its user {}",

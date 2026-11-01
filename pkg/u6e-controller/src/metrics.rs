@@ -8,7 +8,8 @@
 //! the rollouts ended are counted by result, every result always exported,
 //! and the last rollout that failed is timed from the rollouts the policy
 //! file keeps, so that its alert outlives a restart. The sessions refused for
-//! naming another AP are counted per AP.
+//! naming another AP are counted per AP, and a radio not as the site file
+//! plans it is timed from when it was found so.
 
 use std::collections::BTreeSet;
 use std::fmt::Write;
@@ -414,6 +415,7 @@ pub fn render(state: &State) -> String {
 
     configs(&mut m, state, &aps);
     rollouts(&mut m, state);
+    not_as_planned(&mut m, state);
     m.family(
         "wifi_blocked_clients",
         GAUGE,
@@ -468,6 +470,24 @@ fn configs(m: &mut Text, state: &State, aps: &[(&str, &Ap)]) {
     );
     let aside = signer.set_aside().map_or(0, |f| f.len());
     m.sample(&[], aside as f64);
+}
+
+/// The radios that run otherwise than the site file plans (`rf::live`),
+/// since when, for the alert that waits on them.
+fn not_as_planned(m: &mut Text, state: &State) {
+    if state.not_as_planned.is_empty() {
+        return;
+    }
+    m.family(
+        "wifi_radio_not_as_planned_since_timestamp_seconds",
+        GAUGE,
+        "Since when the radio runs otherwise than the site file plans.",
+    );
+    for (key, n) in &state.not_as_planned {
+        if let Some((ap, radio)) = key.split_once('/') {
+            m.sample(&[("ap", ap), ("radio", radio)], unix_seconds(n.since));
+        }
+    }
 }
 
 /// The rollouts, when the controller rolls images out.

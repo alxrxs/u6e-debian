@@ -19,11 +19,16 @@ use u6e_controller::agents::Timing;
 use u6e_controller::config::Config;
 use u6e_controller::names::Resolve;
 use u6e_controller::rf::git::{self, Repo};
+use u6e_controller::rf::live;
 use u6e_controller::rf::site::{self, Change, Setting};
+use u6e_controller::state::Registration;
 use u6e_controller::{Controller, start};
 use u6e_git::Remote;
 use u6e_proto::mac;
-use u6e_proto::msg::{AgentMsg, Band, Bss, Hello, Radio, RateMode, Snapshot, Station};
+use u6e_proto::msg::{
+    AgentMsg, Band, Bss, Command as AgentCommand, CommandKind, CommandResult, CtlMsg, Hello, Radio,
+    RateMode, Snapshot, Station,
+};
 use u6e_proto::tls::Identity;
 
 #[path = "common/keys.rs"]
@@ -375,14 +380,13 @@ fn controller(dir: &Path, scratch: Option<&Scratch>) -> Running {
         .build()
         .unwrap();
     let identity = Identity::from_pem(KEY_CONTROLLER).unwrap();
+    // The tests converge the radios themselves (`converge`).
+    let timing = Timing {
+        reconcile: Duration::from_secs(3600),
+        ..Timing::default()
+    };
     let c = rt
-        .block_on(start(
-            &config,
-            &identity,
-            Timing::default(),
-            Arc::new(NoNames),
-            None,
-        ))
+        .block_on(start(&config, &identity, timing, Arc::new(NoNames), None))
         .unwrap();
     Running { c, _rt: rt }
 }
@@ -472,8 +476,8 @@ fn snapshot(seq: u64, channels: [(u16, u16); 3], secs: u64, client: bool) -> Sna
 }
 
 /// Connects `ap` and gives it two snapshots a moment apart: an interval in
-/// its history.
-fn feed(r: &Running, ap: &str, channels: [(u16, u16); 3], client: bool) {
+/// its history. Its session, whose outbox holds what it is sent.
+fn feed(r: &Running, ap: &str, channels: [(u16, u16); 3], client: bool) -> Registration {
     let hello = Hello {
         ap: ap.into(),
         manifest: "image: test".into(),
@@ -481,21 +485,66 @@ fn feed(r: &Running, ap: &str, channels: [(u16, u16); 3], client: bool) {
         hostapd: String::new(),
         agent: String::new(),
     };
-    let id = r.c.state.write().connect(ap, hello).unwrap().id;
+    let reg = r.c.state.write().connect(ap, hello).unwrap();
     r.c.state
         .write()
-        .apply(ap, id, AgentMsg::Key(snapshot(1, channels, 0, client)))
+        .apply(ap, reg.id, AgentMsg::Key(snapshot(1, channels, 0, client)))
         .unwrap();
     thread::sleep(Duration::from_millis(20));
     r.c.state
         .write()
-        .apply(ap, id, AgentMsg::Key(snapshot(2, channels, 60, client)))
+        .apply(ap, reg.id, AgentMsg::Key(snapshot(2, channels, 60, client)))
         .unwrap();
+    reg
 }
 
-fn feed_both(r: &Running) {
-    feed(r, "ap1", [(6, 20), (36, 80), (37, 160)], true);
-    feed(r, "ap2", [(6, 20), (149, 80), (69, 160)], false);
+fn feed_both(r: &Running) -> [Registration; 2] {
+    [
+        feed(r, "ap1", [(6, 20), (36, 80), (37, 160)], true),
+        feed(r, "ap2", [(6, 20), (149, 80), (69, 160)], false),
+    ]
+}
+
+/// The commands sent on `reg` so far.
+fn sent(reg: &mut Registration) -> Vec<AgentCommand> {
+    let mut out = Vec::new();
+    while let Ok(msg) = reg.outbox.try_recv() {
+        if let CtlMsg::Command(c) = msg {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The next command sent on `reg`, waited for.
+fn next_command(reg: &mut Registration) -> AgentCommand {
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(c) = sent(reg).into_iter().next() {
+            return c;
+        }
+        assert!(start.elapsed() < WAIT, "no command");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// `ap`'s answer to command `id` on session `reg`.
+fn answer(r: &Running, ap: &str, reg: &Registration, id: u64, ok: bool, detail: &str) {
+    let result = AgentMsg::Result(CommandResult {
+        id,
+        ok,
+        detail: detail.into(),
+    });
+    r.c.state.write().apply(ap, reg.id, result).unwrap();
+}
+
+/// One pass of keeping the radios as planned; what each radio asked came
+/// to. The answers must be given meanwhile, from another thread.
+fn converge(r: &Running) -> Vec<(String, Result<String, String>)> {
+    let planner = r.c.access.rf.clone().unwrap();
+    let wait = Duration::from_secs(5);
+    r._rt
+        .block_on(live::converge(&r.c.state, &planner, None, false, wait))
 }
 
 fn http(addr: SocketAddr, method: &str, path: &str, headers: &str, body: &str) -> (u16, Value) {
@@ -685,16 +734,28 @@ fn a_radio_not_of_the_site_is_refused_before_it_is_logged() {
 }
 
 #[test]
-fn an_applied_plan_is_a_commit_an_event_and_then_pending() {
+fn an_applied_plan_is_a_commit_an_event_and_a_live_switch() {
     let s = Scratch::new("rf-apply");
-    let r = controller(&s.dir.0, Some(&s));
-    feed_both(&r);
+    let r = Arc::new(controller(&s.dir.0, Some(&s)));
+    let [_ap1, mut ap2] = feed_both(&r);
     let p = plan(&r);
-    let (status, v) = apply(
-        &r,
-        &format!("{SAME_SITE}{ADMIN}"),
-        &confirm(&p, &["ap2/radio24"]),
+    let body = confirm(&p, &["ap2/radio24"]);
+    let asked = {
+        let r = Arc::clone(&r);
+        thread::spawn(move || apply(&r, &format!("{SAME_SITE}{ADMIN}"), &body))
+    };
+    let c = next_command(&mut ap2);
+    assert_eq!(
+        c.kind,
+        CommandKind::ChannelSwitch {
+            radio: Band::B24,
+            channel: 1,
+            width_mhz: 20,
+            center1: 1
+        }
     );
+    answer(&r, "ap2", &ap2, c.id, true, "wlan24: on 2412 MHz");
+    let (status, v) = asked.join().unwrap();
     assert_eq!(status, 200, "{v}");
     let commit = v["commit"].as_str().unwrap();
     assert_eq!(git_in(&s.remote(), &["rev-parse", "main"]).trim(), commit);
@@ -729,7 +790,12 @@ fn an_applied_plan_is_a_commit_an_event_and_then_pending() {
     );
     let p = plan(&r);
     assert_eq!(p["last"]["commit"], commit);
-    // Until the deploy takes it to ap2, ap2 runs other than the file.
+    // ap2's agent switched the radio live; until its snapshot says so, it
+    // runs other than the file.
+    assert_eq!(
+        v["live"],
+        json!([{"key": "ap2/radio24", "ok": true, "detail": "wlan24: on 2412 MHz"}])
+    );
     let after = radio(&p, "ap2/radio24");
     assert_eq!(
         (after["change"].as_bool(), after["pending"].as_bool()),
@@ -737,7 +803,7 @@ fn an_applied_plan_is_a_commit_an_event_and_then_pending() {
     );
     assert_eq!(
         after["kept"],
-        "waiting for the deploy: it runs channel 6 at 20 MHz, the site file says channel 1 at 20 MHz"
+        "not as planned: it runs channel 6 at 20 MHz, the site file says channel 1 at 20 MHz"
     );
     // What it shows measured is of the channel it still runs.
     assert_eq!(after["busy"], 30.0, "{after}");
@@ -780,4 +846,149 @@ fn without_rf_the_planner_is_off() {
     ]});
     let (status, _) = apply(&r, &format!("{SAME_SITE}{ADMIN}"), &body.to_string());
     assert_eq!(status, 404);
+}
+
+/// An AP back on another channel than the site file plans (its image's,
+/// after a reboot) is switched there live, once: asked again only after
+/// `live::RETRY`, so a radio that does not move is not asked over and over;
+/// once it runs as planned, nothing is.
+#[test]
+fn a_radio_back_off_its_plan_is_switched_once() {
+    let s = Scratch::new("rf-live");
+    let r = Arc::new(controller(&s.dir.0, Some(&s)));
+    let _ap1 = feed(&r, "ap1", [(6, 20), (36, 80), (37, 160)], true);
+    let mut ap2 = feed(&r, "ap2", [(11, 20), (149, 80), (69, 160)], false);
+    let pass = {
+        let r = Arc::clone(&r);
+        thread::spawn(move || converge(&r))
+    };
+    let c = next_command(&mut ap2);
+    assert_eq!(
+        c.kind,
+        CommandKind::ChannelSwitch {
+            radio: Band::B24,
+            channel: 6,
+            width_mhz: 20,
+            center1: 6
+        }
+    );
+    answer(&r, "ap2", &ap2, c.id, true, "wlan24: on 2437 MHz");
+    assert_eq!(
+        pass.join().unwrap(),
+        [(
+            "ap2/radio24".to_owned(),
+            Ok("wlan24: on 2437 MHz".to_owned())
+        )]
+    );
+    // Its snapshot has not come yet: not asked again.
+    assert!(converge(&r).is_empty());
+    assert!(sent(&mut ap2).is_empty());
+    let off = radio(&plan(&r), "ap2/radio24")["not_as_planned"].clone();
+    assert!(off["since"].is_u64(), "{off}");
+    // As planned now: nothing asked, nothing shown.
+    let state = &r.c.state;
+    let id = ap2.id;
+    let on6 = snapshot(3, [(6, 20), (149, 80), (69, 160)], 120, false);
+    state.write().apply("ap2", id, AgentMsg::Key(on6)).unwrap();
+    assert!(converge(&r).is_empty());
+    assert!(state.read().not_as_planned.is_empty());
+    let events = events(&r, "?ap=ap2");
+    let moved = events.iter().filter(|e| e["action"] == "reconcile").count();
+    assert_eq!(moved, 1, "{events:?}");
+}
+
+/// A radio whose AP refuses the switch stays not as planned, saying why,
+/// in the plan and the metrics, and is not asked again meanwhile.
+#[test]
+fn a_refused_switch_is_shown_and_not_looped() {
+    let s = Scratch::new("rf-refused");
+    let r = Arc::new(controller(&s.dir.0, Some(&s)));
+    let mut ap2 = feed(&r, "ap2", [(11, 20), (149, 80), (69, 160)], false);
+    let pass = {
+        let r = Arc::clone(&r);
+        thread::spawn(move || converge(&r))
+    };
+    let c = next_command(&mut ap2);
+    answer(
+        &r,
+        "ap2",
+        &ap2,
+        c.id,
+        false,
+        "wlan24: channel 6 is not enabled",
+    );
+    let [(key, result)] = pass.join().unwrap().try_into().unwrap();
+    assert_eq!(
+        (key.as_str(), result),
+        (
+            "ap2/radio24",
+            Err("wlan24: channel 6 is not enabled".into())
+        )
+    );
+    assert!(converge(&r).is_empty());
+    assert!(sent(&mut ap2).is_empty());
+    let off = radio(&plan(&r), "ap2/radio24")["not_as_planned"].clone();
+    assert_eq!(
+        off["detail"],
+        "not moved as planned: wlan24: channel 6 is not enabled"
+    );
+    let (_, metrics) = {
+        let mut sock = TcpStream::connect(r.c.metrics).unwrap();
+        write!(
+            sock,
+            "GET /metrics HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut resp = String::new();
+        sock.read_to_string(&mut resp).unwrap();
+        let (h, b) = resp.split_once("\r\n\r\n").unwrap();
+        (h.to_owned(), b.to_owned())
+    };
+    assert!(
+        metrics.contains(
+            "wifi_radio_not_as_planned_since_timestamp_seconds{ap=\"ap2\",radio=\"radio24\"} "
+        ),
+        "{metrics}"
+    );
+}
+
+/// A clone whose last fetch failed may hold an older plan than the site's:
+/// nothing is moved by it, though what runs otherwise is still shown.
+#[test]
+fn a_stale_clone_moves_nothing() {
+    let s = Scratch::new("rf-stale");
+    let r = controller(&s.dir.0, Some(&s));
+    // The clone made, then its remote gone.
+    plan(&r);
+    fs::rename(s.remote(), s.dir.0.join("gone.git")).unwrap();
+    thread::sleep(Duration::from_millis(10));
+    let mut ap2 = feed(&r, "ap2", [(11, 20), (149, 80), (69, 160)], false);
+    // A fetch that fails, as the timer's does.
+    let planner = r.c.access.rf.clone().unwrap();
+    r._rt.block_on(planner.refresh());
+    assert!(converge(&r).is_empty());
+    assert!(sent(&mut ap2).is_empty());
+    assert!(r.c.state.read().not_as_planned.contains_key("ap2/radio24"));
+}
+
+/// The plan's hash is of what the planner reads of the site file: a commit
+/// to another file of the repository meanwhile changes nothing, and the
+/// plan confirmed before it still applies.
+#[test]
+fn a_commit_to_another_file_leaves_the_plan_as_confirmed() {
+    let s = Scratch::new("rf-hash");
+    let r = Arc::new(controller(&s.dir.0, Some(&s)));
+    let [_ap1, mut ap2] = feed_both(&r);
+    let p = plan(&r);
+    s.push_other("README.md", "The site, described.\n");
+    let body = confirm(&p, &["ap2/radio24"]);
+    let asked = {
+        let r = Arc::clone(&r);
+        thread::spawn(move || apply(&r, &format!("{SAME_SITE}{ADMIN}"), &body))
+    };
+    let c = next_command(&mut ap2);
+    answer(&r, "ap2", &ap2, c.id, true, "wlan24: on 2412 MHz");
+    let (status, v) = asked.join().unwrap();
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(s.log()[1], "meanwhile");
 }

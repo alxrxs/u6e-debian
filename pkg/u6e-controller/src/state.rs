@@ -234,7 +234,20 @@ pub fn action_name(kind: &CommandKind) -> &'static str {
         CommandKind::Unblock { .. } => "unblock",
         CommandKind::Steer { .. } => "steer",
         CommandKind::SyncBlocks { .. } => "sync",
+        CommandKind::ChannelSwitch { .. } => "channel",
+        CommandKind::TxPower { .. } => "power",
     }
+}
+
+/// A radio that runs otherwise than the site file plans (`rf::live`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct NotAsPlanned {
+    /// Since when it is found so.
+    pub since: SystemTime,
+    /// How it differs, or what came of the last ask to move it.
+    pub detail: String,
+    /// When it was last asked to move.
+    pub tried: Option<Instant>,
 }
 
 /// Who waits for a command's result.
@@ -503,6 +516,8 @@ pub struct State {
     /// The rollouts, newest last.
     pub rollouts: VecDeque<Rollout>,
     next_rollout: u64,
+    /// The radios not as the site file plans them, by key (`ap/radio`).
+    pub not_as_planned: BTreeMap<String, NotAsPlanned>,
     /// Configurations sent and rollouts ended, by result, for the metrics.
     pub apply_counts: BTreeMap<&'static str, u64>,
     pub rollout_counts: BTreeMap<&'static str, u64>,
@@ -535,6 +550,7 @@ impl State {
             images: BTreeMap::new(),
             rollouts: VecDeque::new(),
             next_rollout: 0,
+            not_as_planned: BTreeMap::new(),
             apply_counts: BTreeMap::new(),
             rollout_counts: BTreeMap::new(),
             policy_dirty: false,
@@ -1047,9 +1063,10 @@ impl State {
         });
     }
 
-    /// Why `ap` may not be sent a configuration now; it must be connected,
-    /// have none on its way and not be under a rollout.
-    fn sendable(&self, ap: &str) -> Result<(), String> {
+    /// Why `ap` may not be sent a configuration or a radio command now; it
+    /// must be connected, have no configuration on its way and not be under
+    /// a rollout.
+    pub(crate) fn sendable(&self, ap: &str) -> Result<(), String> {
         let entry = self.aps.get(ap).ok_or_else(|| format!("no AP {ap:.64}"))?;
         if self.rollouts.iter().any(|r| r.ap == ap && r.is_open()) {
             return Err(format!("{ap} is being rolled out to"));

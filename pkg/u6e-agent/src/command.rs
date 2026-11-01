@@ -11,7 +11,9 @@
 //! reports the client's answer.
 //! Blocks live in RAM: on each connection the controller sends the whole set
 //! (`SyncBlocks`), which every BSS's deny ACL is made to hold exactly, and
-//! they go back onto a BSS whose hostapd started again without them.
+//! they go back onto a BSS whose hostapd started again without them. A
+//! channel switch or a power for a radio goes to `apply::Radios`, which
+//! checks it against the radio and the regulatory domain.
 
 use std::collections::BTreeSet;
 use std::io::{self, ErrorKind};
@@ -23,8 +25,10 @@ use std::time::{Duration, Instant};
 use u6e_proto::mac;
 use u6e_proto::msg::{Command, CommandKind, CommandResult, Snapshot};
 
+use crate::apply::Radios;
 use crate::clientsock::ClientSocket;
 use crate::neighbors::{ANSWER_WAIT, Element, Hostapd, Target};
+use crate::regdomain;
 use crate::{collect, events};
 
 /// TBTTs for which a steer's candidate list stays valid, and a forced
@@ -53,6 +57,7 @@ pub struct Commands {
     dir: PathBuf,
     targets: Arc<Mutex<Vec<Target>>>,
     blocks: Arc<Blocks>,
+    radios: Radios,
 }
 
 /// What a command came to: the replies (or the refusal), and whether every
@@ -60,12 +65,14 @@ pub struct Commands {
 type Outcome = Result<String, String>;
 
 impl Commands {
-    /// Commands for the hostapds of `dir`, through a client bound in `run`.
+    /// Commands for the hostapds of `dir`, through a client bound in `run`,
+    /// and for the radios through `radios`.
     pub fn open(
         run: &Path,
         dir: &Path,
         targets: Arc<Mutex<Vec<Target>>>,
         blocks: Arc<Blocks>,
+        radios: Radios,
     ) -> io::Result<Self> {
         Ok(Commands {
             hostapd: Hostapd::bind(run, "command", dir)?,
@@ -73,6 +80,7 @@ impl Commands {
             dir: dir.to_owned(),
             targets,
             blocks,
+            radios,
         })
     }
 
@@ -124,6 +132,20 @@ impl Commands {
                 self.on_every_bss(&format!("DENY_ACL DEL_MAC {}", mac::format(mac)))
             }
             CommandKind::SyncBlocks { ref macs } => self.sync(macs, last),
+            CommandKind::ChannelSwitch {
+                radio,
+                channel,
+                width_mhz,
+                center1,
+            } => self.radios.switch(
+                radio,
+                regdomain::Target {
+                    channel,
+                    width_mhz,
+                    center_channel: center1,
+                },
+            ),
+            CommandKind::TxPower { radio, dbm } => self.radios.power(radio, dbm),
             CommandKind::Steer {
                 mac,
                 target_bssid,
@@ -580,11 +602,14 @@ mod tests {
                 target("6f74686572", "02000000000bff5c000080950e0603029b00"),
             ]));
             let blocks = Arc::new(Blocks::default());
+            let run = t.path().join("run");
+            let radios = Radios::open(&run, &dir).unwrap();
             let cmds = Commands::open(
-                &t.path().join("run"),
+                &run,
                 &dir,
                 Arc::clone(&targets),
                 Arc::clone(&blocks),
+                radios,
             )
             .unwrap();
             Rig {

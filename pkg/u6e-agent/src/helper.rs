@@ -5,8 +5,10 @@
 //! one and renders it for the running hostapd and sets the radios' new
 //! transmit powers (nl80211 wants CAP_NET_ADMIN for that), or restarts
 //! u6e-wifi with it, putting the previous one back when the radios do not
-//! come up again; it puts back the previous one when the agent asks; and it
-//! publishes the hash of what is installed for the agent to report.
+//! come up again; it puts back the previous one when the agent asks; it sets
+//! a radio's transmit power the controller commands, as the radio runs (the
+//! installed configuration keeps its own); and it publishes the hash of what
+//! is installed for the agent to report.
 //!
 //! It takes only configurations signed for this AP by the configuration key
 //! the image pins, newer
@@ -64,6 +66,8 @@ pub enum Request {
     },
     /// Put back the configuration the last install replaced.
     Revert,
+    /// Set the transmit power of the radio of `band` to `dbm`, as it runs.
+    Power { band: Band, dbm: i8 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,6 +199,16 @@ impl Server {
             Request::Revert => {
                 let _lock = self.lock()?;
                 self.revert().map(Reply::Done)
+            }
+            Request::Power { band, dbm } => {
+                let iface = wificonf::iface(band);
+                if !(0..=DBM_MAX).contains(&dbm) {
+                    return Err(format!("{iface}: {dbm} dBm is out of range"));
+                }
+                let _lock = self.lock()?;
+                let mbm = (i32::from(dbm) * 100).to_string();
+                run(&[&self.iw, "dev", iface, "set", "txpower", "fixed", &mbm])?;
+                Ok(Reply::Done(format!("{iface}: {dbm} dBm")))
             }
         }
     }
@@ -636,6 +650,27 @@ pub mod tests {
             assert_eq!(mode(&r.server.dir.join(PREVIOUS).join(&n)), 0o600, "{n}");
         }
         assert_eq!(mode(&r.server.state.join(wificonf::HASH)), 0o640);
+    }
+
+    /// A power the controller commands is set through iw as the radio runs;
+    /// the installed configuration keeps its own, and its hash stays.
+    #[test]
+    fn a_commanded_power_is_set_and_installs_nothing() {
+        let r = Rig::new();
+        let before = r.installed();
+        let power = |dbm| Request::Power {
+            band: Band::B5,
+            dbm,
+        };
+        assert_eq!(r.ask(power(20)), done("wlan5: 20 dBm"));
+        assert_eq!(r.log(), "iw dev wlan5 set txpower fixed 2000\n");
+        for dbm in [-1, DBM_MAX + 1] {
+            assert_eq!(
+                r.ask(power(dbm)),
+                Err(format!("wlan5: {dbm} dBm is out of range"))
+            );
+        }
+        assert_eq!(r.installed(), before);
     }
 
     /// Only the radios whose power changed are set, through iw.

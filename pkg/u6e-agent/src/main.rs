@@ -144,7 +144,9 @@ fn start_link(
         }
     };
     let (run, ctrl) = (clientsock::run_dir(), Path::new(neighbors::HOSTAPD));
-    let commands = command::Commands::open(&run, ctrl, Arc::clone(targets), Arc::clone(blocks));
+    let commands = apply::Radios::open(&run, ctrl).and_then(|radios| {
+        command::Commands::open(&run, ctrl, Arc::clone(targets), Arc::clone(blocks), radios)
+    });
     let hello = link::local_hello();
     let worker = neighbors::Hostapd::bind(&run, "apply", ctrl).and_then(|h| {
         let mut a = apply::Apply::new(

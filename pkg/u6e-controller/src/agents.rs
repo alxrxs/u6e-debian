@@ -47,8 +47,9 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often a session pings, how long it waits for any word from the peer
 /// before dropping it (the agent keeps the same 60 s on its side), how long
 /// an operator waits for a command's result and an apply for an AP's answer
-/// to a configuration, when scans stop, and how long a rollout's gate a
-/// restarted controller goes on with waits at least for the AP.
+/// to a configuration, when scans stop, how long a rollout's gate a
+/// restarted controller goes on with waits at least for the AP, and how
+/// often the radios are compared with the site file's plan (`rf::live`).
 #[derive(Debug, Clone, Copy)]
 pub struct Timing {
     pub ping: Duration,
@@ -60,6 +61,7 @@ pub struct Timing {
     pub spectrum: Limits,
     /// Past the agent's longest redial (30 s) and a boot's tail.
     pub resume: Duration,
+    pub reconcile: Duration,
 }
 
 impl Default for Timing {
@@ -71,6 +73,7 @@ impl Default for Timing {
             apply: Duration::from_secs(300),
             spectrum: Limits::default(),
             resume: Duration::from_secs(120),
+            reconcile: Duration::from_secs(30),
         }
     }
 }

@@ -28,7 +28,7 @@ pub const ROOT: &str = "u6e";
 pub const PIN: &str = "planner: fixed";
 
 /// What keeps a radio's settings as they are.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct Pins {
     pub radio: bool,
     pub channel: bool,
@@ -38,7 +38,7 @@ pub struct Pins {
 }
 
 /// One radio as the site file states it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SiteRadio {
     pub band: Band,
     pub channel: u16,

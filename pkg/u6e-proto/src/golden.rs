@@ -293,6 +293,22 @@ fn samples() -> Samples {
                 macs: vec![mac, target_bssid],
             },
         ),
+        (
+            "ChannelSwitch",
+            CommandKind::ChannelSwitch {
+                radio: Band::B6,
+                channel: 300,
+                width_mhz: 320,
+                center1: 301,
+            },
+        ),
+        (
+            "TxPower",
+            CommandKind::TxPower {
+                radio: Band::B5,
+                dbm: -100,
+            },
+        ),
     ];
     for (name, kind) in commands {
         ctl.push((name, CtlMsg::Command(Command { id: 1 << 42, kind })));

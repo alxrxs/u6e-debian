@@ -62,12 +62,14 @@ use crate::rollout::Engine;
 use crate::stage::{Ssh, Stage, Target, Waits};
 use crate::state::{Shared, State};
 
-/// A running controller: its state and the addresses it listens on.
+/// A running controller: its state, the addresses it listens on, and what
+/// its web listener's actions take (for a listener of another's own).
 pub struct Controller {
     pub state: Shared,
     pub agents: SocketAddr,
     pub http: SocketAddr,
     pub metrics: SocketAddr,
+    pub access: Access,
 }
 
 /// The signer of `[configs]`, its key read from its file (and wiped there
@@ -148,12 +150,11 @@ pub async fn start(
     let agents = bind(config.listen_agents).await?;
     let http = bind(config.listen_http).await?;
     let metrics = bind(config.listen_metrics).await?;
-    let controller = Controller {
-        state: state.clone(),
-        agents: agents.local_addr()?,
-        http: http.local_addr()?,
-        metrics: metrics.local_addr()?,
-    };
+    let addresses = (
+        agents.local_addr()?,
+        http.local_addr()?,
+        metrics.local_addr()?,
+    );
     let store = Store::new(config.policy_path.clone());
     let engine = config
         .rollouts
@@ -205,6 +206,17 @@ pub async fn start(
         e.resume();
         access.rollouts = Some(e.clone());
     }
+    if let Some(planner) = &access.rf {
+        let live = rf::live::supervise(state.clone(), Arc::clone(planner), timing);
+        tokio::spawn(live);
+    }
+    let controller = Controller {
+        state: state.clone(),
+        agents: addresses.0,
+        http: addresses.1,
+        metrics: addresses.2,
+        access: access.clone(),
+    };
     let web = http::router(state.clone(), access);
     tokio::spawn(serve_http("http", http, web));
     tokio::spawn(spectrum::supervise(state.clone()));

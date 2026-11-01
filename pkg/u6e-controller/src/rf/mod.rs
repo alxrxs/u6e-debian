@@ -3,8 +3,9 @@
 //! site file's constraints (`site`, `plan`), and proposes; nothing changes
 //! until an admin applies a proposal. Applying it is a commit of the site
 //! file to its repository by the controller (`git`, line-level `yaml` edits
-//! of the affected keys only), which the next configuration rendered from
-//! the site file takes to the APs.
+//! of the affected keys only), after which the radios are moved there live
+//! (`live`, which keeps them where the site file plans them from then on),
+//! and the next configuration rendered from the site file states it too.
 //!
 //! `GET /api/rf/plan` is the plan for anyone who may view, with its hash;
 //! it reads the site file from the clone,
@@ -22,6 +23,7 @@ pub mod channels;
 pub mod config;
 pub mod git;
 pub mod history;
+pub mod live;
 pub mod plan;
 pub mod site;
 pub mod yaml;
@@ -119,11 +121,13 @@ fn planned(settings: &Settings, state: &State, text: &str) -> Result<(Plan, Site
     Ok((plan::plan(&inputs), site))
 }
 
-/// The plan's hash: of the commit it read and every proposal, so a plan
-/// that changed in anything is told apart.
-fn hash(plan: &Plan, rev: &str) -> String {
+/// The plan's hash: of what the planner read of the site file (each
+/// radio's settings and pins, the country) and every proposal, so a plan
+/// that changed in anything is told apart, and a commit to anything else
+/// in the repository changes nothing.
+fn hash(plan: &Plan, site: &Site) -> String {
     let mut h = DefaultHasher::new();
-    rev.hash(&mut h);
+    (&site.country, &site.aps).hash(&mut h);
     for p in &plan.radios {
         (p.key(), p.current, p.proposed, p.group).hash(&mut h);
     }
@@ -139,6 +143,32 @@ impl Planner {
         }
     }
 
+    /// Fetches into the clone, whose lock the caller holds, and notes when
+    /// it did or why it could not.
+    async fn fetch(&self, clone: &mut Checkout) -> Result<(), String> {
+        let repo = self.settings.repo.clone();
+        let fetched = spawn_blocking(move || repo.fetch())
+            .await
+            .map_err(|e| e.to_string())?;
+        match fetched {
+            Ok(()) => {
+                clone.fetched = Some((Instant::now(), SystemTime::now()));
+                clone.error = None;
+                Ok(())
+            }
+            Err(e) => {
+                clone.error = Some(e.to_string());
+                Err(e.to_string())
+            }
+        }
+    }
+
+    /// Fetches now, whatever the last fetch was.
+    pub async fn refresh(&self) {
+        let mut clone = self.clone.lock().await;
+        let _ = self.fetch(&mut clone).await;
+    }
+
     /// Fetches unless that was done less than `FETCH_EVERY` ago (or `force`),
     /// then reads the site file; the clone's lock is held by the caller.
     async fn read(&self, clone: &mut Checkout, force: bool) -> Result<Read, String> {
@@ -146,17 +176,9 @@ impl Planner {
             .fetched
             .is_some_and(|(t, _)| t.elapsed() < FETCH_EVERY);
         if force || !fresh {
-            let repo = self.settings.repo.clone();
-            let fetched = spawn_blocking(move || repo.fetch())
-                .await
-                .map_err(|e| e.to_string())?;
-            match fetched {
-                Ok(()) => {
-                    clone.fetched = Some((Instant::now(), SystemTime::now()));
-                    clone.error = None;
-                }
-                Err(e) if force => return Err(e.to_string()),
-                Err(e) => clone.error = Some(e.to_string()),
+            let fetched = self.fetch(clone).await;
+            if force {
+                fetched?;
             }
         }
         let repo = self.settings.repo.clone();
@@ -274,8 +296,8 @@ pub async fn get_plan(Ext(web): Ext<Web>) -> Response {
         }
     };
     let state = web.state.read();
-    let plan = match planned(&planner.settings, &state, &read.text) {
-        Ok((p, _)) => p,
+    let (plan, inputs) = match planned(&planner.settings, &state, &read.text) {
+        Ok(planned) => planned,
         Err(e) => return error(StatusCode::UNPROCESSABLE_ENTITY, &e),
     };
     let mut site = json!({ "rev": read.rev, "file": planner.settings.repo.file });
@@ -288,11 +310,21 @@ pub async fn get_plan(Ext(web): Ext<Web>) -> Response {
     let mut v = json!({
         "configured": true,
         "at": unix_ms(SystemTime::now()),
-        "hash": hash(&plan, &read.rev),
+        "hash": hash(&plan, &inputs),
         "window_hours": planner.settings.rules.window_hours,
         "notes": plan.notes,
         "site": site,
-        "radios": plan.radios.iter().map(proposal).collect::<Vec<_>>(),
+        "radios": plan
+            .radios
+            .iter()
+            .map(|p| {
+                let mut o = proposal(p);
+                if let Some(n) = state.not_as_planned.get(&p.key()) {
+                    o["not_as_planned"] = json!({ "since": unix_ms(n.since), "detail": n.detail });
+                }
+                o
+            })
+            .collect::<Vec<_>>(),
     });
     if let Some(a) = planner.last() {
         v["last"] = applied(&a);
@@ -467,7 +499,7 @@ pub async fn apply(Ext(web): Ext<Web>, req: HeaderMap, body: Bytes) -> Response 
         })?;
         let (plan, site) = planned(&planner.settings, &web.state.read(), &read.text)
             .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
-        if hash(&plan, &read.rev) != b.plan {
+        if hash(&plan, &site) != b.plan {
             return Err((
                 StatusCode::CONFLICT,
                 "the plan changed: review it again".to_owned(),
@@ -515,9 +547,37 @@ pub async fn apply(Ext(web): Ext<Web>, req: HeaderMap, body: Bytes) -> Response 
         clone.fetched = Some((Instant::now(), SystemTime::now()));
     }
     drop(clone);
+    // The radios go where the commit plans them, live.
+    let moved = match &outcome {
+        Ok((chosen, _)) => {
+            let keys: Vec<String> = chosen.iter().map(Proposal::key).collect();
+            live::converge(&web.state, planner, Some(&keys), true, web.access.timeout).await
+        }
+        Err(_) => Vec::new(),
+    };
     let (status, body, last) = match outcome {
         Ok((chosen, landed)) => {
             let short = &landed.commit[..landed.commit.len().min(12)];
+            let live: Vec<Value> = chosen
+                .iter()
+                .map(|p| {
+                    let key = p.key();
+                    let rs: Vec<&Result<String, String>> =
+                        moved.iter().filter(|(k, _)| *k == key).map(|(_, r)| r).collect();
+                    let (ok, detail) = if rs.is_empty() && p.restart.is_some() {
+                        (false, "committed; takes effect with the next configuration push (radar check)".to_owned())
+                    } else if rs.is_empty() {
+                        (false, "not moved now: it is moved once its AP can be asked".to_owned())
+                    } else {
+                        let ok = rs.iter().all(|r| r.is_ok());
+                        let said: Vec<&str> = rs.iter().map(|r| match r {
+                            Ok(d) | Err(d) => d.as_str(),
+                        }).collect();
+                        (ok, said.join("; "))
+                    };
+                    json!({ "key": key, "ok": ok, "detail": detail })
+                })
+                .collect();
             for p in &chosen {
                 let detail = format!(
                     "{}: {} → {}, commit {short}",
@@ -540,6 +600,7 @@ pub async fn apply(Ext(web): Ext<Web>, req: HeaderMap, body: Bytes) -> Response 
                 "commit": landed.commit,
                 "radios": radios,
                 "detail": detail,
+                "live": live,
             });
             let last = Applied {
                 at: SystemTime::now(),
@@ -632,6 +693,8 @@ mod tests {
             measured: true,
             kept: None,
             pending: false,
+            planned_power: Some(18),
+            planned_dfs: false,
             restart: None,
             group,
             reason: String::new(),
