@@ -521,7 +521,7 @@ fn rollouts(m: &mut Text, state: &State) {
         m.family(
             "wifi_rollout_last_failure_timestamp_seconds",
             GAUGE,
-            "When the last image rollout that rolled back or failed ended.",
+            "When the last image rollout that did not end done (refused, rolled back or failed) ended.",
         );
         m.sample(&[], unix_seconds(last));
     }

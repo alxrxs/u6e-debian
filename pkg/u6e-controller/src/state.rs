@@ -191,9 +191,9 @@ pub const OUTCOMES: [(RolloutOutcome, &str); 4] = [
     (RolloutOutcome::Failed, "failed"),
 ];
 
-/// Whether `o` is a rollout's failure, which raises its alert.
+/// Whether `o` is a rollout's failure, which raises its alert: anything but done.
 pub fn is_failure(o: RolloutOutcome) -> bool {
-    matches!(o, RolloutOutcome::RolledBack | RolloutOutcome::Failed)
+    o != RolloutOutcome::Done
 }
 
 /// The name of a rollout's outcome.

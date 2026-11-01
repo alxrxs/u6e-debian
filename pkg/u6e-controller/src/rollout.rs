@@ -23,7 +23,11 @@
 //! or a staging that failed part way, the image the AP ran before is staged
 //! again: rolled back, or failed if that fails too. A controller restarted
 //! during a staging stages again (the staging that died with it may have
-//! left the AP anywhere between its two systems); one restarted during the
+//! left the AP anywhere between its two systems, rebooting even), the AP
+//! given the gate's time to answer either first, and rolls back if it
+//! answers neither; a rollback gives it that time too. Every end but done
+//! raises the failure (`wifi_rollout_last_failure_timestamp_seconds`). One
+//! restarted during the
 //! gate gives the AP at least `Timing::resume` to come back to it, so a
 //! restart never rolls a healthy AP back. The kept images are pruned after
 //! each image added and each rollout: each AP keeps what it runs, what it
@@ -252,22 +256,35 @@ impl Engine {
                     self.log(
                         id,
                         if resumed {
-                            "the controller restarted during the staging: staging again".into()
+                            "the controller restarted during the staging: staging again, once \
+                             the AP answers"
+                                .into()
                         } else {
                             format!("staging {} on {}, as {} asked", r.image_id, r.ap, r.user)
                         },
                     );
-                    match self.stage(id, &r.ap, &r.image_id).await {
+                    // A staging the restart cut short may have left the AP
+                    // rebooting: it has the gate's time to answer.
+                    let wait = if resumed {
+                        self.0.settings.gate
+                    } else {
+                        Duration::ZERO
+                    };
+                    match self.stage(id, &r.ap, &r.image_id, wait).await {
                         Staged::Done => {
                             let gate =
                                 u64::try_from(self.0.settings.gate.as_millis()).unwrap_or(u64::MAX);
                             let deadline_ms = unix_ms().saturating_add(gate);
                             Next::Phase(Phase::Gate { deadline_ms })
                         }
-                        Staged::Untouched(why) => Next::End(RolloutOutcome::Refused, why),
-                        Staged::Failed(why) => Next::Phase(Phase::RollingBack {
-                            why: format!("the staging failed: {why}"),
-                        }),
+                        Staged::Untouched(why) if !resumed => {
+                            Next::End(RolloutOutcome::Refused, why)
+                        }
+                        Staged::Untouched(why) | Staged::Failed(why) => {
+                            Next::Phase(Phase::RollingBack {
+                                why: format!("the staging failed: {why}"),
+                            })
+                        }
                     }
                 }
                 Phase::Gate { deadline_ms } => {
@@ -296,7 +313,9 @@ impl Engine {
                 }
                 Phase::RollingBack { why } => {
                     self.log(id, format!("{why}: staging {} again", r.previous));
-                    match self.stage(id, &r.ap, &r.previous).await {
+                    // The AP may be rebooting from what went wrong.
+                    let wait = self.0.settings.gate;
+                    match self.stage(id, &r.ap, &r.previous, wait).await {
                         Staged::Done => Next::End(
                             RolloutOutcome::RolledBack,
                             format!("{why}; {} is staged again", r.previous),
@@ -330,8 +349,9 @@ impl Engine {
             .map_err(|e| e.to_string())?
     }
 
-    /// Stages `image` on `ap`, its lines in rollout `id`'s log.
-    async fn stage(&self, id: u64, ap: &str, image: &str) -> Staged {
+    /// Stages `image` on `ap`, which has `wait` to answer first, its lines
+    /// in rollout `id`'s log.
+    async fn stage(&self, id: u64, ap: &str, image: &str, wait: Duration) -> Staged {
         let kept = match self.verified(ap, image).await {
             Ok(k) => k,
             Err(why) => return Staged::Untouched(why),
@@ -340,8 +360,8 @@ impl Engine {
             return Staged::Untouched(format!("no address of {ap} is configured"));
         };
         let log = |line: String| self.log(id, line);
-        let staging = self.0.stager.stage(target, &kept, &log);
-        match timeout(STAGE_MAX, staging).await {
+        let staging = self.0.stager.stage(target, &kept, wait, &log);
+        match timeout(STAGE_MAX + wait, staging).await {
             Ok(staged) => staged,
             Err(_) => Staged::Failed(format!("the staging took longer than {STAGE_MAX:?}")),
         }

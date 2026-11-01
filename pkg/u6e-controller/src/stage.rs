@@ -57,12 +57,15 @@ pub enum Staged {
 /// Where a staging's lines go.
 pub type Log<'a> = &'a (dyn Fn(String) + Send + Sync);
 
-/// What stages an image on an AP.
+/// What stages an image on an AP. `wait` is how long the AP may take to
+/// answer either of its systems first (a staging resumed by a restarted
+/// controller finds it rebooting, say); with none it is looked at once.
 pub trait Stage: Send + Sync {
     fn stage<'a>(
         &'a self,
         target: &'a Target,
         image: &'a Kept,
+        wait: Duration,
         log: Log<'a>,
     ) -> Pin<Box<dyn Future<Output = Staged> + Send + 'a>>;
 }
@@ -151,9 +154,10 @@ impl Stage for Ssh {
         &'a self,
         target: &'a Target,
         image: &'a Kept,
+        wait: Duration,
         log: Log<'a>,
     ) -> Pin<Box<dyn Future<Output = Staged> + Send + 'a>> {
-        Box::pin(self.staged(target, image, log))
+        Box::pin(self.staged(target, image, wait, log))
     }
 }
 
@@ -167,9 +171,24 @@ impl Ssh {
         }
     }
 
-    async fn staged(&self, t: &Target, image: &Kept, log: Log<'_>) -> Staged {
-        let Some(now) = self.system(t).await else {
-            return Staged::Untouched(format!("{} answers neither its image nor stock", t.ap));
+    async fn staged(&self, t: &Target, image: &Kept, wait: Duration, log: Log<'_>) -> Staged {
+        let started = Instant::now();
+        let now = loop {
+            match self.system(t).await {
+                Some(s) => break s,
+                None if started.elapsed() < wait => sleep(self.waits.poll).await,
+                None => {
+                    let waited = if wait.is_zero() {
+                        String::new()
+                    } else {
+                        format!(" in {} s", started.elapsed().as_secs())
+                    };
+                    return Staged::Untouched(format!(
+                        "{} answers neither its image nor stock{waited}",
+                        t.ap
+                    ));
+                }
+            }
         };
         let r = async {
             if now == System::Image {
@@ -1014,7 +1033,7 @@ exec sh -c "$cmd"
         let lines = std::sync::Mutex::new(Vec::new());
         let log = |l: String| lines.lock().unwrap().push(l);
         assert_eq!(
-            rt.block_on(stager.stage(&target, &kept, &log)),
+            rt.block_on(stager.stage(&target, &kept, Duration::ZERO, &log)),
             Staged::Done
         );
         let read = |p: &str| fs::read_to_string(ap.join(p)).unwrap();
@@ -1049,7 +1068,7 @@ exec sh -c "$cmd"
         fs::write(image.join("u6e.initrd"), &initrd).unwrap();
         lines.lock().unwrap().clear();
         assert_eq!(
-            rt.block_on(stager.stage(&target, &kept, &log)),
+            rt.block_on(stager.stage(&target, &kept, Duration::ZERO, &log)),
             Staged::Done
         );
         let seen = lines.lock().unwrap().clone();
@@ -1060,8 +1079,25 @@ exec sh -c "$cmd"
         // Neither system answers: nothing is done.
         fs::write(ap.join("state"), "down\n").unwrap();
         assert!(matches!(
-            rt.block_on(stager.stage(&target, &kept, &log)),
+            rt.block_on(stager.stage(&target, &kept, Duration::ZERO, &log)),
             Staged::Untouched(_)
         ));
+        // Given time, an AP rebooting is waited for: past the time it is not,
+        // once it answers it is staged.
+        let r = rt.block_on(stager.stage(&target, &kept, Duration::from_millis(200), &log));
+        assert_eq!(
+            r,
+            Staged::Untouched("ap1 answers neither its image nor stock in 0 s".into())
+        );
+        let state = ap.join("state");
+        let up = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            fs::write(state, "debian\n").unwrap();
+        });
+        assert_eq!(
+            rt.block_on(stager.stage(&target, &kept, Duration::from_secs(5), &log)),
+            Staged::Done
+        );
+        up.join().unwrap();
     }
 }

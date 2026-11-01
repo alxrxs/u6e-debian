@@ -83,6 +83,7 @@ impl Stage for SimStage {
         &'a self,
         target: &'a Target,
         image: &'a Kept,
+        _wait: Duration,
         log: Log<'a>,
     ) -> Pin<Box<dyn Future<Output = Staged> + Send + 'a>> {
         Box::pin(async move {

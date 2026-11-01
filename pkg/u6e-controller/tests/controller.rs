@@ -110,11 +110,15 @@ fn config_text(key: &str, ap2: bool, dir: &Path, gate_secs: u64) -> String {
 }
 
 /// The stand-in for the staging over SSH: it logs what it is asked to
-/// stage, as `<ap> <image>`, takes its time for an image named `slow`, and
-/// fails one named `bad` part way, or finds the AP down for `down`.
+/// stage, as `<ap> <image>`, and how long the AP had to answer; takes its
+/// time for an image named `slow`, and fails one named `bad` part way, or
+/// finds the AP down for `down`, or while `away` says it is rebooting (and
+/// waits for it within its time).
 #[derive(Default)]
 struct FakeStage {
     staged: Mutex<Vec<String>>,
+    waits: Mutex<Vec<Duration>>,
+    away: Mutex<Option<Instant>>,
 }
 
 impl Stage for FakeStage {
@@ -122,9 +126,23 @@ impl Stage for FakeStage {
         &'a self,
         target: &'a Target,
         image: &'a Kept,
+        wait: Duration,
         log: Log<'a>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Staged> + Send + 'a>> {
         Box::pin(async move {
+            self.waits.lock().unwrap().push(wait);
+            let away = *self.away.lock().unwrap();
+            if let Some(back) = away.filter(|b| *b > Instant::now()) {
+                let left = back - Instant::now();
+                if left > wait {
+                    tokio::time::sleep(wait).await;
+                    return Staged::Untouched(format!(
+                        "{} answers neither its image nor stock",
+                        target.ap
+                    ));
+                }
+                tokio::time::sleep(left).await;
+            }
             if image.id.contains("down") {
                 return Staged::Untouched(format!(
                     "{} answers neither its image nor stock",
@@ -3315,13 +3333,83 @@ fn a_restarted_controller_goes_on_with_the_rollout() {
     let log = &json_get(r.c.http, "/api/rollouts")[id.to_string()]["log"];
     assert!(
         log.as_array().unwrap().contains(&json!(
-            "the controller restarted during the staging: staging again"
+            "the controller restarted during the staging: staging again, once the AP answers"
         )),
         "{log}"
     );
     assert_eq!(
         stage.staged.lock().unwrap()[1..],
         ["ap1 img-3-slow-ap1", "ap1 img-3-slow-ap1"]
+    );
+}
+
+/// A controller restarted while the staging has the AP rebooting gives it
+/// the gate's time to answer before it stages again; an AP that answers
+/// neither system in that time is rolled back, given that time again, and a
+/// rollout that cannot be undone either ends failed, its alert raised:
+/// never "refused" with the AP left in stock.
+#[test]
+fn a_restart_during_the_aps_reboot_waits_for_it() {
+    let dir = TempDir::new("restart-reboot");
+    let stage = Arc::new(FakeStage::default());
+    let r = managed(Timing::default(), &dir.0, 2, Arc::clone(&stage));
+    for id in ["img-1-ap1", "img-2-slow-ap1"] {
+        keep(&r, id, "ap1").unwrap();
+    }
+    let mut ap1 = ap_on(&r, KEY_AP1, "ap1", "img-1-ap1", 1, image_config(1));
+    ap1.expect_sync();
+    let id = upgrade(&r, "ap1", "img-2-slow-ap1").1["id"]
+        .as_u64()
+        .unwrap();
+    wait_for("the staging", || stage.staged.lock().unwrap().len() == 1);
+    drop(ap1);
+    drop(r);
+
+    // Back up within the gate's time: staged again, then done.
+    *stage.away.lock().unwrap() = Some(Instant::now() + Duration::from_millis(800));
+    let r = managed(Timing::default(), &dir.0, 2, Arc::clone(&stage));
+    wait_for("the staging again", || {
+        stage.staged.lock().unwrap().len() == 2
+    });
+    assert_eq!(stage.waits.lock().unwrap()[1], Duration::from_secs(2));
+    let manifest = "image:     img-2-slow-ap1\nbuilt_ms:  2\n";
+    let mut ap1 = Agent::running(r.c.agents, KEY_AP1, "ap1", manifest);
+    ap1.send(&AgentMsg::Key(running_config(1, image_config(2))))
+        .unwrap();
+    assert_eq!(wait_result(&r, id)["outcome"], "done");
+    drop(ap1);
+    drop(r);
+
+    // Away for longer than that, through the rollback too: failed, alerted.
+    let r = managed(Timing::default(), &dir.0, 2, Arc::clone(&stage));
+    keep(&r, "img-3-slow-ap1", "ap1").unwrap();
+    let manifest = "image:     img-2-slow-ap1\nbuilt_ms:  2\n";
+    let mut ap1 = Agent::running(r.c.agents, KEY_AP1, "ap1", manifest);
+    ap1.send(&AgentMsg::Key(running_config(1, image_config(2))))
+        .unwrap();
+    ap1.expect_sync();
+    let id = upgrade(&r, "ap1", "img-3-slow-ap1").1["id"]
+        .as_u64()
+        .unwrap();
+    wait_for("the staging", || stage.staged.lock().unwrap().len() == 3);
+    drop(ap1);
+    drop(r);
+    *stage.away.lock().unwrap() = Some(Instant::now() + Duration::from_secs(3600));
+    let r = managed(Timing::default(), &dir.0, 2, Arc::clone(&stage));
+    let result = wait_result(&r, id);
+    assert_eq!(result["outcome"], "failed", "{result}");
+    let detail = result["detail"].as_str().unwrap();
+    assert!(
+        detail.starts_with("the staging failed: ap1 answers neither"),
+        "{detail}"
+    );
+    assert_eq!(
+        stage.waits.lock().unwrap()[3..],
+        [Duration::from_secs(2), Duration::from_secs(2)]
+    );
+    assert_eq!(
+        metrics_of(&r, "wifi_rollout_last_failure_timestamp_seconds").len(),
+        1
     );
 }
 
