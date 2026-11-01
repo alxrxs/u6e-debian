@@ -57,6 +57,12 @@ pub const GATE_MAX: Duration = Duration::from_secs(30 * 60);
 pub const STAGE_MAX: Duration = Duration::from_secs(45 * 60);
 /// How often a gate's verdict is looked for.
 const POLL: Duration = Duration::from_millis(250);
+/// The waits between the tries of a policy save.
+const SAVE_TRIES: [Duration; 3] = [
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+];
 
 /// The checked `[rollouts]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +153,16 @@ impl File {
     }
 }
 
+/// What a log line calls `phase`.
+fn phase_name(phase: &Phase) -> &'static str {
+    match phase {
+        Phase::Checking => "check",
+        Phase::Staging => "staging",
+        Phase::Gate { .. } => "health gate",
+        Phase::RollingBack { .. } => "rollback",
+    }
+}
+
 /// What a rollout's step leads to.
 enum Next {
     Phase(Phase),
@@ -207,22 +223,37 @@ impl Engine {
     }
 
     /// An admin's rollout of `image_id` to `ap`: kept in the policy file
-    /// before its first step is taken; its id.
+    /// before its first step is taken, or refused; its id.
     pub async fn upgrade(&self, ap: &str, image_id: &str, user: &str) -> Result<u64, String> {
         let id = self.0.state.write().upgrade(ap, image_id, user)?;
-        self.save().await;
+        if !self.save().await {
+            let why = "the policy file could not be saved, so nothing was done";
+            self.0
+                .state
+                .write()
+                .rollout_end(id, RolloutOutcome::Refused, why.into());
+            return Err(why.into());
+        }
         tokio::spawn(self.clone().run(id, false));
         Ok(id)
     }
 
-    /// Saves the policy file, if it changed.
-    async fn save(&self) {
+    /// Saves the policy file, if it changed, trying again a few times; it is
+    /// what a restarted controller goes on from, so a step is taken only
+    /// once it is saved. Whether it is.
+    async fn save(&self) -> bool {
         let inner = &self.0;
-        if inner.state.write().take_dirty()
-            && !save_policy(inner.policy.clone(), inner.state.clone()).await
-        {
-            inner.state.write().mark_dirty();
+        if !inner.state.write().take_dirty() {
+            return true;
         }
+        for backoff in SAVE_TRIES {
+            if save_policy(inner.policy.clone(), inner.state.clone()).await {
+                return true;
+            }
+            sleep(backoff).await;
+        }
+        inner.state.write().mark_dirty();
+        false
     }
 
     fn log(&self, id: u64, line: String) {
@@ -329,7 +360,25 @@ impl Engine {
             };
             resumed = false;
             match next {
-                Next::Phase(phase) => self.0.state.write().set_phase(id, phase),
+                Next::Phase(phase) => {
+                    let step = phase_name(&phase);
+                    self.0.state.write().set_phase(id, phase);
+                    if !self.save().await {
+                        // Untaken, a step a restart would not know of.
+                        self.0.state.write().set_phase(id, r.phase.clone());
+                        let outcome = if r.phase == Phase::Checking {
+                            RolloutOutcome::Refused
+                        } else {
+                            RolloutOutcome::Failed
+                        };
+                        let why = format!(
+                            "the policy file could not be saved, so the {step} was not taken"
+                        );
+                        self.0.state.write().rollout_end(id, outcome, why);
+                        self.save().await;
+                        return;
+                    }
+                }
                 Next::End(outcome, detail) => {
                     self.0.state.write().rollout_end(id, outcome, detail);
                     self.save().await;
@@ -337,7 +386,6 @@ impl Engine {
                     return;
                 }
             }
-            self.save().await;
         }
     }
 

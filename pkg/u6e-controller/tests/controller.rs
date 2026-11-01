@@ -3319,6 +3319,49 @@ fn rollouts_run_one_at_a_time() {
     );
 }
 
+/// A rollout's step is taken only once the policy file keeps it, which a
+/// restarted controller goes on from: one that cannot be saved ends the
+/// rollout, failed, its gate never begun; an upgrade that cannot be saved
+/// does nothing.
+#[test]
+fn a_step_that_cannot_be_saved_is_not_taken() {
+    let dir = TempDir::new("unsaved");
+    let stage = Arc::new(FakeStage::default());
+    let r = managed(Timing::default(), &dir.0, 60, Arc::clone(&stage));
+    for id in ["img-1-ap1", "img-2-slow-ap1"] {
+        keep(&r, id, "ap1").unwrap();
+    }
+    let mut ap1 = ap_on(&r, KEY_AP1, "ap1", "img-1-ap1", 1, image_config(1));
+    ap1.expect_sync();
+    let (status, v) = upgrade(&r, "ap1", "img-2-slow-ap1");
+    assert_eq!(status, 202, "{v}");
+    let id = v["id"].as_u64().unwrap();
+    wait_for("the slow staging", || {
+        stage.staged.lock().unwrap().len() == 1
+    });
+    // The file can no longer be replaced: a directory is in its place.
+    let path = dir.0.join("policy.json");
+    fs::remove_file(&path).unwrap();
+    fs::create_dir_all(path.join("x")).unwrap();
+    let result = wait_result(&r, id);
+    assert_eq!(result["outcome"], "failed", "{result}");
+    assert_eq!(
+        result["detail"],
+        "the policy file could not be saved, so the health gate was not taken"
+    );
+    assert!(step_of(&r, id) != "gate");
+    let (status, v) = upgrade(&r, "ap1", "img-2-slow-ap1");
+    assert_eq!(
+        (status, &v["error"]),
+        (
+            409,
+            &json!("the policy file could not be saved, so nothing was done")
+        )
+    );
+    assert_eq!(stage.staged.lock().unwrap().len(), 1);
+    fs::remove_dir_all(&path).unwrap();
+}
+
 fn hold(r: &Running, ap: &str, reason: Option<&str>) -> Result<String, String> {
     r._rt.block_on(local::hold(&r.dir.join("sock"), ap, reason))
 }
