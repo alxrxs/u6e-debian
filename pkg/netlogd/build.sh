@@ -7,10 +7,10 @@ cd "$(dirname "$0")"
 VER=1.4.4 DEB=1
 [ ! -e work ] || { echo "work exists; remove it first" >&2; exit 1; }
 mkdir work; mkdir -p out
-base=https://deb.debian.org/debian/pool/main/s/systemd-netlogd
-for f in systemd-netlogd_$VER-$DEB.dsc systemd-netlogd_$VER.orig.tar.gz systemd-netlogd_$VER-$DEB.debian.tar.xz; do
-	curl -fsSL -o "work/$f" "$base/$f"
-done
+../fetch-debian.sh work 20250216T205656Z main/s/systemd-netlogd \
+	51fbb0eaeaaa68ef6b80b01049200e8d93c7765a378e1d920a186bf14f44acf4=systemd-netlogd_$VER-$DEB.dsc \
+	041144dbc3196d657fba494a288dee7afcef8719a0c5c2573086f77cabff986a=systemd-netlogd_$VER.orig.tar.gz \
+	dee0e6cb2793bcfaa2c46c6eda03f8d805e37c7bb8bde08f95005ba80b33c6b4=systemd-netlogd_$VER-$DEB.debian.tar.xz
 dpkg-source -x work/systemd-netlogd_$VER-$DEB.dsc work/systemd-netlogd-$VER
 cp journal-rotation-cursor.patch work/systemd-netlogd-$VER/debian/patches/
 echo journal-rotation-cursor.patch >> work/systemd-netlogd-$VER/debian/patches/series

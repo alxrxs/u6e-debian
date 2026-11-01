@@ -7,10 +7,10 @@ cd "$(dirname "$0")"
 VER=6.15.0 DEB=1
 [ ! -e work ] || { echo "work exists; remove it first" >&2; exit 1; }
 mkdir work; mkdir -p out
-base=https://deb.debian.org/debian/pool/main/i/iproute2
-for f in iproute2_$VER-$DEB.dsc iproute2_$VER.orig.tar.xz iproute2_$VER-$DEB.debian.tar.xz; do
-	curl -fsSL -o "work/$f" "$base/$f"
-done
+../fetch-debian.sh work 20250527T022950Z main/i/iproute2 \
+	2558690474d6cdda5e2c4022b520935623ddd41fbf8e936315e3f4314f6f21dd=iproute2_$VER-$DEB.dsc \
+	8041854a882583ad5263466736c9c8c68c74b1a35754ab770d23343f947528fb=iproute2_$VER.orig.tar.xz \
+	780375193dffeb85f310a918b806f2f4e480f76b815a1f0f1eac5d0488ea1a8f=iproute2_$VER-$DEB.debian.tar.xz
 dpkg-source -x work/iproute2_$VER-$DEB.dsc work/iproute2-$VER
 cp nss-qdisc.patch work/iproute2-$VER/debian/patches/
 echo nss-qdisc.patch >> work/iproute2-$VER/debian/patches/series
