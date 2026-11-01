@@ -9,11 +9,12 @@
 //! can still be found and unblocked; an associated client says it too.
 //!
 //! Each AP's Wi-Fi configuration is shown by hash only (`config`): the one it
-//! reports installed, the one it last acknowledged, the deploy runner's
-//! latest for it and the one relayed to it last, whether it drifts (runs
-//! another than the runner's latest), and how the last one went. The runner's link (`runner`) and
-//! the image rollouts with their gate, result and log (`rollouts`) are beside
-//! the APs.
+//! reports installed, the one it last acknowledged, the latest one signed for
+//! it and the one sent to it last, whether it drifts (runs another than the
+//! latest), and how the last one went. Beside the APs are what the
+//! controller manages (`manage`: whether it signs configurations, and, when it
+//! rolls images out, each AP's kept images and those it runs) and the image
+//! rollouts with their step, gate, result and log (`rollouts`).
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -22,7 +23,7 @@ use u6e_proto::PROTOCOL;
 use u6e_proto::mac;
 use u6e_proto::msg::{Band, Event, EventKind, Flow, Flows, Radio, RateMode, Snapshot, Station};
 
-use crate::policy::ConfigId;
+use crate::policy::{ConfigId, Phase};
 use crate::state::{Action, Ap, ClientView, Rollout, State, mechanism_name, outcome_name};
 
 /// The APs and clients of the APs `wanted` says yes to, and the clients
@@ -32,7 +33,7 @@ pub fn view(state: &State, wanted: impl Fn(&str) -> bool, flows: bool) -> Value 
         "aps": aps(state, &wanted),
         "clients": clients(state, &wanted),
         "blocked": blocked(state),
-        "runner": runner(state),
+        "manage": manage(state),
         "rollouts": rollouts(state, LIVE_LOG),
     });
     if flows {
@@ -106,16 +107,24 @@ fn flow(f: &Flow) -> Value {
     })
 }
 
-/// The deploy runner's link: whether it admits one, and whether one is
-/// connected, since when, running what.
-pub fn runner(state: &State) -> Value {
-    let r = &state.runner;
-    let mut o = json!({ "configured": r.configured, "up": r.is_up() });
-    if let Some(v) = &r.version {
-        o["version"] = v.clone().into();
-    }
-    if let Some(t) = r.connected_since {
-        o["since"] = unix_ms(t).into();
+/// What the controller manages: whether it signs configurations, and, when
+/// it rolls images out, each AP's kept images (oldest first) and the image it
+/// runs (and the other it may run, after a rollout that failed part way).
+pub fn manage(state: &State) -> Value {
+    let mut o = json!({ "configs": state.signer.is_some() });
+    if let Some(kept) = &state.kept {
+        let aps = state.aps().map(|(name, _)| {
+            let runs = state.images.get(name);
+            let mut ap = json!({ "kept": kept.get(name).cloned().unwrap_or_default() });
+            if let Some(r) = runs.and_then(|i| i.running.as_ref()) {
+                ap["running"] = r.clone().into();
+            }
+            if let Some(e) = runs.and_then(|i| i.either.as_ref()) {
+                ap["either"] = e.clone().into();
+            }
+            (name.to_owned(), ap)
+        });
+        o["images"] = Value::Object(aps.collect());
     }
     o
 }
@@ -142,6 +151,7 @@ fn rollout(r: &Rollout, log: usize) -> Value {
         "previous": r.previous,
         "user": r.user,
         "at": unix_ms(r.at),
+        "phase": phase(&r.phase),
         "log": r.log.iter().skip(skip).collect::<Vec<_>>(),
     });
     if let Some((healthy, detail)) = &r.gate {
@@ -153,6 +163,17 @@ fn rollout(r: &Rollout, log: usize) -> Value {
     o
 }
 
+/// A rollout's step, by the name the policy file gives it, and its gate's
+/// deadline.
+fn phase(p: &Phase) -> Value {
+    match p {
+        Phase::Checking => json!({ "step": "checking" }),
+        Phase::Staging => json!({ "step": "staging" }),
+        Phase::Gate { deadline_ms } => json!({ "step": "gate", "deadline": deadline_ms }),
+        Phase::RollingBack { why } => json!({ "step": "rolling_back", "why": why }),
+    }
+}
+
 /// Every AP's configuration, by AP, as `config_of` shows it.
 pub fn config(state: &State) -> Value {
     let aps = state
@@ -162,7 +183,7 @@ pub fn config(state: &State) -> Value {
 }
 
 /// An AP's configuration, by hash, as far as it is known: installed (while
-/// connected), acknowledged, the runner's latest (with whether it drifts
+/// connected), acknowledged, the latest signed (with whether it drifts
 /// from that) and sent last, and how the last one went. An AP that reports
 /// no hash and was never sent a configuration has none of it.
 pub fn config_of(ap: &Ap) -> Map<String, Value> {

@@ -1,8 +1,9 @@
 //! The operator's actions on a client, `POST /api/clients/{mac}/kick`,
 //! `/block`, `/unblock` and `/steer` (`{"target_bssid": "<mac>"}`, and
 //! `"force": true` to have the client disassociated if it declines); and on an
-//! AP, `POST /api/aps/{ap}/upgrade` (`{"image_id": "<kept image>"}`), the
-//! rollout the deploy runner then carries out and the controller gates.
+//! AP, `POST /api/aps/{ap}/upgrade` (`{"image_id": "<its newest kept
+//! image>"}`, which the admin saw and confirms), the rollout `rollout` then
+//! carries out.
 //!
 //! A request acts only when it comes from the UI's own page and from an
 //! admin, checked in that order ([`refusal`], which also gates the start of a
@@ -20,8 +21,9 @@
 //! tells it again, then sent to every connected AP; an AP that is away is
 //! given the whole policy when it reconnects. Each AP's result is awaited for
 //! `Timing::command` (504 past it), and each is an event and a journal line.
-//! An upgrade is answered once the runner has it (202 with its id; 409 when
-//! it cannot start); how it goes is in `/api/rollouts` and the events.
+//! An upgrade is answered once the policy file holds it (202 with its id;
+//! 409 when it cannot start); how it goes is in `/api/rollouts` and the
+//! events.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -37,11 +39,12 @@ use tokio::task::JoinSet;
 use u6e_proto::mac;
 use u6e_proto::msg::CommandKind;
 
-use crate::agents::save_policy;
 use crate::config::Config;
 use crate::http::{error, json_response};
+use crate::images::image_name;
 use crate::policy::{self, Store};
 use crate::rf::{self, Planner};
+use crate::rollout::Engine;
 use crate::state::{Action, Shared, Waiter, action_name};
 
 /// The user the sign-in proxy names.
@@ -61,6 +64,8 @@ pub struct Access {
     pub timeout: Duration,
     /// The RF planner, when the configuration has one.
     pub rf: Option<Arc<Planner>>,
+    /// The rollouts, when the configuration has them.
+    pub rollouts: Option<Engine>,
 }
 
 impl Access {
@@ -71,6 +76,7 @@ impl Access {
             policy,
             timeout,
             rf: rf::from(config.rf.as_ref()),
+            rollouts: None,
         }
     }
 }
@@ -208,16 +214,8 @@ struct UpgradeBody {
     image_id: String,
 }
 
-/// Whether `id` could name a kept image: one path component of letters,
-/// digits, `.`, `_` and `-`, not starting with a dot. The runner checks that
-/// one of that name is kept for the AP.
-fn image_name(id: &str) -> bool {
-    let ok = |c: char| c.is_ascii_alphanumeric() || "._-".contains(c);
-    (1..=128).contains(&id.len()) && !id.starts_with('.') && id.chars().all(ok)
-}
-
-/// `POST /api/aps/{ap}/upgrade`: an admin's rollout of a kept image to the
-/// AP, handed to the deploy runner.
+/// `POST /api/aps/{ap}/upgrade`: an admin's rollout of the AP's newest kept
+/// image.
 pub async fn upgrade(
     Ext(web): Ext<Web>,
     Path(ap): Path<String>,
@@ -234,11 +232,14 @@ pub async fn upgrade(
         return error(StatusCode::BAD_REQUEST, "image_id is not an image's name");
     }
     let who = user(&req).unwrap_or_else(|| "(no user)".into());
-    let started = {
-        let mut state = web.state.write();
-        let started = state.upgrade(&ap, &b.image_id, &who);
-        if let Err(why) = &started {
-            state.record(Action {
+    let started = match &web.access.rollouts {
+        Some(engine) => engine.upgrade(&ap, &b.image_id, &who).await,
+        None => Err("rollouts are off: the controller has no [rollouts]".into()),
+    };
+    match started {
+        Ok(id) => (StatusCode::ACCEPTED, json_response(&json!({ "id": id }))).into_response(),
+        Err(why) => {
+            web.state.write().record(Action {
                 at: SystemTime::now(),
                 user: Some(who),
                 action: "upgrade",
@@ -247,18 +248,8 @@ pub async fn upgrade(
                 ok: false,
                 detail: format!("{}: {why}", b.image_id),
             });
+            error(StatusCode::CONFLICT, &why)
         }
-        started.map(|id| (id, state.take_dirty()))
-    };
-    match started {
-        Ok((id, dirty)) => {
-            // The rollout outlives the controller from here on.
-            if dirty {
-                save_policy(web.access.policy.clone(), web.state.clone()).await;
-            }
-            (StatusCode::ACCEPTED, json_response(&json!({ "id": id }))).into_response()
-        }
-        Err(why) => error(StatusCode::CONFLICT, &why),
     }
 }
 

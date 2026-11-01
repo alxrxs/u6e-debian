@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Prune the kept images of the u6e-debian tree <tree> (deploy.sh's
 images/) by its retention rule: keep each access point's running image
-(stamps/running-<ap>), its image of the current inputs (stamps/built-<ap>),
-those named by --keep (the deploy runner's, which ap-image.sh's
-prune_images asks it for) and the newest --newest (3) of each access point
-(by name, which starts with the build time); prune nothing while what an
+(stamps/running-<ap>), its image of the current inputs (stamps/built-<ap>)
+and the newest --newest (3) of each access point (by name, which starts
+with the build time); prune nothing while what an
 access point named by --ap runs is not known (its stamps/ap-<ap> names other
 inputs than its built image and no running image is recorded). An image is a
 directory whose MANIFEST names its access point (`ap:`); anything else,
@@ -18,9 +17,8 @@ MANIFEST is read only as a small regular file, an image is first renamed to
 emptied of its regular files and removed, one that holds anything else is
 left, and an error on one image skips that image, said, never the run.
 Leftover `.<id>.pruning` directories of an interrupted run go first. Use it
-through ap-image.sh's prune_images (or prune.sh), which passes the runner's
-keeps: run alone it knows only the stamps.
-  python3 -I prune-images.py <tree> --ap <ap>... [--keep <id>]... [--newest N] [--dry-run]
+through ap-image.sh's prune_images (or prune.sh).
+  python3 -I prune-images.py <tree> --ap <ap>... [--newest N] [--dry-run]
 """
 import argparse
 import os
@@ -146,7 +144,6 @@ def main():
     p.add_argument("tree")
     p.add_argument("--ap", action="append", required=True)
     p.add_argument("--newest", type=int, default=3)
-    p.add_argument("--keep", action="append", default=[])
     p.add_argument("--dry-run", action="store_true")
     a = p.parse_args()
     try:
@@ -168,7 +165,6 @@ def main():
                 except OSError as e:
                     say(f"{name}: {e}; left")
     found = images(dir_fd)
-    keep.update(a.keep)
     by_ap = {}
     for name, ap in found:
         by_ap.setdefault(ap, []).append(name)

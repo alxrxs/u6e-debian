@@ -167,9 +167,11 @@ export const DID = {
   unblock: 'unblocked',
   steer: 'steered',
   apply: 'applied a Wi-Fi configuration',
-  repush: 'asked for the Wi-Fi configuration again',
+  repush: 'signed the latest Wi-Fi configuration again',
+  configs: 'set a configuration file aside',
   upgrade: 'asked for an image rollout',
   rollout: 'rolled an image out',
+  image: 'kept or pruned an image',
   'rf-plan': 'applied an RF plan',
 };
 

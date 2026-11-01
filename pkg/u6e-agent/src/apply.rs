@@ -1,10 +1,10 @@
-//! A new Wi-Fi configuration from the deploy runner, relayed by the
-//! controller (`ApplyConfig`), applied the least disruptive way each radio
+//! A new Wi-Fi configuration the controller signed and sent
+//! (`ApplyConfig`), applied the least disruptive way each radio
 //! allows. It is the only way the radios' configuration changes, so the hash
 //! the snapshots carry always says what runs.
 //!
-//! Nothing is installed before the whole request passes: the runner's
-//! signature over it, for this AP, with a sequence number past the last one
+//! Nothing is installed before the whole request passes: its signature by
+//! the configuration key the image pins, for this AP, with a sequence number past the last one
 //! applied and the image's build time and within its validity by a
 //! synchronized clock (no replay, not even after a reboot), its SHA-256, each
 //! radio's file, and any new channel or power one the radio may take now
@@ -180,9 +180,9 @@ pub struct Apply {
     phy: Box<dyn Phy>,
     /// The other APs' BSSs, from the 802.11k rounds: where clients go.
     targets: Arc<Mutex<Vec<Target>>>,
-    /// The deploy runner's public key, as the image pins it; without one,
-    /// no configuration is taken.
-    runner: Option<[u8; 32]>,
+    /// The configuration key's public half, as the image pins it; without
+    /// one, no configuration is taken.
+    signer: Option<[u8; 32]>,
     /// This AP's name, which a configuration must be signed for.
     ap: String,
     /// The last sequence number sent to the helper, whose own record (which
@@ -203,7 +203,7 @@ impl Apply {
         helper: helper::Client,
         phy: Box<dyn Phy>,
         targets: Arc<Mutex<Vec<Target>>>,
-        runner: Option<[u8; 32]>,
+        signer: Option<[u8; 32]>,
         ap: String,
         floor: u64,
     ) -> Self {
@@ -212,7 +212,7 @@ impl Apply {
             helper,
             phy,
             targets,
-            runner,
+            signer,
             ap,
             last_seq: 0,
             floor,
@@ -248,10 +248,10 @@ impl Apply {
     /// The request checked whole, with the installed configuration's hash
     /// and each radio's step; the error says why it is refused.
     fn check(&mut self, c: &SignedConfig) -> Result<(Option<[u8; 32]>, Vec<Step>), String> {
-        let runner = self
-            .runner
-            .ok_or("no deploy runner key in this image: live configuration is off")?;
-        config::verify(&runner, &self.ap, c)?;
+        let signer = self
+            .signer
+            .ok_or("no configuration key in this image: live configuration is off")?;
+        config::verify(&signer, &self.ap, c)?;
         let (last, floor) = (self.last_seq, self.floor);
         if let Some(why) = config::replayed(c.seq, last, "the last applied", floor) {
             return Err(why);
@@ -598,7 +598,7 @@ mod tests {
     use u6e_proto::msg::{Bss, RadioConfig, RateMode, Station};
 
     use crate::helper::Server;
-    use crate::helper::tests::{iw, logs, runner, runner_public, signed, stranger, with5};
+    use crate::helper::tests::{iw, logs, signed, signer, signer_public, stranger, with5};
     use crate::neighbors::Element;
     use crate::regdomain::tests::{radio5, radio6};
     use crate::regdomain::{BandCaps, Channel};
@@ -728,7 +728,7 @@ mod tests {
                 iw: iw(t.path(), &helper_log),
                 up_wait: Duration::from_secs(2),
                 cac_wait: Duration::from_secs(2),
-                runner: Some(runner_public()),
+                signer: Some(signer_public()),
                 ap: "ap1".into(),
                 floor: 0,
                 now: || Some(0),
@@ -755,7 +755,7 @@ mod tests {
                 },
                 phy: Box::new(FakePhy),
                 targets,
-                runner: Some(runner_public()),
+                signer: Some(signer_public()),
                 ap: "ap1".into(),
                 last_seq: 0,
                 floor: 0,
@@ -865,11 +865,10 @@ mod tests {
 
     use Mechanism::{ChannelSwitch, InPlace, Power, Restart, Unchanged};
 
-    /// The controller relays configurations but cannot make one: whatever
-    /// the runner did not sign for this AP, or signed for it before, is
-    /// refused before the helper hears of it.
+    /// Whatever the configuration key did not sign for this AP, or signed
+    /// for it before, is refused before the helper hears of it.
     #[test]
-    fn a_configuration_the_runner_did_not_sign_now_for_this_ap_is_refused() {
+    fn a_configuration_not_signed_now_for_this_ap_is_refused() {
         let mut r = Rig::new();
         let new = || with5(&edit(WLAN5, "dtim_period=3", "dtim_period=1"), 23);
         let mut unsigned = signed(1, new());
@@ -879,11 +878,11 @@ mod tests {
         for (c, why) in [
             (
                 config::sign(&stranger(), "ap1", 1, new()),
-                "not signed by the deploy runner",
+                "not signed by the configuration key",
             ),
-            (unsigned, "not signed by the deploy runner"),
+            (unsigned, "not signed by the configuration key"),
             (
-                config::sign(&runner(), "ap2", 1, new()),
+                config::sign(&signer(), "ap2", 1, new()),
                 "for another AP (ap2)",
             ),
             (altered, "the configuration does not match its SHA-256"),
@@ -948,11 +947,11 @@ mod tests {
         }
 
         let mut keyless = Rig::new();
-        keyless.apply.runner = None;
+        keyless.apply.signer = None;
         let done = keyless.run(signed(1, new()));
         assert_eq!(
             done.detail,
-            "refused: no deploy runner key in this image: live configuration is off"
+            "refused: no configuration key in this image: live configuration is off"
         );
     }
 

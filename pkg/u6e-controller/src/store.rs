@@ -1,13 +1,11 @@
-//! What the runner keeps across its restarts, in its state directory (the
-//! service's `StateDirectory`, its own alone): the latest configuration it
-//! signed for each AP, which holds the site's secrets (so every file is
-//! 0600), the image it staged on each AP, the rollout under way, and the
-//! results the controller has not acknowledged yet. Each file is its format
+//! What the controller keeps of the configurations it signed, in a directory
+//! of its own (`[configs] state`, 0700): the latest one for each AP, which
+//! holds the site's secrets, so every file is 0600. Each file is its format
 //! ([`FORMAT`]) and one frame (`u6e_proto::frame`), written beside the old one
 //! and renamed over it, so a crash leaves either; the bytes of each frame are
 //! wiped once used. A file of another format, or that does not decode, is
-//! not read: the runner sets it aside as `<name>.corrupt-<ms>` and goes on
-//! without it, and says so until someone removes it.
+//! not read: the controller sets it aside as `<name>.corrupt-<ms>` and goes
+//! on without it, and says so until someone removes it.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Write};
@@ -21,12 +19,12 @@ use u6e_proto::frame::{read_frame, write_frame, zeroize};
 
 /// What every file starts with: a mark, and the format of what follows,
 /// raised with every change to what the files hold.
-const MARK: &[u8; 4] = b"U6DS";
-pub const FORMAT: u16 = 2;
+const MARK: &[u8; 4] = b"U6CS";
+pub const FORMAT: u16 = 1;
 /// What a file set aside is named after: `<name>.corrupt-<ms>`.
 const ASIDE: &str = ".corrupt-";
 
-/// The state directory.
+/// The directory.
 pub struct Store {
     dir: PathBuf,
 }
@@ -113,20 +111,12 @@ impl Store {
         fs::rename(&temp, &path)?;
         File::open(&self.dir)?.sync_all()
     }
-
-    /// Empties `name`.
-    pub fn remove(&self, name: &str) -> io::Result<()> {
-        match fs::remove_file(self.dir.join(name)) {
-            Err(e) if e.kind() != ErrorKind::NotFound => Err(e),
-            _ => File::open(&self.dir)?.sync_all(),
-        }
-    }
 }
 
 /// Why a file was not read.
 #[derive(Debug)]
 pub enum Unreadable {
-    /// It could not be read at all: the runner cannot go on.
+    /// It could not be read at all: the controller cannot go on.
     Io(io::Error),
     /// It is of another format, or does not decode: why.
     Corrupt(String),
@@ -137,10 +127,10 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    use crate::tests::TestDir;
+    use crate::testdir::TestDir;
 
     #[test]
-    fn saved_loaded_and_removed_owner_only() {
+    fn saved_and_loaded_owner_only() {
         let t = TestDir::new();
         let s = Store::open(&t.path().join("state")).unwrap();
         assert_eq!(s.load::<Vec<String>>("x").unwrap(), None);
@@ -152,9 +142,6 @@ mod tests {
         let mode = |p: PathBuf| fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(t.path().join("state")), 0o700);
         assert_eq!(mode(t.path().join("state/x")), 0o600);
-        s.remove("x").unwrap();
-        s.remove("x").unwrap();
-        assert_eq!(s.load::<Vec<String>>("x").unwrap(), None);
     }
 
     /// A file of another format, or that does not decode, is not read, and
@@ -172,9 +159,9 @@ mod tests {
             Err(Unreadable::Corrupt(why)) => why,
             other => panic!("{other:?}"),
         };
-        assert_eq!(why(&s), "of format 9, not 2");
+        assert_eq!(why(&s), "of format 9, not 1");
         fs::write(&path, b"garbage").unwrap();
-        assert_eq!(why(&s), "not of format 2");
+        assert_eq!(why(&s), "not of format 1");
         // An older file of the same format whose frame no longer decodes.
         s.save("x", &7u8).unwrap();
         assert!(matches!(

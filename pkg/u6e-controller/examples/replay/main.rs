@@ -983,7 +983,7 @@ async fn main() -> io::Result<()> {
     let config = Config::parse(&config).map_err(io::Error::other)?;
     let identity = Identity::from_pem(KEY_CONTROLLER).map_err(io::Error::other)?;
     let timing = Timing::default();
-    let c = u6e_controller::start(&config, &identity, timing, Arc::new(Names)).await?;
+    let c = u6e_controller::start(&config, &identity, timing, Arc::new(Names), None).await?;
     let user = HeaderValue::from_static(if admin { "operator" } else { "viewer" });
     let groups = HeaderValue::from_str(&config.admin_group).map_err(io::Error::other)?;
     let signed_in = move |mut req: Request| {

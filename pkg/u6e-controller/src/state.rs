@@ -3,13 +3,13 @@
 //! events. All of that is in RAM; an AP sends it all again when it
 //! reconnects. Beside it are the operator's side: the clients blocked (kept
 //! on disk by `policy`), the commands waiting for their results, the actions
-//! taken, and the names of the clients' addresses; and the deploy runner's
-//! (`runner`): the Wi-Fi configurations it signs, relayed to the AP whose
-//! configured host name they are signed for and known here by hash only
-//! (each AP's last acknowledged one kept on disk too), the runner's latest
-//! for each AP, which an AP that runs another is asked to take again, and the
-//! image rollouts with their health gate (the open ones kept on disk too).
-//! Each pair of snapshots also feeds the radios' hourly history the RF
+//! taken, and the names of the clients' addresses; the live Wi-Fi
+//! configurations, signed here (`configs`) for the AP whose configured host
+//! name they name and known here by hash only once sent (each AP's last
+//! acknowledged one kept on disk too), the latest one of each AP signed again
+//! when the AP runs another; and the image rollouts with their health gate,
+//! which `rollout` carries out, and the images each AP runs (kept on disk
+//! too). Each pair of snapshots also feeds the radios' hourly history the RF
 //! planner scores (`rf::history`).
 //!
 //! The state also sets each AP's tick and flow cadence. While a UI client
@@ -19,7 +19,7 @@
 //! The session follows per-AP channels holding what the watchers want. The
 //! scans of the APs' radios are kept here too, watched as `spectrum` says.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -29,13 +29,13 @@ use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
 use u6e_proto::delta::{self, Gap};
 use u6e_proto::msg::{
     AgentMsg, Command, CommandKind, CommandResult, ConfigApplied, CtlMsg, Event, EventKind, Flows,
-    Hello, Mechanism, RolloutOutcome, RolloutRequest, RolloutResult, RunnerCtlMsg, SignedConfig,
-    SiteDeployState, Snapshot, Station,
+    Hello, Mechanism, RadioConfig, Snapshot, Station,
 };
 use u6e_proto::{PROTOCOL, mac};
 
+use crate::configs::Signer;
 use crate::names::{self, Names};
-use crate::policy::{Blocked, ConfigId, Policy, SavedRollout};
+use crate::policy::{ApImages, Blocked, ConfigId, Phase, Policy, SavedRollout};
 use crate::rf::history::{self, History};
 use crate::spectrum::{self, Limits, Scan, Stopped};
 
@@ -65,12 +65,6 @@ const OUTBOX_CAP: usize = 64;
 pub const ROLLOUTS_CAP: usize = 20;
 /// Lines of a rollout's log kept, newest last.
 pub const ROLLOUT_LOG_CAP: usize = 400;
-/// How long the runner has to take a rollout on before the controller closes
-/// it as not started.
-pub const ROLLOUT_START: Duration = Duration::from_secs(120);
-/// Longer than any rollout takes: staging, the gate, staging the previous
-/// image again.
-pub const ROLLOUT_STALE: Duration = Duration::from_secs(3 * 3600);
 
 /// What changed, for the UI to fetch.
 #[derive(Debug, Clone, PartialEq)]
@@ -85,18 +79,19 @@ pub enum Change {
     Action(Action),
     /// The scan of a radio (AP, radio) started, stopped or was joined.
     Spectrum(String, String),
-    /// The runner's link, a configuration or a rollout changed.
+    /// A configuration, a rollout or the kept images changed.
     Deploy,
 }
 
 /// One action on one AP (or on none, when no AP was connected to carry a
 /// block out), with what came of it: an operator's on a client (`mac`), or
-/// one of the deploy runner's (`apply`, `repush`, `rollout`) or an admin's
-/// (`upgrade`, `rf-plan`: an RF plan committed to the site file) on an AP.
+/// one of the controller's own (`apply`, `repush`, `rollout`, `image`) or an
+/// admin's (`upgrade`, `rf-plan`: an RF plan committed to the site file) on
+/// an AP.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Action {
     pub at: SystemTime,
-    /// The signed-in user, as the proxy named them, or who asked the runner.
+    /// The signed-in user, as the proxy named them, or the local caller.
     pub user: Option<String>,
     pub action: &'static str,
     pub mac: Option<[u8; 6]>,
@@ -105,95 +100,30 @@ pub struct Action {
     pub detail: String,
 }
 
-/// What came of the last configuration relayed to an AP.
+/// What came of the last configuration sent to an AP.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Applied {
     pub at: SystemTime,
     pub result: ConfigApplied,
 }
 
-/// A configuration relayed to an AP and not answered yet: the runner's id of
-/// its request, and when it went.
+/// Who waits for an AP's answer to a configuration.
+enum ApplyWaiter {
+    /// A local caller's apply.
+    Local(oneshot::Sender<ConfigApplied>),
+    /// The latest one signed again, whose answer only the events hear.
+    Repush,
+}
+
+/// A configuration sent to an AP and not answered yet: who waits for the
+/// answer, and since when.
 struct Relay {
-    id: u64,
+    waiter: ApplyWaiter,
     config: ConfigId,
     since: Instant,
 }
 
-/// The deploy runner's link: at most one runner at a time, its key the one
-/// the configuration names.
-#[derive(Default)]
-pub struct Runner {
-    /// Whether the configuration admits a runner at all.
-    pub configured: bool,
-    /// What it said it runs, at its last connection.
-    pub version: Option<String>,
-    pub connected_since: Option<SystemTime>,
-    session: Option<RunnerLive>,
-    /// The state files the runner set aside because it could not read them,
-    /// as its current (or last) session told them, and those its session
-    /// before told, which are not recorded again.
-    pub discarded: Vec<Discarded>,
-    discarded_before: Vec<Discarded>,
-}
-
-/// The deploy of the site file the RF planner asked the runner for last, and
-/// how it goes: no state until the runner answers.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SiteDeploy {
-    pub id: u64,
-    /// The commit pushed.
-    pub rev: String,
-    pub user: Option<String>,
-    pub state: Option<SiteDeployState>,
-    pub detail: String,
-    /// When it was asked for, and when the runner last said anything of it.
-    pub asked: SystemTime,
-    pub at: SystemTime,
-}
-
-/// The name of a site deploy's state, as the API and the events spell it.
-pub fn site_deploy_name(s: Option<SiteDeployState>) -> &'static str {
-    match s {
-        None => "asked",
-        Some(SiteDeployState::Refused) => "refused",
-        Some(SiteDeployState::Running) => "running",
-        Some(SiteDeployState::Done) => "done",
-        Some(SiteDeployState::Failed) => "failed",
-    }
-}
-
-/// A state file of the runner's that it could not read and set aside.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Discarded {
-    pub file: String,
-    pub detail: String,
-    pub at_ms: u64,
-}
-
-impl Runner {
-    pub fn is_up(&self) -> bool {
-        self.session.is_some()
-    }
-}
-
-/// The connection currently serving the runner; dropping `stop` ends it.
-struct RunnerLive {
-    id: u64,
-    _stop: oneshot::Sender<()>,
-    outbox: mpsc::Sender<RunnerCtlMsg>,
-}
-
-/// What a session gets when it takes over the runner's link.
-pub struct RunnerRegistration {
-    pub id: u64,
-    /// What to send the runner: answers, re-pushes, rollouts, gates.
-    pub outbox: mpsc::Receiver<RunnerCtlMsg>,
-    /// Resolves when a newer connection of the runner takes over.
-    pub stop: oneshot::Receiver<()>,
-}
-
-/// One image rollout, from its request to the runner's last word on it.
+/// One image rollout, from an admin's request to its end.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Rollout {
     pub id: u64,
@@ -203,8 +133,8 @@ pub struct Rollout {
     pub previous: String,
     pub user: String,
     pub at: SystemTime,
-    /// The runner said it took it on ([`ROLLOUT_START`]).
-    pub started: bool,
+    /// The step it is at, or ended at.
+    pub phase: Phase,
     /// The AP's sessions numbered past this one are the AP coming back.
     after: u64,
     /// The radios the AP had up and the clients on every AP when it was
@@ -212,9 +142,9 @@ pub struct Rollout {
     /// (on any AP: those that roamed away during the reboot count).
     radios: usize,
     clients: usize,
-    /// The gate's verdict, once it was sent: healthy, and what was seen.
+    /// The gate's verdict, once it was given: healthy, and what was seen.
     pub gate: Option<(bool, String)>,
-    /// The runner's last word on it, and when it came.
+    /// How it ended, and why.
     pub result: Option<(RolloutOutcome, String)>,
     pub ended: Option<SystemTime>,
     pub log: VecDeque<String>,
@@ -224,6 +154,21 @@ impl Rollout {
     pub fn is_open(&self) -> bool {
         self.result.is_none()
     }
+}
+
+/// How a rollout ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RolloutOutcome {
+    /// Never begun: an image was not what its MANIFEST lists, or the AP
+    /// answered neither of its systems.
+    Refused,
+    /// The AP runs the image and passed the health gate.
+    Done,
+    /// The AP failed the health gate, or its staging failed, and runs its
+    /// previous image again.
+    RolledBack,
+    /// Neither the image nor the way back could be staged.
+    Failed,
 }
 
 /// The name of a mechanism, as the API and the events spell it.
@@ -239,20 +184,16 @@ pub fn mechanism_name(m: Mechanism) -> &'static str {
 
 /// The outcomes, by the names the API, the metrics and the policy file
 /// spell them.
-const OUTCOMES: [(RolloutOutcome, &str); 5] = [
+pub const OUTCOMES: [(RolloutOutcome, &str); 4] = [
     (RolloutOutcome::Refused, "refused"),
     (RolloutOutcome::Done, "done"),
     (RolloutOutcome::RolledBack, "rolled_back"),
     (RolloutOutcome::Failed, "failed"),
-    (RolloutOutcome::NotStarted, "not_started"),
 ];
 
 /// Whether `o` is a rollout's failure, which raises its alert.
 pub fn is_failure(o: RolloutOutcome) -> bool {
-    matches!(
-        o,
-        RolloutOutcome::RolledBack | RolloutOutcome::Failed | RolloutOutcome::NotStarted
-    )
+    matches!(o, RolloutOutcome::RolledBack | RolloutOutcome::Failed)
 }
 
 /// The name of a rollout's outcome.
@@ -263,12 +204,14 @@ pub fn outcome_name(o: RolloutOutcome) -> &'static str {
         .map_or("", |(_, n)| n)
 }
 
-/// The outcome of a name [`outcome_name`] gave.
-fn outcome_of(name: &str) -> Option<RolloutOutcome> {
-    OUTCOMES.iter().find(|(_, n)| *n == name).map(|(o, _)| *o)
+/// The outcome of a name [`outcome_name`] gave; one it never gives (of an
+/// older controller's) as a failure.
+fn outcome_of(name: &str) -> RolloutOutcome {
+    let found = OUTCOMES.iter().find(|(_, n)| *n == name);
+    found.map_or(RolloutOutcome::Failed, |(o, _)| *o)
 }
 
-/// An answer that a configuration was not applied, for the runner.
+/// An answer that a configuration was not applied.
 fn not_applied(sha256: [u8; 32], detail: String) -> ConfigApplied {
     ConfigApplied {
         sha256,
@@ -352,7 +295,7 @@ pub struct Ap {
     /// Its radios' scans, by radio, once one was watched.
     pub scans: BTreeMap<String, Scan>,
     /// The configuration it last acknowledged (kept in the policy), the
-    /// runner's latest for it (what it should run), the one relayed to it
+    /// latest one signed for it (what it should run), the one sent to it
     /// last, and what came of that.
     pub acked: Option<ConfigId>,
     pub latest: Option<ConfigId>,
@@ -406,7 +349,7 @@ impl Ap {
         self.snapshot.as_ref()?.config_sha256
     }
 
-    /// Whether it runs another configuration than the runner's latest for
+    /// Whether it runs another configuration than the latest one signed for
     /// it, while connected. An image built after that one was signed carries
     /// a newer configuration of its own, which stands.
     pub fn drifts(&self) -> bool {
@@ -460,15 +403,6 @@ impl Ap {
         let ended =
             scans.filter_map(|(radio, scan)| scan.end(Stopped::Link).then(|| radio.clone()));
         ended.collect()
-    }
-
-    /// The runner's request to sign its latest configuration for this AP
-    /// again, named as its configurations are (the AP's host name).
-    fn repush(&self) -> RunnerCtlMsg {
-        RunnerCtlMsg::Repush {
-            ap: self.hostname.clone(),
-            installed: self.installed(),
-        }
     }
 
     /// One more watcher (`more`) or one fewer, of the AP or its flows.
@@ -560,16 +494,16 @@ pub struct State {
     pub spectrum: Limits,
     /// Wakes `spectrum::supervise` when a scan's deadline may have moved.
     pub(crate) wake: Arc<Notify>,
-    pub runner: Runner,
-    /// The site deploy asked for last.
-    pub site_deploy: Option<SiteDeploy>,
+    /// What signs the configurations, when they are on.
+    pub(crate) signer: Option<Signer>,
+    /// The kept images of each AP, oldest first, when rollouts are on.
+    pub kept: Option<BTreeMap<String, Vec<String>>>,
+    /// The images each AP runs (kept in the policy).
+    pub images: BTreeMap<String, ApImages>,
     /// The rollouts, newest last.
     pub rollouts: VecDeque<Rollout>,
     next_rollout: u64,
-    /// The last result the runner sent for a rollout not held here: its id,
-    /// outcome, what the runner said, and when it came (kept in the policy).
-    pub orphan: Option<(u64, RolloutOutcome, String, SystemTime)>,
-    /// Configurations relayed and rollouts ended, by result, for the metrics.
+    /// Configurations sent and rollouts ended, by result, for the metrics.
     pub apply_counts: BTreeMap<&'static str, u64>,
     pub rollout_counts: BTreeMap<&'static str, u64>,
     /// The policy changed since it was saved; the session that changed it
@@ -596,11 +530,11 @@ impl State {
             addresses: HashMap::new(),
             spectrum: Limits::default(),
             wake: Arc::new(Notify::new()),
-            runner: Runner::default(),
-            site_deploy: None,
+            signer: None,
+            kept: None,
+            images: BTreeMap::new(),
             rollouts: VecDeque::new(),
             next_rollout: 0,
-            orphan: None,
             apply_counts: BTreeMap::new(),
             rollout_counts: BTreeMap::new(),
             policy_dirty: false,
@@ -609,9 +543,9 @@ impl State {
     }
 
     /// The state with a saved policy's blocks, acknowledged configurations
-    /// (of the APs still configured) and recent rollouts, the gates of those
-    /// not over going on: every session of this process is one the AP came
-    /// back with.
+    /// and images run (of the APs still configured) and recent rollouts, the
+    /// gates of those not over going on: every session of this process is
+    /// one the AP came back with.
     pub fn with_policy(mut self, policy: Policy) -> Self {
         for (name, config) in policy.configs {
             if let Some(ap) = self.aps.get_mut(&name) {
@@ -622,7 +556,7 @@ impl State {
             let ended = r.result.as_ref().map(|(_, _, at)| *at);
             let result = r
                 .result
-                .and_then(|(outcome, detail, _)| Some((outcome_of(&outcome)?, detail)));
+                .map(|(outcome, detail, _)| (outcome_of(&outcome), detail));
             Rollout {
                 id: r.id,
                 ap: r.ap,
@@ -630,7 +564,7 @@ impl State {
                 previous: r.previous,
                 user: r.user,
                 at: r.at,
-                started: r.started,
+                phase: r.phase,
                 after: 0,
                 radios: r.radios,
                 clients: r.clients,
@@ -640,22 +574,34 @@ impl State {
                 log: VecDeque::new(),
             }
         });
-        let orphan = policy
-            .orphan
-            .and_then(|(id, outcome, detail, at)| Some((id, outcome_of(&outcome)?, detail, at)));
+        let mut images = policy.images;
+        images.retain(|ap, _| self.aps.contains_key(ap));
         State {
             blocked: policy.blocked,
+            images,
             rollouts: rollouts.collect(),
             next_rollout: policy.next_rollout,
-            orphan,
             ..self
         }
     }
 
-    /// The state admitting a deploy runner.
-    pub fn with_runner(mut self) -> Self {
-        self.runner.configured = true;
-        self
+    /// The state signing configurations with `signer`.
+    pub fn with_signer(mut self, signer: Signer) -> Self {
+        for ap in self.aps.values_mut() {
+            ap.latest = signer.latest(&ap.hostname);
+        }
+        State {
+            signer: Some(signer),
+            ..self
+        }
+    }
+
+    /// The state rolling out the kept images of `index`.
+    pub fn with_rollouts(self, index: BTreeMap<String, Vec<String>>) -> Self {
+        State {
+            kept: Some(index),
+            ..self
+        }
     }
 
     /// What the policy file is to hold now.
@@ -671,7 +617,7 @@ impl State {
             previous: r.previous.clone(),
             user: r.user.clone(),
             at: r.at,
-            started: r.started,
+            phase: r.phase.clone(),
             radios: r.radios,
             clients: r.clients,
             gate: r.gate.clone(),
@@ -684,11 +630,9 @@ impl State {
         Policy {
             blocked: self.blocked.clone(),
             configs: acked.collect(),
+            images: self.images.clone(),
             rollouts: rollouts.collect(),
             next_rollout: self.next_rollout,
-            orphan: self.orphan.clone().map(|(id, outcome, detail, at)| {
-                (id, outcome_name(outcome).to_owned(), detail, at)
-            }),
         }
     }
 
@@ -756,8 +700,21 @@ impl State {
     }
 
     /// Hands the AP to a new connection, which said `hello`. A connection
-    /// already serving it is told to stop.
+    /// already serving it is told to stop. Outside a rollout of it, the
+    /// image it names is the one it runs.
     pub fn connect(&mut self, ap: &str, hello: Hello) -> Option<Registration> {
+        let rolling = self.rollouts.iter().any(|r| r.ap == ap && r.is_open());
+        let image = hello.image();
+        if !rolling && !image.is_empty() && self.aps.contains_key(ap) {
+            let runs = ApImages {
+                running: Some(image.to_owned()),
+                either: None,
+            };
+            if self.images.get(ap) != Some(&runs) {
+                self.images.insert(ap.to_owned(), runs);
+                self.policy_dirty = true;
+            }
+        }
         let entry = self.aps.get_mut(ap)?;
         self.next_id += 1;
         let id = self.next_id;
@@ -1069,12 +1026,12 @@ impl State {
         self.notify(Change::Action(action));
     }
 
-    /// Records one of the runner's actions (or an admin's request of one) on
-    /// `ap`.
-    fn record_deploy(
+    /// Records one of the controller's own actions (or an admin's request
+    /// of one) on `ap`, or on none.
+    pub(crate) fn record_deploy(
         &mut self,
         action: &'static str,
-        ap: &str,
+        ap: Option<&str>,
         user: Option<String>,
         ok: bool,
         detail: String,
@@ -1084,193 +1041,91 @@ impl State {
             user,
             action,
             mac: None,
-            ap: Some(ap.to_owned()),
+            ap: ap.map(str::to_owned),
             ok,
             detail,
         });
     }
 
-    /// Records what went wrong with the runner itself, of no AP.
-    fn record_runner(&mut self, action: &'static str, detail: String) {
-        self.record(Action {
-            at: SystemTime::now(),
-            user: None,
-            action,
-            mac: None,
-            ap: None,
-            ok: false,
-            detail,
-        });
+    /// Why `ap` may not be sent a configuration now; it must be connected,
+    /// have none on its way and not be under a rollout.
+    fn sendable(&self, ap: &str) -> Result<(), String> {
+        let entry = self.aps.get(ap).ok_or_else(|| format!("no AP {ap:.64}"))?;
+        if self.rollouts.iter().any(|r| r.ap == ap && r.is_open()) {
+            return Err(format!("{ap} is being rolled out to"));
+        }
+        if entry.session.is_none() {
+            return Err(format!("{ap} is not connected"));
+        }
+        if entry.relay.is_some() {
+            return Err(format!("a configuration for {ap} is on its way already"));
+        }
+        Ok(())
     }
 
-    /// Hands the runner's link to a new connection, which said it runs
-    /// `version`; a connection already serving it is told to stop. The gate
-    /// verdicts of the open rollouts go first: one sent while no runner was
-    /// connected, or to one that restarted since, was never heard.
-    pub fn runner_connect(&mut self, version: String) -> RunnerRegistration {
-        self.next_id += 1;
-        let id = self.next_id;
-        let (stop_tx, stop) = oneshot::channel();
-        let (outbox_tx, outbox) = mpsc::channel(OUTBOX_CAP);
-        for r in self.rollouts.iter().filter(|r| r.is_open()) {
-            if let Some((healthy, detail)) = &r.gate {
-                let _ = outbox_tx.try_send(RunnerCtlMsg::RolloutGate {
-                    id: r.id,
-                    healthy: *healthy,
-                    detail: detail.clone(),
-                });
-            }
+    /// A local caller's configuration for `ap`: signed under the next
+    /// sequence number, kept as the AP's latest and sent; the AP's answer
+    /// comes on the receiver. Refused, nothing is signed.
+    pub fn apply_config(
+        &mut self,
+        ap: &str,
+        radios: Vec<RadioConfig>,
+    ) -> Result<oneshot::Receiver<ConfigApplied>, String> {
+        if self.signer.is_none() {
+            return Err("live configuration is off: the controller has no [configs]".into());
         }
-        // A site deploy asked for while no runner was connected, or before
-        // one that restarted answered, is asked for again.
-        if let Some(d) = self.site_deploy.as_ref().filter(|d| d.state.is_none()) {
-            let _ = outbox_tx.try_send(RunnerCtlMsg::DeploySite {
-                id: d.id,
-                rev: d.rev.clone(),
-            });
-        }
-        self.runner.session = Some(RunnerLive {
-            id,
-            _stop: stop_tx,
-            outbox: outbox_tx,
-        });
-        self.runner.version = Some(version);
-        self.runner.connected_since = Some(SystemTime::now());
-        self.runner.discarded_before = std::mem::take(&mut self.runner.discarded);
-        self.notify(Change::Deploy);
-        RunnerRegistration { id, outbox, stop }
+        self.sendable(ap)?;
+        let (tx, rx) = oneshot::channel();
+        self.sign_and_send(ap, Some(radios), ApplyWaiter::Local(tx))?;
+        Ok(rx)
     }
 
-    /// Ends the runner's session `id`; a no-op when a newer one took over.
-    pub fn runner_disconnect(&mut self, id: u64) {
-        if self.runner.session.as_ref().is_some_and(|s| s.id == id) {
-            self.runner.session = None;
-            self.runner.connected_since = None;
-            self.notify(Change::Deploy);
-        }
-    }
-
-    /// Asks the runner to deploy the site file as commit `rev`, which the
-    /// RF planner pushed for `user`: now, or when the runner next connects.
-    /// Its id.
-    pub fn deploy_site(&mut self, rev: &str, user: Option<String>) -> u64 {
-        self.next_id += 1;
-        let id = self.next_id;
-        let now = SystemTime::now();
-        self.site_deploy = Some(SiteDeploy {
-            id,
-            rev: rev.to_owned(),
-            user: user.clone(),
-            state: None,
-            detail: String::new(),
-            asked: now,
-            at: now,
-        });
-        let sent = self.to_runner(RunnerCtlMsg::DeploySite {
-            id,
-            rev: rev.to_owned(),
-        });
-        let detail = if sent {
-            format!("{}: asked of the deploy runner", &rev[..rev.len().min(12)])
-        } else {
-            format!(
-                "{}: asked; the deploy runner is not connected, and is asked when it is",
-                &rev[..rev.len().min(12)]
-            )
+    /// Signs `radios` for `ap`, or its latest again with `None`, and sends
+    /// them, the answer to `waiter`.
+    fn sign_and_send(
+        &mut self,
+        ap: &str,
+        radios: Option<Vec<RadioConfig>>,
+        waiter: ApplyWaiter,
+    ) -> Result<(), String> {
+        let (Some(signer), Some(entry)) = (self.signer.as_mut(), self.aps.get_mut(ap)) else {
+            return Err("live configuration is off".into());
         };
-        self.record_site_deploy(user, true, detail);
-        id
-    }
-
-    /// The runner's word on site deploy `id`: a state it took is an event,
-    /// each line it runs with only the deploy's detail.
-    pub fn site_deployed(&mut self, id: u64, state: SiteDeployState, detail: String) {
-        let Some(d) = self.site_deploy.as_mut().filter(|d| d.id == id) else {
-            return;
+        let config = match radios {
+            Some(r) => signer.sign(&entry.hostname, r),
+            None => signer
+                .resign(&entry.hostname)
+                .ok_or_else(|| format!("nothing was signed for {ap}"))?,
         };
-        let moved = d.state != Some(state);
-        (d.state, d.detail, d.at) = (Some(state), detail, SystemTime::now());
-        let rev = &d.rev[..d.rev.len().min(12)];
-        let word = format!("{rev}: {}: {}", site_deploy_name(d.state), d.detail);
-        let user = d.user.clone();
-        if moved {
-            let ok = !matches!(state, SiteDeployState::Refused | SiteDeployState::Failed);
-            self.record_site_deploy(user, ok, word);
-        }
-        self.notify(Change::Deploy);
-    }
-
-    fn record_site_deploy(&mut self, user: Option<String>, ok: bool, detail: String) {
-        self.record(Action {
-            at: SystemTime::now(),
-            user,
-            action: "site-deploy",
-            mac: None,
-            ap: None,
-            ok,
-            detail,
-        });
-    }
-
-    /// Queues `msg` for the runner; false when none is connected or it is too
-    /// far behind.
-    fn to_runner(&self, msg: RunnerCtlMsg) -> bool {
-        let live = self.runner.session.as_ref();
-        live.is_some_and(|s| s.outbox.try_send(msg).is_ok())
-    }
-
-    /// Relays `config`, the runner's request `id`, to the AP it is signed for:
-    /// the one whose configured host name is `config.ap`, which only that
-    /// AP's key holds a session of. It becomes the AP's latest. Only its hash
-    /// and sequence stay here; the text goes to the AP's session and nowhere
-    /// else. `Err` is the runner's answer when it cannot go, which is
-    /// recorded.
-    pub fn relay(&mut self, id: u64, config: SignedConfig) -> Result<(), ConfigApplied> {
-        let ap = config.ap.clone();
-        let sent = self.send_config(id, config);
-        if let Err(answer) = &sent {
-            *self.apply_counts.entry("failed").or_default() += 1;
-            self.record_deploy("apply", &ap, None, false, answer.detail.clone());
-        }
-        sent
-    }
-
-    fn send_config(&mut self, id: u64, config: SignedConfig) -> Result<(), ConfigApplied> {
-        let sha256 = config.sha256;
         let signed = ConfigId {
-            sha256,
+            sha256: config.sha256,
             seq: config.seq,
         };
-        let found = self.aps.iter_mut().find(|(_, a)| a.hostname == config.ap);
-        let Some((name, entry)) = found else {
-            let why = format!("no AP has the host name {:.64}", config.ap);
-            return Err(not_applied(sha256, why));
-        };
-        let name = name.clone();
         entry.latest = Some(signed);
         let Some(live) = &entry.session else {
-            return Err(not_applied(sha256, format!("{name} is not connected")));
+            return Err(format!("{ap} is not connected"));
         };
-        if entry.relay.is_some() {
-            let why = format!("a configuration for {name} is on its way already");
-            return Err(not_applied(sha256, why));
-        }
         if live.outbox.try_send(CtlMsg::ApplyConfig(config)).is_err() {
-            return Err(not_applied(sha256, format!("{name} is not keeping up")));
+            return Err(format!("{ap} is not keeping up"));
         }
         entry.relay = Some(Relay {
-            id,
+            waiter,
             config: signed,
             since: Instant::now(),
         });
         entry.wanted = Some(signed);
+        eprintln!(
+            "u6e-controller: {ap}: signed {} under {}",
+            mac::hex(&signed.sha256),
+            signed.seq
+        );
         self.notify(Change::Deploy);
         Ok(())
     }
 
-    /// The AP's answer to a configuration: the runner's, recorded, and when it
-    /// applied, the one the AP acknowledged. An answer that comes after the
-    /// relay was given up on still says what the AP runs.
+    /// The AP's answer to a configuration: its waiter's, recorded, and when
+    /// it applied, the one the AP acknowledged. An answer that comes after
+    /// its wait was given up on still says what the AP runs.
     fn applied(&mut self, ap: &str, c: ConfigApplied) {
         let Some(entry) = self.aps.get_mut(ap) else {
             return;
@@ -1307,20 +1162,21 @@ impl State {
             c.detail
         );
         let (ok, result) = (c.ok, if c.ok { "ok" } else { "failed" });
-        if let Some(r) = relay {
-            self.to_runner(RunnerCtlMsg::ConfigApplied {
-                id: r.id,
-                result: c,
-            });
+        if let Some(Relay {
+            waiter: ApplyWaiter::Local(tx),
+            ..
+        }) = relay
+        {
+            let _ = tx.send(c);
         }
         *self.apply_counts.entry(result).or_default() += 1;
-        self.record_deploy("apply", ap, None, ok, detail);
+        self.record_deploy("apply", Some(ap), None, ok, detail);
         self.notify(Change::Deploy);
     }
 
-    /// Gives up on the configurations relayed `wait` or longer ago: the
-    /// runner hears no answer came. The AP may still apply one; its hash
-    /// then says so.
+    /// Gives up on the configurations sent `wait` or longer ago: their
+    /// waiters hear no answer came. The AP may still apply one; its hash then
+    /// says so.
     pub fn expire_relays(&mut self, now: Instant, wait: Duration) {
         let mut expired = Vec::new();
         for (name, a) in &mut self.aps {
@@ -1333,193 +1189,96 @@ impl State {
         }
         for (name, r) in expired {
             let why = format!("no answer from {name} in {wait:?}");
-            let answer = not_applied(r.config.sha256, why.clone());
-            self.to_runner(RunnerCtlMsg::ConfigApplied {
-                id: r.id,
-                result: answer,
-            });
+            if let ApplyWaiter::Local(tx) = r.waiter {
+                let _ = tx.send(not_applied(r.config.sha256, why.clone()));
+            }
             *self.apply_counts.entry("timeout").or_default() += 1;
-            self.record_deploy("apply", &name, None, false, why);
+            self.record_deploy("apply", Some(&name), None, false, why);
         }
     }
 
-    /// The runner's latest configuration for the AP of host name `hostname`,
-    /// as it tells each session it opens: an AP that runs another is asked
-    /// to take it again.
-    pub fn latest(&mut self, hostname: &str, latest: ConfigId) {
-        let Some((name, entry)) = self.aps.iter_mut().find(|(_, a)| a.hostname == hostname) else {
-            return;
-        };
-        entry.latest = Some(latest);
-        let (name, session) = (name.clone(), entry.session.as_ref().map(|s| s.id));
-        self.notify(Change::Deploy);
-        if let Some(id) = session {
-            self.check_installed(&name, id);
-        }
-    }
-
-    /// At the first key frame of session `id`, when the runner tells its
-    /// latest, and when a rollout of the AP ends: whether the AP runs the
-    /// runner's latest configuration for it ([`Ap::drifts`]). If not, the
-    /// runner is asked to sign that one again; a runner not connected now is
-    /// asked when it tells its latest on connecting.
+    /// At the first key frame of session `id`, when its clock comes, and
+    /// when a rollout of the AP ends: whether the AP runs the latest
+    /// configuration signed for it ([`Ap::drifts`]). If not, that one is
+    /// signed again, under a new sequence number, and sent: never an older
+    /// one, whatever the AP acknowledged.
     pub fn check_installed(&mut self, ap: &str, id: u64) {
-        let Some(entry) = self.live(ap, id) else {
-            return;
-        };
-        if !entry.drifts() || entry.relay.is_some() {
+        let drifts = self.live(ap, id).is_some_and(|e| e.drifts());
+        if !drifts || self.sendable(ap).is_err() {
             return;
         }
-        let (installed, latest, msg) = (entry.installed(), entry.latest, entry.repush());
-        let sent = self.to_runner(msg);
+        let entry = &self.aps[ap];
+        let (installed, latest) = (entry.installed(), entry.latest);
+        let sent = self.sign_and_send(ap, None, ApplyWaiter::Repush);
         let detail = format!(
-            "runs {}, not the runner's latest {}: {}",
+            "runs {}, not the latest {}: {}",
             short(installed),
             short(latest.map(|l| l.sha256)),
-            if sent {
-                "the runner is asked to sign it again"
-            } else {
-                "the runner is asked once it is connected"
+            match &sent {
+                Ok(()) => "signed again".to_owned(),
+                Err(why) => format!("not signed again: {why}"),
             }
         );
-        self.record_deploy("repush", ap, None, true, detail);
+        self.record_deploy("repush", Some(ap), None, sent.is_ok(), detail);
     }
 
-    /// An admin's rollout of `image_id` to `ap`: refused here when it could
-    /// not start (the runner then never hears of it), else queued for the
-    /// runner, which may still refuse it.
-    pub fn upgrade(&mut self, ap: &str, image_id: &str, user: &str) -> Result<u64, String> {
-        if !self.runner.is_up() {
-            return Err("the deploy runner is not connected".into());
+    /// Records the state files the signer set aside, unreadable, with why.
+    pub fn set_aside(&mut self, files: crate::configs::SetAside) {
+        for (file, why) in files {
+            let detail = format!(
+                "its configuration file {file} could not be read ({why}) and was set aside"
+            );
+            self.record_deploy("configs", None, None, false, detail);
         }
-        let entry = self.aps.get(ap).ok_or_else(|| format!("no AP {ap}"))?;
-        let Some(current) = entry
+    }
+
+    /// An admin's rollout of `image_id` to `ap`, the AP's newest kept image,
+    /// recorded at its first step; refused when it could not start, or
+    /// could not be undone: the image the AP runs must be kept too.
+    pub fn upgrade(&mut self, ap: &str, image_id: &str, user: &str) -> Result<u64, String> {
+        let kept = self
+            .kept
+            .as_ref()
+            .ok_or("rollouts are off: the controller has no [rollouts]")?;
+        let entry = self.aps.get(ap).ok_or_else(|| format!("no AP {ap:.64}"))?;
+        let mine = kept.get(ap).map(Vec::as_slice).unwrap_or_default();
+        let Some(newest) = mine.last() else {
+            return Err(format!("no image of {ap} is kept"));
+        };
+        if newest != image_id {
+            return Err(format!(
+                "only {ap}'s newest kept image, {newest}, rolls out"
+            ));
+        }
+        let running = self.images.get(ap).and_then(|i| i.running.as_deref());
+        let hello = entry
             .hello
             .as_ref()
             .map(Hello::image)
-            .filter(|i| !i.is_empty())
-        else {
+            .filter(|i| !i.is_empty());
+        let Some(previous) = running.or(hello).map(str::to_owned) else {
             return Err(format!(
                 "what {ap} runs is not known, so it could not be rolled back"
             ));
         };
-        if current == image_id {
+        if previous == image_id {
             return Err(format!("{ap} runs {image_id} already"));
         }
-        self.close_stale(SystemTime::now());
+        if !mine.contains(&previous) {
+            return Err(format!(
+                "{ap} runs {previous}, which is not kept, so it could not be rolled back"
+            ));
+        }
         if let Some(r) = self.rollouts.iter().find(|r| r.is_open()) {
             return Err(format!(
                 "the rollout of {} to {} is not over",
                 r.image_id, r.ap
             ));
         }
-        let id = self.start_rollout(ap, image_id, user)?;
-        self.record_deploy(
-            "upgrade",
-            ap,
-            Some(user.to_owned()),
-            true,
-            format!("{image_id} asked"),
-        );
-        Ok(id)
-    }
-
-    /// A rollout a local caller asked the runner for: queued as the runner's
-    /// to judge, which refuses what the controller would have.
-    pub fn rollout_ask(&mut self, ap: &str, image_id: &str, user: &str) {
-        if self.aps.contains_key(ap) && self.start_rollout(ap, image_id, user).is_ok() {
-            let detail = format!("{image_id} asked through the runner");
-            self.record_deploy("upgrade", ap, Some(user.to_owned()), true, detail);
-        } else {
-            let detail = format!("{image_id} asked through the runner: no such AP, or no runner");
-            self.record_deploy("upgrade", ap, Some(user.to_owned()), false, detail);
-        }
-    }
-
-    /// The runner took rollout `id` on.
-    pub fn rollout_started(&mut self, id: u64) {
-        if let Some(r) = self.rollouts.iter_mut().find(|r| r.id == id && !r.started) {
-            r.started = true;
-            self.policy_dirty = true;
-        }
-    }
-
-    /// Closes the open rollouts the runner has not taken on in `wait` since
-    /// they were asked for: lost with a session that ended, they would hold
-    /// up every other until [`ROLLOUT_STALE`]. The AP was not touched.
-    pub fn close_unstarted(&mut self, now: SystemTime, wait: Duration) {
-        let late = |r: &Rollout| now.duration_since(r.at).is_ok_and(|d| d >= wait);
-        let ids: Vec<u64> = self
-            .rollouts
-            .iter()
-            .filter(|r| r.is_open() && !r.started && late(r))
-            .map(|r| r.id)
-            .collect();
-        for id in ids {
-            self.rollout_result(RolloutResult {
-                id,
-                outcome: RolloutOutcome::NotStarted,
-                detail: format!("the runner did not take it on in {wait:?}"),
-            });
-        }
-    }
-
-    /// A state file the runner could not read and set aside, as its session
-    /// tells it: recorded once, unless its session before told it too.
-    pub fn state_discarded(&mut self, d: Discarded) {
-        if self.runner.discarded.contains(&d) {
-            return;
-        }
-        if !self.runner.discarded_before.contains(&d) {
-            let detail = format!(
-                "its state file {} could not be read ({}) and was set aside",
-                d.file, d.detail
-            );
-            self.record_runner("runner state", detail);
-        }
-        self.runner.discarded.push(d);
-        self.notify(Change::Deploy);
-    }
-
-    /// Closes the rollouts the runner has not ended in [`ROLLOUT_STALE`]: a
-    /// runner restarted meanwhile forgot them, and they would hold up every
-    /// other.
-    fn close_stale(&mut self, now: SystemTime) {
-        let stale = |r: &Rollout| now.duration_since(r.at).is_ok_and(|d| d >= ROLLOUT_STALE);
-        let ids: Vec<u64> = self
-            .rollouts
-            .iter()
-            .filter(|r| r.is_open() && stale(r))
-            .map(|r| r.id)
-            .collect();
-        for id in ids {
-            let detail = format!("no result from the runner in {ROLLOUT_STALE:?}");
-            self.rollout_result(RolloutResult {
-                id,
-                outcome: RolloutOutcome::Failed,
-                detail,
-            });
-        }
-    }
-
-    /// Records a rollout and sends it to the runner; its id.
-    fn start_rollout(&mut self, ap: &str, image_id: &str, user: &str) -> Result<u64, String> {
-        let entry = &self.aps[ap];
-        let previous = entry.hello.as_ref().map_or("", Hello::image).to_owned();
         let snap = entry.snapshot.as_ref();
         let radios = snap.map_or(0, |s| s.radios.iter().filter(|r| r.up).count());
         let clients = self.site_clients();
         let id = self.next_rollout + 1;
-        let request = RolloutRequest {
-            id,
-            ap: ap.to_owned(),
-            image_id: image_id.to_owned(),
-            previous: previous.clone(),
-            user: user.to_owned(),
-        };
-        if !self.to_runner(RunnerCtlMsg::Rollout(request)) {
-            return Err("the deploy runner is not connected".into());
-        }
         self.next_rollout = id;
         if self.rollouts.len() == ROLLOUTS_CAP {
             self.rollouts.pop_front();
@@ -1531,7 +1290,7 @@ impl State {
             previous,
             user: user.to_owned(),
             at: SystemTime::now(),
-            started: false,
+            phase: Phase::Checking,
             after: self.next_id,
             radios,
             clients,
@@ -1541,8 +1300,24 @@ impl State {
             log: VecDeque::new(),
         });
         self.policy_dirty = true;
+        let detail = format!("{image_id} asked");
+        self.record_deploy("upgrade", Some(ap), Some(user.to_owned()), true, detail);
         self.notify(Change::Deploy);
         Ok(id)
+    }
+
+    /// Rollout `id`, as it is now.
+    pub fn rollout(&self, id: u64) -> Option<&Rollout> {
+        self.rollouts.iter().find(|r| r.id == id)
+    }
+
+    /// Moves rollout `id` on to `phase`.
+    pub fn set_phase(&mut self, id: u64, phase: Phase) {
+        if let Some(r) = self.rollouts.iter_mut().find(|r| r.id == id) {
+            r.phase = phase;
+            self.policy_dirty = true;
+            self.notify(Change::Deploy);
+        }
     }
 
     /// The clients associated with any AP now.
@@ -1551,11 +1326,15 @@ impl State {
         snaps.map(|s| s.stations.len()).sum()
     }
 
-    /// A line of rollout `id`'s log, from the runner.
+    /// A line of rollout `id`'s log, to the journal too.
     pub fn rollout_log(&mut self, id: u64, line: String) {
         let Some(r) = self.rollouts.iter_mut().find(|r| r.id == id) else {
             return;
         };
+        eprintln!(
+            "u6e-controller: rollout {id} of {} to {}: {line}",
+            r.image_id, r.ap
+        );
         if r.log.len() == ROLLOUT_LOG_CAP {
             r.log.pop_front();
         }
@@ -1563,51 +1342,60 @@ impl State {
         self.notify(Change::Deploy);
     }
 
-    /// The runner's last word on a rollout. The runner sends it until it is
-    /// acknowledged, so it may come again, and is then recorded once.
-    pub fn rollout_result(&mut self, res: RolloutResult) {
-        let Some(r) = self.rollouts.iter_mut().find(|r| r.id == res.id) else {
-            return self.orphan_result(res);
-        };
-        // The runner's word on one closed as not started, which it took on
-        // late after all, stands over the controller's.
-        let not_started = matches!(r.result, Some((RolloutOutcome::NotStarted, _)));
-        if !r.is_open() && !(not_started && res.outcome != RolloutOutcome::NotStarted) {
+    /// Ends rollout `id`: what the AP runs is recorded (after a staging
+    /// that failed part way, either image), and the AP is checked again for
+    /// its configuration, which nothing was signed for during the rollout.
+    pub fn rollout_end(&mut self, id: u64, outcome: RolloutOutcome, detail: String) {
+        let Some(r) = self.rollouts.iter_mut().find(|r| r.id == id && r.is_open()) else {
             return;
-        }
-        r.started |= res.outcome != RolloutOutcome::NotStarted;
-        r.result = Some((res.outcome, res.detail.clone()));
+        };
+        r.result = Some((outcome, detail.clone()));
         r.ended = Some(SystemTime::now());
         self.policy_dirty = true;
-        let (ap, user, image) = (r.ap.clone(), r.user.clone(), r.image_id.clone());
-        let outcome = outcome_name(res.outcome);
-        *self.rollout_counts.entry(outcome).or_default() += 1;
-        let ok = res.outcome == RolloutOutcome::Done;
-        let detail = format!("{image}: {}: {}", outcome.replace('_', " "), res.detail);
-        self.record_deploy("rollout", &ap, Some(user), ok, detail);
+        let (ap, user, image, previous) = (
+            r.ap.clone(),
+            r.user.clone(),
+            r.image_id.clone(),
+            r.previous.clone(),
+        );
+        let runs = match outcome {
+            RolloutOutcome::Done => Some((image.clone(), None)),
+            RolloutOutcome::RolledBack => Some((previous, None)),
+            RolloutOutcome::Failed => Some((previous, Some(image.clone()))),
+            RolloutOutcome::Refused => None,
+        };
+        if let Some((running, either)) = runs {
+            let running = Some(running);
+            self.images.insert(ap.clone(), ApImages { running, either });
+        }
+        let name = outcome_name(outcome);
+        *self.rollout_counts.entry(name).or_default() += 1;
+        let ok = outcome == RolloutOutcome::Done;
+        let detail = format!("{image}: {}: {detail}", name.replace('_', " "));
+        self.record_deploy("rollout", Some(&ap), Some(user), ok, detail);
         self.notify(Change::Deploy);
-        // The runner signs nothing for an AP under rollout, so an AP that
-        // came back during it is checked again now that it is over.
         let session = self.aps.get(&ap).and_then(|a| a.session.as_ref());
         if let Some(id) = session.map(|s| s.id) {
             self.check_installed(&ap, id);
         }
     }
 
-    /// The runner's result for rollout `id`, which this controller does not
-    /// hold (its policy file was lost, or the rollout left the ring): kept as
-    /// the orphan, whose time raises an alert, and recorded.
-    fn orphan_result(&mut self, res: RolloutResult) {
-        let outcome = outcome_name(res.outcome);
-        let detail = format!(
-            "rollout {}, which this controller does not hold: {}: {}",
-            res.id,
-            outcome.replace('_', " "),
-            res.detail
-        );
-        self.record_runner("rollout", detail);
-        self.orphan = Some((res.id, res.outcome, res.detail, SystemTime::now()));
-        self.policy_dirty = true;
+    /// The kept images that must stay: what each AP runs or may run, and
+    /// both of the rollout under way.
+    pub fn images_needed(&self) -> BTreeSet<String> {
+        let runs = self.images.values();
+        let mut needed: BTreeSet<String> = runs
+            .flat_map(|i| i.running.iter().chain(&i.either).cloned())
+            .collect();
+        for r in self.rollouts.iter().filter(|r| r.is_open()) {
+            needed.extend([r.image_id.clone(), r.previous.clone()]);
+        }
+        needed
+    }
+
+    /// The kept images are now those of `index`.
+    pub fn set_kept(&mut self, index: BTreeMap<String, Vec<String>>) {
+        self.kept = Some(index);
         self.notify(Change::Deploy);
     }
 
@@ -1649,15 +1437,11 @@ impl State {
         {
             return;
         }
-        let detail = format!("back with {image}: {up} radios up, {clients} clients on the site");
-        r.gate = Some((true, detail.clone()));
-        let id = r.id;
+        r.gate = Some((
+            true,
+            format!("back with {image}: {up} radios up, {clients} clients on the site"),
+        ));
         self.policy_dirty = true;
-        self.to_runner(RunnerCtlMsg::RolloutGate {
-            id,
-            healthy: true,
-            detail,
-        });
         self.notify(Change::Deploy);
     }
 
@@ -1666,14 +1450,8 @@ impl State {
         let Some(r) = self.gating(ap) else {
             return;
         };
-        r.gate = Some((false, why.clone()));
-        let id = r.id;
+        r.gate = Some((false, why));
         self.policy_dirty = true;
-        self.to_runner(RunnerCtlMsg::RolloutGate {
-            id,
-            healthy: false,
-            detail: why,
-        });
         self.notify(Change::Deploy);
     }
 

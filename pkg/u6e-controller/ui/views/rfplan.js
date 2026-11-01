@@ -3,9 +3,8 @@
 // measured, what it predicts the change does and why. Nothing changes until
 // an admin applies chosen proposals, exactly as shown (the controller refuses
 // them once the plan changed), which commits them to the site file; the
-// controller then asks the deploy runner to deploy that commit, and the
-// panel follows the deploy until it ends. Proposals that free each other's
-// spectrum are chosen together.
+// next configuration rendered from it takes them to the access points.
+// Proposals that free each other's spectrum are chosen together.
 
 import { h, icon, ask, ago, bandName } from '../util.js';
 
@@ -14,21 +13,10 @@ const LOCK = 'M6 11h12v10H6zM8 11V7a4 4 0 0 1 8 0v4';
 const OK = 'M12 3a9 9 0 1 0 0 18a9 9 0 0 0 0-18M8 12l3 3 5-6';
 const BAD = 'M12 3a9 9 0 1 0 0 18a9 9 0 0 0 0-18M12 8v5M12 16.5v.01';
 const INFO = 'M12 3a9 9 0 1 0 0 18a9 9 0 0 0 0-18M12 11v5M12 7.5v.01';
-const WAIT = 'M12 3a9 9 0 1 0 0 18a9 9 0 0 0 0-18M12 7v5l3 2';
 const REFRESH = 'M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7';
 const COMMIT = 'M12 8a4 4 0 1 0 0 8a4 4 0 0 0 0-8M3 12h5M16 12h5';
-/** How often the plan is asked for again while it is shown, and while a
- * deploy runs. */
+/** How often the plan is asked for again while it is shown. */
 const EVERY_MS = 60_000;
-const DEPLOYING_MS = 3_000;
-/** What each state of a deploy says, and its tone. */
-const DEPLOY = {
-  asked: ['wait', 'asked of the deploy runner'],
-  running: ['wait', 'deploying'],
-  done: ['ok', 'deployed'],
-  refused: ['bad', 'refused by the deploy runner'],
-  failed: ['bad', 'failed'],
-};
 
 /** The planner's reason as a sentence. */
 function sentence(text) {
@@ -116,11 +104,10 @@ export function rfPlan(store) {
   const offered = new Set();
   let timer = null;
 
-  /** Asks for the plan again in a while: soon while a deploy runs. */
+  /** Asks for the plan again in a while. */
   function again() {
     clearTimeout(timer);
-    const state = plan?.deploy?.state;
-    timer = setTimeout(load, state === 'asked' || state === 'running' ? DEPLOYING_MS : EVERY_MS);
+    timer = setTimeout(load, EVERY_MS);
   }
 
   async function load() {
@@ -154,7 +141,7 @@ export function rfPlan(store) {
     const yes = await ask(document.body, {
       title: `Apply ${n} ${n === 1 ? 'change' : 'changes'}?`,
       text: `The controller commits ${n === 1 ? 'it' : 'them'} to ${plan.site?.file || 'the site file'} as wifi-controller, naming you, ` +
-        'and has the deploy runner take the commit to the access points: a channel switch announcement moves their clients along, without a reboot.' + restart,
+        'and the next configuration rendered from it takes the change to the access points: a channel switch announcement moves their clients along, without a reboot.' + restart,
       confirm: 'Commit',
     });
     if (!yes) return;
@@ -178,18 +165,6 @@ export function rfPlan(store) {
       || (last ? [last.ok ? 'ok' : 'bad', `Last applied ${ago(last.at)}${last.user ? ` by ${last.user}` : ''}: ${last.ok ? last.detail : `failed, ${last.detail}`}.`] : []);
     if (!tone) return null;
     return h('p', { class: 'result', role: 'status', 'data-tone': tone }, icon(tone === 'ok' ? OK : BAD), h('span', {}, text));
-  }
-
-  /** How the deploy of the last commit goes. */
-  function deployLine() {
-    const d = plan?.deploy;
-    if (!d) return null;
-    const [tone, word] = d.state === 'asked' && !d.runner
-      ? ['wait', 'waiting for the deploy runner, which is not connected']
-      : DEPLOY[d.state] || ['wait', d.state];
-    const detail = d.detail && d.state !== 'asked' ? `: ${d.detail}` : '';
-    const text = `Deploy of ${d.rev.slice(0, 12)}: ${word}${detail} (${ago(d.at)}).`;
-    return h('p', { class: 'result deploy', role: 'status', 'data-tone': tone }, icon(tone === 'ok' ? OK : tone === 'bad' ? BAD : WAIT), h('span', {}, text));
   }
 
   function foot(changes) {
@@ -259,7 +234,7 @@ export function rfPlan(store) {
     }));
     const notes = (plan.notes || []).map((n) => h('p', { class: 'plan-note' }, icon(INFO), h('span', {}, n)));
     if (site.error) notes.push(h('p', { class: 'plan-note warn' }, icon(BAD), h('span', {}, `The site file could not be fetched (${site.error}); this plan reads it as last fetched.`)));
-    body.replaceChildren(...[...notes, list, deployLine(), resultLine(), foot(changes)].filter(Boolean));
+    body.replaceChildren(...[...notes, list, resultLine(), foot(changes)].filter(Boolean));
   }
 
   load();

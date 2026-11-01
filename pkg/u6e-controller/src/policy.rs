@@ -2,14 +2,15 @@
 //! blocked, and the Wi-Fi configuration each AP last acknowledged, by its hash
 //! and sequence number (never its text). `policy.json` is
 //! `{"blocked": ["02:00:00:00:00:01", ...], "configs": {"ap1": {"sha256":
-//! "<64 hex>", "seq": 1792929600000}}, "rollouts": [...], "next_rollout": 7}`.
-//! An AP keeps its blocks in RAM only, so this file is what every AP is given
-//! again when it connects. The recent image rollouts are kept too, with their
-//! gate's verdict and result, so a restart neither loses one nor numbers a new
-//! one as an old one: the gates of those not over go on, the runner's result,
-//! which it sends until it is acknowledged, finds them, and a failed one's
-//! time still raises its alert. So does the last result the runner sent for
-//! a rollout this controller did not hold (`orphan`).
+//! "<64 hex>", "seq": 1792929600000}}, "images": {"ap1": {"running": "<id>"}},
+//! "rollouts": [...], "next_rollout": 7}`. An AP keeps its blocks in RAM
+//! only, so this file is what every AP is given again when it connects. The
+//! image each AP runs is kept (and, after a rollout that failed part way, the
+//! other one it may run), which is what a rollout of it rolls back to; and
+//! the recent rollouts, each with the step it is at, its gate's verdict and
+//! its result, so a restart neither loses one nor numbers a new one as an old
+//! one: one not over goes on from its step, and a failed one's time still
+//! raises its alert.
 //!
 //! A save writes the whole file beside the old one, syncs it, renames it over
 //! the old one and syncs the directory: a crash at any point leaves either the
@@ -30,7 +31,7 @@ use u6e_proto::mac;
 /// The clients blocked, by MAC.
 pub type Blocked = BTreeSet<[u8; 6]>;
 
-/// A configuration as the deploy runner signed it: its hash and sequence
+/// A configuration as the controller signed it: its hash and sequence
 /// number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConfigId {
@@ -44,13 +45,39 @@ pub struct Policy {
     pub blocked: Blocked,
     /// The configuration each AP last acknowledged, by AP.
     pub configs: BTreeMap<String, ConfigId>,
+    /// The images each AP runs, by AP.
+    pub images: BTreeMap<String, ApImages>,
     /// The recent rollouts, oldest first.
     pub rollouts: Vec<SavedRollout>,
     /// The id the last rollout was given.
     pub next_rollout: u64,
-    /// The last result for a rollout not held here: its id, outcome (as the
-    /// metrics name it), what the runner said, and when it came.
-    pub orphan: Option<(u64, String, String, SystemTime)>,
+}
+
+/// The kept images an AP runs, as far as the controller knows.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApImages {
+    /// The image it ran last: what a rollout of it rolls back to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running: Option<String>,
+    /// The new image of a rollout that failed part way, which it may run
+    /// instead, until it says which.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub either: Option<String>,
+}
+
+/// Where a rollout is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum Phase {
+    /// Checking the two images against their MANIFESTs.
+    Checking,
+    /// Staging the new image.
+    Staging,
+    /// Staged: the gate's verdict is awaited until `deadline_ms`.
+    Gate { deadline_ms: u64 },
+    /// Staging the image it ran before again, after `why`.
+    RollingBack { why: String },
 }
 
 /// A rollout as it outlives the controller.
@@ -62,15 +89,15 @@ pub struct SavedRollout {
     pub previous: String,
     pub user: String,
     pub at: SystemTime,
-    /// The runner said it took it on.
-    pub started: bool,
+    /// The step it is at, or ended at.
+    pub phase: Phase,
     /// The radios up on the AP and the site's clients when it was asked.
     pub radios: usize,
     pub clients: usize,
     /// The gate's verdict, once it was given: healthy, and what was seen.
     pub gate: Option<(bool, String)>,
-    /// How it ended, once it did: the outcome as the metrics name it, what
-    /// the runner said, and when.
+    /// How it ended, once it did: the outcome as the metrics name it, why,
+    /// and when.
     pub result: Option<(String, String, SystemTime)>,
 }
 
@@ -82,22 +109,12 @@ struct PolicyFile {
     // before the controller relayed them.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     configs: BTreeMap<String, ConfigFile>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    images: BTreeMap<String, ApImages>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     rollouts: Vec<RolloutFile>,
     #[serde(default, skip_serializing_if = "is_zero")]
     next_rollout: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    orphan: Option<OrphanFile>,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OrphanFile {
-    id: u64,
-    outcome: String,
-    detail: String,
-    /// Milliseconds since the Unix epoch.
-    at: u64,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -114,8 +131,7 @@ struct RolloutFile {
     user: String,
     /// Milliseconds since the Unix epoch.
     at: u64,
-    #[serde(default)]
-    started: bool,
+    phase: Phase,
     radios: usize,
     clients: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -212,7 +228,7 @@ pub fn load(path: &Path) -> io::Result<Policy> {
         previous: r.previous,
         user: r.user,
         at: time(r.at),
-        started: r.started,
+        phase: r.phase,
         radios: r.radios,
         clients: r.clients,
         gate: r.gate.map(|g| (g.healthy, g.detail)),
@@ -221,9 +237,9 @@ pub fn load(path: &Path) -> io::Result<Policy> {
     Ok(Policy {
         blocked,
         configs,
+        images: file.images,
         rollouts: rollouts.collect(),
         next_rollout: file.next_rollout,
-        orphan: file.orphan.map(|o| (o.id, o.outcome, o.detail, time(o.at))),
     })
 }
 
@@ -255,7 +271,7 @@ fn write_temp(path: &Path, policy: &Policy) -> io::Result<PathBuf> {
         previous: r.previous.clone(),
         user: r.user.clone(),
         at: millis(r.at),
-        started: r.started,
+        phase: r.phase.clone(),
         radios: r.radios,
         clients: r.clients,
         gate: r
@@ -271,17 +287,9 @@ fn write_temp(path: &Path, policy: &Policy) -> io::Result<PathBuf> {
     let file = PolicyFile {
         blocked: policy.blocked.iter().map(|m| mac::format(*m)).collect(),
         configs: configs.collect(),
+        images: policy.images.clone(),
         rollouts: rollouts.collect(),
         next_rollout: policy.next_rollout,
-        orphan: policy
-            .orphan
-            .clone()
-            .map(|(id, outcome, detail, at)| OrphanFile {
-                id,
-                outcome,
-                detail,
-                at: millis(at),
-            }),
     };
     let mut body = serde_json::to_vec_pretty(&file).map_err(io::Error::other)?;
     body.push(b'\n');
@@ -335,6 +343,12 @@ mod tests {
             seq: 1_792_929_600_000,
         };
         p.configs.insert("ap1".into(), c);
+        let running = Some("20261024-120000-abc-def-ap1".into());
+        let images = ApImages {
+            running,
+            either: None,
+        };
+        p.images.insert("ap1".into(), images);
         p.rollouts.push(SavedRollout {
             id: 7,
             ap: "ap1".into(),
@@ -342,14 +356,15 @@ mod tests {
             previous: "20261024-120000-abc-def-ap1".into(),
             user: "admin".into(),
             at: UNIX_EPOCH + Duration::from_millis(1_792_929_600_123),
-            started: true,
+            phase: Phase::Gate {
+                deadline_ms: 1_792_929_700_000,
+            },
             radios: 3,
             clients: 9,
             gate: Some((true, "back".into())),
             result: Some(("done".into(), "back".into(), time(1_792_929_700_000))),
         });
         p.next_rollout = 7;
-        p.orphan = Some((5, "failed".into(), "gone".into(), time(1_792_929_800_000)));
         save(&path, &p).unwrap();
         assert_eq!(load(&path).unwrap(), p);
         let text = fs::read_to_string(&path).unwrap();
@@ -359,6 +374,7 @@ mod tests {
             serde_json::json!({
                 "blocked": ["02:00:00:00:00:01", "02:00:00:00:00:02"],
                 "configs": {"ap1": {"sha256": "ab".repeat(32), "seq": 1_792_929_600_000u64}},
+                "images": {"ap1": {"running": "20261024-120000-abc-def-ap1"}},
                 "rollouts": [{
                     "id": 7,
                     "ap": "ap1",
@@ -366,14 +382,13 @@ mod tests {
                     "previous": "20261024-120000-abc-def-ap1",
                     "user": "admin",
                     "at": 1_792_929_600_123u64,
-                    "started": true,
+                    "phase": {"gate": {"deadline_ms": 1_792_929_700_000u64}},
                     "radios": 3,
                     "clients": 9,
                     "gate": {"healthy": true, "detail": "back"},
                     "result": {"outcome": "done", "detail": "back", "at": 1_792_929_700_000u64},
                 }],
                 "next_rollout": 7,
-                "orphan": {"id": 5, "outcome": "failed", "detail": "gone", "at": 1_792_929_800_000u64},
             })
         );
         save(&path, &Policy::default()).unwrap();

@@ -381,6 +381,7 @@ fn controller(dir: &Path, scratch: Option<&Scratch>) -> Running {
             &identity,
             Timing::default(),
             Arc::new(NoNames),
+            None,
         ))
         .unwrap();
     Running { c, _rt: rt }
@@ -601,7 +602,6 @@ fn the_plan_is_for_anyone_and_says_what_it_rests_on() {
         radio(&p, "ap2/radio5")["kept"],
         "the site file keeps its channel (planner: fixed)"
     );
-    assert!(p.get("deploy").is_none());
 }
 
 #[test]
@@ -685,7 +685,7 @@ fn a_radio_not_of_the_site_is_refused_before_it_is_logged() {
 }
 
 #[test]
-fn an_applied_plan_is_a_commit_an_event_a_deploy_asked_for_and_then_pending() {
+fn an_applied_plan_is_a_commit_an_event_and_then_pending() {
     let s = Scratch::new("rf-apply");
     let r = controller(&s.dir.0, Some(&s));
     feed_both(&r);
@@ -727,30 +727,8 @@ fn an_applied_plan_is_a_commit_an_event_a_deploy_asked_for_and_then_pending() {
         ev["detail"].as_str().unwrap().contains(&commit[..12]),
         "{ev}"
     );
-    // The deploy of that commit is asked of the runner, which this
-    // controller has none of yet: it is asked when one connects.
-    assert!(v["deploy"].is_u64(), "{v}");
-    let asked = events(&r, "")
-        .into_iter()
-        .find(|e| e["action"] == "site-deploy")
-        .unwrap();
-    assert_eq!(
-        asked["detail"],
-        format!(
-            "{}: asked; the deploy runner is not connected, and is asked when it is",
-            &commit[..12]
-        )
-    );
     let p = plan(&r);
     assert_eq!(p["last"]["commit"], commit);
-    assert_eq!(
-        (
-            &p["deploy"]["rev"],
-            &p["deploy"]["state"],
-            &p["deploy"]["runner"]
-        ),
-        (&json!(commit), &json!("asked"), &json!(false))
-    );
     // Until the deploy takes it to ap2, ap2 runs other than the file.
     let after = radio(&p, "ap2/radio24");
     assert_eq!(

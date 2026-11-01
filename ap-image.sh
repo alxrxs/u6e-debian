@@ -72,10 +72,7 @@ ap_image() {
 
 # boot_ap <ap> <key>: boot <ap>'s image of the inputs <key> (ap_image) on it,
 # unless it runs it already or BOOT=0, and wait for its radios; then
-# stamps/ap-<ap> records it. The deploy runner (site.conf's runner_staged)
-# is told what was staged as soon as it is, before anything can stop the
-# run: until it is told, no stamp is written, so the next run stages the
-# image again and tells it then.
+# stamps/ap-<ap> records it.
 boot_ap() {
 	local ap=$1 key=$2 up=
 	ap_image "$ap" "$key" || return 0
@@ -85,10 +82,6 @@ boot_ap() {
 	fi
 	boot/stage.sh "$IMAGE" || fail "$ap: did not boot $IMAGE"
 	echo "${IMAGE##*/}" > "stamps/running-$ap"
-	if declare -F runner_staged > /dev/null; then
-		runner_staged "$ap" "${IMAGE##*/}" ||
-			fail "$ap: booted $IMAGE, but the deploy runner was not told; run again"
-	fi
 	for _ in $(seq 30); do
 		up=$(cd boot && . ./lib.sh && T=15 ap_root -n 'systemctl is-active -q u6e-wifi &&
 			for i in wlan24 wlan5 wlan6; do hostapd_cli -p /run/hostapd -i $i status | grep -x state=ENABLED; done | wc -l' 2>/dev/null)
@@ -105,28 +98,17 @@ boot_ap() {
 # another tree's is pruned by the same rule without running its code; with
 # DRY_RUN=1 only list them. Kept are each AP's running image
 # (stamps/running-<ap>, which boot_ap writes as it stages one), its image of
-# the current inputs (stamps/built-<ap>), the images the deploy runner needs
-# (site.conf's runner_images: what it staged on each AP, both of a rollout
-# under way, both of one that failed), and the newest KEEP_IMAGES (default 3)
-# of each AP. Nothing is pruned while an AP's running image is not known, or
-# the runner does not say which it needs. prune-images.py reads the stamps,
-# root's to read in a tree another user can write.
+# the current inputs (stamps/built-<ap>), and the newest KEEP_IMAGES (default
+# 3) of each AP. Nothing is pruned while an AP's running image is not known.
+# prune-images.py reads the stamps, root's to read in a tree another user can
+# write.
 prune_images() {
-	local tree=${1:-.} here keep=() aps ap ids id
+	local tree=${1:-.} here keep=() aps ap
 	here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 	read -ra aps <<< "$U6E_APS"
 	for ap in "${aps[@]}"; do
 		keep+=(--ap "$ap")
 	done
 	[ "${DRY_RUN:-0}" = 1 ] && keep+=(--dry-run)
-	if declare -F runner_images > /dev/null; then
-		ids=$(runner_images) || {
-			echo "images: the deploy runner did not say which images it needs; none pruned"
-			return 0
-		}
-		for id in $ids; do
-			keep+=(--keep "$id")
-		done
-	fi
 	python3 -I "$here/prune-images.py" "$tree" --newest "${KEEP_IMAGES:-3}" "${keep[@]}"
 }

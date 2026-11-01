@@ -1,12 +1,15 @@
 //! The controller against fake agents on loopback. Each test starts its own
 //! controller (in-process, or the binary when only its log can show the
 //! result) on ports of its own, and speaks the link to it with u6e-proto
-//! alone: a blocking rustls client, the framing and the messages.
+//! alone: a blocking rustls client, the framing and the messages. Its local
+//! socket is asked as root's commands ask it (`local`), and its images are
+//! staged by a stand-in (`FakeStage`) that logs what it is asked to stage.
 
 use std::collections::{BTreeSet, HashMap};
 use std::hash::{DefaultHasher, Hasher};
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -23,18 +26,20 @@ use tungstenite::client::IntoClientRequest;
 use tungstenite::{HandshakeError, Message};
 use u6e_controller::agents::Timing;
 use u6e_controller::config::Config;
+use u6e_controller::images::Kept;
+use u6e_controller::local;
 use u6e_controller::names::Resolve;
 use u6e_controller::spectrum::Limits;
+use u6e_controller::stage::{Log, Stage, Staged, Target};
 use u6e_controller::state::{FLOWS_IDLE, FLOWS_WATCHED, TICK_IDLE, TICK_WATCHED};
 use u6e_controller::{Controller, start};
 use u6e_proto::PROTOCOL;
-use u6e_proto::config::config_sha256;
+use u6e_proto::config::{self, config_sha256};
 use u6e_proto::frame::{decode_frame, frame_body, write_frame};
 use u6e_proto::msg::{
     AgentMsg, Band, Bss, ClientFlows, CommandKind, CommandResult, ConfigApplied, CtlMsg, Event,
     EventKind, FieldDelta, Flow, Flows, Hello, Mechanism, Radio, RadioApplied, RadioConfig,
-    RateMode, RolloutOutcome, RolloutRequest, RolloutResult, RunnerCtlMsg, RunnerHello, RunnerMsg,
-    SignedConfig, Snapshot, SnapshotDelta, SpectrumFrame, Station, Temp,
+    RateMode, SignedConfig, Snapshot, SnapshotDelta, SpectrumFrame, Station, Temp,
 };
 use u6e_proto::tls::{self, Identity};
 use u6e_proto::{mac, version};
@@ -45,9 +50,9 @@ mod keys;
 use keys::{KEY_AP1, KEY_AP2, KEY_CONTROLLER};
 
 // Throwaway, like the keys of `keys`: an AP that is not enrolled, and the
-// deploy runner's link key.
+// key the controller signs configurations with.
 const KEY_STRANGER: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIIN98nA5U+8ay1kTe7TR4rEzYomCSC7d4p/BpYYuf1qw\n-----END PRIVATE KEY-----\n";
-const KEY_RUNNER: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEINAqUTkY6FWIuFA8ryg9VCageTDEsBn8b3MW/ZMra3Ny\n-----END PRIVATE KEY-----\n";
+const KEY_SIGNING: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEINAqUTkY6FWIuFA8ryg9VCageTDEsBn8b3MW/ZMra3Ny\n-----END PRIVATE KEY-----\n";
 
 /// How long a test waits for something that should happen, before failing.
 const WAIT: Duration = Duration::from_secs(20);
@@ -67,22 +72,82 @@ const ADMIN: &str =
     "X-Auth-Request-Groups: staff,wifi-admins\r\nX-Forwarded-Preferred-Username: alice\r\n";
 
 /// A configuration on loopback ports of the system's choosing, admitting
-/// `ap1` and, with `ap2`, `ap2`, and the deploy runner, its policy in `dir`.
-fn config_text(key: &str, ap2: bool, dir: &Path) -> String {
+/// `ap1` and, with `ap2`, `ap2`, each staged through 192.0.2.1, its policy, its
+/// local socket, its signed configurations and its kept images in `dir`
+/// (where the files it reads are written), each AP's gate `gate_secs` long.
+fn config_text(key: &str, ap2: bool, dir: &Path, gate_secs: u64) -> String {
+    let file = |name: &str, body: &str| {
+        let p = dir.join(name);
+        fs::write(&p, body).unwrap();
+        fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+        p.display().to_string()
+    };
+    let signing = file("signing-key.pem", KEY_SIGNING);
+    let (root, password, hosts) = (
+        file("ap-root-key", ""),
+        file("ap-pw", "x"),
+        file("ap-hosts", ""),
+    );
+    let ap = |name: &str, key: &str| {
+        let k = mac::hex(&identity(key).public_key());
+        format!("[aps.{name}]\npublic_key = \"{k}\"\naddress = \"192.0.2.1\"\n")
+    };
     let mut text = format!(
         "listen_agents = \"127.0.0.1:0\"\nlisten_http = \"127.0.0.1:0\"\n\
          listen_metrics = \"127.0.0.1:0\"\nkey = \"{key}\"\n\
-         public_origin = \"{ORIGIN}\"\npolicy_path = \"{}\"\n\
-         [runner]\npublic_key = \"{}\"\n[aps.ap1]\npublic_key = \"{}\"\n",
+         public_origin = \"{ORIGIN}\"\npolicy_path = \"{}\"\nsocket = \"{}\"\n\
+         [configs]\nsigning_key = \"{signing}\"\nstate = \"{}\"\n\
+         [rollouts]\nimages = \"{}\"\ngate_secs = {gate_secs}\nroot_key = \"{root}\"\n\
+         stock_password = \"{password}\"\nknown_hosts = \"{hosts}\"\n{}",
         dir.join("policy.json").display(),
-        mac::hex(&identity(KEY_RUNNER).public_key()),
-        mac::hex(&identity(KEY_AP1).public_key())
+        dir.join("sock").display(),
+        dir.join("configs").display(),
+        dir.join("images").display(),
+        ap("ap1", KEY_AP1),
     );
     if ap2 {
-        let k = mac::hex(&identity(KEY_AP2).public_key());
-        text.push_str(&format!("[aps.ap2]\npublic_key = \"{k}\"\n"));
+        text.push_str(&ap("ap2", KEY_AP2));
     }
     text
+}
+
+/// The stand-in for the staging over SSH: it logs what it is asked to
+/// stage, as `<ap> <image>`, takes its time for an image named `slow`, and
+/// fails one named `bad` part way, or finds the AP down for `down`.
+#[derive(Default)]
+struct FakeStage {
+    staged: Mutex<Vec<String>>,
+}
+
+impl Stage for FakeStage {
+    fn stage<'a>(
+        &'a self,
+        target: &'a Target,
+        image: &'a Kept,
+        log: Log<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Staged> + Send + 'a>> {
+        Box::pin(async move {
+            if image.id.contains("down") {
+                return Staged::Untouched(format!(
+                    "{} answers neither its image nor stock",
+                    target.ap
+                ));
+            }
+            self.staged
+                .lock()
+                .unwrap()
+                .push(format!("{} {}", target.ap, image.id));
+            log(format!("staging {} on {}", image.id, target.hostname));
+            if image.id.contains("slow") {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+            }
+            if image.id.contains("bad") {
+                return Staged::Failed("go8.sh failed".into());
+            }
+            log("staged".into());
+            Staged::Done
+        })
+    }
 }
 
 /// A resolver of the names it is given, which counts what it is asked.
@@ -99,11 +164,13 @@ impl Resolve for FakeDns {
     }
 }
 
-/// A controller in this process, alive as long as the runtime, its policy
+/// A controller in this process, alive as long as the runtime, its files
 /// in a directory of its own unless it was given one.
 struct Running {
     c: Controller,
     dns: Arc<FakeDns>,
+    /// Where its files are.
+    dir: PathBuf,
     _rt: Runtime,
     _dir: Option<TempDir>,
 }
@@ -116,6 +183,12 @@ fn controller(timing: Timing) -> Running {
 }
 
 fn controller_in(timing: Timing, dir: &Path) -> Running {
+    managed(timing, dir, 420, Arc::new(FakeStage::default()))
+}
+
+/// A controller with its files in `dir`, its gates `gate_secs` long, its
+/// images staged by `stage`.
+fn managed(timing: Timing, dir: &Path, gate_secs: u64, stage: Arc<FakeStage>) -> Running {
     // Two workers are plenty, and a worker per core in every test of eight
     // test processes at once runs into the threads a cgroup allows.
     let rt = Builder::new_multi_thread()
@@ -123,15 +196,23 @@ fn controller_in(timing: Timing, dir: &Path) -> Running {
         .enable_all()
         .build()
         .unwrap();
-    let config = Config::parse(&config_text("unused.pem", true, dir)).unwrap();
+    let config = Config::parse(&config_text("unused.pem", true, dir, gate_secs)).unwrap();
     let dns = Arc::new(FakeDns::default());
     let resolver: Arc<dyn Resolve> = dns.clone();
+    let stager: Arc<dyn Stage> = stage;
     let c = rt
-        .block_on(start(&config, &identity(KEY_CONTROLLER), timing, resolver))
+        .block_on(start(
+            &config,
+            &identity(KEY_CONTROLLER),
+            timing,
+            resolver,
+            Some(stager),
+        ))
         .unwrap();
     Running {
         c,
         dns,
+        dir: dir.to_owned(),
         _rt: rt,
         _dir: None,
     }
@@ -205,48 +286,24 @@ impl Agent {
         a
     }
 
-    /// The deploy runner of this protocol, which has said Hello.
-    fn runner(addr: SocketAddr) -> Agent {
-        let (mut r, theirs) = Agent::versioned(addr, KEY_RUNNER, PROTOCOL);
-        assert_eq!(theirs, PROTOCOL);
-        let hello = RunnerHello {
-            version: "1.0.0".into(),
-        };
-        r.send_any(&RunnerMsg::Hello(hello)).unwrap();
-        r
-    }
-
     fn send(&mut self, msg: &AgentMsg) -> io::Result<()> {
-        self.send_any(msg)
-    }
-
-    fn send_any(&mut self, msg: &impl serde::Serialize) -> io::Result<()> {
         let mut out = Vec::new();
         write_frame(&mut out, msg)?;
         self.send_bytes(&out)
     }
 
-    /// The runner's next message from the controller other than a ping,
-    /// which is answered.
-    fn expect_runner(&mut self) -> RunnerCtlMsg {
-        let start = Instant::now();
-        loop {
-            assert!(start.elapsed() < WAIT, "no message for the runner");
-            match self.next(decode_frame::<RunnerCtlMsg>).unwrap() {
-                RunnerCtlMsg::Ping(n) => self.send_any(&RunnerMsg::Pong(n)).unwrap(),
-                msg => return msg,
-            }
-        }
-    }
-
-    /// Asserts the runner hears nothing but pings for `wait`.
-    fn runner_hears_nothing(&mut self, wait: Duration) {
+    /// Asserts the agent is sent nothing but pings and syncs for `wait`.
+    fn hears_nothing(&mut self, wait: Duration) {
         self.sock.set_read_timeout(Some(wait)).unwrap();
         let start = Instant::now();
         while start.elapsed() < wait {
-            match self.next(decode_frame::<RunnerCtlMsg>) {
-                Ok(RunnerCtlMsg::Ping(n)) => self.send_any(&RunnerMsg::Pong(n)).unwrap(),
-                Ok(msg) => panic!("the runner was sent {msg:?}"),
+            match self.recv() {
+                Ok(CtlMsg::Ping(n)) => self.send(&AgentMsg::Pong(n)).unwrap(),
+                Ok(CtlMsg::Command(u6e_proto::msg::Command {
+                    id,
+                    kind: CommandKind::SyncBlocks { .. },
+                })) => self.reply(id, true, "synced"),
+                Ok(msg) => panic!("the agent was sent {msg:?}"),
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(e) => panic!("{e}"),
             }
@@ -580,7 +637,11 @@ fn spawn_binary(dir: &TempDir) -> Binary {
     let key = dir.0.join("key.pem");
     fs::write(&key, KEY_CONTROLLER).unwrap();
     let config = dir.0.join("config.toml");
-    fs::write(&config, config_text(key.to_str().unwrap(), false, &dir.0)).unwrap();
+    fs::write(
+        &config,
+        config_text(key.to_str().unwrap(), false, &dir.0, 420),
+    )
+    .unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_u6e-controller"))
         .arg("--config")
         .arg(&config)
@@ -1610,13 +1671,14 @@ fn policy_survives_restart() {
     drop(r);
     fs::write(dir.0.join("policy.json"), "{\"blocked\": [\"02:00\"]}").unwrap();
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
-    let config = Config::parse(&config_text("unused.pem", true, &dir.0)).unwrap();
+    let config = Config::parse(&config_text("unused.pem", true, &dir.0, 420)).unwrap();
     let resolver: Arc<dyn Resolve> = Arc::new(FakeDns::default());
     let started = rt.block_on(start(
         &config,
         &identity(KEY_CONTROLLER),
         Timing::default(),
         resolver,
+        None,
     ));
     let e = started.err().expect("started on a bad policy");
     assert!(e.to_string().contains("policy.json"), "{e}");
@@ -2397,22 +2459,90 @@ fn a_scan_stops_at_its_limit_and_with_its_link() {
 /// never keep or show.
 const SECRET: &str = "wpa_passphrase=never-shown-anywhere";
 
-/// A configuration of `ap` under `seq`, as the runner would send it. The
-/// controller does not check signatures (the APs do), so this one has none
-/// worth the name.
-fn signed(ap: &str, seq: u64, dtim: u8) -> SignedConfig {
-    let radios = vec![RadioConfig {
+/// The public half of the key configurations are signed with.
+fn signing_public() -> [u8; 32] {
+    identity(KEY_SIGNING).public_key()
+}
+
+fn radios(dtim: u8) -> Vec<RadioConfig> {
+    vec![RadioConfig {
         radio: Band::B5,
         text: format!("interface=wlan5\n{SECRET}\ndtim_period={dtim}\n"),
         txpower_dbm: 23,
-    }];
-    SignedConfig {
-        ap: ap.into(),
-        seq,
-        not_after: seq + 1,
-        sha256: config_sha256(&radios),
-        radios,
-        signature: vec![0; 64],
+    }]
+}
+
+/// The hash an image's own configuration is known by.
+fn image_config(n: u8) -> [u8; 32] {
+    config_sha256(&radios(100 + n))
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+/// `local::apply` as root's command runs it, from a thread of its own: the
+/// test's thread plays the AP meanwhile.
+fn apply_in_thread(
+    r: &Running,
+    ap: &str,
+    radios: Vec<RadioConfig>,
+) -> thread::JoinHandle<Result<String, String>> {
+    let (socket, ap) = (r.dir.join("sock"), ap.to_owned());
+    thread::spawn(move || {
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(local::apply(&socket, &ap, radios))
+    })
+}
+
+/// `local::apply` of a configuration no AP is asked to answer.
+fn apply_now(r: &Running, ap: &str, radios: Vec<RadioConfig>) -> Result<String, String> {
+    apply_in_thread(r, ap, radios).join().unwrap()
+}
+
+/// An AP as its agent judges a configuration (`config::verify`, then
+/// `config::replayed` against the last one it applied and its image's build
+/// time, and `config::expired`; one with a radio marked `# refused` stands
+/// for one it finds wrong).
+struct Judge {
+    ap: &'static str,
+    last: u64,
+    built: u64,
+}
+
+impl Judge {
+    /// Answers the next configuration the AP is sent: what it was, and why
+    /// it was refused.
+    fn answer(&mut self, a: &mut Agent) -> (SignedConfig, Result<(), String>) {
+        let CtlMsg::ApplyConfig(c) = a.expect() else {
+            panic!("no configuration");
+        };
+        let verdict = config::verify(&signing_public(), self.ap, &c).and_then(|()| {
+            if c.radios.iter().any(|r| r.text.contains("# refused")) {
+                return Err("a radio's file is wrong".into());
+            }
+            let replay = config::replayed(c.seq, self.last, "the last applied", self.built);
+            replay
+                .or_else(|| config::expired(&c, Some(now_ms())))
+                .map_or(Ok(()), Err)
+        });
+        if verdict.is_ok() {
+            self.last = c.seq;
+        }
+        let detail = match &verdict {
+            Ok(()) => "set in place".to_owned(),
+            Err(why) => format!("refused: {why}"),
+        };
+        a.send(&AgentMsg::ConfigApplied(applied(
+            c.sha256,
+            verdict.is_ok(),
+            &detail,
+        )))
+        .unwrap();
+        (c, verdict)
     }
 }
 
@@ -2437,195 +2567,125 @@ fn running_config(seq: u64, installed: [u8; 32]) -> Snapshot {
     }
 }
 
-/// The key decides the role: an AP's key that speaks as the runner gets an
-/// agent's session, which its runner messages end, and relays nothing; the
-/// runner's key that speaks as an AP gets the runner's session, and no AP
-/// is ever its.
-#[test]
-fn an_ap_key_is_never_the_runner_and_the_runner_key_never_an_ap() {
-    let r = controller(Timing::default());
-    let mut runner = Agent::runner(r.c.agents);
-    wait_for("the runner", || r.c.state.read().runner.is_up());
-    let mut ap1 = Agent::hello(r.c.agents, KEY_AP1, "ap1");
-    ap1.send(&AgentMsg::Key(snapshot(1, Vec::new(), Vec::new())))
+/// An AP up on `image` built at `built`, its first key frame reporting
+/// `installed` and a client, and taken in; it is not checked for its blocks:
+/// what comes next may be a configuration.
+fn ap_on(r: &Running, pem: &str, ap: &str, image: &str, built: u64, installed: [u8; 32]) -> Agent {
+    let manifest = format!("image:     {image}\nbuilt_ms:  {built}\n");
+    let dialed = SystemTime::now();
+    let mut a = Agent::running(r.c.agents, pem, ap, &manifest);
+    a.send(&AgentMsg::Key(running_config(1, installed)))
         .unwrap();
-    wait_for("ap1", || seq_of(&r, "ap1") == Some(1));
-
-    // ap2's key, saying what the runner says.
-    let (mut fake, theirs) = Agent::versioned(r.c.agents, KEY_AP2, PROTOCOL);
-    assert_eq!(theirs, PROTOCOL);
-    let hello = RunnerHello {
-        version: "1.0.0".into(),
-    };
-    fake.send_any(&RunnerMsg::Hello(hello)).unwrap();
-    fake.send_any(&RunnerMsg::ApplyConfig {
-        id: 1,
-        config: signed("ap1", 5, 1),
-    })
-    .unwrap();
-    fake.ends();
-    assert!(!r.c.state.read().ap("ap2").unwrap().is_up());
-
-    // The runner's key, saying what an AP says.
-    let (mut posing, theirs) = Agent::versioned(r.c.agents, KEY_RUNNER, PROTOCOL);
-    assert_eq!(theirs, PROTOCOL);
-    posing
-        .send(&AgentMsg::Hello(Hello {
-            ap: "ap2".into(),
-            manifest: "image: test".into(),
-            kernel: String::new(),
-            hostapd: String::new(),
-            agent: String::new(),
-        }))
-        .unwrap();
-    posing
-        .send(&AgentMsg::Key(snapshot(1, Vec::new(), Vec::new())))
-        .unwrap();
-    // It took the runner's link over, as a newer runner connection does.
-    runner.ends();
-    let state = r.c.state.read();
-    assert!(state.runner.is_up());
-    assert!(!state.ap("ap2").unwrap().is_up());
-    assert!(state.ap("ap2").unwrap().snapshot.is_none());
-    drop(state);
-
-    // ap1 was relayed nothing on the way: the first configuration it gets
-    // is the real runner's.
-    let mut runner = Agent::runner(r.c.agents);
-    wait_for("the runner again", || {
-        r.c.state.read().runner.version.is_some()
+    wait_for("the AP's session", || {
+        let state = r.c.state.read();
+        let entry = state.ap(ap).unwrap();
+        entry.snapshot.is_some() && entry.connected_since.is_some_and(|t| t >= dialed)
     });
-    let c = signed("ap1", 6, 2);
-    runner
-        .send_any(&RunnerMsg::ApplyConfig {
-            id: 2,
-            config: c.clone(),
-        })
-        .unwrap();
-    assert_eq!(ap1.expect(), CtlMsg::ApplyConfig(c));
+    a
 }
 
-/// A configuration goes to the AP it is signed for and the AP's answer back
-/// to the runner; the controller keeps its hash and sequence (on disk too),
-/// never its text. What cannot go, or is not answered in time, is answered
-/// by the controller.
+/// A configuration is signed with the signing key (not the link's) for the
+/// AP alone, sent, and the AP's answer is the local caller's; the controller
+/// keeps its hash and sequence (on disk too), never its text but in the
+/// latest's own file, its alone. What cannot go is refused before anything
+/// is signed, one at a time; one not answered in time is answered by the
+/// controller.
 #[test]
-fn a_configuration_is_relayed_and_kept_by_its_hash_alone() {
-    let dir = TempDir::new("relay");
+fn a_configuration_is_signed_sent_and_kept_by_its_hash_alone() {
     let timing = Timing {
         ping: Duration::from_millis(100),
         apply: Duration::from_millis(500),
         ..Timing::default()
     };
-    let r = controller_in(timing, &dir.0);
-    let mut runner = Agent::runner(r.c.agents);
-    let mut ap1 = Agent::hello(r.c.agents, KEY_AP1, "ap1");
-    ap1.send(&AgentMsg::Key(snapshot(1, Vec::new(), Vec::new())))
-        .unwrap();
+    let r = controller(timing);
+    let mut ap1 = ap_on(&r, KEY_AP1, "ap1", "img-1-ap1", 1, image_config(1));
     assert_eq!(ap1.expect_sync(), Vec::<[u8; 6]>::new());
 
-    let c = signed("ap1", 100, 1);
-    let sha = c.sha256;
-    runner
-        .send_any(&RunnerMsg::ApplyConfig {
-            id: 7,
-            config: c.clone(),
-        })
-        .unwrap();
-    assert_eq!(ap1.expect(), CtlMsg::ApplyConfig(c.clone()));
+    let asked = apply_in_thread(&r, "ap1", radios(1));
+    let CtlMsg::ApplyConfig(c) = ap1.expect() else {
+        panic!("no configuration");
+    };
+    assert_eq!(c.sha256, config_sha256(&radios(1)));
+    assert!(c.seq + 60_000 > now_ms() && c.seq <= now_ms());
+    assert_eq!(config::verify(&signing_public(), "ap1", &c), Ok(()));
+    let link = identity(KEY_CONTROLLER).public_key();
+    assert_eq!(
+        config::verify(&link, "ap1", &c),
+        Err("not signed by the configuration key".into())
+    );
+    assert_eq!(
+        config::verify(&signing_public(), "ap2", &c),
+        Err("for another AP (ap1)".into())
+    );
     // One at a time: a second while the first is on its way is refused.
-    runner
-        .send_any(&RunnerMsg::ApplyConfig {
-            id: 8,
-            config: signed("ap1", 101, 2),
-        })
-        .unwrap();
-    match runner.expect_runner() {
-        RunnerCtlMsg::ConfigApplied { id: 8, result } => {
-            assert!(!result.ok);
-            assert_eq!(
-                result.detail,
-                "a configuration for ap1 is on its way already"
-            );
-        }
-        other => panic!("{other:?}"),
-    }
-    ap1.send(&AgentMsg::ConfigApplied(applied(sha, true, "set in place")))
-        .unwrap();
     assert_eq!(
-        runner.expect_runner(),
-        RunnerCtlMsg::ConfigApplied {
-            id: 7,
-            result: applied(sha, true, "set in place"),
-        }
+        apply_now(&r, "ap1", radios(2)),
+        Err("a configuration for ap1 is on its way already".into())
     );
-    let config = json_get(r.c.http, "/api/config");
-    let hex = mac::hex(&sha);
-    assert_eq!(config["ap1"]["acked"], json!({"sha256": hex, "seq": 100}));
-    wait_for("the policy saved", || dir.0.join("policy.json").exists());
-    assert_eq!(
-        config["ap1"]["last"]["radios"],
-        json!([{"band": "5", "mechanism": "in place"}])
-    );
-    let saved: Value =
-        serde_json::from_str(&fs::read_to_string(dir.0.join("policy.json")).unwrap()).unwrap();
-    assert_eq!(
-        saved["configs"],
-        json!({"ap1": {"sha256": hex, "seq": 100}})
-    );
-
-    // For an AP that never connected: answered at once.
-    runner
-        .send_any(&RunnerMsg::ApplyConfig {
-            id: 9,
-            config: signed("ap9", 102, 3),
-        })
-        .unwrap();
-    match runner.expect_runner() {
-        RunnerCtlMsg::ConfigApplied { id: 9, result } => {
-            assert_eq!(result.detail, "no AP has the host name ap9");
-        }
-        other => panic!("{other:?}"),
-    }
-
-    // Not answered in time: the runner hears so; the late answer still
-    // counts for what the AP acknowledged.
-    let late = signed("ap1", 103, 4);
-    runner
-        .send_any(&RunnerMsg::ApplyConfig {
-            id: 10,
-            config: late.clone(),
-        })
-        .unwrap();
-    assert_eq!(ap1.expect(), CtlMsg::ApplyConfig(late.clone()));
-    match runner.expect_runner() {
-        RunnerCtlMsg::ConfigApplied { id: 10, result } => {
-            assert_eq!(
-                (result.ok, result.detail.as_str()),
-                (false, "no answer from ap1 in 500ms")
-            );
-        }
-        other => panic!("{other:?}"),
-    }
     ap1.send(&AgentMsg::ConfigApplied(applied(
-        late.sha256,
+        c.sha256,
+        true,
+        "set in place",
+    )))
+    .unwrap();
+    let done = asked.join().unwrap().unwrap();
+    assert_eq!(
+        done,
+        format!(
+            "ap1: {} (5 GHz in place): set in place",
+            mac::hex(&c.sha256)
+        )
+    );
+    let hex = mac::hex(&c.sha256);
+    let config = json_get(r.c.http, "/api/config");
+    assert_eq!(config["ap1"]["acked"], json!({"sha256": hex, "seq": c.seq}));
+    assert_eq!(
+        config["ap1"]["latest"],
+        json!({"sha256": hex, "seq": c.seq})
+    );
+    wait_for("the policy saved", || {
+        fs::read_to_string(r.dir.join("policy.json")).is_ok_and(|p| p.contains(&hex))
+    });
+    let latest = r.dir.join("configs/latest-ap1");
+    let mode = fs::metadata(&latest).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+
+    // Refused before anything is signed.
+    assert_eq!(apply_now(&r, "ap9", radios(3)), Err("no AP ap9".into()));
+    assert_eq!(
+        apply_now(&r, "ap2", radios(3)),
+        Err("ap2 is not connected".into())
+    );
+    assert_eq!(json_get(r.c.http, "/api/config")["ap2"], json!({}));
+
+    // Not answered in time: the caller hears so; the late answer still
+    // counts for what the AP acknowledged.
+    let late = apply_in_thread(&r, "ap1", radios(4));
+    let CtlMsg::ApplyConfig(c) = ap1.expect() else {
+        panic!("no configuration");
+    };
+    assert_eq!(
+        late.join().unwrap(),
+        Err("ap1: no answer from ap1 in 500ms".into())
+    );
+    ap1.send(&AgentMsg::ConfigApplied(applied(
+        c.sha256,
         true,
         "restarted",
     )))
     .unwrap();
     wait_for("the late answer", || {
         let state = r.c.state.read();
-        state.ap("ap1").unwrap().acked.map(|a| a.seq) == Some(103)
+        state.ap("ap1").unwrap().acked.map(|a| a.seq) == Some(c.seq)
     });
-    runner.runner_hears_nothing(Duration::from_millis(300));
 
-    // Nothing the controller keeps or shows holds the text.
+    // Nothing the controller shows or keeps in its policy holds the text.
     for body in [
         http_get(r.c.http, "/api/config"),
         http_get(r.c.http, "/api/aps"),
         http_get(r.c.http, "/api/events"),
         http_get(r.c.metrics, "/metrics"),
-        fs::read_to_string(dir.0.join("policy.json")).unwrap(),
+        fs::read_to_string(r.dir.join("policy.json")).unwrap(),
     ] {
         assert!(!body.contains("never-shown"), "{body}");
     }
@@ -2633,88 +2693,143 @@ fn a_configuration_is_relayed_and_kept_by_its_hash_alone() {
         metrics_of(&r, "wifi_config_applies_total"),
         [
             "wifi_config_applies_total{result=\"ok\"} 2",
-            "wifi_config_applies_total{result=\"failed\"} 2",
+            "wifi_config_applies_total{result=\"failed\"} 0",
             "wifi_config_applies_total{result=\"timeout\"} 1",
         ]
     );
 }
 
-/// An AP that runs another configuration than the runner's latest for it
-/// has the runner asked to sign that one again: when the runner tells its
-/// latest as it connects, and when the AP comes back while the runner is
-/// connected; unless its image was built after that configuration was
-/// signed, whose own is then the newer.
+/// No configuration is ever applied twice: after a reboot onto the same
+/// image, the latest one is signed again under a newer sequence number;
+/// after a reboot onto an image built since, what was signed before is a
+/// replay to it (its build time is the floor), and nothing is signed again.
 #[test]
-fn an_ap_on_another_configuration_than_the_runners_latest_is_repushed() {
+fn configurations_are_never_replayed_not_even_across_a_reboot() {
     let r = controller(Timing::default());
-    let latest = signed("ap1", 1_000, 1).sha256;
-    let installed = signed("ap1", 1, 9).sha256;
-
-    // The runner, connecting, tells its latest: the AP runs another.
-    let older = "image: old\nbuilt_ms: 500\n";
-    let mut ap1 = Agent::running(r.c.agents, KEY_AP1, "ap1", older);
-    ap1.send(&AgentMsg::Key(running_config(1, installed)))
-        .unwrap();
-    ap1.expect_sync();
-    let mut runner = Agent::runner(r.c.agents);
-    runner
-        .send_any(&RunnerMsg::Latest {
-            ap: "ap1".into(),
-            seq: 1_000,
-            sha256: latest,
-        })
-        .unwrap();
-    let repush = RunnerCtlMsg::Repush {
-        ap: "ap1".into(),
-        installed: Some(installed),
+    let built = now_ms() - 60_000;
+    let mut ap1 = ap_on(&r, KEY_AP1, "ap1", "img-1-ap1", built, image_config(1));
+    let mut judge = Judge {
+        ap: "ap1",
+        last: 0,
+        built,
     };
-    assert_eq!(runner.expect_runner(), repush);
+    let asked = apply_in_thread(&r, "ap1", radios(1));
+    let (first, verdict) = judge.answer(&mut ap1);
+    assert_eq!(verdict, Ok(()));
+    asked.join().unwrap().unwrap();
+    assert!(first.seq > built);
+    // Sent again, it is a replay.
+    assert!(config::replayed(first.seq, judge.last, "the last applied", built).is_some());
+
+    // A reboot onto the same image: back on the image's configuration, the
+    // latest is signed again, newer, and applies.
+    let mut ap1 = ap_on(&r, KEY_AP1, "ap1", "img-1-ap1", built, image_config(1));
+    let mut rebooted = Judge {
+        ap: "ap1",
+        last: 0,
+        built,
+    };
+    let (again, verdict) = rebooted.answer(&mut ap1);
+    assert_eq!((again.sha256, verdict), (first.sha256, Ok(())));
+    assert!(again.seq > first.seq, "{} after {}", again.seq, first.seq);
+
+    // A reboot onto an image built after it: the image's configuration is
+    // the newer and stands; what was signed before is a replay to it.
+    thread::sleep(Duration::from_millis(5));
+    let rebuilt = now_ms();
+    let mut ap1 = ap_on(&r, KEY_AP1, "ap1", "img-2-ap1", rebuilt, image_config(2));
+    ap1.hears_nothing(Duration::from_millis(400));
+    assert!(!r.c.state.read().ap("ap1").unwrap().drifts());
     assert_eq!(
-        metrics_of(&r, "wifi_config_drift"),
-        ["wifi_config_drift{ap=\"ap1\"} 1"]
+        config::replayed(again.seq, 0, "the last applied", rebuilt),
+        Some(format!(
+            "replayed: sequence {} is not past {rebuilt}, this image's build time",
+            again.seq
+        ))
     );
-    let config = json_get(r.c.http, "/api/config");
-    assert_eq!(
-        config["ap1"]["latest"],
-        json!({"sha256": mac::hex(&latest), "seq": 1_000})
-    );
-
-    // Back again, the runner connected: asked at once.
-    let mut ap1 = Agent::running(r.c.agents, KEY_AP1, "ap1", older);
-    ap1.send(&AgentMsg::Key(running_config(1, installed)))
-        .unwrap();
-    ap1.expect_sync();
-    assert_eq!(runner.expect_runner(), repush);
-
-    // Back on the latest: no drift, nothing asked.
-    let mut ap1 = Agent::running(r.c.agents, KEY_AP1, "ap1", older);
-    ap1.send(&AgentMsg::Key(running_config(1, latest))).unwrap();
-    ap1.expect_sync();
-    runner.runner_hears_nothing(Duration::from_millis(300));
-
-    // An image built after the configuration was signed: its own stands.
-    let newer = "image: new\nbuilt_ms: 2000\n";
-    let mut ap1 = Agent::running(r.c.agents, KEY_AP1, "ap1", newer);
-    ap1.send(&AgentMsg::Key(running_config(1, installed)))
-        .unwrap();
-    ap1.expect_sync();
-    runner.runner_hears_nothing(Duration::from_millis(300));
     assert_eq!(
         metrics_of(&r, "wifi_config_drift"),
         ["wifi_config_drift{ap=\"ap1\"} 0"]
     );
 }
 
+/// Only the latest configuration signed for an AP is signed again, whatever
+/// the AP acknowledged: one that refused the latest is offered it again,
+/// never the older one it applied.
+#[test]
+fn the_latest_is_signed_again_never_an_older_one() {
+    let r = controller(Timing::default());
+    let built = now_ms() - 60_000;
+    let mut ap1 = ap_on(&r, KEY_AP1, "ap1", "img-1-ap1", built, image_config(1));
+    let mut judge = Judge {
+        ap: "ap1",
+        last: 0,
+        built,
+    };
+    let asked = apply_in_thread(&r, "ap1", radios(1));
+    assert_eq!(judge.answer(&mut ap1).1, Ok(()));
+    asked.join().unwrap().unwrap();
+    let mut wrong = radios(2);
+    wrong[0].text.push_str("# refused\n");
+    let asked = apply_in_thread(&r, "ap1", wrong.clone());
+    let (refused, _) = judge.answer(&mut ap1);
+    assert_eq!(
+        asked.join().unwrap(),
+        Err("ap1: refused: a radio's file is wrong".into())
+    );
+    assert_eq!(
+        metrics_of(&r, "wifi_config_drift"),
+        ["wifi_config_drift{ap=\"ap1\"} 1"]
+    );
+
+    // A reboot onto its image: the latest, the one it refused, comes again.
+    let mut ap1 = ap_on(&r, KEY_AP1, "ap1", "img-1-ap1", built, image_config(1));
+    let CtlMsg::ApplyConfig(c) = ap1.expect() else {
+        panic!("no configuration");
+    };
+    assert_eq!(c.sha256, config_sha256(&wrong));
+    assert!(c.seq > refused.seq);
+    let events = http_get(r.c.http, "/api/events");
+    assert!(events.contains("not the latest"), "{events}");
+}
+
+/// The latest configuration outlives the controller: after a restart, an
+/// AP back on its image's configuration is signed the latest again, newer.
+#[test]
+fn a_restarted_controller_still_signs_its_latest_again() {
+    let dir = TempDir::new("restart-latest");
+    let r = controller_in(Timing::default(), &dir.0);
+    let built = now_ms() - 60_000;
+    let mut ap1 = ap_on(&r, KEY_AP1, "ap1", "img-1-ap1", built, image_config(1));
+    let mut judge = Judge {
+        ap: "ap1",
+        last: 0,
+        built,
+    };
+    let asked = apply_in_thread(&r, "ap1", radios(1));
+    let (first, _) = judge.answer(&mut ap1);
+    asked.join().unwrap().unwrap();
+    drop(ap1);
+    drop(r);
+    let r = controller_in(Timing::default(), &dir.0);
+    let mut ap1 = ap_on(&r, KEY_AP1, "ap1", "img-1-ap1", built, image_config(1));
+    let mut rebooted = Judge {
+        ap: "ap1",
+        last: 0,
+        built,
+    };
+    let (again, verdict) = rebooted.answer(&mut ap1);
+    assert_eq!((again.sha256, verdict), (first.sha256, Ok(())));
+    assert!(again.seq > first.seq);
+}
+
 /// An AP's key decides which AP a session is: an agent that names itself by
 /// another host name, in its Hello or later, is turned away and counted,
-/// and nothing is relayed to it. Here ap2's key claims ap1's host name while
+/// and nothing is sent to it. Here ap2's key claims ap1's host name while
 /// ap1 is away.
 #[test]
 fn an_agent_naming_another_ap_is_turned_away() {
     let r = controller(Timing::default());
-    let mut runner = Agent::runner(r.c.agents);
-    wait_for("the runner", || r.c.state.read().runner.is_up());
-
     let mut impostor = Agent::hello(r.c.agents, KEY_AP2, "ap1");
     impostor
         .send(&AgentMsg::Key(snapshot(1, Vec::new(), Vec::new())))
@@ -2725,22 +2840,11 @@ fn an_agent_naming_another_ap_is_turned_away() {
     assert!(!state.ap("ap2").unwrap().is_up());
     drop(state);
 
-    // ap1's configuration, with ap1 away: not relayed to the impostor.
-    runner
-        .send_any(&RunnerMsg::ApplyConfig {
-            id: 1,
-            config: signed("ap1", 5, 1),
-        })
-        .unwrap();
-    match runner.expect_runner() {
-        RunnerCtlMsg::ConfigApplied { id: 1, result } => {
-            assert_eq!(
-                (result.ok, result.detail.as_str()),
-                (false, "ap1 is not connected")
-            );
-        }
-        other => panic!("{other:?}"),
-    }
+    // ap1's configuration, with ap1 away: not sent to the impostor.
+    assert_eq!(
+        apply_now(&r, "ap1", radios(1)),
+        Err("ap1 is not connected".into())
+    );
 
     // ap2's own key, its own name first and another one later.
     let mut ap2 = Agent::hello(r.c.agents, KEY_AP2, "ap2");
@@ -2769,373 +2873,557 @@ fn an_agent_naming_another_ap_is_turned_away() {
     );
 }
 
-/// The image the UI's admin asks for goes to the runner with the image the
-/// AP runs now; the gate opens once a new session of the AP runs it with
-/// its radios up and clients back, and fails at once when its agent cannot
-/// be talked to; the runner's log and result end the rollout.
+/// An AP that came back before its clock was synchronized refuses the
+/// latest configuration (it applies nothing until then): once it reports
+/// its clock synchronized, the latest is signed again, once.
 #[test]
-fn an_upgrade_is_gated_by_the_ap_coming_back() {
+fn an_ap_whose_clock_comes_is_signed_the_latest_again() {
     let r = controller(Timing::default());
-    let admin = format!("{SAME_SITE}{ADMIN}");
-    let upgrade = "/api/aps/ap1/upgrade";
-    let body = r#"{"image_id": "img-new"}"#;
-    assert_eq!(post(r.c.http, upgrade, ADMIN, body).0, 403);
-    assert_eq!(post(r.c.http, upgrade, SAME_SITE, body).0, 403);
-    let (status, v) = post(r.c.http, upgrade, &admin, body);
-    assert_eq!(
-        (status, &v["error"]),
-        (409, &json!("the deploy runner is not connected"))
-    );
+    let built = now_ms() - 60_000;
+    let mut ap1 = ap_on(&r, KEY_AP1, "ap1", "img-1-ap1", built, image_config(1));
+    let mut judge = Judge {
+        ap: "ap1",
+        last: 0,
+        built,
+    };
+    let asked = apply_in_thread(&r, "ap1", radios(1));
+    assert_eq!(judge.answer(&mut ap1).1, Ok(()));
+    asked.join().unwrap().unwrap();
 
-    let mut runner = Agent::runner(r.c.agents);
-    wait_for("the runner", || r.c.state.read().runner.is_up());
-    let mut ap1 = Agent::running(r.c.agents, KEY_AP1, "ap1", "image: img-old\n");
-    let s = snapshot(1, vec![bss("wlan5", "Guest")], vec![station(MAC, 0, -54)]);
-    ap1.send(&AgentMsg::Key(s.clone())).unwrap();
-    ap1.expect_sync();
-    let (status, v) = post(r.c.http, upgrade, &admin, r#"{"image_id": "img-old"}"#);
-    assert_eq!(
-        (status, &v["error"]),
-        (409, &json!("ap1 runs img-old already"))
-    );
-    assert_eq!(
-        post(r.c.http, upgrade, &admin, r#"{"image_id": "../x"}"#).0,
-        400
-    );
-
-    let (status, v) = post(r.c.http, upgrade, &admin, body);
-    assert_eq!(status, 202, "{v}");
-    let id = v["id"].as_u64().unwrap();
-    assert_eq!(
-        runner.expect_runner(),
-        RunnerCtlMsg::Rollout(RolloutRequest {
-            id,
-            ap: "ap1".into(),
-            image_id: "img-new".into(),
-            previous: "img-old".into(),
-            user: "alice".into(),
-        })
-    );
-    let (status, v) = post(r.c.http, upgrade, &admin, body);
-    assert_eq!(
-        (status, &v["error"]),
-        (409, &json!("the rollout of img-new to ap1 is not over"))
-    );
-
-    // The session that was up when it was asked never passes the gate.
-    ap1.send(&AgentMsg::Key(snapshot(
-        2,
-        s.bsss.clone(),
-        s.stations.clone(),
-    )))
-    .unwrap();
-    // Back with the image and its radio, but no client yet: not yet.
-    let mut ap1 = Agent::running(r.c.agents, KEY_AP1, "ap1", "image: img-new\n");
-    ap1.send(&AgentMsg::Key(snapshot(1, s.bsss.clone(), Vec::new())))
-        .unwrap();
-    ap1.expect_sync();
-    runner.runner_hears_nothing(Duration::from_millis(300));
-    ap1.send(&AgentMsg::Key(s.clone())).unwrap();
-    match runner.expect_runner() {
-        RunnerCtlMsg::RolloutGate {
-            id: gated,
-            healthy,
-            detail,
-        } => {
-            assert_eq!((gated, healthy), (id, true));
-            assert_eq!(
-                detail,
-                "back with img-new: 1 radios up, 1 clients on the site"
-            );
-        }
-        other => panic!("{other:?}"),
-    }
-    runner
-        .send_any(&RunnerMsg::RolloutLog {
-            id,
-            line: "staged".into(),
-        })
-        .unwrap();
-    runner
-        .send_any(&RunnerMsg::RolloutResult(RolloutResult {
-            id,
-            outcome: RolloutOutcome::Done,
-            detail: "healthy".into(),
-        }))
-        .unwrap();
-    // Acknowledged once the policy file holds it.
-    assert_eq!(runner.expect_runner(), RunnerCtlMsg::RolloutAck { id });
-    assert!(r.c.state.read().rollouts.iter().all(|r| !r.is_open()));
-    let rollouts = json_get(r.c.http, "/api/rollouts");
-    let done = &rollouts[id.to_string()];
-    assert_eq!(done["log"], json!(["staged"]));
-    assert_eq!(
-        done["result"],
-        json!({"outcome": "done", "detail": "healthy"})
-    );
-    assert_eq!(done["gate"]["healthy"], true);
-
-    // The next one: the AP comes back with an agent this controller turns
-    // away, which can never pass.
-    let (status, v) = post(r.c.http, upgrade, &admin, r#"{"image_id": "img-next"}"#);
-    assert_eq!(status, 202, "{v}");
-    let id = v["id"].as_u64().unwrap();
-    assert!(matches!(runner.expect_runner(), RunnerCtlMsg::Rollout(_)));
-    let (mut other, _) = Agent::versioned(r.c.agents, KEY_AP1, PROTOCOL + 1);
-    other.ends();
-    match runner.expect_runner() {
-        RunnerCtlMsg::RolloutGate {
-            id: gated,
-            healthy,
-            detail,
-        } => {
-            assert_eq!((gated, healthy), (id, false));
-            assert!(
-                detail.contains(&format!("protocol {}", PROTOCOL + 1)),
-                "{detail}"
-            );
-        }
-        other => panic!("{other:?}"),
-    }
-    runner
-        .send_any(&RunnerMsg::RolloutResult(RolloutResult {
-            id,
-            outcome: RolloutOutcome::RolledBack,
-            detail: "img-new staged again".into(),
-        }))
-        .unwrap();
-    assert_eq!(runner.expect_runner(), RunnerCtlMsg::RolloutAck { id });
-    // Sent again, as a runner does until it hears the acknowledgement: it
-    // is acknowledged again and counted once.
-    runner
-        .send_any(&RunnerMsg::RolloutResult(RolloutResult {
-            id,
-            outcome: RolloutOutcome::RolledBack,
-            detail: "img-new staged again".into(),
-        }))
-        .unwrap();
-    assert_eq!(runner.expect_runner(), RunnerCtlMsg::RolloutAck { id });
-    assert_eq!(
-        metrics_of(&r, "wifi_rollout_last_failure_timestamp_seconds").len(),
-        1
-    );
-    let rolled = metrics_of(&r, "wifi_rollouts_total");
-    assert!(rolled.contains(&"wifi_rollouts_total{outcome=\"done\"} 1".to_owned()));
-    assert!(rolled.contains(&"wifi_rollouts_total{outcome=\"rolled_back\"} 1".to_owned()));
-    let events = http_get(r.c.http, "/api/events");
-    assert!(
-        events.contains("img-next: rolled back: img-new staged again"),
-        "{events}"
-    );
-
-    // A rollout the runner's local caller asks for comes back as the
-    // controller's, with the image the AP last said it runs (none since the
-    // refused dial, until it is back).
-    let mut ap1 = Agent::running(r.c.agents, KEY_AP1, "ap1", "image: img-new\n");
-    ap1.send(&AgentMsg::Key(s.clone())).unwrap();
-    ap1.expect_sync();
-    runner
-        .send_any(&RunnerMsg::RolloutAsk {
-            ap: "ap1".into(),
-            image_id: "img-x".into(),
-            user: "root".into(),
-        })
-        .unwrap();
-    match runner.expect_runner() {
-        RunnerCtlMsg::Rollout(req) => {
-            assert_eq!(
-                (
-                    req.ap.as_str(),
-                    req.image_id.as_str(),
-                    req.previous.as_str(),
-                    req.user.as_str()
-                ),
-                ("ap1", "img-x", "img-new", "root")
-            );
-        }
-        other => panic!("{other:?}"),
-    }
-}
-
-/// An AP that came back before its clock was synchronized refused the
-/// runner's latest (it applies nothing until then): once it reports its clock
-/// synchronized, the runner is asked to sign that latest again, once.
-#[test]
-fn an_ap_whose_clock_comes_is_asked_again_for_the_latest() {
-    let r = controller(Timing::default());
-    let latest = signed("ap1", 1_000, 1).sha256;
-    let installed = signed("ap1", 1, 9).sha256;
-    let mut runner = Agent::runner(r.c.agents);
-    runner
-        .send_any(&RunnerMsg::Latest {
-            ap: "ap1".into(),
-            seq: 1_000,
-            sha256: latest,
-        })
-        .unwrap();
-    let older = "image: old\nbuilt_ms: 500\n";
-    let mut ap1 = Agent::running(r.c.agents, KEY_AP1, "ap1", older);
+    let manifest = format!("image:     img-1-ap1\nbuilt_ms:  {built}\n");
+    let mut ap1 = Agent::running(r.c.agents, KEY_AP1, "ap1", &manifest);
     let unsynced = Snapshot {
         clock_synced: false,
-        ..running_config(1, installed)
+        ..running_config(1, image_config(1))
     };
     ap1.send(&AgentMsg::Key(unsynced.clone())).unwrap();
-    ap1.expect_sync();
-    let repush = RunnerCtlMsg::Repush {
-        ap: "ap1".into(),
-        installed: Some(installed),
+    // Sent at its first key frame, and refused for its clock.
+    let CtlMsg::ApplyConfig(c) = ap1.expect() else {
+        panic!("no configuration");
     };
-    assert_eq!(runner.expect_runner(), repush);
+    let why = config::expired(&c, None).unwrap();
+    ap1.send(&AgentMsg::ConfigApplied(applied(c.sha256, false, &why)))
+        .unwrap();
     // Still unsynchronized: nothing new.
     ap1.send(&AgentMsg::Key(Snapshot { seq: 2, ..unsynced }))
         .unwrap();
-    runner.runner_hears_nothing(Duration::from_millis(300));
-    // Synchronized: asked again, and only then.
-    ap1.send(&AgentMsg::Key(running_config(3, installed)))
+    ap1.hears_nothing(Duration::from_millis(300));
+    // Synchronized: signed again, and only then.
+    ap1.send(&AgentMsg::Key(running_config(3, image_config(1))))
         .unwrap();
-    assert_eq!(runner.expect_runner(), repush);
-    ap1.send(&AgentMsg::Key(running_config(4, installed)))
+    let mut rebooted = Judge {
+        ap: "ap1",
+        last: 0,
+        built,
+    };
+    let (again, verdict) = rebooted.answer(&mut ap1);
+    assert_eq!(verdict, Ok(()));
+    assert!(again.seq > c.seq);
+    ap1.send(&AgentMsg::Key(running_config(4, again.sha256)))
         .unwrap();
-    runner.runner_hears_nothing(Duration::from_millis(300));
+    ap1.hears_nothing(Duration::from_millis(300));
 }
 
-/// A rollout the runner never says it took on (lost with the session it was
-/// sent on) is closed as not started once `Timing::start` is up, which
-/// raises the failure alert and frees the next upgrade; one it took on is
-/// not. The runner's own word on one closed so, which it took on late,
-/// stands over the controller's.
-#[test]
-fn a_rollout_the_runner_never_takes_on_is_closed() {
-    let dir = TempDir::new("unstarted");
-    let timing = Timing {
-        start: Duration::from_millis(400),
-        ..Timing::default()
-    };
-    let r = controller_in(timing, &dir.0);
-    let admin = format!("{SAME_SITE}{ADMIN}");
-    let upgrade = "/api/aps/ap1/upgrade";
-    let mut runner = Agent::runner(r.c.agents);
-    wait_for("the runner", || r.c.state.read().runner.is_up());
-    let mut ap1 = Agent::running(r.c.agents, KEY_AP1, "ap1", "image: img-old\n");
-    let s = snapshot(1, vec![bss("wlan5", "Guest")], vec![station(MAC, 0, -54)]);
-    ap1.send(&AgentMsg::Key(s)).unwrap();
-    ap1.expect_sync();
+/// An image as the build keeps it, `<dir>/<id>/`: its MANIFEST naming `ap`
+/// and the four files it lists, each its name and the id.
+fn build_image(dir: &Path, id: &str, ap: &str) -> PathBuf {
+    let image = dir.join("build").join(id);
+    fs::create_dir_all(&image).unwrap();
+    let mut manifest = format!("ap:        {ap} (u6e-{ap}, 192.0.2.16/24)\nkernel:    x\n");
+    for name in ["shim.bin", "u6e.dtb", "u6e.initrd", "Image"] {
+        let body = format!("{name} of {id}");
+        fs::write(image.join(name), &body).unwrap();
+        let sha = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, body.as_bytes());
+        manifest += &format!("{}  out/{name}\n", mac::hex(sha.as_ref()));
+    }
+    fs::write(image.join("MANIFEST"), manifest).unwrap();
+    image
+}
 
-    let (status, v) = post(r.c.http, upgrade, &admin, r#"{"image_id": "img-a"}"#);
-    assert_eq!(status, 202, "{v}");
-    let lost = v["id"].as_u64().unwrap();
-    assert!(matches!(runner.expect_runner(), RunnerCtlMsg::Rollout(_)));
-    let outcome = |id: u64| json_get(r.c.http, "/api/rollouts")[id.to_string()]["result"].clone();
-    wait_for("closed as not started", || {
-        outcome(lost)["outcome"] == "not_started"
-    });
+/// Hands the controller image `id` of `ap`, as root's `image add` does.
+fn keep(r: &Running, id: &str, ap: &str) -> Result<String, String> {
+    let image = build_image(&r.dir, id, ap);
+    r._rt
+        .block_on(local::add_image(&r.dir.join("sock"), &image))
+}
+
+fn kept(r: &Running, ap: &str) -> Vec<String> {
+    let state = r.c.state.read();
+    let kept = state.kept.as_ref().unwrap();
+    kept.get(ap).cloned().unwrap_or_default()
+}
+
+/// An image is kept only whole and as its MANIFEST lists it, for an AP of
+/// the configuration; the store keeps what each AP runs and its newest three.
+#[test]
+fn an_image_is_kept_whole_and_pruned_by_the_rule() {
+    let r = controller(Timing::default());
     assert_eq!(
-        outcome(lost)["detail"],
-        "the runner did not take it on in 400ms"
+        keep(&r, "img-1-ap1", "ap1"),
+        Ok("img-1-ap1 kept for ap1".into())
     );
+    assert_eq!(
+        keep(&r, "img-1-ap1", "ap1"),
+        Ok("img-1-ap1 is kept already".into())
+    );
+    assert_eq!(
+        keep(&r, "img-1-ap9", "ap9"),
+        Err("the MANIFEST names ap9, which is no configured AP".into())
+    );
+    let bad = build_image(&r.dir, "img-2-ap1", "ap1");
+    fs::write(bad.join("u6e.dtb"), "another dtb").unwrap();
+    assert_eq!(
+        r._rt.block_on(local::add_image(&r.dir.join("sock"), &bad)),
+        Err("u6e.dtb is not the file the MANIFEST lists".into())
+    );
+    assert_eq!(kept(&r, "ap1"), ["img-1-ap1"]);
+    assert!(!r.dir.join("images/img-2-ap1").exists());
+
+    // ap1 runs its oldest: kept, with the newest three.
+    let _ap1 = ap_on(&r, KEY_AP1, "ap1", "img-1-ap1", 1, image_config(1));
+    wait_for("ap1", || r.c.state.read().images.contains_key("ap1"));
+    for id in ["img-3-ap1", "img-4-ap1", "img-5-ap1", "img-6-ap1"] {
+        keep(&r, id, "ap1").unwrap();
+    }
+    assert_eq!(
+        kept(&r, "ap1"),
+        ["img-1-ap1", "img-4-ap1", "img-5-ap1", "img-6-ap1"]
+    );
+    let events = http_get(r.c.http, "/api/events");
+    assert!(events.contains("img-3-ap1 pruned"), "{events}");
+    assert_eq!(
+        metrics_of(&r, "wifi_images_kept"),
+        ["wifi_images_kept{ap=\"ap1\"} 4"]
+    );
+    let manage = json_get(r.c.http, "/api/manage");
+    assert_eq!(manage["images"]["ap1"]["running"], "img-1-ap1");
+}
+
+/// The rollout of `ap`'s newest image, as an admin asks for it: its status
+/// and its body.
+fn upgrade(r: &Running, ap: &str, image: &str) -> (u16, Value) {
+    let admin = format!("{SAME_SITE}{ADMIN}");
+    let body = format!("{{\"image_id\": \"{image}\"}}");
+    post(r.c.http, &format!("/api/aps/{ap}/upgrade"), &admin, &body)
+}
+
+/// How rollout `id` ended, as `/api/rollouts` says.
+fn result_of(r: &Running, id: u64) -> Value {
+    json_get(r.c.http, "/api/rollouts")[id.to_string()]["result"].clone()
+}
+
+fn wait_result(r: &Running, id: u64) -> Value {
+    wait_for("the rollout's end", || !result_of(r, id).is_null());
+    result_of(r, id)
+}
+
+fn step_of(r: &Running, id: u64) -> Value {
+    json_get(r.c.http, "/api/rollouts")[id.to_string()]["phase"]["step"].clone()
+}
+
+/// The Upgrade rolls out the AP's newest kept image, and only that: staged
+/// once, then done once the AP is back with it, its radios up and its
+/// clients back; the AP runs it from then on.
+#[test]
+fn an_upgrade_rolls_out_the_newest_image_and_its_gate_ends_it() {
+    let stage = Arc::new(FakeStage::default());
+    let dir = TempDir::new("upgrade");
+    let r = managed(Timing::default(), &dir.0, 420, Arc::clone(&stage));
+    for id in ["img-1-ap1", "img-2-ap1"] {
+        keep(&r, id, "ap1").unwrap();
+    }
+    let mut ap1 = ap_on(&r, KEY_AP1, "ap1", "img-1-ap1", 1, image_config(1));
+    ap1.expect_sync();
+    let path = "/api/aps/ap1/upgrade";
+    let body = r#"{"image_id": "img-2-ap1"}"#;
+    assert_eq!(post(r.c.http, path, ADMIN, body).0, 403);
+    assert_eq!(post(r.c.http, path, SAME_SITE, body).0, 403);
+    assert_eq!(upgrade(&r, "ap1", "../x").0, 400);
+    let (status, v) = upgrade(&r, "ap1", "img-1-ap1");
+    assert_eq!(
+        (status, &v["error"]),
+        (
+            409,
+            &json!("only ap1's newest kept image, img-2-ap1, rolls out")
+        )
+    );
+    let (status, v) = upgrade(&r, "ap1", "img-2-ap1");
+    assert_eq!(status, 202, "{v}");
+    let id = v["id"].as_u64().unwrap();
+    wait_for("the gate", || step_of(&r, id) == "gate");
+    assert_eq!(*stage.staged.lock().unwrap(), ["ap1 img-2-ap1"]);
+    let (status, v) = upgrade(&r, "ap1", "img-2-ap1");
+    assert_eq!(
+        (status, &v["error"]),
+        (409, &json!("the rollout of img-2-ap1 to ap1 is not over"))
+    );
+    // Kept on disk at the step it is at.
+    wait_for("the gate kept", || {
+        let text = fs::read_to_string(dir.0.join("policy.json")).unwrap();
+        let policy: Value = serde_json::from_str(&text).unwrap();
+        policy["rollouts"][0]["phase"]["gate"].is_object()
+    });
+
+    // Back with the image and its radio, but no client yet: not yet.
+    let manifest = "image:     img-2-ap1\nbuilt_ms:  2\n";
+    let mut ap1 = Agent::running(r.c.agents, KEY_AP1, "ap1", manifest);
+    let s = running_config(1, image_config(2));
+    ap1.send(&AgentMsg::Key(Snapshot {
+        stations: Vec::new(),
+        ..s.clone()
+    }))
+    .unwrap();
+    ap1.expect_sync();
+    thread::sleep(Duration::from_millis(400));
+    assert!(result_of(&r, id).is_null());
+    ap1.send(&AgentMsg::Key(Snapshot { seq: 2, ..s })).unwrap();
+    assert_eq!(
+        wait_result(&r, id),
+        json!({"outcome": "done", "detail": "back with img-2-ap1: 1 radios up, 1 clients on the site"})
+    );
+    let rollouts = json_get(r.c.http, "/api/rollouts");
+    let log = &rollouts[id.to_string()]["log"];
+    assert_eq!(log[0], "staging img-2-ap1 on ap1, as alice asked", "{log}");
+    assert!(log.as_array().unwrap().contains(&json!("staged")), "{log}");
+    assert_eq!(*stage.staged.lock().unwrap(), ["ap1 img-2-ap1"]);
+    let manage = json_get(r.c.http, "/api/manage");
+    assert_eq!(manage["images"]["ap1"]["running"], "img-2-ap1");
     assert!(
         metrics_of(&r, "wifi_rollouts_total")
-            .contains(&"wifi_rollouts_total{outcome=\"not_started\"} 1".to_owned())
+            .contains(&"wifi_rollouts_total{outcome=\"done\"} 1".to_owned())
     );
+}
+
+/// An AP that does not come back healthy in the gate's time, or whose
+/// staging fails, is rolled back to the image it ran; an image that is not
+/// what its MANIFEST lists, or an AP that answers neither of its systems, is
+/// refused before anything is done to it.
+#[test]
+fn a_rollout_that_fails_its_gate_is_rolled_back() {
+    let dir = TempDir::new("rollback");
+    let stage = Arc::new(FakeStage::default());
+    let r = managed(Timing::default(), &dir.0, 1, Arc::clone(&stage));
+    for id in ["img-1-ap1", "img-2-ap1"] {
+        keep(&r, id, "ap1").unwrap();
+    }
+    let mut ap1 = ap_on(&r, KEY_AP1, "ap1", "img-1-ap1", 1, image_config(1));
+    ap1.expect_sync();
+    let started = |image: &str| {
+        let (status, v) = upgrade(&r, "ap1", image);
+        assert_eq!(status, 202, "{v}");
+        v["id"].as_u64().unwrap()
+    };
+    let id = started("img-2-ap1");
+    assert_eq!(
+        wait_result(&r, id),
+        json!({"outcome": "rolled_back", "detail": "no healthy gate in 1s; img-1-ap1 is staged again"})
+    );
+    assert_eq!(
+        *stage.staged.lock().unwrap(),
+        ["ap1 img-2-ap1", "ap1 img-1-ap1"]
+    );
+
+    keep(&r, "img-3-bad-ap1", "ap1").unwrap();
+    let id = started("img-3-bad-ap1");
+    assert_eq!(
+        wait_result(&r, id)["detail"],
+        "the staging failed: go8.sh failed; img-1-ap1 is staged again"
+    );
+    assert_eq!(
+        stage.staged.lock().unwrap()[2..],
+        ["ap1 img-3-bad-ap1", "ap1 img-1-ap1"]
+    );
+
+    keep(&r, "img-4-ap1", "ap1").unwrap();
+    fs::write(dir.0.join("images/img-4-ap1/Image"), "another kernel").unwrap();
+    let id = started("img-4-ap1");
+    assert_eq!(
+        wait_result(&r, id),
+        json!({"outcome": "refused", "detail": "img-4-ap1/Image is not the file its MANIFEST lists"})
+    );
+    keep(&r, "img-5-down-ap1", "ap1").unwrap();
+    let id = started("img-5-down-ap1");
+    assert_eq!(
+        wait_result(&r, id),
+        json!({"outcome": "refused", "detail": "ap1 answers neither its image nor stock"})
+    );
+    assert_eq!(stage.staged.lock().unwrap().len(), 4);
+    let manage = json_get(r.c.http, "/api/manage");
+    assert_eq!(manage["images"]["ap1"]["running"], "img-1-ap1");
+    let rolled = metrics_of(&r, "wifi_rollouts_total");
+    assert!(rolled.contains(&"wifi_rollouts_total{outcome=\"rolled_back\"} 2".to_owned()));
+    assert!(rolled.contains(&"wifi_rollouts_total{outcome=\"refused\"} 2".to_owned()));
     assert_eq!(
         metrics_of(&r, "wifi_rollout_last_failure_timestamp_seconds").len(),
         1
     );
-
-    // Taken on at once: still open past the wait.
-    let (status, v) = post(r.c.http, upgrade, &admin, r#"{"image_id": "img-b"}"#);
-    assert_eq!(status, 202, "{v}");
-    let taken = v["id"].as_u64().unwrap();
-    assert!(matches!(runner.expect_runner(), RunnerCtlMsg::Rollout(_)));
-    runner
-        .send_any(&RunnerMsg::RolloutStarted { id: taken })
-        .unwrap();
-    std::thread::sleep(Duration::from_millis(900));
-    assert_eq!(outcome(taken), Value::Null);
-
-    // The first came after all, and was refused: the runner's word stands.
-    runner
-        .send_any(&RunnerMsg::RolloutResult(RolloutResult {
-            id: lost,
-            outcome: RolloutOutcome::Refused,
-            detail: "the rollout of img-b to ap1 is not over".into(),
-        }))
-        .unwrap();
-    assert_eq!(
-        runner.expect_runner(),
-        RunnerCtlMsg::RolloutAck { id: lost }
-    );
-    assert_eq!(outcome(lost)["outcome"], "refused");
-}
-
-/// A result for a rollout this controller does not hold (its policy file
-/// was lost) is acknowledged only once it is kept as the orphan, with its
-/// time for the alert, and recorded; it outlives a restart.
-#[test]
-fn a_result_for_an_unknown_rollout_is_kept_and_raised() {
-    let dir = TempDir::new("orphan");
-    let r = controller_in(Timing::default(), &dir.0);
-    let mut runner = Agent::runner(r.c.agents);
-    runner
-        .send_any(&RunnerMsg::RolloutResult(RolloutResult {
-            id: 41,
-            outcome: RolloutOutcome::RolledBack,
-            detail: "img-a staged again".into(),
-        }))
-        .unwrap();
-    assert_eq!(runner.expect_runner(), RunnerCtlMsg::RolloutAck { id: 41 });
     let events = http_get(r.c.http, "/api/events");
     assert!(
-        events.contains(
-            "rollout 41, which this controller does not hold: rolled back: img-a staged again"
-        ),
+        events.contains("img-2-ap1: rolled back: no healthy gate in 1s"),
         "{events}"
-    );
-    for metric in [
-        "wifi_rollout_orphan_result_timestamp_seconds",
-        "wifi_rollout_last_failure_timestamp_seconds",
-    ] {
-        assert_eq!(metrics_of(&r, metric).len(), 1, "{metric}");
-    }
-    drop(runner);
-    drop(r);
-    let again = controller_in(Timing::default(), &dir.0);
-    assert_eq!(
-        metrics_of(&again, "wifi_rollout_orphan_result_timestamp_seconds").len(),
-        1
     );
 }
 
-/// The state files the runner set aside are recorded once, though it tells
-/// them at each session, and counted while it tells them.
+/// One rollout at a time, of any AP; and no configuration is sent to an AP
+/// being rolled out to.
 #[test]
-fn the_runners_discarded_state_is_recorded_once() {
-    let r = controller(Timing::default());
-    let discarded = RunnerMsg::StateDiscarded {
-        file: "rollout.corrupt-1700000000000".into(),
-        detail: "not of format 1".into(),
-        at_ms: 1_700_000_000_000,
+fn rollouts_run_one_at_a_time() {
+    let dir = TempDir::new("one");
+    let stage = Arc::new(FakeStage::default());
+    let r = managed(Timing::default(), &dir.0, 1, Arc::clone(&stage));
+    for (id, ap) in [
+        ("img-1-ap1", "ap1"),
+        ("img-2-slow-ap1", "ap1"),
+        ("img-1-ap2", "ap2"),
+        ("img-2-ap2", "ap2"),
+    ] {
+        keep(&r, id, ap).unwrap();
+    }
+    let mut ap1 = ap_on(&r, KEY_AP1, "ap1", "img-1-ap1", 1, image_config(1));
+    let mut ap2 = ap_on(&r, KEY_AP2, "ap2", "img-1-ap2", 1, image_config(1));
+    ap1.expect_sync();
+    ap2.expect_sync();
+    let (status, v) = upgrade(&r, "ap1", "img-2-slow-ap1");
+    assert_eq!(status, 202, "{v}");
+    let id = v["id"].as_u64().unwrap();
+    wait_for("the slow staging", || {
+        stage.staged.lock().unwrap().len() == 1
+    });
+    let (status, v) = upgrade(&r, "ap2", "img-2-ap2");
+    assert_eq!(
+        (status, &v["error"]),
+        (
+            409,
+            &json!("the rollout of img-2-slow-ap1 to ap1 is not over")
+        )
+    );
+    assert_eq!(
+        apply_now(&r, "ap1", radios(1)),
+        Err("ap1 is being rolled out to".into())
+    );
+    assert_eq!(wait_result(&r, id)["outcome"], "rolled_back");
+    assert_eq!(
+        *stage.staged.lock().unwrap(),
+        ["ap1 img-2-slow-ap1", "ap1 img-1-ap1"]
+    );
+}
+
+/// A controller restarted during a rollout's gate goes on with it from the
+/// policy file: the AP back healthy is done, never staged again nor rolled
+/// back; one restarted during the staging stages again, the staging that
+/// died with it having left the AP anywhere.
+#[test]
+fn a_restarted_controller_goes_on_with_the_rollout() {
+    let dir = TempDir::new("restart-gate");
+    let stage = Arc::new(FakeStage::default());
+    let r = managed(Timing::default(), &dir.0, 420, Arc::clone(&stage));
+    for id in ["img-1-ap1", "img-2-ap1"] {
+        keep(&r, id, "ap1").unwrap();
+    }
+    let mut ap1 = ap_on(&r, KEY_AP1, "ap1", "img-1-ap1", 1, image_config(1));
+    ap1.expect_sync();
+    let id = upgrade(&r, "ap1", "img-2-ap1").1["id"].as_u64().unwrap();
+    wait_for("the gate", || step_of(&r, id) == "gate");
+    drop(ap1);
+    drop(r);
+    let r = managed(Timing::default(), &dir.0, 420, Arc::clone(&stage));
+    let manifest = "image:     img-2-ap1\nbuilt_ms:  2\n";
+    let mut ap1 = Agent::running(r.c.agents, KEY_AP1, "ap1", manifest);
+    ap1.send(&AgentMsg::Key(running_config(1, image_config(2))))
+        .unwrap();
+    assert_eq!(wait_result(&r, id)["outcome"], "done");
+    assert_eq!(*stage.staged.lock().unwrap(), ["ap1 img-2-ap1"]);
+    drop(ap1);
+    drop(r);
+
+    // During the staging.
+    let r = managed(Timing::default(), &dir.0, 420, Arc::clone(&stage));
+    keep(&r, "img-3-slow-ap1", "ap1").unwrap();
+    let manifest = "image:     img-2-ap1\nbuilt_ms:  2\n";
+    let mut ap1 = Agent::running(r.c.agents, KEY_AP1, "ap1", manifest);
+    ap1.send(&AgentMsg::Key(running_config(1, image_config(2))))
+        .unwrap();
+    ap1.expect_sync();
+    let id = upgrade(&r, "ap1", "img-3-slow-ap1").1["id"]
+        .as_u64()
+        .unwrap();
+    wait_for("the staging", || stage.staged.lock().unwrap().len() == 2);
+    drop(ap1);
+    drop(r);
+    let r = managed(Timing::default(), &dir.0, 420, Arc::clone(&stage));
+    wait_for("the staging again", || {
+        stage.staged.lock().unwrap().len() == 3
+    });
+    wait_for("the gate", || step_of(&r, id) == "gate");
+    let manifest = "image:     img-3-slow-ap1\nbuilt_ms:  3\n";
+    let mut ap1 = Agent::running(r.c.agents, KEY_AP1, "ap1", manifest);
+    ap1.send(&AgentMsg::Key(running_config(1, image_config(3))))
+        .unwrap();
+    assert_eq!(wait_result(&r, id)["outcome"], "done");
+    let log = &json_get(r.c.http, "/api/rollouts")[id.to_string()]["log"];
+    assert!(
+        log.as_array().unwrap().contains(&json!(
+            "the controller restarted during the staging: staging again"
+        )),
+        "{log}"
+    );
+    assert_eq!(
+        stage.staged.lock().unwrap()[1..],
+        ["ap1 img-3-slow-ap1", "ap1 img-3-slow-ap1"]
+    );
+}
+
+/// A controller restarted during the gate gives the AP its resume time at
+/// least, past the gate's own: an AP that never comes back is then rolled
+/// back.
+#[test]
+fn a_gate_resumed_with_no_ap_back_is_rolled_back() {
+    let dir = TempDir::new("restart-down");
+    let stage = Arc::new(FakeStage::default());
+    let timing = Timing {
+        resume: Duration::from_millis(1500),
+        ..Timing::default()
     };
-    let count = || metrics_of(&r, "wifi_runner_state_discarded_files");
-    let mut runner = Agent::runner(r.c.agents);
-    runner.send_any(&discarded).unwrap();
-    wait_for("told", || {
-        count() == ["wifi_runner_state_discarded_files 1"]
+    let r = managed(timing, &dir.0, 420, Arc::clone(&stage));
+    for id in ["img-1-ap1", "img-2-ap1"] {
+        keep(&r, id, "ap1").unwrap();
+    }
+    let mut ap1 = ap_on(&r, KEY_AP1, "ap1", "img-1-ap1", 1, image_config(1));
+    ap1.expect_sync();
+    let id = upgrade(&r, "ap1", "img-2-ap1").1["id"].as_u64().unwrap();
+    wait_for("the gate", || step_of(&r, id) == "gate");
+    drop(ap1);
+    drop(r);
+    // Its gate long past, as after a long time down.
+    let path = dir.0.join("policy.json");
+    let mut v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    v["rollouts"][0]["phase"]["gate"]["deadline_ms"] = json!(1);
+    fs::write(&path, serde_json::to_string(&v).unwrap()).unwrap();
+    let started = Instant::now();
+    let r = managed(timing, &dir.0, 420, Arc::clone(&stage));
+    assert_eq!(wait_result(&r, id)["outcome"], "rolled_back");
+    assert!(started.elapsed() >= Duration::from_millis(1400));
+    assert_eq!(
+        *stage.staged.lock().unwrap(),
+        ["ap1 img-2-ap1", "ap1 img-1-ap1"]
+    );
+}
+
+/// The gate fails at once when the AP comes back with an agent this
+/// controller turns away, which can never pass.
+#[test]
+fn an_unhealthy_gate_is_rolled_back_at_once() {
+    let dir = TempDir::new("unhealthy");
+    let stage = Arc::new(FakeStage::default());
+    let r = managed(Timing::default(), &dir.0, 420, Arc::clone(&stage));
+    for id in ["img-1-ap1", "img-2-ap1"] {
+        keep(&r, id, "ap1").unwrap();
+    }
+    let mut ap1 = ap_on(&r, KEY_AP1, "ap1", "img-1-ap1", 1, image_config(1));
+    ap1.expect_sync();
+    let id = upgrade(&r, "ap1", "img-2-ap1").1["id"].as_u64().unwrap();
+    wait_for("the gate", || step_of(&r, id) == "gate");
+    let (mut other, _) = Agent::versioned(r.c.agents, KEY_AP1, PROTOCOL + 1);
+    other.ends();
+    let result = wait_result(&r, id);
+    assert_eq!(result["outcome"], "rolled_back");
+    let detail = result["detail"].as_str().unwrap();
+    assert!(
+        detail.starts_with(&format!(
+            "unhealthy: its agent speaks protocol {}",
+            PROTOCOL + 1
+        )),
+        "{detail}"
+    );
+}
+
+/// An AP that comes back during a rollout on another configuration than
+/// its latest is signed nothing while the rollout runs, and the latest once
+/// it is over: here rolled back to the image it ran, built before that
+/// configuration was signed.
+#[test]
+fn an_ap_back_during_a_rollout_gets_its_configuration_after_it() {
+    let dir = TempDir::new("after");
+    let stage = Arc::new(FakeStage::default());
+    let r = managed(Timing::default(), &dir.0, 1, Arc::clone(&stage));
+    for id in ["img-1-ap1", "img-2-slow-ap1"] {
+        keep(&r, id, "ap1").unwrap();
+    }
+    let built = now_ms() - 60_000;
+    let mut ap1 = ap_on(&r, KEY_AP1, "ap1", "img-1-ap1", built, image_config(1));
+    let mut judge = Judge {
+        ap: "ap1",
+        last: 0,
+        built,
+    };
+    let asked = apply_in_thread(&r, "ap1", radios(1));
+    let (acked, _) = judge.answer(&mut ap1);
+    asked.join().unwrap().unwrap();
+    let id = upgrade(&r, "ap1", "img-2-slow-ap1").1["id"]
+        .as_u64()
+        .unwrap();
+    wait_for("the slow staging", || {
+        stage.staged.lock().unwrap().len() == 1
     });
-    drop(runner);
-    let mut runner = Agent::runner(r.c.agents);
-    runner.send_any(&discarded).unwrap();
-    wait_for("told again", || {
-        let s = r.c.state.read();
-        s.runner.is_up() && s.runner.discarded.len() == 1
-    });
-    let events = http_get(r.c.http, "/api/events");
-    let told = "its state file rollout.corrupt-1700000000000 could not be read";
-    assert_eq!(events.matches(told).count(), 1, "{events}");
-    // A session that tells none: the file was dealt with.
-    drop(runner);
-    let _runner = Agent::runner(r.c.agents);
-    wait_for("none", || {
-        count() == ["wifi_runner_state_discarded_files 0"]
-    });
+    // The AP reboots onto its image while the staging still runs.
+    let mut ap1 = ap_on(&r, KEY_AP1, "ap1", "img-1-ap1", built, image_config(1));
+    ap1.hears_nothing(Duration::from_millis(500));
+    assert_eq!(wait_result(&r, id)["outcome"], "rolled_back");
+    let mut rebooted = Judge {
+        ap: "ap1",
+        last: 0,
+        built,
+    };
+    let (again, verdict) = rebooted.answer(&mut ap1);
+    assert_eq!((again.sha256, verdict), (acked.sha256, Ok(())));
+}
+
+/// Root's two local commands reach the running controller on its socket:
+/// `apply` reads the rendered script on stdin and fails when the AP cannot
+/// take it, `image add` hands over an image as the build keeps it.
+#[test]
+fn the_local_commands_reach_the_running_controller() {
+    let dir = TempDir::new("cli");
+    let _b = spawn_binary(&dir);
+    let config = dir.0.join("config.toml");
+    let command = |args: &[&str], stdin: &str| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_u6e-controller"))
+            .args(args)
+            .arg("--config")
+            .arg(&config)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        let text = |b: &[u8]| String::from_utf8_lossy(b).trim().to_owned();
+        (out.status.success(), text(&out.stdout), text(&out.stderr))
+    };
+    let script = include_str!("fixtures/u6e-wifi.sh");
+    assert_eq!(
+        command(&["apply", "ap1"], script),
+        (
+            false,
+            String::new(),
+            "u6e-controller: ap1 is not connected".into()
+        )
+    );
+    let (ok, _, why) = command(&["apply", "ap1"], "#!/bin/sh\n");
+    assert!(!ok && why.contains("no install_confs"), "{why}");
+    let image = build_image(&dir.0, "img-1-ap1", "ap1");
+    let image = image.to_str().unwrap();
+    assert_eq!(
+        command(&["image", "add", image], ""),
+        (true, "img-1-ap1 kept for ap1".into(), String::new())
+    );
+    assert!(dir.0.join("images/img-1-ap1/MANIFEST").exists());
+    let (ok, _, usage) = command(&["image"], "");
+    assert!(!ok && usage.starts_with("usage:"), "{usage}");
 }

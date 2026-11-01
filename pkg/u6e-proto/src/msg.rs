@@ -1,5 +1,4 @@
-//! The messages of the agent-to-controller link and of the deploy runner's
-//! link to the controller, and the state they carry. postcard encodes them
+//! The messages of the agent-to-controller link, and the state they carry. postcard encodes them
 //! without a schema, so every change to their layout (a field, a variant, an
 //! order) bumps [`crate::PROTOCOL`].
 
@@ -76,8 +75,8 @@ pub enum CtlMsg {
     },
     /// Install this configuration and apply it the least disruptive way
     /// [`Mechanism`] names; answered by an [`AgentMsg::ConfigApplied`] of the
-    /// same `sha256`. Signed by the deploy runner, the only party that
-    /// originates one: the controller relays it unread and cannot forge it.
+    /// same `sha256`. Signed with the controller's configuration key, which
+    /// the AP's image pins, apart from the key of the link.
     ApplyConfig(SignedConfig),
 }
 
@@ -102,9 +101,9 @@ impl Hello {
     }
 
     /// The image's build time in milliseconds since the Unix epoch; 0 for an
-    /// image from before the manifest said. No configuration the deploy
-    /// runner signed before it (its sequence number is its signing time)
-    /// applies on the image.
+    /// image from before the manifest said. No configuration the controller
+    /// signed before it (its sequence number is its signing time) applies on
+    /// the image.
     pub fn built_ms(&self) -> u64 {
         self.manifest_line("built_ms").parse().unwrap_or(0)
     }
@@ -468,10 +467,10 @@ impl Drop for RadioConfig {
     }
 }
 
-/// A whole configuration of one AP, as the deploy runner signed it: Ed25519
+/// A whole configuration of one AP, as the controller signed it: Ed25519
 /// over [`crate::config::payload`] (the protocol, `ap`, `seq`, `not_after`
-/// and `sha256`), by the key the AP's image pins. `seq` grows with every
-/// configuration the runner signs for the AP and `not_after` ends its
+/// and `sha256`), by the configuration key the AP's image pins. `seq` grows
+/// with every configuration signed for the AP and `not_after` ends its
 /// validity soon after, so an old one cannot be replayed.
 ///
 /// On the wire: a change to it bumps [`crate::PROTOCOL`].
@@ -479,7 +478,7 @@ impl Drop for RadioConfig {
 pub struct SignedConfig {
     /// The AP it is for, by its host name.
     pub ap: String,
-    /// The runner's signing time, in milliseconds since the Unix epoch.
+    /// The signing time, in milliseconds since the Unix epoch.
     pub seq: u64,
     /// The last moment, in the same milliseconds, at which it may apply.
     pub not_after: u64,
@@ -530,178 +529,6 @@ pub enum Mechanism {
     Power,
     /// u6e-wifi restarted, after asking every client to move to another AP.
     Restart,
-}
-
-/// Everything the deploy runner (`wifi-deploy`) sends the controller. The
-/// runner is the only party that originates configuration or images.
-///
-/// On the wire: a change to it bumps [`crate::PROTOCOL`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub enum RunnerMsg {
-    /// First message of a connection.
-    Hello(RunnerHello),
-    /// Answer to [`RunnerCtlMsg::Ping`], echoing its value.
-    Pong(u64),
-    /// Apply a rendered and signed configuration to the AP it names; the
-    /// controller relays it unchanged and answers with a
-    /// [`RunnerCtlMsg::ConfigApplied`] of the same id.
-    ApplyConfig { id: u64, config: SignedConfig },
-    /// One line of a rollout's log, as it runs.
-    RolloutLog { id: u64, line: String },
-    /// How a rollout ended: the last word on it.
-    RolloutResult(RolloutResult),
-    /// A local caller of the runner asks for a rollout: the controller makes
-    /// it a [`RunnerCtlMsg::Rollout`] of its own, which it gates and shows as
-    /// it does an admin's.
-    RolloutAsk {
-        ap: String,
-        image_id: String,
-        user: String,
-    },
-    /// The latest configuration the runner signed for the AP of host name
-    /// `ap`, by its sequence number and hash: what the AP should run. Sent
-    /// for every AP when the session starts and with each one signed.
-    Latest {
-        ap: String,
-        seq: u64,
-        sha256: [u8; 32],
-    },
-    /// The runner took rollout `id` on: sent when it does, and again at
-    /// each session while it runs. A rollout not taken on in a while is the
-    /// controller's to close.
-    RolloutStarted { id: u64 },
-    /// A file of the runner's state directory it could not read (`detail`
-    /// says why) was moved aside at `at_ms` and the runner went on without
-    /// it. Sent at each session of the runner's process.
-    StateDiscarded {
-        file: String,
-        detail: String,
-        at_ms: u64,
-    },
-    /// How the deploy of [`RunnerCtlMsg::DeploySite`] `id` goes, with what
-    /// the runner or the deploy said last. The last word on the latest one is
-    /// sent again at each session.
-    SiteDeploy {
-        id: u64,
-        rev: String,
-        state: SiteDeployState,
-        detail: String,
-    },
-}
-
-/// Everything the controller sends the deploy runner.
-///
-/// On the wire: a change to it bumps [`crate::PROTOCOL`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub enum RunnerCtlMsg {
-    Ping(u64),
-    /// The agent's answer to a [`RunnerMsg::ApplyConfig`], or the
-    /// controller's own when the AP could not be asked.
-    ConfigApplied {
-        id: u64,
-        result: ConfigApplied,
-    },
-    /// The AP runs another configuration (`installed`) than the runner's
-    /// latest for it ([`RunnerMsg::Latest`]): sign that latest one again,
-    /// under a new sequence number (the old one is a replay to the AP), and
-    /// send it. `ap` is the name configurations are signed for (the AP's
-    /// host name, as the controller's configuration binds it to the AP's
-    /// key).
-    Repush {
-        ap: String,
-        installed: Option<[u8; 32]>,
-    },
-    /// Roll an image out to an AP, as an admin asked; the runner may refuse.
-    Rollout(RolloutRequest),
-    /// A rollout's health gate as the controller sees the AP: healthy once
-    /// it is back with the image, every radio up and clients returning;
-    /// unhealthy when it cannot get there. The runner waits its gate time
-    /// after staging for healthy, and rolls the AP back on unhealthy or when
-    /// the time runs out.
-    RolloutGate {
-        id: u64,
-        healthy: bool,
-        detail: String,
-    },
-    /// The controller has recorded the [`RunnerMsg::RolloutResult`] of
-    /// rollout `id`: the runner stops sending it again.
-    RolloutAck {
-        id: u64,
-    },
-    /// Deploy the site file as commit `rev` (40 hex digits) of the site's
-    /// repository has it, which the controller just pushed: the runner takes
-    /// it only when `rev` is the head of the site's branch and what changed
-    /// since the commit it last deployed is plain settings of the site file
-    /// alone. The controller names a commit and supplies no content. Answered
-    /// by [`RunnerMsg::SiteDeploy`]s of the same id.
-    DeploySite {
-        id: u64,
-        rev: String,
-    },
-}
-
-/// Where a site deploy is.
-///
-/// On the wire: a change to it bumps [`crate::PROTOCOL`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SiteDeployState {
-    /// Not taken: the commit is not the branch's head, changes more than
-    /// the site file's settings, or another came after it.
-    Refused,
-    /// The live deploy runs.
-    Running,
-    Done,
-    Failed,
-}
-
-/// What the runner is, sent once per connection.
-///
-/// On the wire: a change to it bumps [`crate::PROTOCOL`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunnerHello {
-    pub version: String,
-}
-
-/// On the wire: a change to it bumps [`crate::PROTOCOL`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RolloutRequest {
-    /// Chosen by the controller; the runner's log and result carry it.
-    pub id: u64,
-    pub ap: String,
-    /// The kept build to stage, as the image names itself.
-    pub image_id: String,
-    /// The image the AP runs now, as its agent reported it. The runner rolls
-    /// a failed gate back to the image it staged there itself, and takes
-    /// this only for an AP it has staged nothing on yet. Empty when the
-    /// controller does not know.
-    pub previous: String,
-    /// Who asked, for the runner's audit.
-    pub user: String,
-}
-
-/// On the wire: a change to it bumps [`crate::PROTOCOL`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RolloutResult {
-    pub id: u64,
-    pub outcome: RolloutOutcome,
-    pub detail: String,
-}
-
-/// On the wire: a change to it bumps [`crate::PROTOCOL`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RolloutOutcome {
-    /// Not started: another rollout runs, the image is unknown, ...
-    Refused,
-    /// The AP runs the image and passed the health gate.
-    Done,
-    /// The AP failed the health gate and runs its previous image again.
-    RolledBack,
-    /// Neither the image nor the way back could be staged.
-    Failed,
-    /// The runner never took it on; the controller's own word.
-    NotStarted,
 }
 
 #[cfg(test)]

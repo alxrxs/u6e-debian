@@ -12,5 +12,5 @@ u6e-proto = { path = "../u6e-proto" }
 rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std"] }
 
 [dev-dependencies]
-# The tests sign configurations as the deploy runner does.
+# The tests sign configurations as the controller does.
 aws-lc-rs = { version = "1.18", default-features = false, features = ["alloc", "aws-lc-sys"] }

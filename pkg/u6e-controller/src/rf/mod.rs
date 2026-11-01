@@ -3,15 +3,11 @@
 //! site file's constraints (`site`, `plan`), and proposes; nothing changes
 //! until an admin applies a proposal. Applying it is a commit of the site
 //! file to its repository by the controller (`git`, line-level `yaml` edits
-//! of the affected keys only), after which the controller asks the deploy
-//! runner to deploy that commit: the runner checks it is the branch's head
-//! and, of what the deploy reads, changes only the site file's settings, and
-//! has the site's live deploy render it, sign it and take it to the APs (a
-//! channel switch or a power change, no reboot). The controller names a commit; it never supplies a
-//! configuration.
+//! of the affected keys only), which the next configuration rendered from
+//! the site file takes to the APs.
 //!
-//! `GET /api/rf/plan` is the plan for anyone who may view, with its hash and
-//! how the last site deploy goes; it reads the site file from the clone,
+//! `GET /api/rf/plan` is the plan for anyone who may view, with its hash;
+//! it reads the site file from the clone,
 //! fetched at most once a minute. `POST /api/rf/apply`
 //! (`{"plan": "<hash>", "radios": [{"key", "channel", "width", "center",
 //! "power"}, …]}`) is gated as the other actions are (`actions::refusal`):
@@ -48,7 +44,7 @@ use u6e_proto::msg::Band;
 
 use crate::actions::{self, Via, Web};
 use crate::http::{error, json_response};
-use crate::state::{Action, Shared, State, site_deploy_name};
+use crate::state::{Action, Shared, State};
 use crate::view;
 
 use self::config::Settings;
@@ -259,24 +255,6 @@ fn applied(a: &Applied) -> Value {
     o
 }
 
-/// How the last site deploy goes.
-fn deploy(state: &State) -> Option<Value> {
-    let d = state.site_deploy.as_ref()?;
-    let mut o = json!({
-        "id": d.id,
-        "rev": d.rev,
-        "state": site_deploy_name(d.state),
-        "detail": d.detail,
-        "asked": unix_ms(d.asked),
-        "at": unix_ms(d.at),
-        "runner": state.runner.is_up(),
-    });
-    if let Some(u) = &d.user {
-        o["user"] = u.clone().into();
-    }
-    Some(o)
-}
-
 /// `GET /api/rf/plan`.
 pub async fn get_plan(Ext(web): Ext<Web>) -> Response {
     let Some(planner) = &web.access.rf else {
@@ -318,9 +296,6 @@ pub async fn get_plan(Ext(web): Ext<Web>) -> Response {
     });
     if let Some(a) = planner.last() {
         v["last"] = applied(&a);
-    }
-    if let Some(d) = deploy(&state) {
-        v["deploy"] = d;
     }
     json_response(&v)
 }
@@ -558,8 +533,6 @@ pub async fn apply(Ext(web): Ext<Web>, req: HeaderMap, body: Bytes) -> Response 
                     &detail,
                 );
             }
-            // The site's live deploy takes the commit to the APs.
-            let deploy = web.state.write().deploy_site(&landed.commit, user.clone());
             let radios: Vec<String> = chosen.iter().map(Proposal::key).collect();
             let detail = format!("committed {short} to {}", planner.settings.repo.branch);
             let body = json!({
@@ -567,7 +540,6 @@ pub async fn apply(Ext(web): Ext<Web>, req: HeaderMap, body: Bytes) -> Response 
                 "commit": landed.commit,
                 "radios": radios,
                 "detail": detail,
-                "deploy": deploy,
             });
             let last = Applied {
                 at: SystemTime::now(),

@@ -1,7 +1,7 @@
-//! u6e-proto's framing over tokio's streams, for the local socket and the
-//! stage helper's: one frame read whole, then decoded and wiped as
-//! `frame::read_frame` does; one written from an encoding wiped once sent.
-//! Their frames can hold a Wi-Fi configuration's secrets.
+//! u6e-proto's framing over tokio's streams, for the local socket: one frame
+//! read whole, then decoded and wiped as `frame::read_frame` does; one
+//! written from an encoding wiped once sent. Its frames can hold a Wi-Fi
+//! configuration's secrets.
 
 use std::io::{self, ErrorKind};
 

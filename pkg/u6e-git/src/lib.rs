@@ -1,5 +1,5 @@
-//! The `git` command as the controller and the deploy runner run it on their
-//! clones of the site's repository: from its arguments, never through a
+//! The `git` command as the controller runs it on its clone of the site's
+//! repository: from its arguments, never through a
 //! shell; over SSH with the clone's own key, the server checked against a
 //! known_hosts of its own (the two go together); each run bounded in time,
 //! its whole process group killed past the bound, so a stalled connection

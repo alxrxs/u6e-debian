@@ -1,8 +1,7 @@
 //! A Wi-Fi configuration's identity and authority: the hash it is known by,
-//! and the deploy runner's Ed25519 signature over it, which the AP checks
-//! against the runner's key its image pins. The controller relays
-//! configurations but holds no key that signs one, so it cannot make an AP
-//! run one the runner did not render. The sequence number is the runner's
+//! and the controller's Ed25519 signature over it, made with its
+//! configuration key (not the key of its TLS link), which the AP checks
+//! against the public half its image pins. The sequence number is the
 //! signing time in milliseconds: the AP takes one past both the last it
 //! applied and its image's build time ([`replayed`]), and before its signed
 //! `not_after`, [`VALIDITY_MS`] later ([`expired`]), while its clock is
@@ -14,13 +13,12 @@ use aws_lc_rs::signature::{ED25519, Ed25519KeyPair, UnparsedPublicKey};
 use crate::PROTOCOL;
 use crate::msg::{RadioConfig, SignedConfig};
 
-/// Sets what the runner signs here apart from anything else its key signs
-/// (its TLS handshakes).
+/// Sets what is signed here apart from anything else a key could sign.
 const CONTEXT: &str = "u6e wifi config";
 
-/// How long a signed configuration may apply: every one the runner signs is
-/// applied at once (a live apply or a re-push), so one held back longer is
-/// a replay.
+/// How long a signed configuration may apply: every one the controller signs
+/// is sent at once (a live apply or a re-push), so one held back longer is a
+/// replay.
 pub const VALIDITY_MS: u64 = 10 * 60 * 1000;
 
 /// The hash a configuration is known by: SHA-256 of the postcard encoding of
@@ -33,7 +31,7 @@ pub fn config_sha256(radios: &[RadioConfig]) -> [u8; 32] {
     h
 }
 
-/// The bytes the runner signs: [`CONTEXT`], the protocol, the AP, the
+/// The bytes signed: [`CONTEXT`], the protocol, the AP, the
 /// sequence number, the end of validity and the hash, postcard-encoded.
 pub fn payload(protocol: u16, ap: &str, seq: u64, not_after: u64, sha256: &[u8; 32]) -> Vec<u8> {
     postcard::to_stdvec(&(CONTEXT, protocol, ap, seq, not_after, sha256)).unwrap_or_default()
@@ -58,21 +56,22 @@ pub fn sign(key: &Ed25519KeyPair, ap: &str, seq: u64, radios: Vec<RadioConfig>) 
     }
 }
 
-/// Checks that `c` is a configuration for `ap`, whole, signed by the runner
-/// whose public key is `runner`; the error says what it is not.
-pub fn verify(runner: &[u8; 32], ap: &str, c: &SignedConfig) -> Result<(), String> {
+/// Checks that `c` is a configuration for `ap`, whole, signed by the
+/// configuration key whose public half is `signer`; the error says what it
+/// is not.
+pub fn verify(signer: &[u8; 32], ap: &str, c: &SignedConfig) -> Result<(), String> {
     if c.ap != ap {
         return Err(format!("for another AP ({:.64})", c.ap));
     }
     if config_sha256(&c.radios) != c.sha256 {
         return Err("the configuration does not match its SHA-256".into());
     }
-    UnparsedPublicKey::new(&ED25519, runner)
+    UnparsedPublicKey::new(&ED25519, signer)
         .verify(
             &payload(PROTOCOL, &c.ap, c.seq, c.not_after, &c.sha256),
             &c.signature,
         )
-        .map_err(|_| "not signed by the deploy runner".into())
+        .map_err(|_| "not signed by the configuration key".into())
 }
 
 /// Why sequence number `seq` may not apply when `last` (named `what`) was
@@ -106,7 +105,7 @@ mod tests {
 
     use crate::msg::Band;
 
-    /// Throwaway test keys: the runner's, and another.
+    /// Throwaway test keys: the signer's, and another.
     fn key(seed: u8) -> Ed25519KeyPair {
         Ed25519KeyPair::from_seed_unchecked(&[seed; 32]).unwrap()
     }
@@ -124,38 +123,38 @@ mod tests {
     }
 
     #[test]
-    fn a_configuration_the_runner_signed_for_this_ap_passes() {
-        let runner = key(1);
-        let c = sign(&runner, "ap1", 7, radios());
+    fn a_configuration_signed_for_this_ap_passes() {
+        let signer = key(1);
+        let c = sign(&signer, "ap1", 7, radios());
         assert_eq!(c.signature.len(), 64);
-        assert_eq!(verify(&public(&runner), "ap1", &c), Ok(()));
+        assert_eq!(verify(&public(&signer), "ap1", &c), Ok(()));
     }
 
     /// Whatever is changed after signing, or signed by another key, fails.
     #[test]
     fn a_forged_or_altered_configuration_fails() {
-        let runner = key(1);
-        let pk = public(&runner);
-        let good = sign(&runner, "ap1", 7, radios());
+        let signer = key(1);
+        let pk = public(&signer);
+        let good = sign(&signer, "ap1", 7, radios());
         let fails = |c: &SignedConfig| verify(&pk, "ap1", c).unwrap_err();
 
         assert_eq!(
             fails(&sign(&key(2), "ap1", 7, radios())),
-            "not signed by the deploy runner"
+            "not signed by the configuration key"
         );
         assert_eq!(
             fails(&SignedConfig {
                 signature: Vec::new(),
                 ..good.clone()
             }),
-            "not signed by the deploy runner"
+            "not signed by the configuration key"
         );
         assert_eq!(
             fails(&SignedConfig {
                 seq: 8,
                 ..good.clone()
             }),
-            "not signed by the deploy runner"
+            "not signed by the configuration key"
         );
         // Its validity stretched.
         assert_eq!(
@@ -163,7 +162,7 @@ mod tests {
                 not_after: good.not_after + 1,
                 ..good.clone()
             }),
-            "not signed by the deploy runner"
+            "not signed by the configuration key"
         );
         let mut text = good.clone();
         text.radios[0].text.push('#');
@@ -176,16 +175,16 @@ mod tests {
         );
         let mut rehashed = power.clone();
         rehashed.sha256 = config_sha256(&rehashed.radios);
-        assert_eq!(fails(&rehashed), "not signed by the deploy runner");
+        assert_eq!(fails(&rehashed), "not signed by the configuration key");
         // Another AP's configuration, its name changed or not.
-        let other = sign(&runner, "ap2", 7, radios());
+        let other = sign(&signer, "ap2", 7, radios());
         assert_eq!(fails(&other), "for another AP (ap2)");
         assert_eq!(
             fails(&SignedConfig {
                 ap: "ap1".into(),
                 ..other
             }),
-            "not signed by the deploy runner"
+            "not signed by the configuration key"
         );
     }
 
@@ -198,13 +197,13 @@ mod tests {
             payload(PROTOCOL, "ap1", 1, 2, &h),
             payload(PROTOCOL + 1, "ap1", 1, 2, &h)
         );
-        let runner = key(1);
-        let mut c = sign(&runner, "ap1", 1, radios());
-        c.signature = runner
+        let signer = key(1);
+        let mut c = sign(&signer, "ap1", 1, radios());
+        c.signature = signer
             .sign(&payload(PROTOCOL + 1, "ap1", 1, c.not_after, &c.sha256))
             .as_ref()
             .to_vec();
-        assert!(verify(&public(&runner), "ap1", &c).is_err());
+        assert!(verify(&public(&signer), "ap1", &c).is_err());
     }
 
     #[test]

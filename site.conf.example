@@ -52,18 +52,11 @@ BT_POWERED=1
 # agent_key in its block below. CONTROLLER unset: no controller link.
 CONTROLLER=controller.example.net:8443
 CONTROLLER_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
-# Optional, with CONTROLLER: the deploy runner's Ed25519 public key (64 hex
-# digits, a plain value). The AP applies the live Wi-Fi configurations the
-# runner signs with it, and nothing else; unset, it applies none.
-RUNNER_KEY=fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210
-# Optional, with RUNNER_KEY: how deploy.sh tells the runner, as root, the
-# kept image it staged on an AP, the one a failed rollout goes back to; and
-# whether the runner keeps a rollout under way, when deploy.sh refuses to
-# start (the runner's state directory holds it as `rollout`).
-runner_staged() { u6e-deploy staged "$1" "$2"; }
-runner_rolling_out() { [ -e /var/lib/u6e-deploy/rollout ]; }
-# ...and the kept images it needs, which deploy.sh never prunes.
-runner_images() { u6e-deploy images; }
+# Optional, with CONTROLLER: the public half (64 hex digits, a plain value)
+# of the key the controller signs live Wi-Fi configurations with (its
+# configuration key, not its link's CONTROLLER_KEY). The AP applies the live
+# configurations signed with it, and nothing else; unset, it applies none.
+CONFIG_KEY=fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210
 # Optional: the newest kept images of each AP deploy.sh keeps however old
 # (default 3), and the room in GiB a run needs on the tree's filesystem
 # (default 15).

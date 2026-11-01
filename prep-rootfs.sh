@@ -263,12 +263,12 @@ peers=$(for a in $U6E_APS; do (U6E_AP=$a; . ./site.conf; echo "${MGMT_ADDR%/*}")
 arm=; [ "${U6E_PERSIST:-0}" = 1 ] && arm=--arm
 # With CONTROLLER set, it also streams the AP's Wi-Fi state to the controller,
 # which it pins by CONTROLLER_KEY; this AP's own key (agent_key) is root's only,
-# and systemd hands the agent a copy (LoadCredential). With RUNNER_KEY too, it
-# and its config helper (below) take the live Wi-Fi configurations the deploy
-# runner of that key signs, which the controller only relays.
+# and systemd hands the agent a copy (LoadCredential). With CONFIG_KEY too, it
+# and its config helper (below) take the live Wi-Fi configurations the
+# controller signs with that key (its configuration key, not its link's).
 link=
 cred=
-runner=
+signer=
 if [ -n "${CONTROLLER:-}" ]; then
 	[[ ${CONTROLLER_KEY:-} =~ ^[0-9a-fA-F]{64}$ ]] || { echo "CONTROLLER_KEY must be 64 hex digits" >&2; exit 1; }
 	install -d -m0700 $RF/etc/u6e-agent
@@ -276,10 +276,10 @@ if [ -n "${CONTROLLER:-}" ]; then
 	grep -q -- '-----BEGIN PRIVATE KEY-----' $RF/etc/u6e-agent/key.pem || { echo "agent_key: no PKCS#8 private key" >&2; exit 1; }
 	link="--controller $CONTROLLER --key %d/key.pem --controller-key $CONTROLLER_KEY"
 	cred=LoadCredential=key.pem:/etc/u6e-agent/key.pem
-	if [ -n "${RUNNER_KEY:-}" ]; then
-		[[ $RUNNER_KEY =~ ^[0-9a-fA-F]{64}$ ]] || { echo "RUNNER_KEY must be 64 hex digits" >&2; exit 1; }
-		runner="--runner-key $RUNNER_KEY"
-		link="$link $runner"
+	if [ -n "${CONFIG_KEY:-}" ]; then
+		[[ $CONFIG_KEY =~ ^[0-9a-fA-F]{64}$ ]] || { echo "CONFIG_KEY must be 64 hex digits" >&2; exit 1; }
+		signer="--config-key $CONFIG_KEY"
+		link="$link $signer"
 	fi
 fi
 # The agent runs as its own user with no capabilities: hostapd gives that
@@ -440,7 +440,7 @@ SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @privile
 UNIT
 
 # The agent's config helper (u6e-agent --config-helper): the live Wi-Fi
-# configurations the deploy runner signs (RUNNER_KEY), installed in
+# configurations the controller signs (CONFIG_KEY), installed in
 # /run/u6e-wifi, root's alone (they hold the secrets; the helper tells the
 # agent how each radio takes a new one, the agent never reads them), then
 # rendered for the running hostapd with the new powers set, or u6e-wifi
@@ -476,7 +476,7 @@ cat > $RF/etc/systemd/system/u6e-wifi-config@.service <<UNIT
 Description=U6E Wi-Fi configuration helper: classifies and installs a configuration for u6e-agent
 
 [Service]
-ExecStart=/usr/local/sbin/u6e-agent --config-helper $runner
+ExecStart=/usr/local/sbin/u6e-agent --config-helper $signer
 StandardInput=socket
 StandardOutput=socket
 StandardError=journal
@@ -848,7 +848,7 @@ ln -sf /etc/systemd/system/u6e-nss.service $RF/etc/systemd/system/multi-user.tar
 # is kept, /etc/u6e-image carries that name, its build time in milliseconds
 # and its versions (u6e-agent reports them to the controller), and MANIFEST
 # adds the checksums. The build time is the floor of the live configurations'
-# sequence numbers (the deploy runner's signing times): one signed before the
+# sequence numbers (the controller's signing times): one signed before the
 # image was built never applies on it, not even after a reboot.
 g() { git -c safe.directory='*' -C "$1" log -1 --format='%h %s'; }
 built_ms=$(date +%s%3N)

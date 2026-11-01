@@ -3,11 +3,12 @@
 //! their number follows the clients on the air, not every MAC ever seen; the
 //! connection counts only for those of an AP that has sent its flows. The
 //! spectrum series are per radio that scans, of every AP with a snapshot.
-//! The deploy runner's series exist only when the configuration admits one;
-//! the configurations relayed and the rollouts ended are counted by result,
-//! every result always exported, and the last rollout that failed is timed
-//! from the rollouts the policy file keeps, so that its alert outlives a
-//! restart. The sessions refused for naming another AP are counted per AP.
+//! The configurations' series exist only when the controller signs them,
+//! the rollouts' only when it rolls images out; the configurations sent and
+//! the rollouts ended are counted by result, every result always exported,
+//! and the last rollout that failed is timed from the rollouts the policy
+//! file keeps, so that its alert outlives a restart. The sessions refused for
+//! naming another AP are counted per AP.
 
 use std::collections::BTreeSet;
 use std::fmt::Write;
@@ -23,14 +24,12 @@ use u6e_proto::mac;
 use u6e_proto::msg::{Radio, Snapshot, Station};
 
 use crate::spectrum::{RADIOS, Scan};
-use crate::state::{Ap, Shared, State, is_failure};
+use crate::state::{Ap, OUTCOMES, Shared, State, is_failure};
 use crate::view::band;
 
 /// The operator's actions and their results, every pair always exported.
 const ACTIONS: [&str; 4] = ["kick", "block", "unblock", "steer"];
 const RESULTS: [&str; 3] = ["ok", "failed", "timeout"];
-/// How a rollout ended (`state::outcome_name`).
-const OUTCOMES: [&str; 5] = ["done", "rolled_back", "failed", "refused", "not_started"];
 
 const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
@@ -413,9 +412,8 @@ pub fn render(state: &State) -> String {
         }
     }
 
-    if state.runner.configured {
-        deploy(&mut m, state, &aps);
-    }
+    configs(&mut m, state, &aps);
+    rollouts(&mut m, state);
     m.family(
         "wifi_blocked_clients",
         GAUGE,
@@ -439,18 +437,15 @@ pub fn render(state: &State) -> String {
     m.out
 }
 
-/// The deploy runner's link, the APs' configurations and the rollouts.
-fn deploy(m: &mut Text, state: &State, aps: &[(&str, &Ap)]) {
-    m.family(
-        "wifi_runner_connected",
-        GAUGE,
-        "Whether the deploy runner is connected.",
-    );
-    m.sample(&[], f64::from(u8::from(state.runner.is_up())));
+/// The APs' configurations, when the controller signs them.
+fn configs(m: &mut Text, state: &State, aps: &[(&str, &Ap)]) {
+    let Some(signer) = &state.signer else {
+        return;
+    };
     m.family(
         "wifi_config_drift",
         GAUGE,
-        "Whether the connected AP runs another Wi-Fi configuration than the deploy runner's latest for it.",
+        "Whether the connected AP runs another Wi-Fi configuration than the latest one signed for it.",
     );
     for &(ap, a) in aps {
         if a.latest.is_some() && a.snapshot.is_some() {
@@ -460,18 +455,40 @@ fn deploy(m: &mut Text, state: &State, aps: &[(&str, &Ap)]) {
     m.family(
         "wifi_config_applies_total",
         COUNTER,
-        "Configurations relayed to the APs, by result (timeout: the AP did not answer in time).",
+        "Configurations sent to the APs, by result (timeout: the AP did not answer in time).",
     );
     for result in RESULTS {
         let n = state.apply_counts.get(result).copied();
         m.sample(&[("result", result)], n.unwrap_or(0) as f64);
     }
     m.family(
+        "wifi_config_state_discarded_files",
+        GAUGE,
+        "Files of signed configurations the controller could not read and set aside.",
+    );
+    let aside = signer.set_aside().map_or(0, |f| f.len());
+    m.sample(&[], aside as f64);
+}
+
+/// The rollouts, when the controller rolls images out.
+fn rollouts(m: &mut Text, state: &State) {
+    let Some(kept) = &state.kept else {
+        return;
+    };
+    m.family(
+        "wifi_images_kept",
+        GAUGE,
+        "Images the controller keeps for the AP, which it can roll out or back to.",
+    );
+    for (ap, ids) in kept {
+        m.sample(&[("ap", ap)], ids.len() as f64);
+    }
+    m.family(
         "wifi_rollouts_total",
         COUNTER,
-        "Image rollouts the deploy runner ended, by outcome.",
+        "Image rollouts ended, by outcome.",
     );
-    for outcome in OUTCOMES {
+    for (_, outcome) in OUTCOMES {
         let n = state.rollout_counts.get(outcome).copied();
         m.sample(&[("outcome", outcome)], n.unwrap_or(0) as f64);
     }
@@ -480,31 +497,13 @@ fn deploy(m: &mut Text, state: &State, aps: &[(&str, &Ap)]) {
         let (outcome, _) = r.result.as_ref()?;
         is_failure(*outcome).then_some(r.ended?)
     });
-    let orphan = state.orphan.as_ref();
-    let orphan_failed = orphan.filter(|(_, o, _, _)| is_failure(*o)).map(|o| o.3);
-    if let Some(last) = failed.chain(orphan_failed).max() {
+    if let Some(last) = failed.max() {
         m.family(
             "wifi_rollout_last_failure_timestamp_seconds",
             GAUGE,
-            "When the last image rollout that rolled back, failed or was never started ended.",
+            "When the last image rollout that rolled back or failed ended.",
         );
         m.sample(&[], unix_seconds(last));
-    }
-    if let Some((_, _, _, at)) = orphan {
-        m.family(
-            "wifi_rollout_orphan_result_timestamp_seconds",
-            GAUGE,
-            "When the runner last sent a result for a rollout this controller does not hold.",
-        );
-        m.sample(&[], unix_seconds(*at));
-    }
-    if state.runner.configured {
-        m.family(
-            "wifi_runner_state_discarded_files",
-            GAUGE,
-            "State files the deploy runner could not read and set aside, as it last told.",
-        );
-        m.sample(&[], state.runner.discarded.len() as f64);
     }
 }
 

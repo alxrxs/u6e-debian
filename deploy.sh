@@ -124,17 +124,12 @@ fi
 # (ap-image.sh's image_tree), the blobs, the site and the two source trees.
 tree=$(image_tree) || fail "image_tree: cannot read this checkout's image inputs"
 image=$tree/$(head_of "$BLOBS")/$(sha256sum < site.conf | cut -c1-16)/$(head_of linux-7.2.8)/$(head_of backports-7.2)
-# The deploy runner holds the same lock on images/ for each rollout, its gate
-# and its way back included (u6e-deploy --stage-helper), so a rollout and
-# this loop never have two APs down at once: while one runs, this refuses,
-# as it does while the runner keeps one under way (restarting, say).
-if declare -F runner_rolling_out > /dev/null && runner_rolling_out; then
-	fail "the deploy runner has a rollout under way; run again once it is over"
-fi
+# One deploy of this tree at a time (prune.sh takes the same lock), so two
+# never have two APs down at once.
 mkdir -p images
 exec {lock}<images
 flock -n "$lock" ||
-	fail "images/ is locked: a rollout of the deploy runner, or another deploy, is under way; run again once it is over"
+	fail "images/ is locked: another deploy or a prune is under way; run again once it is over"
 for ap in "$@"; do
 	export U6E_AP=$ap
 	boot_ap "$ap" "$image"

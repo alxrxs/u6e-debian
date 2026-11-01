@@ -1,18 +1,16 @@
 //! The agent listener: one task per connection. The handshake admits only the
-//! keys of configured APs and of the deploy runner; the key then says which
-//! the peer is, so an AP's key never gets the runner's session (`runner`) and
-//! the runner's never an AP's, and which AP: an agent that names itself by
-//! another host name than that AP's, in its Hello or later, is turned away
-//! and counted. Each end then states its protocol in the
-//! version frame, and an agent of another protocol is turned away, recorded
-//! in the state for the metrics and the UI. The session then takes the
-//! agent's Hello, applies its key frames, deltas, events, flows and command
-//! and configuration results to the state, pings it, sets its tick and flow
-//! cadence from the AP's watchers, and passes on what the state queues for it
-//! (commands, requests for flows, the runner's configurations). After the
-//! first key frame of every connection it gives the AP the policy's blocks,
-//! all of them, since the AP keeps them in RAM only, and checks that it runs
-//! the configuration it last acknowledged.
+//! keys of configured APs; the key then says which AP the peer is: an agent
+//! that names itself by another host name than that AP's, in its Hello or
+//! later, is turned away and counted. Each end then states its protocol in
+//! the version frame, and an agent of another protocol is turned away,
+//! recorded in the state for the metrics and the UI. The session then takes
+//! the agent's Hello, applies its key frames, deltas, events, flows and
+//! command and configuration results to the state, pings it, sets its tick
+//! and flow cadence from the AP's watchers, and passes on what the state
+//! queues for it (commands, requests for flows, signed configurations). After
+//! the first key frame of every connection it gives the AP the policy's
+//! blocks, all of them, since the AP keeps them in RAM only, and checks that
+//! it runs the latest configuration signed for it.
 //!
 //! Received bytes collect in a buffer and are cut into frames only when whole,
 //! so a read cancelled by another branch of the session's `select!` never
@@ -40,7 +38,6 @@ use u6e_proto::{PROTOCOL, version};
 
 use crate::names::Lookups;
 use crate::policy::{self, Store};
-use crate::runner;
 use crate::spectrum::Limits;
 use crate::state::{FLOWS_WATCHED, Registration, Shared, TICK_WATCHED};
 
@@ -49,8 +46,9 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How often a session pings, how long it waits for any word from the peer
 /// before dropping it (the agent keeps the same 60 s on its side), how long
-/// an operator waits for a command's result and the runner for an AP's
-/// answer to a configuration, and when scans stop.
+/// an operator waits for a command's result and an apply for an AP's answer
+/// to a configuration, when scans stop, and how long a rollout's gate a
+/// restarted controller goes on with waits at least for the AP.
 #[derive(Debug, Clone, Copy)]
 pub struct Timing {
     pub ping: Duration,
@@ -60,8 +58,8 @@ pub struct Timing {
     /// and its undo as long again.
     pub apply: Duration,
     pub spectrum: Limits,
-    /// How long the runner has to take a rollout on.
-    pub start: Duration,
+    /// Past the agent's longest redial (30 s) and a boot's tail.
+    pub resume: Duration,
 }
 
 impl Default for Timing {
@@ -72,7 +70,7 @@ impl Default for Timing {
             command: Duration::from_secs(5),
             apply: Duration::from_secs(300),
             spectrum: Limits::default(),
-            start: crate::state::ROLLOUT_START,
+            resume: Duration::from_secs(120),
         }
     }
 }
@@ -81,11 +79,8 @@ impl Default for Timing {
 #[derive(Clone)]
 pub struct Listener {
     pub acceptor: TlsAcceptor,
-    /// The keys the handshake admits: every AP's, and the runner's.
+    /// The keys the handshake admits: every AP's.
     pub allowed: AllowedKeys,
-    /// The runner's key: the connection holding it is the runner's, every
-    /// other an AP's.
-    pub runner: Option<[u8; 32]>,
     pub state: Shared,
     pub timing: Timing,
     pub lookups: Lookups,
@@ -94,7 +89,7 @@ pub struct Listener {
     pub store: Store,
 }
 
-/// Accepts agents and the runner for the life of the process.
+/// Accepts agents for the life of the process.
 pub async fn serve(listener: TcpListener, l: Listener) {
     loop {
         match listener.accept().await {
@@ -139,10 +134,6 @@ async fn connection(l: Listener, sock: TcpStream, peer: SocketAddr) {
         last_rx: Instant::now(),
         silence: l.timing.silence,
     };
-    if l.runner == Some(key) {
-        runner::serve(conn, l.state, l.timing, l.store).await;
-        return;
-    }
     // The verifier admitted the key; None only if it left the map since.
     let Some(name) = l.allowed.read().ok().and_then(|m| m.get(&key).cloned()) else {
         eprintln!("u6e-controller: {peer}: key no longer enrolled");
@@ -176,23 +167,23 @@ async fn connection(l: Listener, sock: TcpStream, peer: SocketAddr) {
 
 /// A connection after its handshake: the TLS stream, the decrypted bytes not
 /// yet a whole frame, and when the peer was last heard.
-pub(crate) struct Conn {
-    pub(crate) tls: TlsStream<Counted>,
-    pub(crate) peer: SocketAddr,
-    pub(crate) inbuf: Vec<u8>,
-    pub(crate) last_rx: Instant,
+struct Conn {
+    tls: TlsStream<Counted>,
+    peer: SocketAddr,
+    inbuf: Vec<u8>,
+    last_rx: Instant,
     silence: Duration,
 }
 
 impl Conn {
     /// When the peer, silent since it was last heard, is dropped.
-    pub(crate) fn deadline(&self) -> Instant {
+    fn deadline(&self) -> Instant {
         self.last_rx + self.silence
     }
 
     /// Sends this controller's protocol and reads the peer's, before either
     /// end decodes a message.
-    pub(crate) async fn versions(&mut self) -> io::Result<u16> {
+    async fn versions(&mut self) -> io::Result<u16> {
         self.send_bytes(&version::frame(PROTOCOL)).await?;
         let read = |buf: &[u8]| Ok(frame_body(buf)?.map(|(b, n)| (version::decode(b), n)));
         self.wait_frame(read, "version frame").await
@@ -200,7 +191,7 @@ impl Conn {
 
     /// The next whole frame as `read` makes it out; `what` names it in the
     /// error of a peer that stays silent.
-    pub(crate) async fn wait_frame<T>(
+    async fn wait_frame<T>(
         &mut self,
         read: impl Fn(&[u8]) -> io::Result<Option<(T, usize)>>,
         what: &str,
@@ -220,7 +211,7 @@ impl Conn {
         }
     }
 
-    pub(crate) fn take(&mut self, bytes: &[u8]) -> io::Result<()> {
+    fn take(&mut self, bytes: &[u8]) -> io::Result<()> {
         if bytes.is_empty() {
             return Err(ErrorKind::UnexpectedEof.into());
         }
@@ -228,25 +219,19 @@ impl Conn {
         Ok(())
     }
 
-    /// Drops the first `used` bytes, which frames were made of, wiping them
-    /// and what the move leaves behind: a runner's frames hold Wi-Fi secrets.
-    pub(crate) fn consume(&mut self, used: usize) {
-        let len = self.inbuf.len();
-        zeroize(&mut self.inbuf[..used]);
+    /// Drops the first `used` bytes, which frames were made of.
+    fn consume(&mut self, used: usize) {
         self.inbuf.drain(..used);
-        self.inbuf.resize(len, 0);
-        zeroize(&mut self.inbuf[len - used..]);
-        self.inbuf.truncate(len - used);
     }
 
-    pub(crate) async fn send(&mut self, msg: &impl Serialize) -> io::Result<()> {
+    async fn send(&mut self, msg: &impl Serialize) -> io::Result<()> {
         let mut out = Vec::new();
         write_frame(&mut out, msg)?;
         self.send_bytes(&out).await
     }
 
     /// Sends a message that holds secrets, its encoding wiped once sent.
-    pub(crate) async fn send_secret(&mut self, msg: &impl Serialize) -> io::Result<()> {
+    async fn send_secret(&mut self, msg: &impl Serialize) -> io::Result<()> {
         let mut out = Vec::new();
         write_frame(&mut out, msg)?;
         let r = self.send_bytes(&out).await;
@@ -254,7 +239,7 @@ impl Conn {
         r
     }
 
-    pub(crate) async fn send_bytes(&mut self, out: &[u8]) -> io::Result<()> {
+    async fn send_bytes(&mut self, out: &[u8]) -> io::Result<()> {
         let write = async {
             self.tls.write_all(out).await?;
             self.tls.flush().await
@@ -264,7 +249,7 @@ impl Conn {
             .map_err(|_| io::Error::new(ErrorKind::TimedOut, "peer not reading"))?
     }
 
-    pub(crate) async fn shutdown(&mut self) {
+    async fn shutdown(&mut self) {
         let _ = timeout(IO_TIMEOUT, self.tls.shutdown()).await;
     }
 }

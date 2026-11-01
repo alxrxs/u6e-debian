@@ -2,7 +2,7 @@
 //! each field set (numbers too large for the next smaller type, each u8 above
 //! 127 so that a widening to a varint shows), encoded and compared with
 //! `golden/protocol-<PROTOCOL>.txt`, with the hash of a sample configuration
-//! and the bytes the deploy runner signs for it, which every end computes.
+//! and the bytes the controller signs for it, which every end computes.
 //! Bytes that differ while PROTOCOL did not fail the test, as does a variant
 //! with no instance.
 //!
@@ -26,13 +26,8 @@ use crate::mac::hex;
 use crate::msg::{
     AgentMsg, Band, Bss, ClientFlows, Command, CommandKind, CommandResult, ConfigApplied, CtlMsg,
     Event, EventKind, FieldDelta, Flow, Flows, Hello, Mechanism, Radio, RadioApplied, RadioConfig,
-    RateMode, RecDelta, RolloutOutcome, RolloutRequest, RolloutResult, RunnerCtlMsg, RunnerHello,
-    RunnerMsg, SignedConfig, SiteDeployState, Snapshot, SnapshotDelta, SpectrumFrame, Station,
-    Temp,
+    RateMode, RecDelta, SignedConfig, Snapshot, SnapshotDelta, SpectrumFrame, Station, Temp,
 };
-
-/// A commit of the site's repository.
-const REV: &str = "0123456789abcdef0123456789abcdef01234567";
 
 const HOW: &str = "bump u6e_proto::PROTOCOL (pkg/u6e-proto/src/version.rs) and write the \
                    golden: U6E_GOLDEN=write cargo test -p u6e-proto golden";
@@ -118,8 +113,6 @@ type Named<T> = Vec<(&'static str, T)>;
 struct Samples {
     agent: Named<AgentMsg>,
     ctl: Named<CtlMsg>,
-    runner: Named<RunnerMsg>,
-    runner_ctl: Named<RunnerCtlMsg>,
 }
 
 /// A configuration of every radio, each text past 127 bytes so that its
@@ -308,126 +301,7 @@ fn samples() -> Samples {
     ctl.push(("SpectrumStart", CtlMsg::SpectrumStart { radio: radio() }));
     ctl.push(("SpectrumStop", CtlMsg::SpectrumStop { radio: radio() }));
     ctl.push(("ApplyConfig", CtlMsg::ApplyConfig(signed_config())));
-    let id = (1 << 42) + 1;
-    let site_deploy = |state| RunnerMsg::SiteDeploy {
-        id,
-        rev: REV.into(),
-        state,
-        detail: "deployed".into(),
-    };
-    let rollout = |outcome| {
-        RunnerMsg::RolloutResult(RolloutResult {
-            id,
-            outcome,
-            detail: "staged".into(),
-        })
-    };
-    let runner = vec![
-        (
-            "RunnerHello",
-            RunnerMsg::Hello(RunnerHello {
-                version: "1.0.0".into(),
-            }),
-        ),
-        ("RunnerPong", RunnerMsg::Pong(1 << 50)),
-        (
-            "RunnerApplyConfig",
-            RunnerMsg::ApplyConfig {
-                id,
-                config: signed_config(),
-            },
-        ),
-        (
-            "RolloutLog",
-            RunnerMsg::RolloutLog {
-                id,
-                line: "staging".into(),
-            },
-        ),
-        ("RolloutRefused", rollout(RolloutOutcome::Refused)),
-        ("RolloutDone", rollout(RolloutOutcome::Done)),
-        ("RolloutRolledBack", rollout(RolloutOutcome::RolledBack)),
-        ("RolloutFailed", rollout(RolloutOutcome::Failed)),
-        ("RolloutNotStarted", rollout(RolloutOutcome::NotStarted)),
-        (
-            "RolloutAsk",
-            RunnerMsg::RolloutAsk {
-                ap: "ap1".into(),
-                image_id: "u6e-ap1-20261025".into(),
-                user: "root".into(),
-            },
-        ),
-        (
-            "Latest",
-            RunnerMsg::Latest {
-                ap: "ap1".into(),
-                seq: (1 << 42) + 4,
-                sha256: [0x84; 32],
-            },
-        ),
-        ("RolloutStarted", RunnerMsg::RolloutStarted { id }),
-        (
-            "StateDiscarded",
-            RunnerMsg::StateDiscarded {
-                file: "rollout".into(),
-                detail: "not of format 1".into(),
-                at_ms: (1 << 42) + 5,
-            },
-        ),
-        ("SiteDeployRefused", site_deploy(SiteDeployState::Refused)),
-        ("SiteDeployRunning", site_deploy(SiteDeployState::Running)),
-        ("SiteDeployDone", site_deploy(SiteDeployState::Done)),
-        ("SiteDeployFailed", site_deploy(SiteDeployState::Failed)),
-    ];
-    let runner_ctl = vec![
-        ("RunnerPing", RunnerCtlMsg::Ping(1 << 50)),
-        (
-            "RunnerConfigApplied",
-            RunnerCtlMsg::ConfigApplied {
-                id,
-                result: config_applied(),
-            },
-        ),
-        (
-            "Repush",
-            RunnerCtlMsg::Repush {
-                ap: "ap1".into(),
-                installed: Some([0x83; 32]),
-            },
-        ),
-        (
-            "Rollout",
-            RunnerCtlMsg::Rollout(RolloutRequest {
-                id,
-                ap: "ap1".into(),
-                image_id: "u6e-ap1-20261025".into(),
-                previous: "u6e-ap1-20261024".into(),
-                user: "admin".into(),
-            }),
-        ),
-        (
-            "RolloutGate",
-            RunnerCtlMsg::RolloutGate {
-                id,
-                healthy: true,
-                detail: "radios up".into(),
-            },
-        ),
-        ("RolloutAck", RunnerCtlMsg::RolloutAck { id }),
-        (
-            "DeploySite",
-            RunnerCtlMsg::DeploySite {
-                id,
-                rev: REV.into(),
-            },
-        ),
-    ];
-    Samples {
-        agent,
-        ctl,
-        runner,
-        runner_ctl,
-    }
+    Samples { agent, ctl }
 }
 
 /// A client's flows, one of each address family.
@@ -465,7 +339,7 @@ fn flows() -> Flows {
 }
 
 /// The golden text: one `<name> <hex>` line per message, then the hash of
-/// the sample configuration and the bytes the runner signs for it, which
+/// the sample configuration and the bytes the controller signs for it, which
 /// every end must compute alike too.
 fn render() -> String {
     fn lines<T: Serialize>(named: &Named<T>) -> impl Iterator<Item = String> + '_ {
@@ -480,8 +354,6 @@ fn render() -> String {
     let signed = format!("SignedPayload {}\n", hex(&signed));
     lines(&s.agent)
         .chain(lines(&s.ctl))
-        .chain(lines(&s.runner))
-        .chain(lines(&s.runner_ctl))
         .chain([hash, signed])
         .collect()
 }
@@ -497,10 +369,9 @@ fn every_variant_has_an_instance() {
     }
     let s = samples();
     let (agent, ctl) = (values(s.agent), values(s.ctl));
-    let (runner, runner_ctl) = (values(s.runner), values(s.runner_ctl));
     let mut events = Vec::new();
     let (mut bands, mut modes, mut addrs) = (Vec::new(), Vec::new(), Vec::new());
-    let (mut mechanisms, mut outcomes, mut deploys) = (Vec::new(), Vec::new(), Vec::new());
+    let mut mechanisms = Vec::new();
     for m in &agent {
         match m {
             AgentMsg::Event(e) => events.push(e.kind.clone()),
@@ -513,13 +384,6 @@ fn every_variant_has_an_instance() {
                 addrs.extend(flows.flat_map(|f| [f.src, f.dst]));
             }
             AgentMsg::ConfigApplied(c) => mechanisms.extend(c.radios.iter().map(|r| r.mechanism)),
-            _ => {}
-        }
-    }
-    for m in &runner {
-        match m {
-            RunnerMsg::RolloutResult(r) => outcomes.push(r.outcome),
-            RunnerMsg::SiteDeploy { state, .. } => deploys.push(*state),
             _ => {}
         }
     }
@@ -537,11 +401,7 @@ fn every_variant_has_an_instance() {
     assert_every_variant("RateMode", &modes);
     assert_every_variant("IpAddr", &addrs);
     assert_every_variant("CommandKind", &commands);
-    assert_every_variant("RunnerMsg", &runner);
-    assert_every_variant("RunnerCtlMsg", &runner_ctl);
     assert_every_variant("Mechanism", &mechanisms);
-    assert_every_variant("RolloutOutcome", &outcomes);
-    assert_every_variant("SiteDeployState", &deploys);
 }
 
 #[test]

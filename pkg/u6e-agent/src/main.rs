@@ -6,17 +6,18 @@
 //!   u6e-agent --listen <address> --port <port> --gateway <address> [--arm]
 //!             [--peer <address>]...
 //!             [--controller <host:port> --key <path> --controller-key <hex>
-//!              [--runner-key <hex>]]
+//!              [--config-key <hex>]]
 //!   u6e-agent --print-snapshot
 //!   u6e-agent --print-flows [--full]
-//!   u6e-agent --config-helper [--runner-key <hex>]
+//!   u6e-agent --config-helper [--config-key <hex>]
 //!   u6e-agent --publish-config-hash
 //!
 //! With the three controller options it also streams telemetry to the
 //! controller, carries out its commands and forwards the spectrum scans it
-//! asks for, which u6e-spectral runs; with the deploy runner's public key
-//! too, it applies the Wi-Fi configurations the runner signs and the
-//! controller relays (see `link`, `command`, `spectrum` and `apply`).
+//! asks for, which u6e-spectral runs; with the public half of the
+//! controller's configuration key too, it applies the Wi-Fi configurations
+//! the controller signs with it (see `link`, `command`, `spectrum` and
+//! `apply`).
 //! `--print-flows` prints the flows the link would send now, and what
 //! reading them cost. `--config-helper` is the root helper that classifies
 //! and installs those configurations for the agent, one request on the
@@ -70,7 +71,7 @@ struct LinkArgs {
     controller: String,
     key: String,
     controller_key: [u8; 32],
-    runner_key: Option<[u8; 32]>,
+    config_key: Option<[u8; 32]>,
 }
 
 struct Args {
@@ -86,7 +87,7 @@ fn args() -> Option<Args> {
     let (mut listen, mut port, mut gateway, mut arm, mut peers) =
         (None, None, None, false, Vec::new());
     let (mut controller, mut key, mut controller_key) = (None, None, None);
-    let mut runner_key = None;
+    let mut config_key = None;
     let mut a = env::args().skip(1);
     while let Some(k) = a.next() {
         match k.as_str() {
@@ -98,7 +99,7 @@ fn args() -> Option<Args> {
             "--controller" => controller = Some(a.next()?),
             "--key" => key = Some(a.next()?),
             "--controller-key" => controller_key = Some(mac::unhex(&a.next()?)?),
-            "--runner-key" => runner_key = Some(mac::unhex(&a.next()?)?),
+            "--config-key" => config_key = Some(mac::unhex(&a.next()?)?),
             _ => return None,
         }
     }
@@ -107,9 +108,9 @@ fn args() -> Option<Args> {
             controller,
             key,
             controller_key,
-            runner_key,
+            config_key,
         }),
-        (None, None, None) if runner_key.is_none() => None,
+        (None, None, None) if config_key.is_none() => None,
         _ => return None,
     };
     Some(Args {
@@ -151,7 +152,7 @@ fn start_link(
             helper::Client::new(),
             Box::new(apply::NlPhy::default()),
             Arc::clone(targets),
-            l.runner_key,
+            l.config_key,
             hello.ap.clone(),
             hello.built_ms(),
         );
@@ -186,16 +187,16 @@ fn start_link(
 
 /// The root helper: one request on the connection systemd passes as stdin,
 /// answered there, from a member of the agent's group only. It takes
-/// configurations the runner of `--runner-key` signed for this AP alone.
+/// configurations signed for this AP alone with the key of `--config-key`.
 fn config_helper() -> ! {
-    let runner = match env::args().skip(2).collect::<Vec<_>>().as_slice() {
+    let signer = match env::args().skip(2).collect::<Vec<_>>().as_slice() {
         [] => None,
-        [k, hex] if k == "--runner-key" => mac::unhex(hex).map(Some).unwrap_or_else(|| {
-            eprintln!("u6e-agent: --runner-key: not 64 hex digits");
+        [k, hex] if k == "--config-key" => mac::unhex(hex).map(Some).unwrap_or_else(|| {
+            eprintln!("u6e-agent: --config-key: not 64 hex digits");
             process::exit(2);
         }),
         _ => {
-            eprintln!("usage: u6e-agent --config-helper [--runner-key <hex>]");
+            eprintln!("usage: u6e-agent --config-helper [--config-key <hex>]");
             process::exit(2);
         }
     };
@@ -215,7 +216,7 @@ fn config_helper() -> ! {
     }
     let hello = link::local_hello();
     let floor = hello.built_ms();
-    let server = helper::Server::new(runner, hello.ap, floor);
+    let server = helper::Server::new(signer, hello.ap, floor);
     if let Err(e) = server.serve(&mut conn) {
         eprintln!("u6e-agent: config helper: {e}");
         process::exit(1);
@@ -309,7 +310,7 @@ fn main() {
     }
     let Some(a) = args() else {
         eprintln!(
-            "usage: u6e-agent --listen <address> --port <port> --gateway <address> [--arm] [--peer <address>]... [--controller <host:port> --key <path> --controller-key <hex> [--runner-key <hex>]]"
+            "usage: u6e-agent --listen <address> --port <port> --gateway <address> [--arm] [--peer <address>]... [--controller <host:port> --key <path> --controller-key <hex> [--config-key <hex>]]"
         );
         process::exit(2);
     };

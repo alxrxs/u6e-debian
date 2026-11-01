@@ -8,7 +8,8 @@
 //! come up again; it puts back the previous one when the agent asks; and it
 //! publishes the hash of what is installed for the agent to report.
 //!
-//! It takes only configurations the deploy runner signed for this AP, newer
+//! It takes only configurations signed for this AP by the configuration key
+//! the image pins, newer
 //! than the last it installed (the sequence number survives the agent, until
 //! the next boot) and than the image's build time (`Hello::built_ms`, which
 //! survives the boot), and still valid by its synchronized clock (each is
@@ -125,9 +126,9 @@ pub struct Server {
     pub up_wait: Duration,
     /// How long a radio may run its radar check (CAC) after a restart.
     pub cac_wait: Duration,
-    /// The deploy runner's public key, as the image pins it; without one,
-    /// no configuration is taken.
-    pub runner: Option<[u8; 32]>,
+    /// The configuration key's public half, as the image pins it; without
+    /// one, no configuration is taken.
+    pub signer: Option<[u8; 32]>,
     /// This AP's name, which a configuration must be signed for.
     pub ap: String,
     /// The image's build time: no sequence number at or below it applies.
@@ -139,7 +140,7 @@ pub struct Server {
 
 impl Server {
     /// The AP's helper.
-    pub fn new(runner: Option<[u8; 32]>, ap: String, floor: u64) -> Self {
+    pub fn new(signer: Option<[u8; 32]>, ap: String, floor: u64) -> Self {
         Server {
             dir: wificonf::DIR.into(),
             state: wificonf::STATE.into(),
@@ -152,7 +153,7 @@ impl Server {
             up_wait: Duration::from_secs(30),
             // Ten minutes on the weather radar channels, a minute elsewhere.
             cac_wait: Duration::from_secs(11 * 60),
-            runner,
+            signer,
             ap,
             floor,
             now: wificonf::now_ms,
@@ -198,14 +199,14 @@ impl Server {
         }
     }
 
-    /// Whether `c` may be installed at all: signed by the runner for this
-    /// AP, newer than the last installed, every radio once, each file one
+    /// Whether `c` may be installed at all: signed by the configuration key
+    /// for this AP, newer than the last installed, every radio once, each file one
     /// that passes.
     fn check(&self, c: &SignedConfig) -> Result<(), String> {
-        let runner = self
-            .runner
-            .ok_or("no deploy runner key in this image: live configuration is off")?;
-        config::verify(&runner, &self.ap, c)?;
+        let signer = self
+            .signer
+            .ok_or("no configuration key in this image: live configuration is off")?;
+        config::verify(&signer, &self.ap, c)?;
         let last = wificonf::read_seq(&self.dir);
         if let Some(why) = config::replayed(c.seq, last, "the last installed", self.floor) {
             return Err(why);
@@ -416,22 +417,22 @@ pub mod tests {
     use crate::testdir::TestDir;
     use crate::wificonf::tests::{WLAN5, edit, fixture};
 
-    /// The test runner's key and its public half; and another key.
-    pub fn runner() -> Ed25519KeyPair {
+    /// The test configuration key and its public half; and another key.
+    pub fn signer() -> Ed25519KeyPair {
         Ed25519KeyPair::from_seed_unchecked(&[1; 32]).unwrap()
     }
 
-    pub fn runner_public() -> [u8; 32] {
-        runner().public_key().as_ref().try_into().unwrap()
+    pub fn signer_public() -> [u8; 32] {
+        signer().public_key().as_ref().try_into().unwrap()
     }
 
     pub fn stranger() -> Ed25519KeyPair {
         Ed25519KeyPair::from_seed_unchecked(&[2; 32]).unwrap()
     }
 
-    /// `radios` signed by the test runner for "ap1" under `seq`.
+    /// `radios` signed by the test key for "ap1" under `seq`.
     pub fn signed(seq: u64, radios: Vec<RadioConfig>) -> SignedConfig {
-        config::sign(&runner(), "ap1", seq, radios)
+        config::sign(&signer(), "ap1", seq, radios)
     }
 
     /// The fixture with wlan5's text `text` and power `dbm`.
@@ -514,7 +515,7 @@ pub mod tests {
             iw: iw(t.path(), &log),
             up_wait: Duration::from_secs(2),
             cac_wait: Duration::from_secs(5),
-            runner: Some(runner_public()),
+            signer: Some(signer_public()),
             ap: "ap1".into(),
             floor: 0,
             now: || Some(0),
@@ -758,7 +759,7 @@ pub mod tests {
         );
     }
 
-    /// What the runner did not sign for this AP, a replay, or anything the
+    /// What the configuration key did not sign for this AP, a replay, or anything the
     /// helper would not install, leaves everything as it was, whatever the
     /// agent checked.
     #[test]
@@ -768,7 +769,7 @@ pub mod tests {
         let before = (r.installed(), r.log());
         let new = || with5(&edit(WLAN5, "dtim_period=3", "dtim_period=1"), 23);
         let forged = config::sign(&stranger(), "ap1", 11, new());
-        let other_ap = config::sign(&runner(), "ap2", 11, new());
+        let other_ap = config::sign(&signer(), "ap2", 11, new());
         let mut unsigned = signed(11, new());
         unsigned.signature.clear();
         let mut altered = signed(11, fixture());
@@ -778,8 +779,8 @@ pub mod tests {
             with5(&edit(WLAN5, "ctrl_interface=", "ctrl_interface=/etc"), 23),
         );
         for (c, why) in [
-            (forged, "not signed by the deploy runner"),
-            (unsigned, "not signed by the deploy runner"),
+            (forged, "not signed by the configuration key"),
+            (unsigned, "not signed by the configuration key"),
             (other_ap, "for another AP (ap2)"),
             (altered, "the configuration does not match its SHA-256"),
             (
@@ -814,10 +815,10 @@ pub mod tests {
         );
         stale = Request::Classify(signed(11, new()));
         let mut keyless = Rig::new();
-        keyless.server.runner = None;
+        keyless.server.signer = None;
         assert_eq!(
             keyless.ask(stale),
-            Err("no deploy runner key in this image: live configuration is off".into())
+            Err("no configuration key in this image: live configuration is off".into())
         );
         assert_eq!((r.installed(), r.log()), before);
         assert_eq!(wificonf::read_seq(&r.server.dir), 10);
