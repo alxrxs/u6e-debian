@@ -1486,7 +1486,32 @@ impl State {
         };
         self.policy_dirty = true;
         self.record_deploy("hold", Some(ap), Some("root".into()), true, detail.clone());
+        self.check_held_off(ap);
         Ok(detail)
+    }
+
+    /// Ends the holds whose time is up, as release would.
+    pub fn expire_holds(&mut self) {
+        let now = unix_ms();
+        let ended: Vec<(String, Hold)> = self
+            .holds
+            .extract_if(.., |_, h| h.until_ms <= now)
+            .collect();
+        for (ap, h) in ended {
+            self.policy_dirty = true;
+            let detail = format!("{ap}'s hold ended, its time up ({})", h.reason);
+            self.record_deploy("hold", Some(&ap), None, true, detail);
+            self.check_held_off(&ap);
+        }
+    }
+
+    /// What a hold kept from `ap` goes now: the latest configuration, if it
+    /// runs another (something rebooted it meanwhile, say).
+    fn check_held_off(&mut self, ap: &str) {
+        let session = self.aps.get(ap).and_then(|a| a.session.as_ref());
+        if let Some(id) = session.map(|s| s.id) {
+            self.check_installed(ap, id);
+        }
     }
 
     /// The kept images that must stay: what each AP runs or may run, and

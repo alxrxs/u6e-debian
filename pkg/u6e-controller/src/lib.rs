@@ -239,12 +239,15 @@ fn bind_local(config: &Config) -> io::Result<UnixListener> {
 }
 
 /// Gives up on the configurations the APs have not answered in
-/// `Timing::apply`, for the life of the process.
+/// `Timing::apply`, and ends the holds whose time is up, for the life of
+/// the process.
 async fn expire(state: Shared, timing: Timing) {
     let mut every = interval(timing.ping);
     loop {
         every.tick().await;
-        state.write().expire_relays(Instant::now(), timing.apply);
+        let mut state = state.write();
+        state.expire_relays(Instant::now(), timing.apply);
+        state.expire_holds();
     }
 }
 

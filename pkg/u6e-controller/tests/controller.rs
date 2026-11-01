@@ -2699,6 +2699,61 @@ fn a_configuration_is_signed_sent_and_kept_by_its_hash_alone() {
     );
 }
 
+/// A hold keeps the latest configuration from an AP something else reboots
+/// back onto an image built before it; when the hold ends, released or its
+/// time up, the latest goes to it.
+#[test]
+fn a_hold_sends_what_it_held_off_when_it_ends() {
+    let timing = Timing {
+        ping: Duration::from_millis(100),
+        ..Timing::default()
+    };
+    let r = controller(timing);
+    let built = now_ms() - 60_000;
+    let mut ap1 = ap_on(&r, KEY_AP1, "ap1", "img-1-ap1", built, image_config(1));
+    let mut judge = Judge {
+        ap: "ap1",
+        last: 0,
+        built,
+    };
+    let asked = apply_in_thread(&r, "ap1", radios(1));
+    assert_eq!(judge.answer(&mut ap1).1, Ok(()));
+    asked.join().unwrap().unwrap();
+
+    // Held, deploy.sh boots it onto its image again: nothing goes to it.
+    hold(&r, "ap1", Some("wifi.yml boots it")).unwrap();
+    let mut ap1 = ap_on(&r, KEY_AP1, "ap1", "img-1-ap1", built, image_config(1));
+    ap1.hears_nothing(Duration::from_millis(400));
+    assert!(r.c.state.read().ap("ap1").unwrap().drifts());
+    // Released: the latest goes.
+    hold(&r, "ap1", None).unwrap();
+    let mut judge = Judge {
+        ap: "ap1",
+        last: 0,
+        built,
+    };
+    let (c, verdict) = judge.answer(&mut ap1);
+    assert_eq!((c.sha256, verdict), (config_sha256(&radios(1)), Ok(())));
+
+    // Again, the hold left to run out.
+    hold(&r, "ap1", Some("wifi.yml boots it")).unwrap();
+    let mut ap1 = ap_on(&r, KEY_AP1, "ap1", "img-1-ap1", built, image_config(1));
+    ap1.hears_nothing(Duration::from_millis(400));
+    let soon = now_ms() + 300;
+    r.c.state.write().holds.get_mut("ap1").unwrap().until_ms = soon;
+    let mut judge = Judge {
+        ap: "ap1",
+        last: 0,
+        built,
+    };
+    let (c, verdict) = judge.answer(&mut ap1);
+    assert!(now_ms() >= soon);
+    assert_eq!((c.sha256, verdict), (config_sha256(&radios(1)), Ok(())));
+    assert!(r.c.state.read().holds.is_empty());
+    let events = http_get(r.c.http, "/api/events");
+    assert!(events.contains("hold ended, its time up"), "{events}");
+}
+
 /// A configuration waits while a channel switch or a power change to the
 /// AP is unanswered, then goes: the two never interleave on a radio.
 #[test]
