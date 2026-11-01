@@ -13,8 +13,9 @@ mkdir work; mkdir -p out
 git clone -q https://w1.fi/hostap.git work/src
 git -C work/src archive --prefix=wpa-$UP/ "$REV" | xz > work/wpa_$UP.orig.tar.xz
 tar -xJf work/wpa_$UP.orig.tar.xz -C work
-curl -fsSL -o work/debian.tar.xz https://deb.debian.org/debian/pool/main/w/wpa/wpa_$DEBVER.debian.tar.xz
-tar -xJf work/debian.tar.xz -C work/wpa-$UP
+../fetch-debian.sh work 20260216T203826Z main/w/wpa \
+	3e695e586bdcd8c708aebfc87a327559d9faf6d2f2e7f673548c0710a9a368bc=wpa_$DEBVER.debian.tar.xz
+tar -xJf work/wpa_$DEBVER.debian.tar.xz -C work/wpa-$UP
 D=work/wpa-$UP/debian
 # Fixed upstream since 2.11 (the CVE, extra-IEs and sae_pk_gen ones differently), or wpa_supplicant-only
 # unit changes this package does not ship.
