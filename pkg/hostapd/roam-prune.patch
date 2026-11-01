@@ -1,4 +1,4 @@
-From b99bce1c20872c92d0a3a3b1e60bdcbca0a97727 Mon Sep 17 00:00:00 2001
+From 64f9dd7874eae9b6ff58c3279abed12ad994e577 Mon Sep 17 00:00:00 2001
 From: Andrei-Alexandru Bleortu <me@andrei-z.com>
 Date: Tue, 27 Oct 2026 21:51:46 +0200
 Subject: [PATCH] AP: Remove a STA that associated with another AP of the ESS
@@ -21,10 +21,15 @@ The new AP's kernel sends a Layer 2 Update frame for each association
 where the STA is; the old AP receives it from the distribution system.
 Add prune_roamed_sta: on a Layer 2 Update frame received on a wired
 bridge port for one of its associated STAs, the AP removes the STA
-unless it receives a frame from it within two seconds, which a STA that
-left does not send and one still here does. A forged frame therefore
-cannot remove an active STA; an idle one reassociates when it next
-transmits. The STA is not sent a Deauthentication frame.
+unless it receives a frame from it in the two seconds after the next
+one, which a STA that left does not send and one still here does. A
+forged frame therefore cannot remove an active STA; an idle one
+reassociates when it next transmits. The first second is left out: a
+driver whose data path is offloaded (ath11k with NSS) reports received
+frames in batches, so the frames a STA sent just before it left were
+counted only after the frame arrived, and such a STA was kept, for good
+when it then kept acknowledging some frames (about 20 a day per AP). The
+STA is not sent a Deauthentication frame.
 
 The frame is read on an ETH_P_ALL packet socket that ignores outgoing
 frames, with a filter that passes only the Layer 2 Update frame: a
@@ -39,18 +44,18 @@ is refused, and one for an idle STA removes it until it reassociates.
 
 Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
 ---
- hostapd/Makefile      |   5 ++
+ hostapd/Makefile      |   5 +
  hostapd/config_file.c |   2 +
  hostapd/defconfig     |   4 +
- hostapd/hostapd.conf  |   9 ++
+ hostapd/hostapd.conf  |  11 +++
  src/ap/ap_config.h    |   1 +
  src/ap/hostapd.c      |   9 ++
  src/ap/hostapd.h      |   1 +
- src/ap/roam_prune.c   | 197 ++++++++++++++++++++++++++++++++++++++++++
- src/ap/roam_prune.h   |  35 ++++++++
+ src/ap/roam_prune.c   | 218 ++++++++++++++++++++++++++++++++++++++++++
+ src/ap/roam_prune.h   |  35 +++++++
  src/ap/sta_info.c     |   2 +
  src/ap/sta_info.h     |   1 +
- 11 files changed, 266 insertions(+)
+ 11 files changed, 289 insertions(+)
  create mode 100644 src/ap/roam_prune.c
  create mode 100644 src/ap/roam_prune.h
 
@@ -99,20 +104,22 @@ index cecfc7c..92fc360 100644
  # These extensions facilitate efficient use of multiple frequency bands
  # available to the AP and the devices that may associate with it.
 diff --git a/hostapd/hostapd.conf b/hostapd/hostapd.conf
-index a004718..bf4e814 100644
+index a004718..fac04c2 100644
 --- a/hostapd/hostapd.conf
 +++ b/hostapd/hostapd.conf
-@@ -555,6 +555,15 @@ wmm_ac_vo_acm=0
+@@ -555,6 +555,17 @@ wmm_ac_vo_acm=0
  # may not be available with all drivers.
  #disassoc_low_ack=1
  
 +# Remove a STA that associated with another AP of the ESS, as the Layer 2
 +# Update frame that AP sends for it shows when it arrives from the
 +# distribution system (on a wired port of a bridge), unless the STA still
-+# transmits here within two seconds. Without it, such a STA stays associated
-+# until the inactivity timer or excessive missing ACKs remove it, which a STA
-+# that still acknowledges some frames here (one visiting this channel for
-+# peer-to-peer links) can postpone indefinitely. Requires CONFIG_ROAM_PRUNE.
++# transmits here in the two seconds after the next one (the driver may count
++# what it sent before it left only in that first second). Without it, such
++# a STA stays associated until the inactivity timer or excessive missing
++# ACKs remove it, which a STA that still acknowledges some frames here (one
++# visiting this channel for peer-to-peer links) can postpone indefinitely.
++# Requires CONFIG_ROAM_PRUNE.
 +#prune_roamed_sta=0
 +
  # Maximum allowed Listen Interval (how many Beacon periods STAs are allowed to
@@ -185,10 +192,10 @@ index 7e67ac7..d9284b0 100644
  
 diff --git a/src/ap/roam_prune.c b/src/ap/roam_prune.c
 new file mode 100644
-index 0000000..442db6f
+index 0000000..6ee49c6
 --- /dev/null
 +++ b/src/ap/roam_prune.c
-@@ -0,0 +1,197 @@
+@@ -0,0 +1,218 @@
 +/*
 + * Removal of STAs that reassociated to another AP of the ESS
 + *
@@ -207,9 +214,12 @@ index 0000000..442db6f
 + * STA is (IEEE Std 802.11F-2003; the kernel sends it on every association).
 + * Received from the distribution system - on a wired port of a bridge - it
 + * shows that the STA associated elsewhere. The STA is then removed unless it
-+ * transmits to this AP within ROAM_PRUNE_CHECK_SEC, which a STA still here
-+ * does and one that left does not, so that a forged frame cannot remove an
-+ * active STA. The STA is not sent a Deauthentication frame: it is not here.
++ * transmits to this AP in the ROAM_PRUNE_CHECK_SEC that follow the first
++ * ROAM_PRUNE_SETTLE_SEC, which a STA still here does and one that left does
++ * not, so that a forged frame cannot remove an active STA. The first second
++ * is left out because a driver may count the frames the STA sent just before
++ * it left only then (an offloaded data path reports them in batches). The STA
++ * is not sent a Deauthentication frame: it is not here.
 + */
 +
 +#include "utils/includes.h"
@@ -227,6 +237,7 @@ index 0000000..442db6f
 +#include "sta_info.h"
 +#include "roam_prune.h"
 +
++#define ROAM_PRUNE_SETTLE_SEC 1
 +#define ROAM_PRUNE_CHECK_SEC 2
 +
 +/*
@@ -285,11 +296,14 @@ index 0000000..442db6f
 +
 +	if (!(sta->flags & WLAN_STA_ASSOC))
 +		return;
-+	if (read_rx_packets(hapd, sta, &rx_packets) < 0 ||
-+	    rx_packets != sta->roam_prune_rx_packets) {
++	if (read_rx_packets(hapd, sta, &rx_packets) < 0)
++		return;
++	if (rx_packets != sta->roam_prune_rx_packets) {
 +		hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
 +			       HOSTAPD_LEVEL_INFO,
-+			       "Layer 2 Update frame from the distribution system, but the STA is still here; not removed");
++			       "Layer 2 Update frame from the distribution system, but the STA is still here (%lu frames received in %d s); not removed",
++			       rx_packets - sta->roam_prune_rx_packets,
++			       ROAM_PRUNE_CHECK_SEC);
 +		return;
 +	}
 +
@@ -297,6 +311,20 @@ index 0000000..442db6f
 +		       HOSTAPD_LEVEL_INFO,
 +		       "associated with another AP of the ESS (Layer 2 Update frame from the distribution system); removed");
 +	ap_sta_deauthenticate(hapd, sta, WLAN_REASON_PREV_AUTH_NOT_VALID);
++}
++
++
++/* The baseline, once the driver has counted what the STA sent before. */
++static void roam_prune_settled(void *eloop_ctx, void *timeout_ctx)
++{
++	struct hostapd_data *hapd = eloop_ctx;
++	struct sta_info *sta = timeout_ctx;
++
++	if (!(sta->flags & WLAN_STA_ASSOC) ||
++	    read_rx_packets(hapd, sta, &sta->roam_prune_rx_packets) < 0)
++		return;
++	eloop_register_timeout(ROAM_PRUNE_CHECK_SEC, 0, roam_prune_check,
++			       hapd, sta);
 +}
 +
 +
@@ -323,15 +351,14 @@ index 0000000..442db6f
 +
 +	sta = ap_get_sta(hapd, &buf[ETH_ALEN]);
 +	if (!sta || !(sta->flags & WLAN_STA_ASSOC) ||
++	    eloop_is_timeout_registered(roam_prune_settled, hapd, sta) ||
 +	    eloop_is_timeout_registered(roam_prune_check, hapd, sta))
-+		return;
-+	if (read_rx_packets(hapd, sta, &sta->roam_prune_rx_packets) < 0)
 +		return;
 +
 +	wpa_printf(MSG_DEBUG,
 +		   "%s: Layer 2 Update frame for STA " MACSTR " on %s",
 +		   hapd->conf->iface, MAC2STR(sta->addr), ifname);
-+	eloop_register_timeout(ROAM_PRUNE_CHECK_SEC, 0, roam_prune_check,
++	eloop_register_timeout(ROAM_PRUNE_SETTLE_SEC, 0, roam_prune_settled,
 +			       hapd, sta);
 +}
 +
@@ -384,6 +411,7 @@ index 0000000..442db6f
 +
 +void roam_prune_sta_free(struct hostapd_data *hapd, struct sta_info *sta)
 +{
++	eloop_cancel_timeout(roam_prune_settled, hapd, sta);
 +	eloop_cancel_timeout(roam_prune_check, hapd, sta);
 +}
 diff --git a/src/ap/roam_prune.h b/src/ap/roam_prune.h

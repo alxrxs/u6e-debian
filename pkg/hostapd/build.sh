@@ -7,7 +7,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 REV=5b156e272a0266ca6be0f394192bad42b0ff176c  # hostap main, 2026-10-01
-UP=2.13~git20261001 DEBVER=2.11-2 VER=2:2.13~git20261001-0+u6e20
+UP=2.13~git20261001 DEBVER=2.11-2 VER=2:2.13~git20261001-0+u6e21
 [ ! -e work ] || { echo "work exists; remove it first" >&2; exit 1; }
 mkdir work; mkdir -p out
 git clone -q https://w1.fi/hostap.git work/src
