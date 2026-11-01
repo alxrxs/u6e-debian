@@ -26,6 +26,8 @@ const MAX_TEMPS: usize = 32 - SCALARS;
 const MAX_RADIOS: usize = 8;
 const MAX_BSSS: usize = 64;
 const MAX_STATIONS: usize = 1024;
+/// A band's channels each of another limit, three bands, with room.
+const MAX_LIMITS: usize = 256;
 
 /// Whether the delta coding can work on `s`: stations sorted by MAC with each
 /// MAC once, each on a BSS of the list, every list within its cap, and each
@@ -36,6 +38,7 @@ pub fn valid(s: &Snapshot) -> bool {
         && s.radios.len() <= MAX_RADIOS
         && s.bsss.len() <= MAX_BSSS
         && s.stations.len() <= MAX_STATIONS
+        && s.power_limits.len() <= MAX_LIMITS
         && s.stations.windows(2).all(|w| w[0].mac < w[1].mac)
         && s.stations.iter().all(|t| usize::from(t.bss) < s.bsss.len())
         && unique(s.radios.iter().map(|r| &r.phy))
@@ -50,11 +53,12 @@ fn unique<'a>(mut names: impl Iterator<Item = &'a String>) -> bool {
 
 /// Whether a delta can express the change from `prev` to `next`: the same
 /// temperature zones and the same radios, which do not change while a
-/// connection lives, and the same configuration and clock state, which
-/// change so rarely that a key frame carries the new one.
+/// connection lives, and the same configuration, clock state and power
+/// limits, which change so rarely that a key frame carries the new ones.
 fn same_shape(prev: &Snapshot, next: &Snapshot) -> bool {
     prev.config_sha256 == next.config_sha256
         && prev.clock_synced == next.clock_synced
+        && prev.power_limits == next.power_limits
         && prev.temps.len() == next.temps.len()
         && prev
             .temps
@@ -221,7 +225,7 @@ fn scalar_fields(s: &Snapshot) -> Vec<i64> {
         .collect()
 }
 
-fn radio_fields(r: &Radio) -> [i64; 10] {
+fn radio_fields(r: &Radio) -> [i64; 11] {
     [
         r.band as i64,
         r.channel.into(),
@@ -233,6 +237,7 @@ fn radio_fields(r: &Radio) -> [i64; 10] {
         r.rx_ms as i64,
         r.tx_ms as i64,
         r.up.into(),
+        r.max_txpower_dbm.into(),
     ]
 }
 
@@ -245,7 +250,7 @@ fn variant<T: Copy>(all: &[T], i: i64) -> Result<T, Gap> {
 
 const MODES: [RateMode; 4] = [RateMode::Legacy, RateMode::Ht, RateMode::Vht, RateMode::He];
 
-fn radio_from(phy: &str, f: &[i64; 10]) -> Result<Radio, Gap> {
+fn radio_from(phy: &str, f: &[i64; 11]) -> Result<Radio, Gap> {
     let band = variant(&[Band::B24, Band::B5, Band::B6], f[0])?;
     Ok(Radio {
         phy: phy.to_owned(),
@@ -259,6 +264,7 @@ fn radio_from(phy: &str, f: &[i64; 10]) -> Result<Radio, Gap> {
         rx_ms: f[7] as u64,
         tx_ms: f[8] as u64,
         up: f[9] != 0,
+        max_txpower_dbm: f[10] as i8,
     })
 }
 
@@ -320,7 +326,7 @@ fn station_from(mac: [u8; 6], f: &[i64; 22]) -> Result<Station, Gap> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::msg::{Band, Bss, Radio, RateMode, Station, Temp};
+    use crate::msg::{Band, Bss, PowerLimit, Radio, RateMode, Station, Temp};
 
     struct Rng(u64);
 
@@ -426,6 +432,7 @@ mod tests {
             rx_ms: 50_000_000 + r(1_000_000),
             tx_ms: 20_000_000 + r(1_000_000),
             up: true,
+            max_txpower_dbm: 0,
         })
         .collect::<Vec<_>>();
         let temps = ["cpu", "nss", "phy0"].map(|z| Temp {
@@ -444,6 +451,7 @@ mod tests {
             stations: a,
             config_sha256: Some([0xab; 32]),
             clock_synced: true,
+            power_limits: Vec::new(),
         };
         let mut second = first.clone();
         second.seq += 1;
@@ -601,6 +609,14 @@ mod tests {
         }
         let mut n = successor(&a);
         n.clock_synced = false;
+        assert_eq!(diff(&a, &n), None);
+        let mut n = successor(&a);
+        n.power_limits.push(PowerLimit {
+            band: Band::B5,
+            first: 36,
+            last: 48,
+            dbm: 23,
+        });
         assert_eq!(diff(&a, &n), None);
     }
 

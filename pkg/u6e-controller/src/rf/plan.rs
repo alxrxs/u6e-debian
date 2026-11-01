@@ -9,7 +9,9 @@
 //!   preferred scanning channel (PSC), sharing no spectrum with a radio of
 //!   another AP of the site, with the primary of any 20/40 MHz network of
 //!   others the AP hears in its block (802.11 20/40 coexistence), and at no
-//!   more power than the table allows. What the site file keeps (`planner:
+//!   more power than the radio's own limit there: its primary channel's, as
+//!   its AP reports it from the radio's own regulatory rules, or what it
+//!   sends on its channel now when it holds itself below that. What the site file keeps (`planner:
 //!   fixed`), a radio whose AP is away or runs other than the file says,
 //!   keeps its channel; its spectrum is then taken first, so the others plan
 //!   around it. `no_pri_sec_switch` keeps a radio's primary channel.
@@ -26,8 +28,10 @@
 //!   hear it at 25 dB SNR or more, and given back while even that tenth would
 //!   hear it 15 dB above, within the limit and 6 dB under it. A change under
 //!   3 dB is not proposed, and a power above the limit counts as the limit
-//!   (the driver holds it there), so a plan applied is planned again as it
-//!   is.
+//!   (the radio is held there: "clamped", never "not as planned"), so no
+//!   change is proposed whose effect would be only that, and a plan applied
+//!   is planned again as it is. A radio whose AP reports no limit keeps its
+//!   power.
 //! - **Measured only.** Without scans of other channels, a channel's foreign
 //!   busy is known only where one of the site's radios spent hours, so a
 //!   radio moves only onto measured spectrum, or off a conflict; and only for
@@ -37,18 +41,18 @@
 
 use std::collections::BTreeMap;
 
-use u6e_proto::msg::{Band, Radio, Snapshot};
+use u6e_proto::msg::{Band, PowerLimit, Radio, Snapshot};
 
 use super::channels::{self, BANDS};
 use super::history::{self, History, Hour, RSSI_BINS};
 use super::site::{Setting, Site, SiteRadio};
 
-/// A range of a band's channels a country allows, with its power limit.
+/// A range of a band's channels a country allows, and whether they need a
+/// radar check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Allowed {
     pub lo: u16,
     pub hi: u16,
-    pub max_dbm: i32,
     pub dfs: bool,
 }
 
@@ -331,27 +335,33 @@ struct Ctx<'a> {
     rules: &'a Rules,
     country: &'a str,
     table: Option<&'a [Vec<Allowed>; 3]>,
+    live: &'a BTreeMap<String, Option<&'a Snapshot>>,
     neighbours: &'a BTreeMap<String, Vec<Neighbour>>,
     spectrum: Spectrum,
     /// The blocks already decided: band, channels, whose.
     taken: Vec<(Band, Vec<u16>, String)>,
 }
 
-/// Where a radio may be: its block, power limit, and whether that needs a
-/// radar check.
+/// Where a radio may be: its block, its power limit when its AP reports
+/// one, and whether that needs a radar check.
 struct Place {
     chans: Vec<u16>,
-    max: i32,
+    max: Option<i32>,
     dfs: bool,
 }
 
+/// `p` as a radio held to `max` sends it.
+fn capped(p: i32, max: Option<i32>) -> i32 {
+    max.map_or(p, |m| p.min(m))
+}
+
 impl Ctx<'_> {
-    /// The power limit and DFS of a block in the table, or why it is not.
-    fn limits(&self, band: Band, chans: &[u16]) -> Result<(i32, bool), String> {
+    /// Whether a block in the table needs DFS, or why it is not one.
+    fn dfs_of(&self, band: Band, chans: &[u16]) -> Result<bool, String> {
         let Some(table) = self.table else {
             return Err("there is no channel table for the site's country".into());
         };
-        let (mut max, mut dfs) = (i32::MAX, false);
+        let mut dfs = false;
         for c in chans {
             let range = table[band_index(band)]
                 .iter()
@@ -362,10 +372,25 @@ impl Ctx<'_> {
                     self.country
                 ));
             };
-            max = max.min(r.max_dbm);
             dfs |= r.dfs;
         }
-        Ok((max, dfs))
+        Ok(dfs)
+    }
+
+    /// The most the radio of `band` of `ap` sends with `primary` as its
+    /// primary channel, as its AP reports it: what it sends there now when
+    /// it holds itself lower, else the radio's own limit; none unreported.
+    fn power_limit(&self, ap: &str, band: Band, primary: u16) -> Option<i32> {
+        let snap = self.live.get(ap).copied().flatten()?;
+        let radio = snap.radios.iter().find(|r| r.band == band);
+        if let Some(r) = radio.filter(|r| r.up && r.channel == primary && r.max_txpower_dbm > 0) {
+            return Some(i32::from(r.max_txpower_dbm));
+        }
+        let within = |l: &&PowerLimit| l.band == band && (l.first..=l.last).contains(&primary);
+        snap.power_limits
+            .iter()
+            .find(within)
+            .map(|l| i32::from(l.dbm))
     }
 
     /// Where the radio of `ap` may be at `primary` and `width`, or why not.
@@ -380,7 +405,8 @@ impl Ctx<'_> {
                 "channel {primary} is no preferred scanning channel"
             ));
         }
-        let (max, dfs) = self.limits(band, &chans)?;
+        let dfs = self.dfs_of(band, &chans)?;
+        let max = self.power_limit(ap, band, primary);
         if dfs && !self.rules.dfs {
             return Err("its channels need DFS".into());
         }
@@ -416,12 +442,12 @@ impl Ctx<'_> {
 /// what a wider channel costs; none when no client was heard.
 fn power(
     now: Option<i32>,
-    max: i32,
+    max: Option<i32>,
     kept: bool,
     tenth: Option<f64>,
     client: i32,
 ) -> (Option<i32>, Option<String>) {
-    let (Some(p), Some(t)) = (now, tenth.filter(|_| !kept)) else {
+    let (Some(p), Some(t), Some(max)) = (now, tenth.filter(|_| !kept), max) else {
         return (now, None);
     };
     // Above the limit, the driver holds it at the limit.
@@ -491,6 +517,7 @@ pub fn plan(inputs: &Inputs) -> Plan {
         rules,
         country,
         table,
+        live,
         neighbours,
         spectrum: spectrum(history),
         taken: Vec::new(),
@@ -512,13 +539,23 @@ pub fn plan(inputs: &Inputs) -> Plan {
             // runs other than the file says.
             let on = radio.map_or((sr.channel, width), |r| (r.channel, r.width_mhz));
             let measure = measure(hours.filter(|h| (h.channel, h.width) == on));
-            // A power above the limit is the limit: the driver's doing, by
-            // the primary channel's.
-            let limit = ctx.limits(sr.band, &[sr.channel]).ok().map(|(max, _)| max);
-            let stated = sr.power.map(|p| limit.map_or(p, |m| p.min(m)));
+            // A power above the limit is the limit: the radio is held
+            // there, clamped, which is never out of step.
+            let limit = ctx.power_limit(ap, sr.band, sr.channel);
+            let stated = sr.power.map(|p| capped(p, limit));
+            if let (Some(p), Some(s)) = (sr.power, stated)
+                && s < p
+            {
+                notes.push(format!(
+                    "{ap}'s {} radio: the site file's {p} dBm is clamped to {s} dBm, the most it \
+                     sends on channel {}",
+                    band_name(sr.band),
+                    sr.channel
+                ));
+            }
             let dfs = channels::block(sr.band, sr.channel, width)
-                .and_then(|b| ctx.limits(sr.band, &b).ok())
-                .is_some_and(|(_, dfs)| dfs);
+                .and_then(|b| ctx.dfs_of(sr.band, &b).ok())
+                .unwrap_or(false);
             let mut pending = false;
             // What keeps the whole radio as it is.
             let whole = match (snap, radio) {
@@ -712,8 +749,8 @@ fn candidate(ctx: &Ctx, item: &Item, clients: &[(f64, f64)], at: (u16, u16)) -> 
     let client = ctx.rules.client_dbm;
     let tenth = (!clients.is_empty()).then(|| tenth(clients) - widening(from, width));
     let (power, power_why) = power(sr.power, place.max, item.power_kept, tenth, client);
-    let now_db = heard_over(sr.power.map(|p| p.min(place.max)), client);
-    let then_db = heard_over(power.map(|p| p.min(place.max)), client) - widening(from, width);
+    let now_db = heard_over(sr.power.map(|p| capped(p, place.max)), client);
+    let then_db = heard_over(power.map(|p| capped(p, place.max)), client) - widening(from, width);
     // With no client heard, one at the target SNR stands in.
     let nominal = [(TARGET_SNR - now_db, 1.0)];
     let scored = if clients.is_empty() {
@@ -822,10 +859,8 @@ fn decide(ctx: &Ctx, item: &Item) -> Proposal {
         |r| r.phy.clone(),
     );
     let client = ctx.rules.client_dbm;
-    let limit = channels::block(sr.band, sr.channel, width)
-        .and_then(|b| ctx.limits(sr.band, &b).ok())
-        .map(|(max, _)| max);
-    let p_now = sr.power.map(|p| limit.map_or(p, |max| p.min(max)));
+    let limit = ctx.power_limit(item.ap, sr.band, sr.channel);
+    let p_now = sr.power.map(|p| capped(p, limit));
     let mut p = Proposal {
         ap: item.ap.to_owned(),
         radio,
@@ -853,8 +888,8 @@ fn decide(ctx: &Ctx, item: &Item) -> Proposal {
             power: c.power,
         };
         let now_db = heard_over(p_now, client);
-        let then_db = heard_over(c.power.map(|x| x.min(limit.unwrap_or(x))), client)
-            - widening(width, c.width);
+        let then_db =
+            heard_over(c.power.map(|x| capped(x, limit)), client) - widening(width, c.width);
         p.snr_change = then_db - now_db;
         p.measured = c.measured;
         if let Some(m) = m.filter(|_| !clients.is_empty()) {
@@ -903,24 +938,19 @@ mod tests {
 
     const SITE: &str = include_str!("../../tests/fixtures/site.yml");
 
-    fn allowed(lo: u16, hi: u16, max_dbm: i32, dfs: bool) -> Allowed {
-        Allowed {
-            lo,
-            hi,
-            max_dbm,
-            dfs,
-        }
+    fn allowed(lo: u16, hi: u16, dfs: bool) -> Allowed {
+        Allowed { lo, hi, dfs }
     }
 
     fn rules() -> Rules {
         let zz = [
-            vec![allowed(1, 13, 23, false)],
+            vec![allowed(1, 13, false)],
             vec![
-                allowed(36, 48, 23, false),
-                allowed(52, 64, 20, true),
-                allowed(149, 177, 23, false),
+                allowed(36, 48, false),
+                allowed(52, 64, true),
+                allowed(149, 177, false),
             ],
-            vec![allowed(1, 93, 24, false)],
+            vec![allowed(1, 93, false)],
         ];
         Rules {
             window_hours: 24,
@@ -1010,6 +1040,27 @@ mod tests {
         }
     }
 
+    fn limit(band: Band, first: u16, last: u16, dbm: i8) -> PowerLimit {
+        PowerLimit {
+            band,
+            first,
+            last,
+            dbm,
+        }
+    }
+
+    /// The power limits a simulated AP reports: as a radio of its own rules
+    /// would, by band.
+    fn limits() -> Vec<PowerLimit> {
+        vec![
+            limit(Band::B24, 1, 13, 23),
+            limit(Band::B5, 36, 64, 23),
+            limit(Band::B5, 100, 144, 20),
+            limit(Band::B5, 149, 177, 23),
+            limit(Band::B6, 1, 93, 24),
+        ]
+    }
+
     /// Two snapshots a minute apart of an AP with these radios: the first
     /// with every counter at zero.
     fn snapshots(radios: &[Sim]) -> (Snapshot, Snapshot) {
@@ -1042,6 +1093,7 @@ mod tests {
                     rx_ms: 0,
                     tx_ms: ms * r.own / 100,
                     up: true,
+                    max_txpower_dbm: 0,
                 });
             }
             Snapshot {
@@ -1056,6 +1108,7 @@ mod tests {
                 stations,
                 config_sha256: None,
                 clock_synced: true,
+                power_limits: limits(),
             }
         };
         (snap(0), snap(1))
@@ -1283,18 +1336,68 @@ mod tests {
 
     #[test]
     fn a_power_above_the_limit_counts_as_the_limit() {
-        let mut low = rules();
-        low.countries.get_mut("ZZ").unwrap()[0] = vec![allowed(1, 13, 17, false)];
         let mut h = History::new(24);
-        // The driver holds the radios at 17 dBm, the file says 20.
+        // The radios' own rules hold them at 17 dBm, the file says 20.
         let (mut ap1, mut ap2) = (fixture("ap1"), fixture("ap2"));
         (ap1[0].dbm, ap2[0].dbm) = (17, 17);
-        let (a, b) = both(&mut h, &ap1, &ap2);
-        let p = run(SITE, &[("ap1", Some(&a)), ("ap2", Some(&b))], &h, &low);
+        let (mut a, mut b) = both(&mut h, &ap1, &ap2);
+        for s in [&mut a, &mut b] {
+            s.power_limits[0] = limit(Band::B24, 1, 13, 17);
+        }
+        let p = run(SITE, &[("ap1", Some(&a)), ("ap2", Some(&b))], &h, &rules());
         assert!(!of(&p, "ap1/radio24").changes());
         assert!(!of(&p, "ap1/radio24").pending);
+        assert_eq!(of(&p, "ap1/radio24").planned_power, Some(17));
+        assert!(p.notes.iter().any(|n| n
+            == "ap1's 2.4 GHz radio: the site file's 20 dBm is clamped to 17 dBm, the most it \
+                sends on channel 6"));
         // ap2's moves for its channel alone, its power as the file has it.
         assert_eq!(of(&p, "ap2/radio24").proposed.power, Some(20));
+    }
+
+    /// A radio that holds itself below its rules' limit (a 6 GHz one by its
+    /// power spectral density) sends less than the file says: clamped, so
+    /// neither out of step nor raised, nor lowered for nothing.
+    #[test]
+    fn a_radio_held_below_its_limit_is_clamped_not_out_of_step() {
+        let mut h = History::new(24);
+        let (mut ap1, ap2) = (fixture("ap1"), fixture("ap2"));
+        ap1[2].dbm = 19;
+        let (mut a, b) = both(&mut h, &ap1, &ap2);
+        a.radios[2].max_txpower_dbm = 19;
+        let raised = SITE.replace(
+            "      radios:\n        \"5\":\n          hw_mode: a\n          channel: 36\n",
+            "      txpower: {\"6\": 26}\n      radios:\n        \"5\":\n          hw_mode: a\n          channel: 36\n",
+        );
+        let p = run(
+            &raised,
+            &[("ap1", Some(&a)), ("ap2", Some(&b))],
+            &h,
+            &rules(),
+        );
+        let r6 = of(&p, "ap1/radio6");
+        assert!(!r6.pending, "{:?}", r6.kept);
+        assert_eq!(r6.planned_power, Some(19));
+        assert_eq!(r6.proposed.power, r6.current.power);
+        assert!(
+            p.notes
+                .iter()
+                .any(|n| n.contains("26 dBm is clamped to 19 dBm"))
+        );
+    }
+
+    /// An AP that reports no limit: its radios keep their power.
+    #[test]
+    fn without_a_reported_limit_power_stays() {
+        let mut h = History::new(24);
+        let (mut ap1, ap2) = (fixture("ap1"), fixture("ap2"));
+        // A client that would want more power.
+        ap1[1].signals = vec![-88];
+        let (mut a, b) = both(&mut h, &ap1, &ap2);
+        a.power_limits.clear();
+        let p = run(SITE, &[("ap1", Some(&a)), ("ap2", Some(&b))], &h, &rules());
+        let r5 = of(&p, "ap1/radio5");
+        assert_eq!(r5.proposed.power, r5.current.power, "{}", r5.reason);
     }
 
     #[test]
@@ -1466,15 +1569,12 @@ mod tests {
     #[test]
     fn the_power_in_step_is_by_the_primary_channels_limit() {
         let h = History::new(24);
-        let mut split = rules();
-        split.countries.get_mut("ZZ").unwrap()[1] = vec![
-            allowed(36, 40, 23, false),
-            allowed(44, 48, 17, false),
-            allowed(149, 177, 23, false),
-        ];
-        let (_, a) = snapshots(&fixture("ap1"));
+        let (_, mut a) = snapshots(&fixture("ap1"));
         let (_, b) = snapshots(&fixture("ap2"));
-        let p = run(SITE, &[("ap1", Some(&a)), ("ap2", Some(&b))], &h, &split);
+        // A radio of the kernel's rules: 44-48 allow 17 dBm, 36-40 23.
+        a.power_limits[1] = limit(Band::B5, 36, 40, 23);
+        a.power_limits.insert(2, limit(Band::B5, 44, 48, 17));
+        let p = run(SITE, &[("ap1", Some(&a)), ("ap2", Some(&b))], &h, &rules());
         let r5 = of(&p, "ap1/radio5");
         assert!(!r5.pending, "{:?}", r5.kept);
         assert_eq!(r5.planned_power, Some(23));

@@ -25,8 +25,9 @@ use crate::config::{config_sha256, payload};
 use crate::mac::hex;
 use crate::msg::{
     AgentMsg, Band, Bss, ClientFlows, Command, CommandKind, CommandResult, ConfigApplied, CtlMsg,
-    Event, EventKind, FieldDelta, Flow, Flows, Hello, Mechanism, Radio, RadioApplied, RadioConfig,
-    RateMode, RecDelta, SignedConfig, Snapshot, SnapshotDelta, SpectrumFrame, Station, Temp,
+    Event, EventKind, FieldDelta, Flow, Flows, Hello, Mechanism, PowerLimit, Radio, RadioApplied,
+    RadioConfig, RateMode, RecDelta, SignedConfig, Snapshot, SnapshotDelta, SpectrumFrame, Station,
+    Temp,
 };
 
 const HOW: &str = "bump u6e_proto::PROTOCOL (pkg/u6e-proto/src/version.rs) and write the \
@@ -103,6 +104,7 @@ fn radio(phy: &str, band: Band) -> Radio {
         rx_ms: (1 << 33) + 2,
         tx_ms: (1 << 33) + 3,
         up: true,
+        max_txpower_dbm: -100,
     }
 }
 
@@ -187,6 +189,12 @@ fn samples() -> Samples {
             .collect(),
         config_sha256: Some([0x81; 32]),
         clock_synced: true,
+        power_limits: vec![PowerLimit {
+            band: Band::B6,
+            first: 300,
+            last: 301,
+            dbm: -100,
+        }],
     };
     let rec = |idx| RecDelta {
         idx,

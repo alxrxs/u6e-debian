@@ -208,6 +208,7 @@ impl Server {
                 let _lock = self.lock()?;
                 let mbm = (i32::from(dbm) * 100).to_string();
                 run(&[&self.iw, "dev", iface, "set", "txpower", "fixed", &mbm])?;
+                self.publish_power(band, dbm);
                 Ok(Reply::Done(format!("{iface}: {dbm} dBm")))
             }
         }
@@ -315,11 +316,28 @@ impl Server {
         r.map_err(|e| format!("installing: {e}"))
     }
 
-    /// Publishes the hash of the installed configuration for the agent.
+    /// Publishes the hash of the installed configuration for the agent, and
+    /// the power it asks of each radio.
     pub fn publish(&self) {
         let hash = wificonf::installed_hash(&self.dir);
         if let Err(e) = wificonf::write_hash(&self.state, hash) {
             eprintln!("u6e-agent: config helper: publishing the hash: {e}");
+        }
+        let installed = wificonf::read(&self.dir).unwrap_or_default();
+        let asked: Vec<_> = installed.iter().map(|r| (r.radio, r.txpower_dbm)).collect();
+        if let Err(e) = wificonf::write_asked(&self.state, &asked) {
+            eprintln!("u6e-agent: config helper: publishing the powers: {e}");
+        }
+    }
+
+    /// Publishes `dbm` as the power now asked of the radio of `band`.
+    fn publish_power(&self, band: Band, dbm: i8) {
+        let mut asked = wificonf::read_asked(&self.state);
+        asked.retain(|(b, _)| *b != band);
+        asked.push((band, dbm));
+        asked.sort_by_key(|(b, _)| wificonf::BANDS.iter().position(|x| x == b));
+        if let Err(e) = wificonf::write_asked(&self.state, &asked) {
+            eprintln!("u6e-agent: config helper: publishing the powers: {e}");
         }
     }
 
@@ -653,17 +671,30 @@ pub mod tests {
     }
 
     /// A power the controller commands is set through iw as the radio runs;
-    /// the installed configuration keeps its own, and its hash stays.
+    /// the installed configuration keeps its own, and its hash stays. The
+    /// power published as asked of the radio is the commanded one.
     #[test]
     fn a_commanded_power_is_set_and_installs_nothing() {
         let r = Rig::new();
         let before = r.installed();
+        r.server.publish();
+        let asked = || wificonf::read_asked(&r.server.state);
+        let installed: Vec<_> = before.iter().map(|c| (c.radio, c.txpower_dbm)).collect();
+        assert_eq!(asked(), installed);
         let power = |dbm| Request::Power {
             band: Band::B5,
             dbm,
         };
         assert_eq!(r.ask(power(20)), done("wlan5: 20 dBm"));
         assert_eq!(r.log(), "iw dev wlan5 set txpower fixed 2000\n");
+        let mut commanded = installed.clone();
+        commanded[1].1 = 20;
+        assert_eq!(asked(), commanded);
+        let mode = fs::metadata(r.server.state.join(wificonf::ASKED))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o7777, 0o640);
         for dbm in [-1, DBM_MAX + 1] {
             assert_eq!(
                 r.ask(power(dbm)),

@@ -200,13 +200,14 @@ impl Radios {
         switch(&mut self.hostapd, band, &s, self.switch_wait)
     }
 
-    /// Sets the transmit power of the radio of `band` to `dbm`.
+    /// Sets the transmit power of the radio of `band` to `dbm`, held to
+    /// what its channel allows.
     pub fn power(&mut self, band: Band, dbm: i8) -> Result<String, String> {
         let name = wificonf::iface(band);
         let now = self.phy.radio(band)?;
-        regdomain::check_power(&now, dbm).map_err(|e| format!("{name}: {e}"))?;
+        let (dbm, note) = regdomain::clamp_power(&now, dbm).map_err(|e| format!("{name}: {e}"))?;
         match self.helper.ask(&Request::Power { band, dbm })? {
-            Reply::Done(d) => Ok(d),
+            Reply::Done(d) => Ok(note.map_or(d.clone(), |n| format!("{d} ({n})"))),
             _ => Err("the config helper answered something else".into()),
         }
     }
@@ -220,6 +221,9 @@ struct Step {
     class: Class,
     /// For a channel switch: the radio now, and the switch.
     switch: Option<(RadioState, Switch)>,
+    /// That its power is above what its channel allows, which the driver
+    /// holds it to.
+    clamped: Option<String>,
 }
 
 /// What undoes a step that was taken.
@@ -286,7 +290,13 @@ impl Apply {
             detail: String::new(),
         };
         match self.check(&c) {
-            Ok((installed, steps)) => self.carry_out(c, installed, steps, last, &mut done),
+            Ok((installed, steps)) => {
+                let clamped: Vec<String> = steps.iter().filter_map(|s| s.clamped.clone()).collect();
+                self.carry_out(c, installed, steps, last, &mut done);
+                if !clamped.is_empty() {
+                    done.detail = format!("{} ({})", done.detail, clamped.join("; "));
+                }
+            }
             Err(why) => done.detail = format!("refused: {why}"),
         }
         if done.detail.len() > DETAIL_MAX {
@@ -340,7 +350,7 @@ impl Apply {
                 Class::Restart { moved, .. } => *moved && goes.is_some(),
                 _ => false,
             };
-            let mut switch = None;
+            let (mut switch, mut clamped) = (None, None);
             if moves || matches!(class, Class::Power | Class::Restart { .. }) {
                 let now = self.phy.radio(band)?;
                 let mut there = now.clone();
@@ -364,14 +374,16 @@ impl Apply {
                         (s.freq_mhz, s.center_mhz, s.width_mhz);
                     switch = Some((now, s));
                 }
-                regdomain::check_power(&there, r.txpower_dbm)
+                let (_, note) = regdomain::clamp_power(&there, r.txpower_dbm)
                     .map_err(|e| format!("{name}: {e}"))?;
+                clamped = note.map(|n| format!("{name}: {n}"));
             }
             steps.push(Step {
                 band,
                 new,
                 class,
                 switch,
+                clamped,
             });
         }
         Ok((installed, steps))
@@ -895,6 +907,7 @@ mod tests {
             }],
             config_sha256: None,
             clock_synced: true,
+            power_limits: Vec::new(),
         }
     }
 
@@ -1033,8 +1046,8 @@ mod tests {
             "refused: wlan5: line 26: ctrl_interface is not allowed so"
         );
         assert_eq!(
-            refused(&mut r, with5(WLAN5, 31)),
-            "refused: wlan5: 31 dBm is above the 30 dBm allowed on the radio's channel"
+            refused(&mut r, with5(WLAN5, -1)),
+            "refused: wlan5: -1 dBm is out of range"
         );
         assert!(r.requests().is_empty());
         assert_eq!((r.helper(), r.installed()), (String::new(), fixture()));
@@ -1085,6 +1098,23 @@ mod tests {
         assert_eq!(mechanisms(&done), [Unchanged, Power, Unchanged]);
         assert!(r.requests().is_empty());
         assert_eq!(r.helper(), "render\niw dev wlan5 set txpower fixed 2000\n");
+        assert_eq!(r.installed(), new);
+    }
+
+    /// A power above what the radio's channel allows is no refusal: the
+    /// configuration applies, the driver holds the radio to the limit, and
+    /// the answer says so.
+    #[test]
+    fn a_power_above_the_channels_limit_is_clamped() {
+        let mut r = Rig::new();
+        let new = with5(WLAN5, 31);
+        let done = r.run(signed(1, new.clone()));
+        assert!(done.ok, "{}", done.detail);
+        assert_eq!(
+            done.detail,
+            "installed (wlan5: 31 dBm clamped to 30 dBm, the most channel 149 allows)"
+        );
+        assert_eq!(mechanisms(&done), [Unchanged, Power, Unchanged]);
         assert_eq!(r.installed(), new);
     }
 
@@ -1362,16 +1392,24 @@ mod tests {
         assert_eq!(r.installed(), before);
     }
 
-    /// A commanded power is checked against the radio's channels and set by
-    /// the helper.
+    /// A commanded power is held to the radio's channel and set by the
+    /// helper.
     #[test]
     fn a_commanded_power_is_checked_and_set_by_the_helper() {
         let r = Rig::new();
         let mut radios = radios(&r);
         assert_eq!(radios.power(Band::B5, 20), Ok("wlan5: 20 dBm".into()));
         assert_eq!(r.helper(), "iw dev wlan5 set txpower fixed 2000\n");
-        let e = radios.power(Band::B5, 31).unwrap_err();
-        assert!(e.starts_with("wlan5: 31 dBm is above the 30 dBm"), "{e}");
-        assert_eq!(r.helper().lines().count(), 1);
+        assert_eq!(
+            radios.power(Band::B5, 31),
+            Ok("wlan5: 30 dBm (31 dBm clamped to 30 dBm, the most channel 149 allows)".into())
+        );
+        assert_eq!(
+            r.helper(),
+            "iw dev wlan5 set txpower fixed 2000\niw dev wlan5 set txpower fixed 3000\n"
+        );
+        let e = radios.power(Band::B5, -1).unwrap_err();
+        assert_eq!(e, "wlan5: a transmit power below 0 dBm");
+        assert_eq!(r.helper().lines().count(), 2);
     }
 }

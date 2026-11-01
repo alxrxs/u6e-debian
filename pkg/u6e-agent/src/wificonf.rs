@@ -7,8 +7,8 @@
 //! outside hostapd's own run directories fails), telling how a radio can take
 //! a new one, which only the helper does since only it reads what is
 //! installed, and installing it file by file atomically. The hash of what is
-//! installed, which says nothing secret, is the one thing the agent reads,
-//! from [`STATE`].
+//! installed and the power each radio was last asked to send at, which say
+//! nothing secret, are all the agent reads, from [`STATE`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -31,6 +31,9 @@ pub const DIR: &str = "/run/u6e-wifi";
 /// ([`HASH`]): root's, set-group-ID to the agent's group, which reads them.
 pub const STATE: &str = "/run/u6e-wifi-helper";
 pub const HASH: &str = "sha256";
+/// Each radio's power as last asked of it, `<interface> <dBm>` a line: the
+/// installed configuration's, or a power commanded since.
+pub const ASKED: &str = "txpower";
 /// The last sequence number installed, in [`DIR`].
 const SEQ: &str = "seq";
 /// hostapd's control sockets and the group they belong to, as every
@@ -443,6 +446,26 @@ pub fn write_seq(dir: &Path, seq: u64) -> io::Result<()> {
 pub fn write_hash(state: &Path, hash: Option<[u8; 32]>) -> io::Result<()> {
     let text = hash.map_or_else(String::new, |h| mac::hex(&h) + "\n");
     replace(state, HASH, text.as_bytes(), 0o640)
+}
+
+/// Publishes the power asked of each radio for the agent to read.
+pub fn write_asked(state: &Path, asked: &[(Band, i8)]) -> io::Result<()> {
+    let text: String = asked
+        .iter()
+        .map(|(b, dbm)| format!("{} {dbm}\n", iface(*b)))
+        .collect();
+    replace(state, ASKED, text.as_bytes(), 0o640)
+}
+
+/// The powers the helper published; none when it published none.
+pub fn read_asked(state: &Path) -> Vec<(Band, i8)> {
+    let text = fs::read_to_string(state.join(ASKED)).unwrap_or_default();
+    let line = |l: &str| {
+        let (name, dbm) = l.split_once(' ')?;
+        let band = BANDS.into_iter().find(|b| iface(*b) == name)?;
+        Some((band, dbm.trim().parse().ok()?))
+    };
+    text.lines().filter_map(line).collect()
 }
 
 /// The hash the helper published.

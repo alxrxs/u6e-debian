@@ -449,14 +449,14 @@ mod tests {
     #[test]
     fn the_rf_planner_is_configured_in_its_own_section() {
         let rf = "[rf]\nremote = \"/srv/site.git\"\nrepo = \"/var/lib/site\"\nfile = \"wifi/site.yml\"\n\
-                  [rf.channels.KR]\n\"6\" = [{ channels = \"1-93\", max_dbm = 24 }]\n";
+                  [rf.channels.KR]\n\"6\" = [{ channels = \"1-93\" }]\n";
         let c = Config::parse(&format!("{ORIGIN}{rf}")).unwrap();
         let s = c.rf.unwrap();
         assert_eq!(
             (s.repo.file.as_str(), s.repo.branch.as_str()),
             ("wifi/site.yml", "main")
         );
-        assert_eq!(s.rules.countries["KR"][2][0].max_dbm, 24);
+        assert_eq!(s.rules.countries["KR"][2][0].hi, 93);
         let bad = format!("{ORIGIN}{}", rf.replace("1-93", "1-0"));
         assert!(matches!(Config::parse(&bad), Err(ConfigError::Rf(_))));
     }

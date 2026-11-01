@@ -3,10 +3,12 @@
 //! the regulatory rules in force. A channel switch is allowed only onto a
 //! block of 20 MHz channels that are all enabled, the width allowed on each
 //! and by the rules, and none a DFS channel still needing its CAC (hostapd
-//! would take the radio off the air for it); a transmit power only up to the
-//! least the radio's channels and their rules allow.
+//! would take the radio off the air for it). A transmit power is held to its
+//! primary channel's limit by the radio's own rules (a self-managed radio's,
+//! which `GET_REG` of its wiphy returns, else the kernel's), as the driver
+//! holds it.
 
-use u6e_proto::msg::Band;
+use u6e_proto::msg::{Band, PowerLimit};
 
 /// The kernel's `NL80211_RRF_AUTO_BW`: the rule's width may be exceeded by
 /// joining it with the next rule.
@@ -245,40 +247,82 @@ pub fn check_switch(band: Band, r: &RadioState, t: Target) -> Result<Switch, Str
     })
 }
 
-/// Checks that `dbm` is within what the radio's channels and their rules
-/// allow where it operates now.
-pub fn check_power(r: &RadioState, dbm: i8) -> Result<(), String> {
+/// The most the radio transmits where it operates now: its primary
+/// channel's limit and that channel's rule, the one mac80211 holds a fixed
+/// power to whatever the width (`ieee80211_chandef_max_power`), and the one
+/// the controller's planner plans by.
+pub fn power_limit(r: &RadioState) -> Result<i8, String> {
+    let n = channel_of(r.freq_mhz);
+    let c = r
+        .caps
+        .channels
+        .iter()
+        .find(|c| c.freq_mhz == r.freq_mhz)
+        .ok_or(format!("channel {n} is not the radio's"))?;
+    limit_of(c, &r.rules).ok_or(format!("channel {n} is outside the regulatory domain"))
+}
+
+/// The most a radio sends with `c` as its primary channel, by `rules`.
+fn limit_of(c: &Channel, rules: &[RegRule]) -> Option<i8> {
+    let rule = rule_of(rules, c.freq_mhz)?;
+    let mbm = c.max_power_mbm.min(rule.max_eirp_mbm);
+    Some(i8::try_from(mbm / 100).unwrap_or(i8::MAX))
+}
+
+/// The most a radio of `caps` and `rules` sends with the channel at
+/// `freq_mhz` as its primary; none for a channel it does not have.
+pub fn limit_at(caps: &BandCaps, rules: &[RegRule], freq_mhz: u32) -> Option<i8> {
+    let c = caps.channels.iter().find(|c| c.freq_mhz == freq_mhz)?;
+    limit_of(c, rules)
+}
+
+/// What a radio of limit `limit` that was asked for `asked` dBm and sends at
+/// `sends` dBm sends at most: less than its limit only while it sends less
+/// than asked, held there by itself.
+pub fn held_to(limit: i8, asked: Option<i8>, sends: i8) -> i8 {
+    if asked.is_some_and(|a| sends < a) && (1..limit).contains(&sends) {
+        sends
+    } else {
+        limit
+    }
+}
+
+/// The limits of a radio of `band` for the controller's planner: its enabled
+/// channels in runs of one limit, in channel order.
+pub fn power_limits(band: Band, caps: &BandCaps, rules: &[RegRule]) -> Vec<PowerLimit> {
+    let mut runs: Vec<PowerLimit> = Vec::new();
+    for c in caps.channels.iter().filter(|c| !c.disabled) {
+        let Some(dbm) = limit_of(c, rules) else {
+            continue;
+        };
+        let ch = channel_of(c.freq_mhz);
+        match runs.last_mut() {
+            Some(l) if l.dbm == dbm => l.last = ch,
+            _ => runs.push(PowerLimit {
+                band,
+                first: ch,
+                last: ch,
+                dbm,
+            }),
+        }
+    }
+    runs
+}
+
+/// `dbm` as the radio transmits it: held to [`power_limit`], with a note
+/// when that lowered it. A power above the limit is never refused: the
+/// driver clamps it so, and only the note tells.
+pub fn clamp_power(r: &RadioState, dbm: i8) -> Result<(i8, Option<String>), String> {
     if dbm < 0 {
         return Err("a transmit power below 0 dBm".into());
     }
-    let half = u32::from(r.width_mhz.max(20)) / 2;
-    let center = if r.center_mhz == 0 {
-        r.freq_mhz
-    } else {
-        r.center_mhz
-    };
-    let first = center.saturating_sub(half) + 10;
-    let mut limit = u32::MAX;
-    for f in (0..u32::from(r.width_mhz.max(20)) / 20).map(|i| first + 20 * i) {
-        let n = channel_of(f);
-        let c = r
-            .caps
-            .channels
-            .iter()
-            .find(|c| c.freq_mhz == f)
-            .ok_or(format!("channel {n} is not the radio's"))?;
-        let rule =
-            rule_of(&r.rules, f).ok_or(format!("channel {n} is outside the regulatory domain"))?;
-        limit = limit.min(c.max_power_mbm).min(rule.max_eirp_mbm);
+    let limit = power_limit(r)?;
+    if dbm <= limit {
+        return Ok((dbm, None));
     }
-    let mbm = u32::from(dbm.unsigned_abs()) * 100;
-    if mbm > limit {
-        return Err(format!(
-            "{dbm} dBm is above the {} dBm allowed on the radio's channel",
-            limit / 100
-        ));
-    }
-    Ok(())
+    let n = channel_of(r.freq_mhz);
+    let note = format!("{dbm} dBm clamped to {limit} dBm, the most channel {n} allows");
+    Ok((limit, Some(note)))
 }
 
 /// The rule a 20 MHz channel lies within.
@@ -495,27 +539,107 @@ pub mod tests {
         assert_eq!(cac(target(116, 80, 122)), Ok(true));
     }
 
+    /// Power is held to the primary channel's limit, never refused for
+    /// being above it.
     #[test]
-    fn power_is_held_to_the_least_limit_of_the_block() {
+    fn power_is_held_to_the_primary_channels_limit() {
         let r = radio5();
-        assert_eq!(check_power(&r, 30), Ok(()));
+        assert_eq!(clamp_power(&r, 30), Ok((30, None)));
         assert_eq!(
-            check_power(&r, 31).unwrap_err(),
-            "31 dBm is above the 30 dBm allowed on the radio's channel"
+            clamp_power(&r, 31),
+            Ok((
+                30,
+                Some("31 dBm clamped to 30 dBm, the most channel 149 allows".into())
+            ))
         );
         assert_eq!(
-            check_power(&r, -1).unwrap_err(),
+            clamp_power(&r, -1).unwrap_err(),
             "a transmit power below 0 dBm"
         );
-        let mut low = radio5();
-        low.freq_mhz = 5180;
-        low.center_mhz = 5210;
-        assert_eq!(check_power(&low, 23), Ok(()));
-        assert!(check_power(&low, 24).is_err());
         let mut capped = radio5();
         capped.rules[3].max_eirp_mbm = 2000;
-        assert!(check_power(&capped, 21).is_err());
-        assert_eq!(check_power(&radio6(), 24), Ok(()));
-        assert!(check_power(&radio6(), 25).is_err());
+        assert_eq!(clamp_power(&capped, 21).map(|p| p.0), Ok(20));
+        assert_eq!(clamp_power(&radio6(), 24), Ok((24, None)));
+        assert_eq!(clamp_power(&radio6(), 25).map(|p| p.0), Ok(24));
+    }
+
+    /// Less than its limit only while it sends less than asked: held there
+    /// by itself (a 6 GHz radio by its power spectral density).
+    #[test]
+    fn a_radio_sending_less_than_asked_is_held_there() {
+        assert_eq!(held_to(30, Some(26), 19), 19);
+        assert_eq!(held_to(23, Some(26), 23), 23);
+        assert_eq!(held_to(23, Some(20), 20), 23);
+        assert_eq!(held_to(23, None, 19), 23);
+        assert_eq!(held_to(23, Some(26), 0), 23);
+    }
+
+    /// The QCN9074's own KR rules, as `GET_REG` of its self-managed wiphy
+    /// returns them: 5170-5835 MHz at 23 dBm, channel 48 among them.
+    fn self_managed_kr5() -> RadioState {
+        let mut r = radio5();
+        r.rules = vec![RegRule {
+            start_khz: 5_170_000,
+            end_khz: 5_835_000,
+            max_bw_khz: 160_000,
+            max_eirp_mbm: 2300,
+            flags: 0,
+        }];
+        for c in &mut r.caps.channels {
+            c.max_power_mbm = 2300;
+        }
+        (r.freq_mhz, r.center_mhz, r.width_mhz) = (5220, 5210, 80);
+        r
+    }
+
+    /// A self-managed radio is held by its own rules: 23 dBm across 36-48,
+    /// channel 48 too, and the hallway's 36-48 block on 44 at 23 applies.
+    #[test]
+    fn a_self_managed_radio_takes_its_own_rules() {
+        let mut r = self_managed_kr5();
+        assert_eq!(clamp_power(&r, 23), Ok((23, None)));
+        assert_eq!(clamp_power(&r, 26).map(|p| p.0), Ok(23));
+        r.freq_mhz = 5240;
+        assert_eq!(power_limit(&r), Ok(23));
+        let limits = power_limits(Band::B5, &r.caps, &r.rules);
+        assert_eq!(
+            limits,
+            [PowerLimit {
+                band: Band::B5,
+                first: 36,
+                last: 165,
+                dbm: 23
+            }]
+        );
+    }
+
+    /// The hallway's block under the kernel's KR rules: 36-48 at 80 MHz on
+    /// primary 44, where channel 48 allows only 17 dBm. 23 dBm is what
+    /// channel 44 allows, and applies.
+    #[test]
+    fn a_block_with_a_lower_channel_takes_its_primarys_power() {
+        let mut r = radio5();
+        for c in &mut r.caps.channels {
+            if c.freq_mhz == 5240 {
+                c.max_power_mbm = 1700;
+            }
+        }
+        (r.freq_mhz, r.center_mhz, r.width_mhz) = (5220, 5210, 80);
+        assert_eq!(power_limit(&r), Ok(23));
+        assert_eq!(clamp_power(&r, 23), Ok((23, None)));
+        assert_eq!(clamp_power(&r, 26).map(|p| p.0), Ok(23));
+        r.freq_mhz = 5240;
+        assert_eq!(power_limit(&r), Ok(17));
+        let limits = power_limits(Band::B5, &r.caps, &r.rules);
+        let run = |first, last, dbm| PowerLimit {
+            band: Band::B5,
+            first,
+            last,
+            dbm,
+        };
+        assert_eq!(
+            limits[..3],
+            [run(36, 44, 23), run(48, 48, 17), run(52, 64, 20)]
+        );
     }
 }

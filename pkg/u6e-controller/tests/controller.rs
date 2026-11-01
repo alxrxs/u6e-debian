@@ -473,11 +473,13 @@ fn snapshot(seq: u64, bsss: Vec<Bss>, stations: Vec<Station>) -> Snapshot {
             rx_ms: 1000,
             tx_ms: 500,
             up: true,
+            max_txpower_dbm: 0,
         }],
         bsss,
         stations,
         config_sha256: None,
         clock_synced: true,
+        power_limits: Vec::new(),
     }
 }
 

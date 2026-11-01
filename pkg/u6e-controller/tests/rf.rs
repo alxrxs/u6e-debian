@@ -368,9 +368,9 @@ fn controller(dir: &Path, scratch: Option<&Scratch>) -> Running {
     if let Some(s) = scratch {
         text.push_str(&format!(
             "[rf]\nremote = \"{}\"\nrepo = \"{}\"\nfile = \"{FILE}\"\nauthor_email = \"wifi-controller@example.org\"\n\
-             [rf.channels.ZZ]\n\"24\" = [{{ channels = \"1-13\", max_dbm = 23 }}]\n\
-             \"5\" = [{{ channels = \"36-48\", max_dbm = 23 }}, {{ channels = \"149-177\", max_dbm = 23 }}]\n\
-             \"6\" = [{{ channels = \"1-93\", max_dbm = 24 }}]\n",
+             [rf.channels.ZZ]\n\"24\" = [{{ channels = \"1-13\" }}]\n\
+             \"5\" = [{{ channels = \"36-48\" }}, {{ channels = \"149-177\" }}]\n\
+             \"6\" = [{{ channels = \"1-93\" }}]\n",
             s.remote().display(),
             s.repo().path.display(),
         ));
@@ -444,6 +444,7 @@ fn snapshot(seq: u64, channels: [(u16, u16); 3], secs: u64, client: bool) -> Sna
             rx_ms: 0,
             tx_ms: secs * 100,
             up: true,
+            max_txpower_dbm: 0,
         })
         .collect();
     let bsss = bands
@@ -474,6 +475,7 @@ fn snapshot(seq: u64, channels: [(u16, u16); 3], secs: u64, client: bool) -> Sna
         stations,
         config_sha256: None,
         clock_synced: true,
+        power_limits: Vec::new(),
     }
 }
 

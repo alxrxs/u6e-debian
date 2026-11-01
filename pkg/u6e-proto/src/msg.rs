@@ -141,6 +141,24 @@ pub struct Snapshot {
     /// Whether the AP's clock is synchronized, which a signed configuration
     /// needs before it applies.
     pub clock_synced: bool,
+    /// The power each radio's channels allow, by its own regulatory rules
+    /// (a self-managed radio's own, else the kernel's): runs of a band's
+    /// enabled channels of one limit. They change so rarely that a key frame
+    /// carries a change.
+    pub power_limits: Vec<PowerLimit>,
+}
+
+/// The most a radio transmits with `first..=last` of `band` as its primary
+/// channel: that channel's limit, the one the driver holds a fixed power to
+/// whatever the width.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PowerLimit {
+    pub band: Band,
+    pub first: u16,
+    pub last: u16,
+    pub dbm: i8,
 }
 
 /// On the wire: a change to it bumps [`crate::PROTOCOL`].
@@ -172,6 +190,11 @@ pub struct Radio {
     pub rx_ms: u64,
     pub tx_ms: u64,
     pub up: bool,
+    /// The most it transmits on its channel now: its [`PowerLimit`], or the
+    /// power it sends where that is less than the power asked of it (the
+    /// radio holds itself lower, as a 6 GHz one does by its power spectral
+    /// density); 0 while not known.
+    pub max_txpower_dbm: i8,
 }
 
 /// On the wire: a change to it bumps [`crate::PROTOCOL`].

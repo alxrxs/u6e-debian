@@ -57,7 +57,8 @@ use u6e_controller::stage::Stage;
 use u6e_proto::frame::{decode_frame, frame_body, write_frame};
 use u6e_proto::msg::{
     AgentMsg, Band, Bss, CommandKind, CommandResult, ConfigApplied, CtlMsg, Event, EventKind,
-    Flows, Hello, Mechanism, Radio, RadioApplied, RateMode, Snapshot, SpectrumFrame, Station, Temp,
+    Flows, Hello, Mechanism, PowerLimit, Radio, RadioApplied, RateMode, Snapshot, SpectrumFrame,
+    Station, Temp,
 };
 use u6e_proto::tls::{self, Identity};
 use u6e_proto::{PROTOCOL, delta, mac, version};
@@ -236,6 +237,22 @@ fn client(
     }
 }
 
+/// What the simulated radios' own rules allow: 23 dBm on 2.4 and 5 GHz, 24
+/// on 6 GHz, whose radio holds itself to 18 at 160 MHz.
+fn power_limits() -> Vec<PowerLimit> {
+    let limit = |band, first, last, dbm| PowerLimit {
+        band,
+        first,
+        last,
+        dbm,
+    };
+    vec![
+        limit(Band::B24, 1, 13, 23),
+        limit(Band::B5, 36, 177, 23),
+        limit(Band::B6, 1, 93, 24),
+    ]
+}
+
 fn radios(channels: [(u16, u16); 3]) -> Vec<Radio> {
     let bands = [Band::B24, Band::B5, Band::B6];
     let power = [2000, 2300, 1800];
@@ -252,6 +269,7 @@ fn radios(channels: [(u16, u16); 3]) -> Vec<Radio> {
             rx_ms: 0,
             tx_ms: 0,
             up: true,
+            max_txpower_dbm: [23, 23, 18][i],
         })
         .collect()
 }
@@ -728,6 +746,7 @@ impl World {
             stations,
             config_sha256: self.aps[ap].installed,
             clock_synced: true,
+            power_limits: power_limits(),
         }
     }
 }
@@ -1030,10 +1049,10 @@ async fn main() -> io::Result<()> {
          [aps.ap1]\npublic_key = \"{}\"\naddress = \"192.0.2.16\"\n\
          [aps.ap2]\npublic_key = \"{}\"\naddress = \"192.0.2.17\"\n{}\
          [rf]\nremote = \"{}\"\nrepo = \"{}\"\nfile = \"{}\"\n\
-         [rf.channels.ZZ]\n\"24\" = [{{ channels = \"1-13\", max_dbm = 23 }}]\n\
-         \"5\" = [{{ channels = \"36-48\", max_dbm = 23 }}, {{ channels = \"52-64\", max_dbm = 20, dfs = true }}, \
-         {{ channels = \"149-177\", max_dbm = 23 }}]\n\
-         \"6\" = [{{ channels = \"1-93\", max_dbm = 24 }}]\n",
+         [rf.channels.ZZ]\n\"24\" = [{{ channels = \"1-13\" }}]\n\
+         \"5\" = [{{ channels = \"36-48\" }}, {{ channels = \"52-64\", dfs = true }}, \
+         {{ channels = \"149-177\" }}]\n\
+         \"6\" = [{{ channels = \"1-93\" }}]\n",
         policy.display(),
         managed.join("sock").display(),
         public(KEY_AP1).map_err(io::Error::other)?,

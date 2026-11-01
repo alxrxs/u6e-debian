@@ -8,7 +8,9 @@
 //! clients' connections come from ECM (see `ecm`), at the link's cadence.
 //! The installed Wi-Fi configuration's hash is what the config helper
 //! publishes (the configuration itself is root's alone), read again only
-//! when the helper replaced it.
+//! when the helper replaced it; so is the power asked of each radio, which
+//! with the radio's own regulatory rules (its wiphy's `GET_REG`, read again
+//! every [`REGS_FOR`]) says the most it sends.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
@@ -165,6 +167,9 @@ impl<T> Source<T> {
 /// How long the interface list stands without a notification; the transmit
 /// power, which nothing announces, is at most this old.
 const IFACES_FOR: Duration = Duration::from_secs(60);
+/// How long a radio's channels and regulatory rules are taken as read: they
+/// change with the regulatory domain alone.
+const REGS_FOR: Duration = Duration::from_secs(600);
 
 /// The interfaces as of their last dump. A dump costs a firmware round trip
 /// per AP interface under the RTNL lock (for the transmit power), so it is
@@ -216,6 +221,8 @@ pub struct Collector {
     seen: BTreeMap<String, Radio>,
     rates: RateHold,
     config: ConfigHash,
+    /// Each radio's channels and regulatory rules, by wiphy, and when read.
+    regs: HashMap<u32, (Instant, regdomain::BandCaps, Vec<regdomain::RegRule>)>,
 }
 
 impl Collector {
@@ -245,6 +252,7 @@ impl Collector {
             seen: BTreeMap::new(),
             rates: RateHold::default(),
             config: ConfigHash::default(),
+            regs: HashMap::new(),
         }
     }
 
@@ -330,6 +338,37 @@ impl Collector {
             },
         );
         self.up.retain(|bss, _| order.contains(bss));
+        let mut radios = radios;
+        let asked = wificonf::read_asked(&self.paths.wifi);
+        let mut power_limits = Vec::new();
+        for r in &mut radios {
+            let first = bsss.iter().find(|b| b.phy == r.phy);
+            let Some(iface) = first.and_then(|b| ifaces.iter().find(|i| i.name == b.ifname)) else {
+                continue;
+            };
+            let now = Instant::now();
+            let fresh = self
+                .regs
+                .get(&iface.wiphy)
+                .is_some_and(|(at, _, _)| now.duration_since(*at) < REGS_FOR);
+            if !fresh && let Some(nl) = nl.as_mut() {
+                let caps = nl
+                    .dump_wiphy(iface.wiphy)
+                    .map(|raw| nl80211::parse_band(raw, r.band));
+                let caps = caps.unwrap_or_default();
+                let rules = nl.get_reg(iface.wiphy).map(nl80211::parse_reg);
+                self.regs
+                    .insert(iface.wiphy, (now, caps, rules.unwrap_or_default()));
+            }
+            let Some((_, caps, rules)) = self.regs.get(&iface.wiphy) else {
+                continue;
+            };
+            power_limits.extend(regdomain::power_limits(r.band, caps, rules));
+            let limit = regdomain::limit_at(caps, rules, iface.freq_mhz);
+            let asked = asked.iter().find(|(b, _)| *b == r.band).map(|(_, d)| *d);
+            let sends = i8::try_from((r.txpower_mbm + 50).div_euclid(100)).unwrap_or(0);
+            r.max_txpower_dbm = limit.map_or(0, |l| regdomain::held_to(l, asked, sends));
+        }
         let radios = with_gone(&mut self.seen, radios);
         let root = &self.paths.root;
         Snapshot {
@@ -348,6 +387,7 @@ impl Collector {
             stations,
             config_sha256: self.config.get(&self.paths.wifi),
             clock_synced: root.join(&wificonf::SYNCHRONIZED[1..]).exists(),
+            power_limits,
         }
     }
 
@@ -584,6 +624,7 @@ fn radios(
                 rx_ms: s.rx_ms,
                 tx_ms: s.tx_ms,
                 up: enabled(&bss.ifname),
+                max_txpower_dbm: 0,
             })
         })
         .collect()
@@ -848,6 +889,7 @@ mod tests {
                 rx_ms: 358_101,
                 tx_ms: 3_555_556,
                 up: true,
+                max_txpower_dbm: 0,
             }
         );
         assert_eq!(
@@ -1061,6 +1103,7 @@ mod tests {
             rx_ms: 0,
             tx_ms: 0,
             up: true,
+            max_txpower_dbm: 0,
         }
     }
 

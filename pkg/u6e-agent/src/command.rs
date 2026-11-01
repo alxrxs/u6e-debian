@@ -680,6 +680,7 @@ mod tests {
             stations: vec![station(STA, 2)],
             config_sha256: None,
             clock_synced: true,
+            power_limits: Vec::new(),
         }
     }
 

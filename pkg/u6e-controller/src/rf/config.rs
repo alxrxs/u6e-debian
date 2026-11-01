@@ -1,8 +1,9 @@
 //! The RF planner's part of the controller's configuration, `[rf]`: the
 //! clone of the repository holding the site file and how to push to it, the
-//! window it plans over, and the channels it may choose with their power
-//! limits, per country (the regulatory domain's, narrowed to what the site's
-//! clients can use); without `[rf]` the planner is off.
+//! window it plans over, and the channels it may choose, per country (the
+//! regulatory domain's, narrowed to what the site's clients can use; their
+//! power limits are each radio's own, as its AP reports them); without
+//! `[rf]` the planner is off.
 //!
 //! ```toml
 //! [rf]
@@ -19,9 +20,9 @@
 //! widths = { "24" = [20], "5" = [20, 40, 80], "6" = [20, 40, 80, 160] }
 //!
 //! [rf.channels.ZZ]
-//! "24" = [{ channels = "1-13", max_dbm = 20 }]
-//! "5" = [{ channels = "36-48", max_dbm = 23 }, { channels = "52-64", max_dbm = 20, dfs = true }]
-//! "6" = [{ channels = "1-93", max_dbm = 18 }]
+//! "24" = [{ channels = "1-13" }]
+//! "5" = [{ channels = "36-48" }, { channels = "52-64", dfs = true }]
+//! "6" = [{ channels = "1-93" }]
 //! ```
 //!
 //! A range holds every channel of its band from its first to its last;
@@ -71,7 +72,6 @@ pub struct File {
 #[serde(deny_unknown_fields)]
 struct RangeFile {
     channels: String,
-    max_dbm: i32,
     #[serde(default)]
     dfs: bool,
 }
@@ -143,12 +143,7 @@ fn range(band: usize, r: &RangeFile) -> Result<Allowed, String> {
     if lo > hi || !(lo..=hi).any(|c| channels::exists(b, c)) {
         return Err(format!("rf: {:?} holds no channel of its band", r.channels));
     }
-    Ok(Allowed {
-        lo,
-        hi,
-        max_dbm: r.max_dbm,
-        dfs: r.dfs,
-    })
+    Ok(Allowed { lo, hi, dfs: r.dfs })
 }
 
 impl File {
@@ -228,8 +223,8 @@ mod tests {
     #[test]
     fn defaults_and_tables() {
         let s = parse(&format!(
-            "{MIN}\"24\" = [{{ channels = \"1-13\", max_dbm = 23 }}]\n\
-             \"5\" = [{{ channels = \"36-48\", max_dbm = 23 }}, {{ channels = \"52\", max_dbm = 20, dfs = true }}]\n"
+            "{MIN}\"24\" = [{{ channels = \"1-13\" }}]\n\
+             \"5\" = [{{ channels = \"36-48\" }}, {{ channels = \"52\", dfs = true }}]\n"
         ))
         .unwrap();
         assert_eq!(s.repo.branch, "main");
@@ -244,7 +239,6 @@ mod tests {
             [Allowed {
                 lo: 1,
                 hi: 13,
-                max_dbm: 23,
                 dfs: false
             }]
         );
@@ -253,7 +247,6 @@ mod tests {
             Allowed {
                 lo: 52,
                 hi: 52,
-                max_dbm: 20,
                 dfs: true
             }
         );
@@ -264,10 +257,11 @@ mod tests {
     fn bad_tables_refused() {
         for bad in [
             "\"7\" = []\n",
-            "\"5\" = [{ channels = \"48-36\", max_dbm = 1 }]\n",
-            "\"5\" = [{ channels = \"1-13\", max_dbm = 1 }]\n",
-            "\"5\" = [{ channels = \"x\", max_dbm = 1 }]\n",
-            "\"5\" = [{ channels = \"36\", max_dbm = 1, other = 1 }]\n",
+            "\"5\" = [{ channels = \"48-36\" }]\n",
+            "\"5\" = [{ channels = \"1-13\" }]\n",
+            "\"5\" = [{ channels = \"x\" }]\n",
+            "\"5\" = [{ channels = \"36\", other = 1 }]\n",
+            "\"5\" = [{ channels = \"36\", max_dbm = 23 }]\n",
         ] {
             assert!(parse(&format!("{MIN}{bad}")).is_err(), "{bad}");
         }

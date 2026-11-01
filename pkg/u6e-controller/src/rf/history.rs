@@ -219,6 +219,7 @@ mod tests {
             rx_ms: 0,
             tx_ms: tx,
             up: true,
+            max_txpower_dbm: 0,
         }
     }
 
@@ -269,6 +270,7 @@ mod tests {
             stations,
             config_sha256: None,
             clock_synced: true,
+            power_limits: Vec::new(),
         }
     }
 
