@@ -1095,6 +1095,11 @@ async fn agent(addr: SocketAddr, ap: usize, pem: &str, world: Arc<Mutex<World>>)
                 next_flows += cadence;
             }
             _ = events.tick() => {
+                // Looked at here too: the snapshot ticks follow the
+                // controller's cadence, slow while nobody watches.
+                if world.lock().unwrap_or_else(|e| e.into_inner()).away(ap) {
+                    return Err(io::Error::other("link down by the script"));
+                }
                 let due = {
                     let mut w = world.lock().unwrap_or_else(|e| e.into_inner());
                     w.advance();
