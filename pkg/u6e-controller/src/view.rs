@@ -305,8 +305,8 @@ pub fn events(state: &State, ap: Option<&str>) -> Vec<Value> {
     out.into_iter().map(|(_, v)| v).collect()
 }
 
-/// One event as the UI shows it, its BSS named; `None` for a kind this
-/// controller does not know.
+/// One event as the UI shows it, its BSS or radio named as the AP last
+/// reported them; `None` for a kind this controller does not know.
 pub fn event(ap_name: &str, ap: &Ap, ev: &Event) -> Option<Value> {
     let mut o = Map::new();
     o.insert("ap".into(), ap_name.into());
@@ -329,21 +329,29 @@ pub fn event(ap_name: &str, ap: &Ap, ev: &Event) -> Option<Value> {
     match who {
         Ok((m, bss)) => {
             o.insert("mac".into(), mac::format(*m).into());
-            // The BSS list as it is now; it changes only with the AP's config.
-            let snap = ap.snapshot.as_ref();
-            if let Some(b) = snap.and_then(|s| s.bsss.get(usize::from(bss))) {
+            // The BSS list changes only with the AP's config.
+            if let Some(b) = ap.naming.bsss.get(usize::from(bss)) {
                 o.insert("bss".into(), b.ifname.clone().into());
                 o.insert("ssid".into(), b.ssid.clone().into());
-                if let Some(r) = snap.and_then(|s| s.radios.iter().find(|r| r.phy == b.phy)) {
-                    o.insert("band".into(), band(r.band).into());
+                if let Some(b) = band_of(ap, &b.phy) {
+                    o.insert("band".into(), b.into());
                 }
             }
         }
         Err(phy) => {
             o.insert("phy".into(), phy.clone().into());
+            if let Some(b) = band_of(ap, phy) {
+                o.insert("band".into(), b.into());
+            }
         }
     }
     Some(Value::Object(o))
+}
+
+/// The band of `ap`'s radio `phy`, as the AP last reported it.
+fn band_of(ap: &Ap, phy: &str) -> Option<&'static str> {
+    let (_, b) = ap.naming.bands.iter().find(|(p, _)| p == phy)?;
+    Some(band(*b))
 }
 
 /// The merge patch that turns `old` into `new`, or `None` when they are

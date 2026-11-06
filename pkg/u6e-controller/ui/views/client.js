@@ -384,7 +384,7 @@ export default {
         const stamp = `${mine.length}|${mine.at(-1)?.at}`;
         if (stamp !== drawn) {
           drawn = stamp;
-          events.replaceChildren(...feed(store, mine.slice(-200).reverse(), { showMac: false }));
+          events.replaceChildren(...feed(mine.slice(-200).reverse(), { showMac: false }));
         }
         events.hidden = !mine.length;
         noEvents.hidden = !!mine.length;

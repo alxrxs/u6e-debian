@@ -33,8 +33,8 @@ use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
 use u6e_proto::delta::{self, Gap};
 use u6e_proto::msg::{
-    AgentMsg, Binding, Command, CommandKind, CommandResult, ConfigApplied, CtlMsg, Event,
-    EventKind, Flows, Guard, GuardConfig, Hello, Mechanism, RadioConfig, Snapshot, Station,
+    AgentMsg, Band, Binding, Bss, Command, CommandKind, CommandResult, ConfigApplied, CtlMsg,
+    Event, EventKind, Flows, Guard, GuardConfig, Hello, Mechanism, RadioConfig, Snapshot, Station,
 };
 use u6e_proto::{PROTOCOL, mac};
 
@@ -289,6 +289,23 @@ struct Addresses {
     at: SystemTime,
 }
 
+/// What names an AP's events: its BSSs and its radios' bands, as its last
+/// snapshot had them.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Naming {
+    pub bsss: Vec<Bss>,
+    pub bands: Vec<(String, Band)>,
+}
+
+impl Naming {
+    fn of(s: &Snapshot) -> Self {
+        Naming {
+            bsss: s.bsss.clone(),
+            bands: s.radios.iter().map(|r| (r.phy.clone(), r.band)).collect(),
+        }
+    }
+}
+
 /// One configured AP.
 pub struct Ap {
     /// The host name its agent names itself by, and configurations are
@@ -302,6 +319,9 @@ pub struct Ap {
     pub protocol: Option<u16>,
     /// The current snapshot, only while connected.
     pub snapshot: Option<Snapshot>,
+    /// What names its events, kept while it is down, so that they read the
+    /// same whenever they are shown.
+    pub naming: Naming,
     /// When `snapshot` was last brought up to date.
     pub snapshot_at: Option<SystemTime>,
     /// The snapshot before it in this session and when it came: the base
@@ -359,6 +379,7 @@ impl Ap {
             hello: None,
             protocol: None,
             snapshot: None,
+            naming: Naming::default(),
             snapshot_at: None,
             previous: None,
             connected_since: None,
@@ -428,6 +449,10 @@ impl Ap {
 
     /// Makes `next` the current snapshot, the current one its predecessor.
     fn advance(&mut self, next: Snapshot, now: SystemTime) {
+        let naming = Naming::of(&next);
+        if naming != self.naming {
+            self.naming = naming;
+        }
         let prev = self.snapshot.replace(next);
         self.previous = prev.zip(self.snapshot_at);
         self.snapshot_at = Some(now);

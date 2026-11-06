@@ -7,10 +7,9 @@ import { h, dayOf, describe, time } from '../util.js';
 const PAGE = 300;
 const GROUPS = [['', 'All'], ['conn', 'Joins and leaves'], ['auth', 'Sign-ins'], ['radio', 'Radios'], ['guard', 'Guards'], ['action', 'Actions']];
 
-/** The radio an event names, with its band where the AP still lists it. */
-function radioName(store, e) {
-  const band = store.state.aps[e.ap]?.radios?.[e.phy]?.band;
-  return band ? `${e.phy} (${band} GHz)` : e.phy;
+/** The radio an event names, with its band where the controller knows it. */
+function radioName(e) {
+  return e.band ? `${e.phy} (${e.band} GHz)` : e.phy;
 }
 
 /** The actions on an AP an admin takes, rather than the controller itself. */
@@ -32,10 +31,11 @@ function actionText(e, what, showMac) {
 
 /**
  * The feed of `list` (newest first) as list items, a day heading where the
- * date changes. `seen` holds the events already shown, so that those that
- * happen after `since` are marked new the first time they are.
+ * date changes; it reads nothing but the events, so it changes only with
+ * them. `seen` holds the events already shown, so that those that happen
+ * after `since` are marked new the first time they are.
  */
-export function feed(store, list, { seen, since = Infinity, showMac = true } = {}) {
+export function feed(list, { seen, since = Infinity, showMac = true } = {}) {
   const out = [];
   let lastDay = '';
   for (const e of list) {
@@ -44,7 +44,7 @@ export function feed(store, list, { seen, since = Infinity, showMac = true } = {
       out.push(h('li', { class: 'day' }, d));
       lastDay = d;
     }
-    const what = describe(e.phy ? { ...e, phy: radioName(store, e) } : e);
+    const what = describe(e.phy ? { ...e, phy: radioName(e) } : e);
     const key = `${e.ap}|${e.at}|${e.kind}|${e.action || e.guard || ''}|${e.mac || e.phy}`;
     const fresh = seen && !seen.has(key) && e.at > since;
     seen?.add(key);
@@ -132,7 +132,7 @@ export default {
             h('p', {}, store.events.length ? 'Change the filters to see more.' : 'Joins, leaves, sign-ins, radio changes and actions on clients appear here the moment they happen.'));
           return;
         }
-        list.replaceChildren(...feed(store, shown, { seen, since }));
+        list.replaceChildren(...feed(shown, { seen, since }));
       },
     };
     return view;

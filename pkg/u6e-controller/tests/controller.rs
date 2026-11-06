@@ -1020,15 +1020,25 @@ fn api_aps_lists_connected() {
         kind: EventKind::Assoc { mac: MAC, bss: 0 },
     }))
     .unwrap();
-    wait_for("the event", || {
-        r.c.state.read().ap("ap1").unwrap().events.len() == 1
+    a.send(&AgentMsg::Event(Event {
+        at_ms: 6,
+        kind: EventKind::RadioUp { phy: "phy0".into() },
+    }))
+    .unwrap();
+    wait_for("the events", || {
+        r.c.state.read().ap("ap1").unwrap().events.len() == 2
     });
     let events = json_get(r.c.http, "/api/events?ap=ap1");
     let assoc = json!({"ap": "ap1", "at": 5, "kind": "assoc", "mac": "02:00:00:00:00:01",
         "bss": "wlan5", "ssid": "ssid-a", "band": "5"});
-    assert_eq!(events, json!([assoc]));
-    assert_eq!(json_get(r.c.http, "/api/events"), json!([assoc]));
+    let up = json!({"ap": "ap1", "at": 6, "kind": "radio-up", "phy": "phy0", "band": "5"});
+    assert_eq!(events, json!([assoc, up]));
+    assert_eq!(json_get(r.c.http, "/api/events"), json!([assoc, up]));
     assert_eq!(json_get(r.c.http, "/api/events?ap=ap2"), json!([]));
+    // Its link gone, its events still read as they did.
+    drop(a);
+    wait_for("ap1 down", || !r.c.state.read().ap("ap1").unwrap().is_up());
+    assert_eq!(json_get(r.c.http, "/api/events"), json!([assoc, up]));
 }
 
 #[test]
