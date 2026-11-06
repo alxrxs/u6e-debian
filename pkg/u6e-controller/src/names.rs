@@ -9,7 +9,8 @@
 //! [`MISSING_TTL`]; past that the next flows that show the address look it up
 //! again, and the old name is shown until the answer comes. At most
 //! [`CAPACITY`] addresses are known, the one whose answer goes stale first
-//! forgotten for a new one.
+//! forgotten for a new one; while every one known is being looked up, a new
+//! one waits for the next flows.
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::CStr;
@@ -125,8 +126,8 @@ impl Names {
     pub fn due(&mut self, wanted: impl IntoIterator<Item = IpAddr>, now: Instant) -> Vec<IpAddr> {
         let mut out = Vec::new();
         for ip in wanted {
-            if !self.entries.contains_key(&ip) && self.entries.len() >= CAPACITY {
-                self.evict();
+            if !self.entries.contains_key(&ip) && self.entries.len() >= CAPACITY && !self.evict() {
+                continue;
             }
             let e = self.entries.entry(ip).or_insert(Entry {
                 name: None,
@@ -161,12 +162,14 @@ impl Names {
     }
 
     /// Forgets the address whose answer goes stale first, of those not
-    /// being looked up.
-    fn evict(&mut self) {
+    /// being looked up; false when every one is.
+    fn evict(&mut self) -> bool {
         let idle = self.entries.iter().filter(|(_, e)| !e.pending);
-        if let Some(ip) = idle.min_by_key(|(_, e)| e.until).map(|(ip, _)| *ip) {
-            self.entries.remove(&ip);
-        }
+        let Some(ip) = idle.min_by_key(|(_, e)| e.until).map(|(ip, _)| *ip) else {
+            return false;
+        };
+        self.entries.remove(&ip);
+        true
     }
 
     pub fn get(&self, ip: &IpAddr) -> Option<&str> {
@@ -315,12 +318,13 @@ mod tests {
         assert_eq!(n.due([new], t0), [new]);
         assert_eq!(n.entries.len(), CAPACITY);
         assert!(!n.entries.contains_key(&all[0]) && n.entries.contains_key(&all[1]));
-        // Lookups out are never forgotten: with all of them out, the cache
-        // grows past its size rather than lose one.
+        // Lookups out are never forgotten: with all of them out, a new
+        // address waits, and the cache keeps its size.
         let mut busy = Names::default();
         busy.due(all.iter().copied(), t0);
-        busy.due([new], t0);
-        assert_eq!(busy.entries.len(), CAPACITY + 1);
+        assert!(busy.due([new], t0).is_empty());
+        assert_eq!(busy.entries.len(), CAPACITY);
+        assert_eq!(busy.get(&new), None);
     }
 
     #[test]

@@ -1,8 +1,10 @@
-//! A MAC's vendor, from the IEEE registry compacted into the binary at build
-//! time (`build.rs`): the organization its address block was assigned to,
-//! the narrowest of the MA-S (36-bit), MA-M (28-bit) and MA-L (24-bit)
-//! blocks it falls in. A locally administered address, which phones and
-//! laptops make up per network to stay private, has no vendor.
+//! A MAC's vendor, from the IEEE registry as Wireshark compiles it (the
+//! vendored `oui/manuf.tsv`), compacted into the binary at build time
+//! (`build.rs`): the organization its address block was assigned to, the
+//! narrowest of the MA-S (36-bit), MA-M (28-bit) and MA-L (24-bit) blocks it
+//! falls in. A locally administered address, which phones and laptops make
+//! up per network to stay private, has no vendor; nor has one in a block the
+//! registry split up and has not assigned.
 
 const MA_L: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/oui/ma-l.bin"));
 const MA_M: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/oui/ma-m.bin"));
@@ -77,17 +79,14 @@ mod tests {
         // MA-S, inside an MA-L block the registry itself holds.
         assert_eq!(
             vendor(&[0x8c, 0x1f, 0x64, 0xaf, 0xa0, 0x01]),
-            Some(Vendor::Assigned("DATA ELECTRONIC DEVICES, INC"))
+            Some(Vendor::Assigned("Data Electronic Devices, Inc"))
         );
-        // Outside every MA-S block of it: the registry's own.
-        assert_eq!(
-            vendor(&[0x8c, 0x1f, 0x64, 0xff, 0xf0, 0x01]),
-            Some(Vendor::Assigned("IEEE Registration Authority"))
-        );
+        // Outside every MA-S block of it: not assigned.
+        assert_eq!(vendor(&[0x8c, 0x1f, 0x64, 0xff, 0xf0, 0x01]), None);
         // MA-M.
         assert_eq!(
             vendor(&[0xc8, 0x5c, 0xe2, 0x70, 0x00, 0x01]),
-            Some(Vendor::Assigned("SYNERGY SYSTEMS AND SOLUTIONS"))
+            Some(Vendor::Assigned("Synergy Systems And Solutions"))
         );
     }
 
