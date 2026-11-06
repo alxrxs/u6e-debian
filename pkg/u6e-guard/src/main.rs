@@ -1,20 +1,21 @@
-//! The AP's client guards: ARP inspection, rogue-DHCP guard, RA guard and IP
-//! source guard on every Wi-Fi port (`rules`). They bind each client's MAC
-//! to the addresses its DHCP server acknowledges, or the controller seeds
-//! from the servers' leases, or the site makes static (`bindings`), read the
-//! frames that bear on them as they reach the host (`capture`), and report
-//! each violation to the agent, which forwards it; on the VLANs the
-//! controller says to enforce on, they drop the offending frames with `tc`
-//! (`enforce`), never the client. Root for the packet socket and `tc` alone
-//! (CAP_NET_RAW, CAP_NET_ADMIN), in a sandbox (see prep-rootfs.sh).
+//! The AP's client guards: ARP inspection, rogue-DHCP guard, RA guard, IP
+//! source guard and a ban on VLAN-tagged frames, on every Wi-Fi port
+//! (`rules`). They bind each client's MAC to the addresses the site's DHCP
+//! server acknowledges, or the controller seeds from the servers' leases, or
+//! the site makes static (`bindings`), read the frames that bear on them as
+//! they reach the host (`capture`), and report each violation to the agent,
+//! which forwards it; on the VLANs the controller says to enforce on, they
+//! drop exactly the frames they report with `tc` (`enforce`), never the
+//! client. Their own user, with CAP_NET_RAW and CAP_NET_ADMIN alone (`tc`
+//! inherits them), in a sandbox (see prep-rootfs.sh).
 //!
 //!   u6e-guard serve
 //!   u6e-guard clear
 //!
 //! `serve` serves the agent on the socket systemd passes (the protocol is
-//! `u6e_proto::guard`) until stopped. `clear` removes every Wi-Fi port's
-//! ingress qdisc: the unit's last step, so nothing drops once the guards
-//! are not running.
+//! `u6e_proto::guard`) until stopped. `clear` removes the guards' qdiscs and
+//! actions, and fails when tc cannot: the unit's first and last step, so
+//! nothing drops while the guards are not running.
 
 mod bindings;
 mod capture;
@@ -50,7 +51,7 @@ fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let result = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["serve"] => serve(),
-        ["clear"] => ports::scan(Path::new(NET)).and_then(|p| enforce::clear(Path::new(TC), &p)),
+        ["clear"] => enforce::clear(Path::new(TC)),
         _ => {
             eprintln!("usage: u6e-guard serve | clear");
             process::exit(2);
@@ -73,7 +74,7 @@ fn serve() -> io::Result<()> {
         rescan: RESCAN,
     };
     // What a guard that ended without its last step left behind.
-    enforce::clear(&cfg.tc, &ports::scan(&cfg.net)?)?;
+    enforce::clear(&cfg.tc)?;
     let capture = capture::Capture::open()?;
     eprintln!("u6e-guard: reporting only until the controller says otherwise");
     serve::run(&cfg, local::listener()?, capture, stop.as_raw_fd())

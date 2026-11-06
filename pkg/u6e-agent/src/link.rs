@@ -94,6 +94,8 @@ pub struct Config {
     pub spectrum_limit: Duration,
     /// The client guards' socket.
     pub guards: PathBuf,
+    /// Where the place reached in their violations is kept.
+    pub guards_cursor: PathBuf,
 }
 
 impl Config {
@@ -113,6 +115,7 @@ impl Config {
             spectrum: spectrum::SOCKET.into(),
             spectrum_limit: spectrum::LIMIT,
             guards: u6e_proto::guard::SOCKET.into(),
+            guards_cursor: crate::guards::CURSOR.into(),
         }
     }
 }
@@ -171,7 +174,7 @@ fn run_with(
     mut relay: impl FnMut() -> io::Result<Arc<Ring>>,
 ) -> ! {
     let client = tls::client_config(&cfg.identity, cfg.controller_key);
-    let mut guards = Guards::new(cfg.guards.clone());
+    let mut guards = Guards::new(cfg.guards.clone(), cfg.guards_cursor.clone());
     let mut ring = None;
     let mut backoff = *cfg.backoff.start();
     // A failure that repeats is logged once, not at every attempt.
@@ -1318,14 +1321,20 @@ mod tests {
         guards.state.lock().unwrap().violations = vec![violation(1)];
         let socket = guards.socket.clone();
         let fake = Fake::new();
-        let _agent = Agent::spawn_with(&fake, 0, move |c| c.guards = socket, blank);
+        let cursor = dir.path().join("cursor");
+        let tweak = move |c: &mut Config| {
+            c.guards = socket;
+            c.guards_cursor = cursor;
+        };
+        let _agent = Agent::spawn_with(&fake, 0, tweak, blank);
         let mut p = fake.accept();
         p.start();
         assert_eq!(p.recv(), AgentMsg::Bindings(vec![]));
+        assert_eq!(p.recv(), AgentMsg::GuardDrops(vec![]));
         assert_eq!(p.recv(), AgentMsg::Event(violation(1).1));
         let mode = u6e_proto::msg::GuardConfig {
             enforce: vec![42],
-            statics: vec![],
+            ..u6e_proto::msg::GuardConfig::default()
         };
         p.send(CtlMsg::Guards(mode.clone()));
         p.send(CtlMsg::SeedBindings(vec![]));

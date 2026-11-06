@@ -1,13 +1,17 @@
-//! The agent's side of the client guards (`u6e-guard`, a root helper on a
-//! socket of the agent's group): each tick it reads their bindings, sent to
-//! the controller whole when they changed and at the start of each session,
-//! and the violations recorded since the last read, sent as events; it hands
-//! them the mode and the seed of the leases the controller sends, and hands
-//! them again to guards that restarted, which forget both. The violations
-//! are read across sessions, so those of an outage leave once the link is
-//! back (the newest of them: the guards keep 256). An image without the
-//! guards, or guards that do not answer, cost a line in the log.
+//! The agent's side of the client guards (`u6e-guard`, a helper on a socket
+//! of the agent's group): each tick it reads their bindings and drop counts,
+//! each sent to the controller when it changed and at the start of each
+//! session, and the violations recorded since the last read, sent as
+//! events; it hands them the seed of the leases and the mode the controller
+//! sends, and hands them both again (the seed first, so no enforcing mode
+//! meets an empty table) to guards that restarted, which forget them. The
+//! violations are read across sessions, so those of an outage leave once
+//! the link is back (the newest of them: the guards keep 256), and the place
+//! reached is kept in a file that outlives the agent (`cursor`), so a
+//! restarted agent sends none twice. An image without the guards, or guards
+//! that do not answer, cost a line in the log.
 
+use std::fs;
 use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -15,37 +19,63 @@ use std::time::Duration;
 
 use u6e_proto::frame::{read_frame, write_frame};
 use u6e_proto::guard::{Reply, Request};
-use u6e_proto::msg::{AgentMsg, Binding, GuardConfig};
+use u6e_proto::msg::{AgentMsg, Binding, Guard, GuardConfig};
 
 /// The longest a request may take: the guards answer from memory.
 const WAIT: Duration = Duration::from_secs(2);
+/// Where the place reached in the violations is kept: a directory of the
+/// agent's that outlives it, until the AP reboots (prep-rootfs.sh).
+pub const CURSOR: &str = "/run/u6e-agent-state/guards";
 
 pub struct Guards {
     socket: PathBuf,
+    cursor: PathBuf,
     /// The guards' start, as they last said it: another means they
     /// restarted.
     started: Option<u64>,
-    /// The last violation read.
+    /// The last violation read, of the guards started at `started`.
     after: u64,
-    /// The bindings this session was sent last (the guards' start and
-    /// generation).
+    /// The bindings and the drop counts this session was sent last.
     sent: Option<(u64, u64)>,
+    sent_drops: Option<Vec<(Guard, u64)>>,
     config: Option<GuardConfig>,
     seed: Option<Vec<Binding>>,
     failed: String,
 }
 
+/// The guards' start and the last violation read, as `cursor` keeps them.
+fn load(cursor: &PathBuf) -> Option<(u64, u64)> {
+    let text = fs::read_to_string(cursor).ok()?;
+    let (started, after) = text.trim().split_once(' ')?;
+    Some((started.parse().ok()?, after.parse().ok()?))
+}
+
 impl Guards {
-    pub fn new(socket: PathBuf) -> Self {
+    pub fn new(socket: PathBuf, cursor: PathBuf) -> Self {
+        let kept = load(&cursor);
         Guards {
             socket,
-            started: None,
-            after: 0,
+            cursor,
+            started: kept.map(|(s, _)| s),
+            after: kept.map_or(0, |(_, a)| a),
             sent: None,
+            sent_drops: None,
             config: None,
             seed: None,
             failed: String::new(),
         }
+    }
+
+    /// Keeps the place reached, written whole or not at all.
+    fn keep(&mut self) {
+        let Some(started) = self.started else { return };
+        let tmp = self.cursor.with_extension("tmp");
+        let written = fs::write(&tmp, format!("{started} {}\n", self.after))
+            .and_then(|()| fs::rename(&tmp, &self.cursor));
+        let failure = written
+            .err()
+            .map(|e| format!("{}: {e}", self.cursor.display()));
+        self.note(failure);
     }
 
     fn ask(&self, req: &Request) -> io::Result<Reply> {
@@ -91,20 +121,23 @@ impl Guards {
         self.tell(Request::Seed(leases));
     }
 
-    /// A new session: it is sent the bindings at the next read.
+    /// A new session: it is sent the bindings and drop counts at the next
+    /// read.
     pub fn session(&mut self) {
         self.sent = None;
+        self.sent_drops = None;
     }
 
-    /// Appends to `out` the bindings, if this session has not had them as
-    /// they are, and the violations since the last read.
+    /// Appends to `out` the bindings and drop counts, if this session has
+    /// not had them as they are, and the violations since the last read.
     pub fn read_into(&mut self, out: &mut Vec<u8>) -> io::Result<()> {
-        let (started, generation, bindings) = match self.ask(&Request::Bindings) {
+        let (started, generation, bindings, dropped) = match self.ask(&Request::Bindings) {
             Ok(Reply::Bindings {
                 started_ms,
                 generation,
                 bindings,
-            }) => (started_ms, generation, bindings),
+                dropped,
+            }) => (started_ms, generation, bindings, dropped),
             Ok(other) => {
                 self.note(Some(format!("unexpected answer {other:?}")));
                 return Ok(());
@@ -117,27 +150,34 @@ impl Guards {
         self.note(None);
         if self.started != Some(started) {
             // Restarted guards number their violations afresh, and hold
-            // neither the mode nor the seed.
+            // neither the seed nor the mode.
             self.started = Some(started);
             self.after = 0;
-            if let Some(c) = self.config.clone() {
-                self.tell(Request::Mode(c));
-            }
+            self.keep();
             if let Some(s) = self.seed.clone() {
                 self.tell(Request::Seed(s));
+            }
+            if let Some(c) = self.config.clone() {
+                self.tell(Request::Mode(c));
             }
         }
         if self.sent != Some((started, generation)) {
             write_frame(out, &AgentMsg::Bindings(bindings))?;
             self.sent = Some((started, generation));
         }
+        if self.sent_drops.as_ref() != Some(&dropped) {
+            write_frame(out, &AgentMsg::GuardDrops(dropped.clone()))?;
+            self.sent_drops = Some(dropped);
+        }
         if let Ok(Reply::Violations { events }) =
             self.ask(&Request::Violations { after: self.after })
+            && !events.is_empty()
         {
             for (n, ev) in events {
                 self.after = n;
                 write_frame(out, &AgentMsg::Event(ev))?;
             }
+            self.keep();
         }
         Ok(())
     }
@@ -151,7 +191,7 @@ pub mod tests {
     use std::thread;
 
     use u6e_proto::frame::decode_frame;
-    use u6e_proto::msg::{Event, EventKind, Guard, Violation};
+    use u6e_proto::msg::{Event, EventKind, Violation};
 
     use crate::testdir::TestDir;
 
@@ -161,6 +201,7 @@ pub mod tests {
         pub started_ms: u64,
         pub generation: u64,
         pub bindings: Vec<Binding>,
+        pub dropped: Vec<(Guard, u64)>,
         pub violations: Vec<(u64, Event)>,
     }
 
@@ -181,6 +222,7 @@ pub mod tests {
                 started_ms: 1,
                 generation: 0,
                 bindings: Vec::new(),
+                dropped: Vec::new(),
                 violations: Vec::new(),
             }));
             let (a, s) = (Arc::clone(&asked), Arc::clone(&state));
@@ -189,20 +231,20 @@ pub mod tests {
                     let Ok(req) = read_frame::<_, Request>(&mut sock) else {
                         continue;
                     };
-                    let State {
-                        started_ms,
-                        generation,
-                        bindings,
-                        violations,
-                    } = s.lock().unwrap().clone();
+                    let st = s.lock().unwrap().clone();
                     let reply = match &req {
                         Request::Bindings => Reply::Bindings {
-                            started_ms,
-                            generation,
-                            bindings,
+                            started_ms: st.started_ms,
+                            generation: st.generation,
+                            bindings: st.bindings,
+                            dropped: st.dropped,
                         },
                         Request::Violations { after } => Reply::Violations {
-                            events: violations.into_iter().filter(|(n, _)| n > after).collect(),
+                            events: st
+                                .violations
+                                .into_iter()
+                                .filter(|(n, _)| n > after)
+                                .collect(),
                         },
                         _ => Reply::Done,
                     };
@@ -249,11 +291,15 @@ pub mod tests {
         msgs
     }
 
+    fn guards(fake: &Fake, dir: &TestDir) -> Guards {
+        Guards::new(fake.socket.clone(), dir.path().join("cursor"))
+    }
+
     #[test]
-    fn bindings_go_once_per_change_and_violations_once() {
+    fn bindings_and_drops_go_once_per_change_and_violations_once() {
         let dir = TestDir::new();
         let fake = Fake::start(&dir);
-        let mut g = Guards::new(fake.socket.clone());
+        let mut g = guards(&fake, &dir);
         let b = Binding {
             mac: [2, 0, 0, 0, 0, 1],
             ip: [192, 0, 2, 10].into(),
@@ -267,6 +313,7 @@ pub mod tests {
             sent(&out),
             [
                 AgentMsg::Bindings(vec![b]),
+                AgentMsg::GuardDrops(vec![]),
                 AgentMsg::Event(violation(1).1),
                 AgentMsg::Event(violation(2).1)
             ]
@@ -274,25 +321,49 @@ pub mod tests {
         out.clear();
         g.read_into(&mut out).unwrap();
         assert_eq!(sent(&out), []);
-        // A new session is sent the bindings again; a change is sent.
+        // A new session is sent both again; a change is sent.
         g.session();
         g.read_into(&mut out).unwrap();
         fake.state.lock().unwrap().generation = 1;
+        fake.state.lock().unwrap().dropped = vec![(Guard::Arp, 3)];
         g.read_into(&mut out).unwrap();
         assert_eq!(
             sent(&out),
-            [AgentMsg::Bindings(vec![b]), AgentMsg::Bindings(vec![b])]
+            [
+                AgentMsg::Bindings(vec![b]),
+                AgentMsg::GuardDrops(vec![]),
+                AgentMsg::Bindings(vec![b]),
+                AgentMsg::GuardDrops(vec![(Guard::Arp, 3)]),
+            ]
         );
     }
 
     #[test]
-    fn restarted_guards_get_the_mode_and_seed_again() {
+    fn a_restarted_agent_sends_no_violation_twice() {
         let dir = TestDir::new();
         let fake = Fake::start(&dir);
-        let mut g = Guards::new(fake.socket.clone());
+        fake.state.lock().unwrap().violations = vec![violation(1), violation(2)];
+        let mut out = Vec::new();
+        guards(&fake, &dir).read_into(&mut out).unwrap();
+        // The agent restarts: the guards did not.
+        out.clear();
+        fake.state.lock().unwrap().violations.push(violation(3));
+        guards(&fake, &dir).read_into(&mut out).unwrap();
+        let events: Vec<_> = sent(&out)
+            .into_iter()
+            .filter(|m| matches!(m, AgentMsg::Event(_)))
+            .collect();
+        assert_eq!(events, [AgentMsg::Event(violation(3).1)]);
+    }
+
+    #[test]
+    fn restarted_guards_get_the_seed_then_the_mode_again() {
+        let dir = TestDir::new();
+        let fake = Fake::start(&dir);
+        let mut g = guards(&fake, &dir);
         let mode = GuardConfig {
             enforce: vec![42],
-            statics: vec![],
+            ..GuardConfig::default()
         };
         g.configure(mode.clone());
         g.seed(vec![]);
@@ -301,25 +372,17 @@ pub mod tests {
         fake.state.lock().unwrap().violations = vec![violation(1)];
         g.read_into(&mut out).unwrap();
         // They restart: their numbering starts again.
-        *fake.state.lock().unwrap() = State {
-            started_ms: 2,
-            generation: 0,
-            bindings: vec![],
-            violations: vec![violation(1)],
-        };
+        fake.asked.lock().unwrap().clear();
+        let mut st = fake.state.lock().unwrap().clone();
+        st.started_ms = 2;
+        *fake.state.lock().unwrap() = st;
         g.read_into(&mut out).unwrap();
         let asked = fake.asked.lock().unwrap().clone();
-        let modes = asked
+        let told: Vec<_> = asked
             .iter()
-            .filter(|r| matches!(r, Request::Mode(_)))
-            .count();
-        let seeds = asked
-            .iter()
-            .filter(|r| matches!(r, Request::Seed(_)))
-            .count();
-        // Told when sent, then at the first read (the agent cannot tell
-        // whether those were these guards) and after the restart.
-        assert_eq!((modes, seeds), (3, 3));
+            .filter(|r| matches!(r, Request::Mode(_) | Request::Seed(_)))
+            .collect();
+        assert_eq!(told, [&Request::Seed(vec![]), &Request::Mode(mode)]);
         let events = sent(&out)
             .into_iter()
             .filter(|m| matches!(m, AgentMsg::Event(_)))
@@ -330,7 +393,7 @@ pub mod tests {
     #[test]
     fn no_guards_cost_nothing_but_a_log_line() {
         let dir = TestDir::new();
-        let mut g = Guards::new(dir.path().join("absent.sock"));
+        let mut g = Guards::new(dir.path().join("absent.sock"), dir.path().join("cursor"));
         let mut out = Vec::new();
         g.read_into(&mut out).unwrap();
         g.configure(GuardConfig::default());

@@ -41,6 +41,9 @@ pub enum AgentMsg {
     /// The bindings the AP's client guards hold, whole, whenever they change
     /// (at most every tick) and at the start of each session.
     Bindings(Vec<Binding>),
+    /// The frames each guard's filters dropped since the guards started,
+    /// whenever that changes and at the start of each session.
+    GuardDrops(Vec<(Guard, u64)>),
 }
 
 /// Everything the controller sends.
@@ -365,13 +368,16 @@ pub struct Binding {
 pub enum Guard {
     /// ARP inspection: a client's ARP may name only its own bound address.
     Arp,
-    /// Rogue DHCP: no client answers as a DHCP or DHCPv6 server.
+    /// Rogue DHCP: no client answers as a DHCP or DHCPv6 server, and no
+    /// other than the site's server binds an address.
     Dhcp,
     /// RA guard: no client advertises itself as a router or a prefix.
     Ra,
-    /// IP source guard: a client's new connections come from its bound
-    /// address.
+    /// IP source guard: a client's new connections come from no address
+    /// bound to another client.
     Source,
+    /// No client sends a VLAN-tagged frame.
+    Tag,
 }
 
 /// A client breaking a guard's rule, at most once a minute per client and
@@ -405,6 +411,11 @@ pub struct GuardConfig {
     pub enforce: Vec<u16>,
     /// The clients with a static address, bound for good.
     pub statics: Vec<Binding>,
+    /// The site's DHCP servers (the server identifiers of their answers)
+    /// and the relays that bring their answers onto the VLANs: only their
+    /// acknowledgements bind addresses. Empty, none is learnt.
+    pub dhcp_servers: Vec<Ipv4Addr>,
+    pub dhcp_relays: Vec<Ipv4Addr>,
 }
 
 /// The connections the AP forwards, per client, as the NSS connection

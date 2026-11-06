@@ -8,7 +8,9 @@
 //! UI shows its MAC without one), each of those, its `vendor`, `addresses`
 //! and `lease_expires`. A flow's far end carries its DNS name
 //! (`remote_name`) once one was looked up, and the addresses its AP's client
-//! guards bind to it (`bound`). The clients the policy blocks are
+//! guards bind to it (`bound`); a guard's violation is an event of kind
+//! `guard` (its `guard`, `detail`, whether its frame was `dropped`, and the
+//! `repeats` since the last one reported). The clients the policy blocks are
 //! listed whole (`blocked`), associated or not, so that one kept off every AP
 //! can still be found and unblocked; an associated client says it too.
 //!
@@ -17,7 +19,8 @@
 //! it and the one sent to it last, whether it drifts (runs another than the
 //! latest), and how the last one went. Beside the APs are what the
 //! controller manages (`manage`: whether it signs configurations, the VLANs
-//! the client guards enforce on and their static clients, and, when it rolls
+//! the client guards enforce on as sent (none without the leases) and their
+//! static clients, and, when it rolls
 //! images out, each AP's kept images and those it runs) and the image
 //! rollouts with their step, gate, result and log (`rollouts`).
 
@@ -127,7 +130,7 @@ pub fn manage(state: &State) -> Value {
     let guards = &state.guards;
     let mut o = json!({
         "configs": state.signer.is_some(),
-        "guards": { "enforce": guards.enforce, "statics": guards.statics.len() },
+        "guards": { "enforce": state.guard_mode().enforce, "statics": guards.statics.len() },
     });
     if let Some(kept) = &state.kept {
         let aps = state.aps().map(|(name, _)| {
@@ -376,6 +379,7 @@ pub fn guard_name(g: Guard) -> &'static str {
         Guard::Dhcp => "dhcp",
         Guard::Ra => "ra",
         Guard::Source => "source",
+        Guard::Tag => "tag",
     }
 }
 

@@ -320,6 +320,8 @@ pub struct Ap {
     /// Its client guards' violations by guard and VLAN, repeats included,
     /// since the controller started.
     pub violations: BTreeMap<(Guard, u16), u64>,
+    /// The frames its client guards dropped, by guard, since they started.
+    pub guard_drops: Vec<(Guard, u64)>,
     rx_bytes: Arc<AtomicU64>,
     watchers: usize,
     tick: watch::Sender<u16>,
@@ -366,6 +368,7 @@ impl Ap {
             flows: None,
             bindings: Vec::new(),
             violations: BTreeMap::new(),
+            guard_drops: Vec::new(),
             rx_bytes: Arc::new(AtomicU64::new(0)),
             watchers: 0,
             tick: watch::Sender::new(TICK_IDLE),
@@ -981,6 +984,10 @@ impl State {
                 entry.bindings = b;
                 Some(Change::Bindings(ap.to_owned()))
             }
+            AgentMsg::GuardDrops(d) => {
+                entry.guard_drops = d;
+                None
+            }
             // A Pong only proves the agent is alive.
             _ => None,
         };
@@ -1078,14 +1085,30 @@ impl State {
         if self.live(ap, id).is_none() {
             return Vec::new();
         }
-        vec![
-            CtlMsg::Guards(self.guards.clone()),
-            CtlMsg::SeedBindings(self.seed()),
-        ]
+        let seed = self.seed().map(CtlMsg::SeedBindings);
+        seed.into_iter()
+            .chain([CtlMsg::Guards(self.guard_mode())])
+            .collect()
     }
 
-    /// Every client's leased IPv4 addresses, as the guards are seeded.
-    pub fn seed(&self) -> Vec<Binding> {
+    /// The guards' mode as sent: enforcing on no VLAN without the leases,
+    /// since without their seed a client that roamed in is unknown to its
+    /// new AP.
+    pub fn guard_mode(&self) -> GuardConfig {
+        let mut mode = self.guards.clone();
+        if self.leases.exporters.is_empty() {
+            mode.enforce.clear();
+        }
+        mode
+    }
+
+    /// Every client's leased IPv4 addresses, as the guards are seeded; none
+    /// until a read of the leases has worked, so no AP is seeded with an
+    /// empty table after a restart.
+    pub fn seed(&self) -> Option<Vec<Binding>> {
+        if !self.leases.exporters.values().any(|e| e.last_ok.is_some()) {
+            return None;
+        }
         let leased = self.leases.all(SystemTime::now());
         let mut seed: Vec<Binding> = leased
             .flat_map(|(mac, l)| {
@@ -1102,7 +1125,7 @@ impl State {
             })
             .collect();
         seed.sort();
-        seed
+        Some(seed)
     }
 
     /// The APs a session serves.
@@ -1719,7 +1742,7 @@ impl State {
         if !self.leases.take(exporter, read, now) {
             return;
         }
-        let seed = self.seed();
+        let Some(seed) = self.seed() else { return };
         for live in self.aps.values().filter_map(|a| a.session.as_ref()) {
             // A session that far behind is stalled; its next one is seeded.
             let _ = live.outbox.try_send(CtlMsg::SeedBindings(seed.clone()));

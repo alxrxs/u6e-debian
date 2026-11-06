@@ -270,6 +270,10 @@ fn samples() -> Samples {
             "GuardViolationSource",
             EventKind::GuardViolation(violation(Guard::Source)),
         ),
+        (
+            "GuardViolationTag",
+            EventKind::GuardViolation(violation(Guard::Tag)),
+        ),
     ];
     let mut agent = vec![
         (
@@ -322,6 +326,10 @@ fn samples() -> Samples {
     ));
     agent.push(("ConfigApplied", AgentMsg::ConfigApplied(config_applied())));
     agent.push(("Bindings", AgentMsg::Bindings(bindings())));
+    agent.push((
+        "GuardDrops",
+        AgentMsg::GuardDrops(vec![(Guard::Arp, 1 << 40), (Guard::Tag, 70_010)]),
+    ));
     let mut ctl = vec![
         ("SetTick", CtlMsg::SetTick { secs: 300 }),
         ("WantKey", CtlMsg::WantKey),
@@ -377,6 +385,8 @@ fn samples() -> Samples {
         CtlMsg::Guards(GuardConfig {
             enforce: vec![300, 4094],
             statics: bindings(),
+            dhcp_servers: vec![Ipv4Addr::new(192, 0, 2, 53)],
+            dhcp_relays: vec![Ipv4Addr::new(192, 0, 2, 2), Ipv4Addr::new(198, 51, 100, 2)],
         }),
     ));
     ctl.push(("SeedBindings", CtlMsg::SeedBindings(bindings())));

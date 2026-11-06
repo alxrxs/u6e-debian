@@ -126,6 +126,11 @@ pub async fn start(
         .rf
         .as_ref()
         .map_or(rf::history::WINDOW, |rf| rf.rules.window_hours);
+    if !config.guards.enforce.is_empty() && config.leases.is_empty() {
+        eprintln!(
+            "u6e-controller: [guards] enforce needs [leases]: the APs' client guards only report"
+        );
+    }
     let mut state = State::new(config.hostnames.clone())
         .with_policy(saved)
         .with_spectrum(timing.spectrum)

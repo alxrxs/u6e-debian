@@ -11,7 +11,9 @@
 //! naming another AP are counted per AP, and a radio not as the site file
 //! plans it is timed from when it was found so. The lease exporters' series
 //! exist only when the leases are read. The client guards' violations are
-//! counted per AP, guard and VLAN from the first of each, repeats included.
+//! counted per AP, guard and VLAN from the first of each, repeats included,
+//! and the frames their filters dropped per AP and guard as the AP counts
+//! them.
 
 use std::collections::BTreeSet;
 use std::fmt::Write;
@@ -490,6 +492,16 @@ fn guards(m: &mut Text, aps: &[(&str, &Ap)]) {
     for &(ap, a) in aps {
         if a.is_up() {
             m.sample(&[("ap", ap)], a.bindings.len() as f64);
+        }
+    }
+    m.family(
+        "wifi_guard_dropped_total",
+        COUNTER,
+        "Frames the AP's client guards dropped while enforcing, by guard, since they started.",
+    );
+    for &(ap, a) in aps {
+        for (guard, n) in &a.guard_drops {
+            m.sample(&[("ap", ap), ("guard", guard_name(*guard))], *n as f64);
         }
     }
     m.family(

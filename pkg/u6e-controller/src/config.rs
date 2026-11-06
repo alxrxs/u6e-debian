@@ -10,8 +10,10 @@
 //! planner's (`rf::config`), without which it is off; in `[leases]`, the
 //! DHCP nodes' node exporters the clients' leases are read from (`leases`),
 //! none without it; and, in `[guards]`, the VLANs the APs' client guards
-//! enforce on and the clients with a static address, the guards only
-//! reporting without it.
+//! enforce on (only with `[leases]`: without the seed of the leases a client
+//! that roamed in is unknown to its new AP), the clients with a static
+//! address, and the site's DHCP servers and relays, whose acknowledgements
+//! alone bind addresses; the guards only report without it.
 //!
 //! ```toml
 //! listen_agents = "[::]:8443"
@@ -42,6 +44,8 @@
 //! [guards]
 //! enforce = [42]
 //! static = [{ mac = "02:00:00:00:00:01", ip = "192.0.2.5" }]
+//! dhcp_servers = ["192.0.2.53"]
+//! dhcp_relays = ["192.0.2.2", "198.51.100.2"]
 //! ```
 
 use std::collections::{BTreeMap, HashMap};
@@ -127,6 +131,10 @@ struct GuardsFile {
     enforce: Vec<u16>,
     #[serde(default, rename = "static")]
     statics: Vec<StaticFile>,
+    #[serde(default)]
+    dhcp_servers: Vec<Ipv4Addr>,
+    #[serde(default)]
+    dhcp_relays: Vec<Ipv4Addr>,
 }
 
 #[derive(Deserialize)]
@@ -326,6 +334,8 @@ fn guards(file: GuardsFile) -> Result<GuardConfig, ConfigError> {
     Ok(GuardConfig {
         enforce,
         statics: statics.collect::<Result<_, _>>()?,
+        dhcp_servers: file.dhcp_servers,
+        dhcp_relays: file.dhcp_relays,
     })
 }
 

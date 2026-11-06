@@ -309,6 +309,9 @@ $cred
 OpenFile=/sys/kernel/debug/qca-nss-drv/stats/cpu_load_ubi:nss-load:read-only,graceful
 RuntimeDirectory=u6e-agent
 RuntimeDirectoryMode=0755
+# Where it keeps its place in the client guards' violations, which outlives
+# it (tmpfiles, below), so a restarted agent sends none twice.
+ReadWritePaths=-/run/u6e-agent-state
 Restart=always
 RestartSec=10
 CapabilityBoundingSet=
@@ -520,22 +523,27 @@ SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @raw-io 
 UNIT
 
 # u6e-guard (pkg/u6e-guard): the client guards on the Wi-Fi ports (ARP
-# inspection, rogue DHCP, RA guard, IP source guard). They read the frames
-# that bear on them as they reach the host through a packet socket, bind each
-# client's MAC to its DHCP-acknowledged addresses (and those the controller
-# seeds from the DHCP servers' leases, or makes static), and report each
-# violation to the agent on a socket only its group may open; on the VLANs the
-# controller says to enforce on they drop the offending frames with tc ingress
-# flower filters, which nothing else on the Wi-Fi ports uses. Started at boot
-# (and by its socket), it runs as root for the packet socket and tc alone
-# (CAP_NET_RAW, CAP_NET_ADMIN); its last step removes every Wi-Fi port's
-# ingress qdisc, so a guard that is not running drops nothing. tc's modules
-# are loaded at boot, as the sandbox loads none. Every sandbox setting is at
-# its most restrictive but where a comment says what the guards need instead.
+# inspection, rogue DHCP, RA guard, IP source guard, no VLAN tags). They read
+# the frames that bear on them as they reach the host through a packet
+# socket, bind each client's MAC to the addresses the site's DHCP server
+# acknowledges (and those the controller seeds from the DHCP servers' leases,
+# or makes static), and report each violation to the agent on a socket only
+# its group may open; on the VLANs the controller says to enforce on they drop
+# exactly the frames they report with tc ingress filters, which nothing else
+# on the Wi-Fi ports uses. Started at boot (and by its socket), it runs as its
+# own user with CAP_NET_RAW and CAP_NET_ADMIN alone, ambient so tc has them
+# too; its first and last steps remove its qdiscs and actions, and fail
+# loudly when they cannot, so a guard that is not running drops nothing.
+# tc's modules are loaded at boot, as the sandbox loads none. Every sandbox
+# setting is at its most restrictive but where a comment says what the
+# guards need instead. The agent's state directory is created here too.
 install -m0755 target/aarch64-unknown-linux-musl/release/u6e-guard $RF/usr/local/sbin/
-printf 'd /run/u6e-guard 0750 root u6e-agent -\n' > $RF/usr/lib/tmpfiles.d/u6e-guard.conf
+printf 'u u6e-guard - "U6E client guards" -\n' > $RF/usr/lib/sysusers.d/u6e-guard.conf
+chroot $RF systemd-sysusers
+printf 'd /run/u6e-guard 0750 root u6e-agent -\nd /run/u6e-agent-state 0700 u6e-agent u6e-agent -\n' \
+	> $RF/usr/lib/tmpfiles.d/u6e-guard.conf
 install -d $RF/etc/modules-load.d
-printf 'sch_ingress\ncls_flower\nact_gact\n' > $RF/etc/modules-load.d/u6e-guard.conf
+printf 'sch_ingress\ncls_flower\ncls_u32\ncls_matchall\nact_gact\n' > $RF/etc/modules-load.d/u6e-guard.conf
 cat > $RF/etc/systemd/system/u6e-guard.socket <<'UNIT'
 [Unit]
 Description=U6E client guards socket, for u6e-agent
@@ -559,10 +567,14 @@ After=u6e-guard.socket u6e-wifi.service
 [Service]
 ExecStart=/usr/local/sbin/u6e-guard serve
 ExecStopPost=/usr/local/sbin/u6e-guard clear
+User=u6e-guard
+Group=u6e-guard
 Restart=always
 RestartSec=5
 CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
-AmbientCapabilities=
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+# No key of the image's is any of theirs.
+InaccessiblePaths=-/etc/u6e-agent -/etc/ssh -/run/u6e-wifi
 NoNewPrivileges=yes
 UMask=0077
 KeyringMode=private

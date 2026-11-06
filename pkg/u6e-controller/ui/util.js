@@ -176,7 +176,7 @@ export const DID = {
 };
 
 /** The client guards, by the name the controller gives them. */
-export const GUARDS = { arp: 'ARP inspection', dhcp: 'Rogue DHCP guard', ra: 'RA guard', source: 'IP source guard' };
+export const GUARDS = { arp: 'ARP inspection', dhcp: 'Rogue DHCP guard', ra: 'RA guard', source: 'IP source guard', tag: 'VLAN tag guard' };
 
 /** What an event says, as the feed and a client's history show it. */
 export function describe(ev) {

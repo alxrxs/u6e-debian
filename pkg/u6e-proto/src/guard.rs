@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::msg::{Binding, Event, GuardConfig};
+use crate::msg::{Binding, Event, Guard, GuardConfig};
 
 /// Where the guards listen.
 pub const SOCKET: &str = "/run/u6e-guard/sock";
@@ -27,11 +27,13 @@ pub enum Request {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Reply {
     /// `started_ms` tells a guard that restarted (and so forgot its mode and
-    /// seed) from one that did not; `generation` grows with each change.
+    /// seed) from one that did not; `generation` grows with each change;
+    /// `dropped` counts the frames each guard's filters dropped since then.
     Bindings {
         started_ms: u64,
         generation: u64,
         bindings: Vec<Binding>,
+        dropped: Vec<(Guard, u64)>,
     },
     /// Each [`crate::msg::EventKind::GuardViolation`] with its number, the
     /// oldest first; a gap in the numbers is what a full record dropped.

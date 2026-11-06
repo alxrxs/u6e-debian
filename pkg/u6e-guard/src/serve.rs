@@ -4,20 +4,22 @@
 //! connection (`u6e_proto::guard`), a member of its group only, each with a
 //! second to say what it wants. Enforcement follows every change that bears
 //! on it (bindings, the VLANs enforced on, the ports, the rogue advertisers)
-//! at once, and on the way out nothing is left dropping.
+//! at once, its drop counts are read every [`DROPS_EVERY`] while it lasts,
+//! and on the way out nothing is left dropping.
 
 use std::collections::HashMap;
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use u6e_proto::frame::{read_frame, write_frame};
 use u6e_proto::guard::{Reply, Request};
 use u6e_proto::local;
-use u6e_proto::msg::{Binding, GuardConfig};
+use u6e_proto::msg::{Binding, Guard, GuardConfig};
 
+use crate::bindings::Clock;
 use crate::capture::Capture;
 use crate::enforce::{self, Enforcer};
 use crate::frame;
@@ -30,6 +32,8 @@ const BURST: usize = 256;
 const CLIENT_WAIT: Duration = Duration::from_secs(1);
 /// Bindings a seed or a mode may carry at most.
 const MAX_BINDINGS: usize = 16_384;
+/// How often the drop counts are read while enforcing: each read runs tc.
+const DROPS_EVERY: Duration = Duration::from_secs(30);
 
 pub struct Config {
     /// The agent's group: only its members are served.
@@ -59,14 +63,10 @@ struct Server<'a> {
     enforcer: Enforcer,
     enforced: Option<Shape>,
     started_ms: u64,
+    /// Each guard's drops, as last read.
+    dropped: Vec<(Guard, u64)>,
     /// The last failure of each kind, logged once until it changes.
     failed: HashMap<&'static str, String>,
-}
-
-pub fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
 }
 
 /// Serves `listener` until `stop` is readable.
@@ -80,21 +80,27 @@ pub fn run(cfg: &Config, listener: UnixListener, capture: Capture, stop: RawFd) 
         by_index: HashMap::new(),
         enforcer: Enforcer::new(cfg.tc.clone()),
         enforced: None,
-        started_ms: now_ms(),
+        started_ms: Clock::now().wall_ms,
+        dropped: Vec::new(),
         failed: HashMap::new(),
     };
     let mut next_scan = Instant::now();
+    let mut next_drops = Instant::now();
     let mut buf = vec![0u8; 2048];
     loop {
         if Instant::now() >= next_scan {
             s.maintain();
             next_scan = Instant::now() + cfg.rescan;
         }
+        if Instant::now() >= next_drops {
+            s.read_drops();
+            next_drops = Instant::now() + DROPS_EVERY;
+        }
         let wait = next_scan.saturating_duration_since(Instant::now());
         let [frames, asked, stopped] = ready([s.capture.fd(), listener.as_raw_fd(), stop], wait);
         if stopped {
-            // The unit's last step clears every port too, however it ended.
-            return enforce::clear(&cfg.tc, &s.ports);
+            // The unit's last step clears too, however it ended.
+            return enforce::clear(&cfg.tc);
         }
         if frames {
             s.read_frames(&mut buf);
@@ -148,19 +154,34 @@ impl Server<'_> {
             Ok(_) => {}
             Err(e) => self.log_once("ports", Some(e.to_string())),
         }
-        self.guards.expire(now_ms());
+        self.guards.expire(Clock::now());
+    }
+
+    fn read_drops(&mut self) {
+        match self.enforcer.dropped() {
+            Ok(d) if !d.is_empty() => self.dropped = d,
+            Ok(_) => {}
+            Err(e) => self.log_once("drop counts", Some(e.to_string())),
+        }
     }
 
     fn read_frames(&mut self, buf: &mut [u8]) {
         for _ in 0..BURST {
             match self.capture.recv(buf) {
-                Ok(Some((n, ifindex))) => {
-                    let (Some(port), Some(f)) =
-                        (self.by_index.get(&ifindex), frame::parse(&buf[..n]))
-                    else {
+                Ok(Some(r)) => {
+                    let Some(port) = self.by_index.get(&r.ifindex) else {
                         continue;
                     };
-                    self.guards.take(port, &f, now_ms());
+                    let f = match (r.tag, mac_at(buf)) {
+                        (Some(vid), Some(src)) => Some(frame::Frame {
+                            src,
+                            what: frame::What::Tagged { vid },
+                        }),
+                        _ => frame::parse(&buf[..r.len]),
+                    };
+                    if let Some(f) = f {
+                        self.guards.take(port, &f, Clock::now());
+                    }
                 }
                 Ok(None) => return,
                 Err(e) => {
@@ -191,12 +212,13 @@ impl Server<'_> {
     }
 
     fn answer(&mut self, req: Request) -> Reply {
-        let now = now_ms();
+        let now = Clock::now();
         match req {
             Request::Bindings => Reply::Bindings {
                 started_ms: self.started_ms,
                 generation: self.guards.bindings.generation,
                 bindings: self.guards.bindings.list(now),
+                dropped: self.dropped.clone(),
             },
             Request::Violations { after } => Reply::Violations {
                 events: self.guards.after(after),
@@ -218,6 +240,8 @@ impl Server<'_> {
                         }
                     }
                     self.guards.enforce = c.enforce;
+                    self.guards.dhcp_servers = c.dhcp_servers;
+                    self.guards.dhcp_relays = c.dhcp_relays;
                     self.guards.bindings.statics(&c.statics, now);
                     Reply::Done
                 }
@@ -236,7 +260,7 @@ impl Server<'_> {
         if self.enforced.as_ref() == Some(&shape) {
             return;
         }
-        let bindings = self.guards.bindings.list(now_ms());
+        let bindings = self.guards.bindings.list(Clock::now());
         let synced = self
             .enforcer
             .sync(&shape.ports, &shape.enforce, &bindings, &shape.ra);
@@ -245,6 +269,11 @@ impl Server<'_> {
         // A failure is tried again with the next change.
         self.enforced = synced.is_ok().then_some(shape);
     }
+}
+
+/// The source MAC of the frame in `buf`.
+fn mac_at(buf: &[u8]) -> Option<[u8; 6]> {
+    buf.get(6..12)?.try_into().ok()
 }
 
 fn check(bindings: &[Binding]) -> Result<(), String> {
@@ -270,6 +299,14 @@ mod tests {
     use std::thread;
     use u6e_proto::msg::{EventKind, Guard};
 
+    /// A stand-in for tc that shows nothing and does nothing.
+    fn quiet_tc(dir: &TestDir) -> PathBuf {
+        let tc = dir.path().join("tc");
+        std::fs::write(&tc, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&tc, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        tc
+    }
+
     /// A guard serving `dir/sock` with no ports, until `stop` is written to.
     fn start(dir: &TestDir, gid: u32) -> (UnixDatagram, thread::JoinHandle<io::Result<()>>) {
         let sock = dir.path().join("sock");
@@ -280,7 +317,7 @@ mod tests {
         let cfg = Config {
             gid,
             net,
-            tc: "/bin/false".into(),
+            tc: quiet_tc(dir),
             rescan: Duration::from_millis(50),
         };
         let run = thread::spawn(move || {
@@ -309,7 +346,7 @@ mod tests {
         let leased = Binding {
             mac: [2, 0, 0, 0, 0, 1],
             ip: [192, 0, 2, 10].into(),
-            expires_ms: Some(now_ms() + 600_000),
+            expires_ms: Some(Clock::now().wall_ms + 600_000),
         };
         let fixed = Binding {
             mac: [2, 0, 0, 0, 0, 2],
@@ -321,20 +358,21 @@ mod tests {
             Reply::Done
         );
         let mode = GuardConfig {
-            enforce: vec![],
             statics: vec![fixed],
+            ..GuardConfig::default()
         };
         assert_eq!(ask(&dir, &Request::Mode(mode)).unwrap(), Reply::Done);
         let Reply::Bindings {
             generation,
             bindings,
             started_ms,
+            ..
         } = ask(&dir, &Request::Bindings).unwrap()
         else {
             panic!()
         };
         assert_eq!((generation, bindings), (2, vec![leased, fixed]));
-        assert!(started_ms > 0 && started_ms <= now_ms());
+        assert!(started_ms > 0 && started_ms <= Clock::now().wall_ms);
         assert_eq!(
             ask(&dir, &Request::Violations { after: 0 }).unwrap(),
             Reply::Violations { events: vec![] }
@@ -342,7 +380,7 @@ mod tests {
         // What no VLAN is, or too much, is refused.
         let bad = GuardConfig {
             enforce: vec![4095],
-            statics: vec![],
+            ..GuardConfig::default()
         };
         assert_eq!(
             ask(&dir, &Request::Mode(bad)).unwrap(),
@@ -375,15 +413,12 @@ mod tests {
             vlan: 42,
             wifi: true,
         };
-        let f = frame::parse(&frame::tests::arp_frame(
-            [2, 0, 0, 0, 0, 1],
-            [2, 0, 0, 0, 0, 1],
-            [192, 0, 2, 9],
-            2,
-        ))
-        .unwrap();
-        g.take(&port, &f, 5);
+        let f = frame::Frame {
+            src: [2, 0, 0, 0, 0, 1],
+            what: frame::What::Tagged { vid: 0 },
+        };
+        g.take(&port, &f, crate::rules::tests::now(5));
         let events = g.after(0);
-        assert!(matches!(&events[0].1.kind, EventKind::GuardViolation(v) if v.guard == Guard::Arp));
+        assert!(matches!(&events[0].1.kind, EventKind::GuardViolation(v) if v.guard == Guard::Tag));
     }
 }

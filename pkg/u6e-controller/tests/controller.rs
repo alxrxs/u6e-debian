@@ -3928,11 +3928,11 @@ fn the_far_ends_of_watched_flows_are_named() {
     assert!(r.dns.asked.lock().unwrap().contains(&remote));
 }
 
-/// After its first key frame an AP's client guards are given the mode the
-/// configuration sets and the IPv4 leases, which are seeded again when the
-/// leases come or change.
+/// After its first key frame an AP's client guards are seeded with the IPv4
+/// leases and then given the mode the configuration sets; the seed goes
+/// again when the leases change.
 #[test]
-fn the_guards_are_set_up_and_seeded() {
+fn the_guards_are_seeded_then_set_up() {
     let leases = exporter(
         "kea_lease_expiry_timestamp_seconds{device=\"\",family=\"ipv4\",hostname=\"tablet\",\
          ip=\"192.0.2.10\",mac=\"02:00:00:00:00:01\",subnet_id=\"1\"} 4.1e+09\n\
@@ -3942,20 +3942,23 @@ fn the_guards_are_set_up_and_seeded() {
     let dir = TempDir::new("guards");
     let extra = format!(
         "[leases]\nexporters = [\"{leases}\"]\n[guards]\nenforce = [42]\n\
-         static = [{{ mac = \"02:00:00:00:00:09\", ip = \"192.0.2.9\" }}]\n"
+         static = [{{ mac = \"02:00:00:00:00:09\", ip = \"192.0.2.9\" }}]\n\
+         dhcp_servers = [\"192.0.2.53\"]\ndhcp_relays = [\"192.0.2.2\"]\n"
     );
     let r = configured(Timing::default(), &dir.0, 420, Arc::default(), &extra);
+    wait_for("the leases read", || {
+        metrics_of(&r, "wifi_leases_active ") == ["wifi_leases_active 1"]
+    });
     let mut a = ap_with_client(&r, KEY_AP1, "ap1", &[]);
+    wait_for("the guards' setup", || {
+        a.hears_nothing(Duration::from_millis(100));
+        a.guards.len() >= 2
+    });
     let leased = Binding {
         mac: MAC,
         ip: "192.0.2.10".parse().unwrap(),
         expires_ms: Some(4_100_000_000_000),
     };
-    // The seed of the lease read at the start: at once, or after the read.
-    wait_for("the seed of the lease", || {
-        a.hears_nothing(Duration::from_millis(100));
-        a.guards.contains(&CtlMsg::SeedBindings(vec![leased]))
-    });
     let mode = GuardConfig {
         enforce: vec![42],
         statics: vec![Binding {
@@ -3963,10 +3966,58 @@ fn the_guards_are_set_up_and_seeded() {
             ip: "192.0.2.9".parse().unwrap(),
             expires_ms: None,
         }],
+        dhcp_servers: vec!["192.0.2.53".parse().unwrap()],
+        dhcp_relays: vec!["192.0.2.2".parse().unwrap()],
     };
-    assert_eq!(a.guards[0], CtlMsg::Guards(mode));
+    assert_eq!(
+        a.guards[..2],
+        [CtlMsg::SeedBindings(vec![leased]), CtlMsg::Guards(mode)]
+    );
     let manage = json_get(r.c.http, "/api/manage");
     assert_eq!(manage["guards"], json!({"enforce": [42], "statics": 1}));
+}
+
+/// A controller that has read no lease yet (its exporter does not answer,
+/// as after a restart with the DHCP nodes away) seeds no AP with an empty
+/// table: the AP is given the mode alone.
+#[test]
+fn no_seed_before_the_leases_are_read() {
+    let gone = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = gone.local_addr().unwrap();
+    drop(gone);
+    let dir = TempDir::new("noseed");
+    let extra = format!("[leases]\nexporters = [\"{addr}\"]\n[guards]\nenforce = [42]\n");
+    let r = configured(Timing::default(), &dir.0, 420, Arc::default(), &extra);
+    wait_for("the failed read", || {
+        metrics_of(&r, "wifi_leases_exporter_up")
+            == [format!("wifi_leases_exporter_up{{exporter=\"{addr}\"}} 0")]
+    });
+    let mut a = ap_with_client(&r, KEY_AP1, "ap1", &[]);
+    wait_for("the mode", || {
+        a.hears_nothing(Duration::from_millis(100));
+        !a.guards.is_empty()
+    });
+    a.hears_nothing(Duration::from_millis(500));
+    assert!(
+        matches!(a.guards[..], [CtlMsg::Guards(_)]),
+        "{:?}",
+        a.guards
+    );
+}
+
+/// Without the leases the guards are never told to enforce: a client that
+/// roamed in would be unknown to its new AP.
+#[test]
+fn no_enforcing_without_the_leases() {
+    let dir = TempDir::new("noleases");
+    let extra = "[guards]\nenforce = [42]\n";
+    let r = configured(Timing::default(), &dir.0, 420, Arc::default(), extra);
+    let mut a = ap_with_client(&r, KEY_AP1, "ap1", &[]);
+    wait_for("the mode", || {
+        a.hears_nothing(Duration::from_millis(100));
+        !a.guards.is_empty()
+    });
+    assert_eq!(a.guards, [CtlMsg::Guards(GuardConfig::default())]);
 }
 
 /// An AP's bindings show on its clients, and its guards' violations are
@@ -3981,6 +4032,11 @@ fn violations_are_events_and_counted() {
         expires_ms: Some(4_100_000_000_000),
     };
     a.send(&AgentMsg::Bindings(vec![bound])).unwrap();
+    a.send(&AgentMsg::GuardDrops(vec![
+        (Guard::Arp, 7),
+        (Guard::Tag, 1),
+    ]))
+    .unwrap();
     let v = Violation {
         guard: Guard::Arp,
         mac: MAC,
@@ -4027,6 +4083,13 @@ fn violations_are_events_and_counted() {
     assert_eq!(
         metrics_of(&r, "wifi_guard_violations_total{"),
         ["wifi_guard_violations_total{ap=\"ap1\",guard=\"arp\",vlan=\"42\"} 3"]
+    );
+    assert_eq!(
+        metrics_of(&r, "wifi_guard_dropped_total{"),
+        [
+            "wifi_guard_dropped_total{ap=\"ap1\",guard=\"arp\"} 7",
+            "wifi_guard_dropped_total{ap=\"ap1\",guard=\"tag\"} 1"
+        ]
     );
     assert_eq!(
         metrics_of(&r, "wifi_guard_bindings{"),

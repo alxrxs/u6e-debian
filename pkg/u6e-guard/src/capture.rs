@@ -6,10 +6,13 @@
 //! offloaded, which is when its first packets are seen. The socket taps the
 //! ports before the bridge, and before any `tc` filter that drops a frame.
 //!
-//! From a Wi-Fi port it takes ARP, IPv4 TCP SYNs and UDP datagrams (DHCP
-//! whole, the rest their headers), DHCPv6 from the servers' port, and router
-//! advertisements; from an uplink port, DHCP servers' answers. The program
-//! names the ports' interface indices, so it is made again when they change.
+//! From a Wi-Fi port it takes every VLAN-tagged frame (its tag in the data,
+//! or taken off by the kernel before the tap, which the socket's auxiliary
+//! data then holds), ARP, IPv4 TCP SYNs and UDP datagrams (DHCP whole, the
+//! rest their headers), DHCPv6 from the servers' port, router advertisements
+//! and IPv6 behind extension headers (whole: an advertisement may hide
+//! there); from an uplink port, DHCP servers' answers. The program names the
+//! ports' interface indices, so it is made again when they change.
 
 use std::io;
 use std::mem;
@@ -20,6 +23,8 @@ use crate::ports::Port;
 const ETH_P_ALL: u16 = 0x0003;
 const SOL_PACKET: libc::c_int = 263;
 const PACKET_IGNORE_OUTGOING: libc::c_int = 23;
+const PACKET_AUXDATA: libc::c_int = 8;
+const TP_STATUS_VLAN_VALID: u32 = 1 << 4;
 
 /// What a frame of interest keeps: the headers alone, or a DHCP message or
 /// router advertisement whole.
@@ -40,8 +45,10 @@ const MSH: u16 = 0xa0;
 const AND: u16 = 0x50;
 const JEQ: u16 = 0x10;
 const JSET: u16 = 0x40;
-/// The interface a frame came in on, as an absolute load (SKF_AD_IFINDEX).
+/// The interface a frame came in on, and whether the kernel took a VLAN tag
+/// off it, as absolute loads (SKF_AD_IFINDEX, SKF_AD_VLAN_TAG_PRESENT).
 const IFINDEX: u32 = 0xffff_f000 + 8;
+const VLAN_TAG_PRESENT: u32 = 0xffff_f000 + 48;
 
 /// One instruction, its jump (if any) to a label, or a label.
 enum Ins {
@@ -93,7 +100,11 @@ pub fn program(ports: &[Port]) -> Vec<libc::sock_filter> {
     p.extend([
         Op(RET, 0),
         Label("wifi"),
+        Op(LD | ABS, VLAN_TAG_PRESENT),
+        Jump(JMP | JEQ, 1, "short"),
         Op(LD | H | ABS, 12),
+        Jump(JMP | JEQ, 0x8100, "short"),
+        Jump(JMP | JEQ, 0x88a8, "short"),
         Jump(JMP | JEQ, 0x0806, "short"),
         Jump(JMP | JEQ, 0x0800, "wifi4"),
         Jump(JMP | JEQ, 0x86dd, "wifi6"),
@@ -120,6 +131,11 @@ pub fn program(ports: &[Port]) -> Vec<libc::sock_filter> {
         Op(LD | B | ABS, 20),
         Jump(JMP | JEQ, 58, "icmp6"),
         Jump(JMP | JEQ, 17, "udp6"),
+        // Hop-by-hop, routing, fragment, destination options.
+        Jump(JMP | JEQ, 0, "whole"),
+        Jump(JMP | JEQ, 43, "whole"),
+        Jump(JMP | JEQ, 44, "whole"),
+        Jump(JMP | JEQ, 60, "whole"),
         Op(RET, 0),
         Label("icmp6"),
         Op(LD | B | ABS, 54),
@@ -154,6 +170,15 @@ pub fn program(ports: &[Port]) -> Vec<libc::sock_filter> {
     assemble(&p)
 }
 
+/// A frame read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Received {
+    pub len: usize,
+    pub ifindex: i32,
+    /// The VLAN of the tag the kernel took off the frame, if it did.
+    pub tag: Option<u16>,
+}
+
 /// The packet socket.
 pub struct Capture {
     fd: OwnedFd,
@@ -178,6 +203,7 @@ impl Capture {
             fd: unsafe { OwnedFd::from_raw_fd(fd) },
         };
         c.option(SOL_PACKET, PACKET_IGNORE_OUTGOING, &1i32)?;
+        c.option(SOL_PACKET, PACKET_AUXDATA, &1i32)?;
         c.attach(&[libc::sock_filter {
             code: RET,
             jt: 0,
@@ -220,23 +246,26 @@ impl Capture {
         self.attach(&program(ports))
     }
 
-    /// The next frame into `buf`: its length and the interface it came in
-    /// on; `None` when none is waiting.
-    pub fn recv(&self, buf: &mut [u8]) -> io::Result<Option<(usize, i32)>> {
-        // SAFETY: a zeroed sockaddr_ll is a valid one for recvfrom to fill.
+    /// The next frame into `buf`, if one is waiting: its length, the
+    /// interface it came in on, and the VLAN tag the kernel took off it.
+    pub fn recv(&self, buf: &mut [u8]) -> io::Result<Option<Received>> {
+        // SAFETY: zeroed sockaddr_ll and msghdr are valid for recvmsg to fill.
         let mut from: libc::sockaddr_ll = unsafe { mem::zeroed() };
-        let mut len = mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t;
-        // SAFETY: `buf` and `from` are valid for the sizes passed.
-        let n = unsafe {
-            libc::recvfrom(
-                self.fd.as_raw_fd(),
-                buf.as_mut_ptr().cast(),
-                buf.len(),
-                0,
-                (&raw mut from).cast(),
-                &mut len,
-            )
+        let mut control = [0u64; 8];
+        let mut iov = libc::iovec {
+            iov_base: buf.as_mut_ptr().cast(),
+            iov_len: buf.len(),
         };
+        // SAFETY: as above.
+        let mut msg: libc::msghdr = unsafe { mem::zeroed() };
+        msg.msg_name = (&raw mut from).cast();
+        msg.msg_namelen = mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t;
+        msg.msg_iov = &raw mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen = mem::size_of_val(&control) as _;
+        // SAFETY: every buffer msg points at is valid for its stated length.
+        let n = unsafe { libc::recvmsg(self.fd.as_raw_fd(), &raw mut msg, 0) };
         if n < 0 {
             let e = io::Error::last_os_error();
             return match e.kind() {
@@ -244,7 +273,27 @@ impl Capture {
                 _ => Err(e),
             };
         }
-        Ok(Some((n as usize, from.sll_ifindex)))
+        let mut tag = None;
+        // SAFETY: the kernel filled `msg` and its control buffer; the
+        // CMSG macros walk only within them.
+        unsafe {
+            let mut c = libc::CMSG_FIRSTHDR(&raw const msg);
+            while !c.is_null() {
+                if (*c).cmsg_level == SOL_PACKET && (*c).cmsg_type == PACKET_AUXDATA {
+                    let aux: libc::tpacket_auxdata =
+                        std::ptr::read_unaligned(libc::CMSG_DATA(c).cast());
+                    if aux.tp_status & TP_STATUS_VLAN_VALID != 0 {
+                        tag = Some(aux.tp_vlan_tci & 0x0fff);
+                    }
+                }
+                c = libc::CMSG_NXTHDR(&raw const msg, c);
+            }
+        }
+        Ok(Some(Received {
+            len: n as usize,
+            ifindex: from.sll_ifindex,
+            tag,
+        }))
     }
 
     pub fn fd(&self) -> RawFd {
@@ -268,6 +317,11 @@ mod tests {
     /// Runs `prog` on `pkt` arriving on `ifindex`, as the kernel does: what
     /// it keeps of the frame (0: drops it).
     fn run(prog: &[libc::sock_filter], pkt: &[u8], ifindex: u32) -> u32 {
+        run_tagged(prog, pkt, ifindex, false)
+    }
+
+    /// The same, `tagged` saying whether the kernel took a tag off the frame.
+    fn run_tagged(prog: &[libc::sock_filter], pkt: &[u8], ifindex: u32, tagged: bool) -> u32 {
         let (mut a, mut x, mut pc) = (0u32, 0u32, 0usize);
         let load = |at: usize, n: usize| -> Option<u32> {
             Some(
@@ -286,6 +340,7 @@ mod tests {
             };
             match i.code & 0x07 {
                 LD if i.k == IFINDEX => a = ifindex,
+                LD if i.k == VLAN_TAG_PRESENT => a = u32::from(tagged),
                 LD => {
                     let at = if i.code & 0xe0 == IND { x + i.k } else { i.k };
                     let Some(v) = load(at as usize, size) else {
@@ -358,6 +413,18 @@ mod tests {
             assert_eq!(run(&prog, pkt, 7), *uplink, "case {i} on the uplink");
             assert_eq!(run(&prog, pkt, 99), 0, "case {i} elsewhere");
         }
+        // Tagged, in the data or taken off: whatever it carries.
+        let mut tagged = arp_frame(CLIENT, CLIENT, [0; 4], 1);
+        tagged.splice(12..12, [0x81, 0, 0, 0]);
+        assert_eq!(
+            (run(&prog, &tagged, 21), run(&prog, &tagged, 7)),
+            (SHORT, 0)
+        );
+        let ns = ipv6_frame(CLIENT, 58, &[135, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(run_tagged(&prog, &ns, 21, true), SHORT);
+        // Behind an extension header, whole.
+        let (nh, payload) = crate::frame::tests::behind(&[(0, 0)], 58, &ra_body(0, &[]));
+        assert_eq!(run(&prog, &ipv6_frame(CLIENT, nh, &payload), 21), WHOLE);
         let mut fragment = ipv4_frame(CLIENT, [192, 0, 2, 10], 17, &udp(5000, 53, &[]));
         fragment[20] = 0x01;
         assert_eq!(run(&prog, &fragment, 10), 0);

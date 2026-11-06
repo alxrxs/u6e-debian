@@ -1,6 +1,7 @@
 //! The frames the guards look at, read from their Ethernet bytes: ARP, DHCP
-//! and DHCPv6 messages, router advertisements, and the first packet of a
-//! client's IPv4 connection (a TCP SYN or a UDP datagram). Everything else,
+//! and DHCPv6 messages, router advertisements (behind IPv6 extension headers
+//! too), the first packet of a client's IPv4 connection (a TCP SYN or a UDP
+//! datagram), and VLAN-tagged frames, whatever they carry. Everything else,
 //! and anything too short or malformed, reads as nothing.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -10,6 +11,15 @@ use crate::dhcp::{self, Message};
 const ETH_ARP: u16 = 0x0806;
 const ETH_IPV4: u16 = 0x0800;
 const ETH_IPV6: u16 = 0x86dd;
+const ETH_8021Q: u16 = 0x8100;
+const ETH_8021AD: u16 = 0x88a8;
+/// IPv6 extension headers: hop-by-hop, routing, fragment, destination.
+const HOP_BY_HOP: u8 = 0;
+const ROUTING: u8 = 43;
+const FRAGMENT: u8 = 44;
+const DESTINATION: u8 = 60;
+/// Extension headers walked at most.
+const EXT_MAX: usize = 8;
 const TCP: u8 = 6;
 const UDP: u8 = 17;
 const ICMPV6: u8 = 58;
@@ -45,6 +55,10 @@ pub enum What {
     Conn {
         src: Ipv4Addr,
     },
+    /// A frame carrying a VLAN tag, of this VLAN (0: priority only).
+    Tagged {
+        vid: u16,
+    },
 }
 
 /// A router advertisement: what makes a host take its sender as a router.
@@ -56,6 +70,10 @@ pub struct Ra {
     pub prefixes: Vec<(Ipv6Addr, u8, u8)>,
     /// Route information: each route's prefix and length.
     pub routes: Vec<(Ipv6Addr, u8)>,
+    /// Whether it names DNS servers or search domains (RDNSS, DNSSL).
+    pub dns: bool,
+    /// The extension headers before it: each one's type and length field.
+    pub ext: Vec<(u8, u8)>,
 }
 
 fn u16_at(b: &[u8], at: usize) -> Option<u16> {
@@ -80,6 +98,9 @@ fn v6_at(b: &[u8], at: usize) -> Option<Ipv6Addr> {
 pub fn parse(b: &[u8]) -> Option<Frame> {
     let src = mac_at(b, 6)?;
     let what = match u16_at(b, 12)? {
+        ETH_8021Q | ETH_8021AD => What::Tagged {
+            vid: u16_at(b, 14)? & 0x0fff,
+        },
         ETH_ARP => arp(&b[14..])?,
         ETH_IPV4 => ipv4(&b[14..])?,
         ETH_IPV6 => ipv6(&b[14..])?,
@@ -134,10 +155,26 @@ fn ipv6(b: &[u8]) -> Option<What> {
         return None;
     }
     let src = v6_at(b, 8)?;
-    let l4 = b.get(40..)?;
-    match *b.get(6)? {
-        ICMPV6 if *l4.first()? == ROUTER_ADVERTISEMENT => Some(What::Ra(ra(l4)?)),
-        UDP if u16_at(l4, 0)? == 547 => Some(What::Dhcp6Server {
+    let (mut nh, mut at, mut ext) = (*b.get(6)?, 40, Vec::new());
+    while matches!(nh, HOP_BY_HOP | ROUTING | FRAGMENT | DESTINATION) && ext.len() < EXT_MAX {
+        let (next, len) = (*b.get(at)?, *b.get(at + 1)?);
+        if nh == FRAGMENT {
+            // A later fragment holds no header of what it carries.
+            if u16_at(b, at + 2)? & 0xfff8 != 0 {
+                return None;
+            }
+            ext.push((nh, 0));
+            at += 8;
+        } else {
+            ext.push((nh, len));
+            at += 8 * (usize::from(len) + 1);
+        }
+        nh = next;
+    }
+    let l4 = b.get(at..)?;
+    match nh {
+        ICMPV6 if *l4.first()? == ROUTER_ADVERTISEMENT => Some(What::Ra(Ra { ext, ..ra(l4)? })),
+        UDP if ext.is_empty() && u16_at(l4, 0)? == 547 => Some(What::Dhcp6Server {
             src,
             kind: *l4.get(8)?,
         }),
@@ -167,6 +204,7 @@ fn ra(b: &[u8]) -> Option<Ra> {
                 p[..have].copy_from_slice(&opt[8..8 + have]);
                 ra.routes.push((p.into(), opt[2]));
             }
+            25 | 31 => ra.dns = true,
             _ => {}
         }
         opts = &opts[len..];
@@ -332,6 +370,10 @@ pub mod tests {
             &[
                 pio("2001:db8:1::", 64, 0xc0),
                 vec![1, 1, 2, 0, 0, 0, 0, 1],
+                vec![
+                    25, 3, 0, 0, 0, 0, 0x0e, 0x10, 0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0x53,
+                ],
                 rio("fd00:1:2:3::", 64),
             ],
         );
@@ -342,6 +384,8 @@ pub mod tests {
                 lifetime: 1800,
                 prefixes: vec![("2001:db8:1::".parse().unwrap(), 64, 0xc0)],
                 routes: vec![("fd00:1:2:3::".parse().unwrap(), 64)],
+                dns: true,
+                ext: vec![],
             })
         );
         // An option claiming more than the packet holds: not a valid RA.
@@ -350,5 +394,57 @@ pub mod tests {
         assert_eq!(parse(&ipv6_frame(CLIENT, ICMPV6, &bad)), None);
         // Other ICMPv6 messages are not read.
         assert_eq!(parse(&ipv6_frame(CLIENT, ICMPV6, &[135, 0, 0, 0])), None);
+    }
+
+    /// `l4` behind the extension headers `ext` (each a type and length
+    /// field; a fragment header is the first fragment's).
+    pub fn behind(ext: &[(u8, u8)], last: u8, l4: &[u8]) -> (u8, Vec<u8>) {
+        let mut out = Vec::new();
+        let types: Vec<u8> = ext.iter().map(|(t, _)| *t).skip(1).chain([last]).collect();
+        for ((_, len), next) in ext.iter().zip(types) {
+            let size = if ext[0].0 == FRAGMENT {
+                8
+            } else {
+                8 * (usize::from(*len) + 1)
+            };
+            let mut h = vec![0u8; size];
+            h[0] = next;
+            h[1] = *len;
+            out.extend(h);
+        }
+        out.extend(l4);
+        (ext.first().map_or(last, |(t, _)| *t), out)
+    }
+
+    #[test]
+    fn a_router_advertisement_behind_extension_headers_is_one() {
+        let body = ra_body(0, &[]);
+        for ext in [
+            vec![(HOP_BY_HOP, 0)],
+            vec![(DESTINATION, 2), (HOP_BY_HOP, 0)],
+            vec![(FRAGMENT, 0)],
+        ] {
+            let (nh, payload) = behind(&ext, ICMPV6, &body);
+            let f = parse(&ipv6_frame(CLIENT, nh, &payload)).unwrap();
+            let What::Ra(ra) = f.what else {
+                panic!("{f:?}")
+            };
+            assert_eq!(ra.ext.len(), ext.len(), "{ext:?}");
+        }
+        // A later fragment carries no header to read.
+        let (nh, mut payload) = behind(&[(FRAGMENT, 0)], ICMPV6, &body);
+        payload[3] = 0x08;
+        assert_eq!(parse(&ipv6_frame(CLIENT, nh, &payload)), None);
+    }
+
+    #[test]
+    fn a_tagged_frame_is_read_as_one_whatever_it_carries() {
+        let mut f = arp_frame(CLIENT, CLIENT, [192, 0, 2, 10], 1);
+        let tag = [0x81, 0x00, 0x20, 0x2a];
+        f.splice(12..12, tag);
+        assert_eq!(parse(&f).unwrap().what, What::Tagged { vid: 42 });
+        f[12..14].copy_from_slice(&[0x88, 0xa8]);
+        f[14..16].copy_from_slice(&[0, 0]);
+        assert_eq!(parse(&f).unwrap().what, What::Tagged { vid: 0 });
     }
 }

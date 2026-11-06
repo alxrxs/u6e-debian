@@ -1,23 +1,29 @@
-//! The four guards' rules, applied to each frame of interest:
+//! The client guards' rules. Each names only what is provably wrong, so that
+//! enforcing (`enforce`) drops exactly the frames reporting reports, and a
+//! client the guards know nothing of (a static address nobody listed, a
+//! lease from before the AP's seed) is never in the way:
 //!
-//! - ARP inspection: an ARP frame from a client names the client's own MAC
-//!   as its sender and, unless it probes (0.0.0.0) or is link-local, an
-//!   address bound to that MAC.
-//! - Rogue DHCP: no DHCP or DHCPv6 server message comes from a client.
+//! - ARP inspection: no client's ARP names as its sender an address bound to
+//!   another MAC, nor, when either MAC holds an address, another MAC than
+//!   the frame's own.
+//! - Rogue DHCP: no DHCP or DHCPv6 server message comes from a client, and
+//!   on the uplink only the site's servers' acknowledgements, through its
+//!   relays, bind addresses (any other server message is reported).
 //! - RA guard: a client's router advertisement offers no default route (its
-//!   router lifetime is 0), no prefix to configure or treat as on link, and
-//!   no route but to a unique local prefix of /48 or longer: what a Thread
-//!   border router advertises for its mesh, which phones and speakers on
-//!   the network legitimately do.
-//! - IP source guard: a connection a client opens comes from an address
-//!   bound to its MAC, or a link-local one (asking for a lease from 0.0.0.0
-//!   is DHCP, which this guard does not look at).
+//!   router lifetime is 0), sits behind no extension header, names no DNS
+//!   server or domain, and no prefix or route but a unique local one (a
+//!   route of /48 or longer): what a Thread border router advertises for its
+//!   mesh, as phones and speakers on the network do.
+//! - IP source guard: no connection a client opens comes from an address
+//!   bound to another MAC.
+//! - VLAN tags: no client sends a tagged frame (the ports are untagged).
 //!
-//! The uplink's DHCP acknowledgements bind addresses, a client's release or
-//! decline unbinds one. A violation is recorded at most once a minute per
-//! client and guard, with the number of repeats in between, in a record of
-//! the newest [`RECORD`]. A client whose advertisement broke the RA guard is
-//! remembered for an hour: enforcing, its advertisements are dropped.
+//! A violation is recorded at most once a minute per client and guard, with
+//! the repeats in between, in a record of the newest [`RECORD`]; it says
+//! whether enforcing dropped the frame. A client whose advertisement broke
+//! the RA guard is remembered for an hour: enforcing, all its advertisements
+//! are dropped (a lifetime-0 rogue one is told from a border router's only
+//! by what flower cannot read).
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -25,7 +31,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use u6e_proto::mac;
 use u6e_proto::msg::{Event, EventKind, Guard, Violation};
 
-use crate::bindings::Bindings;
+use crate::bindings::{Bindings, Clock};
 use crate::dhcp;
 use crate::frame::{Frame, Ra, What};
 use crate::ports::Port;
@@ -37,7 +43,7 @@ pub const QUIET_MS: u64 = 60_000;
 /// How long a client that sent a rogue advertisement stays one.
 pub const RA_OFFENDER_MS: u64 = 3_600_000;
 /// A lease acknowledged without its length.
-const LEASE_DEFAULT_S: u64 = 3600;
+const LEASE_DEFAULT_MS: u64 = 3_600_000;
 /// Clients tracked by the rate limit at most.
 const QUIET_CAP: usize = 4096;
 
@@ -46,25 +52,104 @@ pub struct Guards {
     pub bindings: Bindings,
     /// The VLANs enforced on.
     pub enforce: Vec<u16>,
-    /// The clients that sent a rogue advertisement, until when.
+    /// The site's DHCP servers and relays: only their acknowledgements bind.
+    pub dhcp_servers: Vec<Ipv4Addr>,
+    pub dhcp_relays: Vec<Ipv4Addr>,
+    /// The clients that sent a rogue advertisement, until when (boot clock).
     pub ra_offenders: BTreeMap<[u8; 6], u64>,
     /// The violations, numbered, the newest last.
     pub record: VecDeque<(u64, Event)>,
     next: u64,
-    /// When each client and guard was last reported, and the repeats since.
+    /// When each client and guard was last reported (boot clock), and the
+    /// repeats since.
     quiet: HashMap<([u8; 6], Guard), (u64, u32)>,
 }
 
+/// One violation as found, before it is recorded.
+struct Found {
+    guard: Guard,
+    ip: Option<IpAddr>,
+    detail: String,
+    /// Whether the enforcing filters drop the frame.
+    drops: bool,
+}
+
 impl Guards {
-    /// Applies the rules to `frame`, which came in on `port` at `now_ms`.
-    pub fn take(&mut self, port: &Port, frame: &Frame, now_ms: u64) {
-        if !port.wifi {
-            self.uplink(frame, now_ms);
-            return;
+    /// Applies the rules to `frame`, which came in on `port`.
+    pub fn take(&mut self, port: &Port, frame: &Frame, now: Clock) {
+        let found = if port.wifi {
+            self.client_frame(frame, now)
+        } else {
+            self.uplink_frame(frame, now)
+        };
+        if let Some(f) = found {
+            self.record(port, frame.src, f, now);
         }
+    }
+
+    /// What a DHCP server's answer on the uplink does: the site's
+    /// acknowledgement binds the address it assigns, any other server's
+    /// message is reported.
+    fn uplink_frame(&mut self, frame: &Frame, now: Clock) -> Option<Found> {
+        let What::Dhcp {
+            src,
+            server: true,
+            msg,
+        } = &frame.what
+        else {
+            return None;
+        };
+        if self.dhcp_servers.is_empty() {
+            return None;
+        }
+        let sid = msg.server_id;
+        let sites = sid.is_some_and(|s| self.dhcp_servers.contains(&s))
+            && (self.dhcp_servers.contains(src) || self.dhcp_relays.contains(src));
+        if !sites {
+            let sid = sid.map_or("none".into(), |s| s.to_string());
+            let detail =
+                format!("answers as a DHCP server on the uplink (server {sid}), not the site's");
+            return Some(Found {
+                guard: Guard::Dhcp,
+                ip: Some((*src).into()),
+                detail,
+                drops: false,
+            });
+        }
+        if msg.kind == Some(dhcp::ACK) && !msg.yiaddr.is_unspecified() {
+            let lease = msg
+                .lease_s
+                .map_or(LEASE_DEFAULT_MS, |s| u64::from(s) * 1000);
+            self.bindings.learn(msg.chaddr, msg.yiaddr, lease, now);
+        }
+        None
+    }
+
+    fn client_frame(&mut self, frame: &Frame, now: Clock) -> Option<Found> {
         let src = frame.src;
+        let found = |guard, ip: Option<IpAddr>, detail: String, drops| Found {
+            guard,
+            ip,
+            detail,
+            drops,
+        };
         match &frame.what {
-            What::Arp { sha, spa } => self.arp(port, src, *sha, *spa, now_ms),
+            What::Tagged { vid } => {
+                let detail = format!("sends frames tagged for VLAN {vid}");
+                Some(found(Guard::Tag, None, detail, true))
+            }
+            What::Arp { sha, spa } => {
+                if let Some(other) = self.bindings.owner(*spa, src, now) {
+                    let detail = format!("claims {spa}, bound to {}", mac::format(other));
+                    return Some(found(Guard::Arp, Some((*spa).into()), detail, true));
+                }
+                let lies = *sha != src
+                    && (self.bindings.holds_any(src, now) || self.bindings.holds_any(*sha, now));
+                lies.then(|| {
+                    let detail = format!("names {} as its sender", mac::format(*sha));
+                    found(Guard::Arp, Some((*spa).into()), detail, true)
+                })
+            }
             What::Dhcp {
                 src: ip,
                 server: true,
@@ -75,145 +160,69 @@ impl Guards {
                     "answers as a DHCP server ({kind} for {})",
                     mac::format(msg.chaddr)
                 );
-                self.violate(
-                    port,
-                    Guard::Dhcp,
-                    src,
-                    Some((*ip).into()),
-                    detail,
-                    true,
-                    now_ms,
-                );
+                Some(found(Guard::Dhcp, Some((*ip).into()), detail, true))
             }
             What::Dhcp {
                 server: false, msg, ..
             } => {
                 if matches!(msg.kind, Some(dhcp::RELEASE | dhcp::DECLINE)) {
-                    self.bindings.release(msg.chaddr, msg.ciaddr, now_ms);
+                    self.bindings.release(msg.chaddr, msg.ciaddr, now);
                 }
+                None
             }
             What::Dhcp6Server { src: ip, kind } => {
                 let detail = format!("answers as a DHCPv6 server (message type {kind})");
-                self.violate(
-                    port,
-                    Guard::Dhcp,
-                    src,
-                    Some((*ip).into()),
-                    detail,
-                    true,
-                    now_ms,
-                );
+                Some(found(Guard::Dhcp, Some((*ip).into()), detail, true))
             }
             What::Ra(ra) => {
-                if let Some(why) = rogue(ra) {
-                    let dropped = self.ra_offenders.get(&src).is_some_and(|&u| u > now_ms);
-                    self.ra_offenders.insert(src, now_ms + RA_OFFENDER_MS);
-                    let detail = format!("advertises itself as a router: {why}");
-                    self.violate(port, Guard::Ra, src, None, detail, dropped, now_ms);
-                }
+                let why = rogue(ra)?;
+                let offender = self
+                    .ra_offenders
+                    .get(&src)
+                    .is_some_and(|&u| u > now.boot_ms);
+                self.ra_offenders.insert(src, now.boot_ms + RA_OFFENDER_MS);
+                let drops = offender || ra.lifetime != 0 || !ra.ext.is_empty();
+                let detail = format!("advertises itself as a router: {why}");
+                Some(found(Guard::Ra, None, detail, drops))
             }
             What::Conn { src: ip } => {
-                if !ip.is_link_local() && !self.bindings.bound(src, *ip, now_ms) {
-                    let detail = self.unbound(src, *ip, now_ms);
-                    self.violate(
-                        port,
-                        Guard::Source,
-                        src,
-                        Some((*ip).into()),
-                        detail,
-                        true,
-                        now_ms,
-                    );
-                }
+                let other = self.bindings.owner(*ip, src, now)?;
+                let detail = format!("uses {ip}, bound to {}", mac::format(other));
+                Some(found(Guard::Source, Some((*ip).into()), detail, true))
             }
         }
     }
 
-    /// A DHCP server's acknowledgement binds the address it assigns.
-    fn uplink(&mut self, frame: &Frame, now_ms: u64) {
-        let What::Dhcp {
-            server: true, msg, ..
-        } = &frame.what
-        else {
-            return;
-        };
-        if msg.kind == Some(dhcp::ACK) && !msg.yiaddr.is_unspecified() {
-            let lease = msg.lease_s.map_or(LEASE_DEFAULT_S, u64::from);
-            let until = now_ms.saturating_add(lease.saturating_mul(1000));
-            self.bindings.learn(msg.chaddr, msg.yiaddr, until, now_ms);
-        }
-    }
-
-    fn arp(&mut self, port: &Port, src: [u8; 6], sha: [u8; 6], spa: Ipv4Addr, now_ms: u64) {
-        let detail = if sha != src {
-            format!("names {} as its sender", mac::format(sha))
-        } else if exempt(spa) || self.bindings.bound(src, spa, now_ms) {
-            return;
-        } else {
-            self.unbound(src, spa, now_ms)
-        };
-        self.violate(
-            port,
-            Guard::Arp,
-            src,
-            Some(spa.into()),
-            detail,
-            true,
-            now_ms,
-        );
-    }
-
-    /// Why `ip` is not `mac`'s.
-    fn unbound(&self, mac: [u8; 6], ip: Ipv4Addr, now_ms: u64) -> String {
-        match self.bindings.owner(ip, mac, now_ms) {
-            Some(other) => format!("uses {ip}, bound to {}", mac::format(other)),
-            None => format!("uses {ip}, bound to no client"),
-        }
-    }
-
-    /// Records a violation unless the client was reported for this guard in
-    /// the last minute; `drops` says whether enforcing would drop the frame.
-    #[allow(clippy::too_many_arguments)]
-    fn violate(
-        &mut self,
-        port: &Port,
-        guard: Guard,
-        mac: [u8; 6],
-        ip: Option<IpAddr>,
-        detail: String,
-        drops: bool,
-        now_ms: u64,
-    ) {
-        if let Some((last, repeats)) = self.quiet.get_mut(&(mac, guard))
-            && now_ms.saturating_sub(*last) < QUIET_MS
+    /// Records `f`, unless the client was reported for its guard in the
+    /// last minute.
+    fn record(&mut self, port: &Port, mac: [u8; 6], f: Found, now: Clock) {
+        if let Some((last, repeats)) = self.quiet.get_mut(&(mac, f.guard))
+            && now.boot_ms.saturating_sub(*last) < QUIET_MS
         {
             *repeats = repeats.saturating_add(1);
             return;
         }
         if self.quiet.len() >= QUIET_CAP {
-            self.quiet
-                .retain(|_, (last, _)| now_ms.saturating_sub(*last) < QUIET_MS);
+            let fresh = |last: u64| now.boot_ms.saturating_sub(last) < QUIET_MS;
+            self.quiet.retain(|_, (last, _)| fresh(*last));
         }
-        let repeats = self
-            .quiet
-            .insert((mac, guard), (now_ms, 0))
-            .map_or(0, |(_, r)| r);
+        let repeats = self.quiet.insert((mac, f.guard), (now.boot_ms, 0));
         let v = Violation {
-            guard,
+            guard: f.guard,
             mac,
             ifname: port.name.clone(),
             vlan: port.vlan,
-            ip,
-            detail,
-            dropped: drops && self.enforce.contains(&port.vlan),
-            repeats,
+            ip: f.ip,
+            detail: f.detail,
+            dropped: f.drops && port.wifi && self.enforce.contains(&port.vlan),
+            repeats: repeats.map_or(0, |(_, r)| r),
         };
         if self.record.len() == RECORD {
             self.record.pop_front();
         }
         self.next += 1;
         let ev = Event {
-            at_ms: now_ms,
+            at_ms: now.wall_ms,
             kind: EventKind::GuardViolation(v),
         };
         self.record.push_back((self.next, ev));
@@ -226,30 +235,29 @@ impl Guards {
     }
 
     /// Forgets the offenders and bindings whose time is up.
-    pub fn expire(&mut self, now_ms: u64) {
-        self.bindings.expire(now_ms);
-        self.ra_offenders.retain(|_, &mut until| until > now_ms);
+    pub fn expire(&mut self, now: Clock) {
+        self.bindings.expire(now);
+        self.ra_offenders
+            .retain(|_, &mut until| until > now.boot_ms);
     }
-}
-
-/// The sender addresses of an ARP frame no binding is needed for: a probe's,
-/// and link-local ones.
-fn exempt(ip: Ipv4Addr) -> bool {
-    ip.is_unspecified() || ip.is_link_local()
 }
 
 /// What makes `ra` a router's, if anything.
 fn rogue(ra: &Ra) -> Option<String> {
+    let ula = |p: &Ipv6Addr| p.segments()[0] & 0xfe00 == 0xfc00;
     let mut why = Vec::new();
     if ra.lifetime > 0 {
         why.push(format!("a default route for {} s", ra.lifetime));
     }
-    for (prefix, len, flags) in &ra.prefixes {
-        if *flags != 0 {
-            why.push(format!("the prefix {prefix}/{len}"));
-        }
+    if !ra.ext.is_empty() {
+        why.push("behind an extension header".into());
     }
-    let ula = |p: &Ipv6Addr| p.segments()[0] & 0xfe00 == 0xfc00;
+    if ra.dns {
+        why.push("DNS servers or domains".into());
+    }
+    for (prefix, len, _) in ra.prefixes.iter().filter(|(p, ..)| !ula(p)) {
+        why.push(format!("the prefix {prefix}/{len}"));
+    }
     for (prefix, len) in &ra.routes {
         if !(ula(prefix) && *len >= 48) {
             why.push(format!("a route to {prefix}/{len}"));
@@ -268,11 +276,14 @@ fn dhcp_name(kind: u8) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::frame::{self, tests::*};
 
-    const OTHER: [u8; 6] = [2, 0, 0, 0, 0, 2];
+    pub const OTHER: [u8; 6] = [2, 0, 0, 0, 0, 2];
+    const ROUTER: [u8; 6] = [2, 0, 0, 0, 0, 0xfe];
+    pub const SERVER: [u8; 4] = [192, 0, 2, 53];
+    pub const RELAY: [u8; 4] = [192, 0, 2, 2];
 
     fn port(wifi: bool, vlan: u16) -> Port {
         Port {
@@ -283,9 +294,26 @@ mod tests {
         }
     }
 
-    fn take(g: &mut Guards, wifi: bool, bytes: Vec<u8>, now_ms: u64) {
+    pub fn now(ms: u64) -> Clock {
+        Clock {
+            wall_ms: ms,
+            boot_ms: ms,
+        }
+    }
+
+    /// Guards that trust SERVER through RELAY, enforcing on `enforce`.
+    pub fn guards(enforce: &[u16]) -> Guards {
+        Guards {
+            enforce: enforce.to_vec(),
+            dhcp_servers: vec![SERVER.into()],
+            dhcp_relays: vec![RELAY.into()],
+            ..Guards::default()
+        }
+    }
+
+    fn take(g: &mut Guards, wifi: bool, bytes: Vec<u8>, ms: u64) {
         let f = frame::parse(&bytes).expect("a frame of interest");
-        g.take(&port(wifi, 42), &f, now_ms);
+        g.take(&port(wifi, 42), &f, now(ms));
     }
 
     fn violations(g: &Guards) -> Vec<Violation> {
@@ -296,21 +324,53 @@ mod tests {
         all.collect()
     }
 
-    /// A DHCP ACK of 192.0.2.10 to CLIENT, as the uplink brings it.
-    fn ack(g: &mut Guards, now_ms: u64) {
-        let m = crate::dhcp::tests::message(2, dhcp::ACK, [192, 0, 2, 10], Some(600));
-        let f = ipv4_frame([2, 0, 0, 0, 0, 0xfe], [192, 0, 2, 1], 17, &udp(67, 68, &m));
-        take(g, false, f, now_ms);
+    /// A DHCP answer of `kind` assigning 192.0.2.10 to CLIENT, from `src`
+    /// naming `server`, as the uplink brings it.
+    pub fn answer(kind: u8, src: [u8; 4], server: [u8; 4]) -> Vec<u8> {
+        let m = crate::dhcp::tests::answer(kind, [192, 0, 2, 10], 600, server);
+        ipv4_frame(ROUTER, src, 17, &udp(67, 68, &m))
     }
 
     #[test]
-    fn arp_names_only_the_senders_own_bound_address() {
-        let mut g = Guards::default();
-        ack(&mut g, 0);
+    fn only_the_sites_acknowledgements_bind() {
+        let mut g = guards(&[42]);
+        take(&mut g, false, answer(dhcp::ACK, RELAY, SERVER), 0);
+        take(&mut g, false, answer(dhcp::ACK, SERVER, SERVER), 0);
+        assert_eq!(g.bindings.list(now(0)).len(), 1);
+        assert!(g.record.is_empty());
+        // Another server, through the relay or not, binds nothing.
+        let mut h = guards(&[42]);
+        take(
+            &mut h,
+            false,
+            answer(dhcp::ACK, [192, 0, 2, 66], [192, 0, 2, 66]),
+            0,
+        );
+        take(&mut h, false, answer(dhcp::ACK, RELAY, [192, 0, 2, 66]), 0);
+        assert!(h.bindings.list(now(0)).is_empty());
+        let v = &violations(&h)[0];
+        assert_eq!((v.guard, v.dropped), (Guard::Dhcp, false));
+        assert_eq!(
+            v.detail,
+            "answers as a DHCP server on the uplink (server 192.0.2.66), not the site's"
+        );
+        // Unconfigured, nothing is learnt or reported.
+        let mut u = Guards::default();
+        take(&mut u, false, answer(dhcp::ACK, RELAY, SERVER), 0);
+        assert!(u.bindings.list(now(0)).is_empty() && u.record.is_empty());
+    }
+
+    #[test]
+    fn arp_may_not_claim_another_clients_address_or_mac() {
+        let mut g = guards(&[42]);
+        take(&mut g, false, answer(dhcp::ACK, RELAY, SERVER), 0);
         for ok in [
             arp_frame(CLIENT, CLIENT, [192, 0, 2, 10], 2),
             arp_frame(CLIENT, CLIENT, [0, 0, 0, 0], 1),
             arp_frame(CLIENT, CLIENT, [169, 254, 7, 7], 1),
+            // Unbound: the guards know nothing against it.
+            arp_frame(OTHER, OTHER, [192, 0, 2, 99], 2),
+            arp_frame(OTHER, [2, 0, 0, 0, 0, 3], [192, 0, 2, 99], 2),
         ] {
             take(&mut g, true, ok, 1000);
         }
@@ -324,72 +384,71 @@ mod tests {
         take(
             &mut g,
             true,
-            arp_frame(CLIENT, CLIENT, [192, 0, 2, 99], 2),
+            arp_frame(CLIENT, OTHER, [192, 0, 2, 10], 2),
             1000,
         );
         take(
             &mut g,
             true,
-            arp_frame(CLIENT, OTHER, [192, 0, 2, 10], 2),
-            70_000,
+            arp_frame([2, 0, 0, 0, 0, 3], CLIENT, [192, 0, 2, 99], 2),
+            1000,
         );
-        let details: Vec<_> = violations(&g)
+        let seen: Vec<_> = violations(&g)
             .into_iter()
-            .map(|v| (v.guard, v.detail, v.dropped))
+            .map(|v| (v.mac, v.detail, v.dropped))
             .collect();
         assert_eq!(
-            details,
+            seen,
             [
                 (
-                    Guard::Arp,
-                    "uses 192.0.2.10, bound to 02:00:00:00:00:01".into(),
-                    false
+                    OTHER,
+                    "claims 192.0.2.10, bound to 02:00:00:00:00:01".into(),
+                    true
                 ),
+                (CLIENT, "names 02:00:00:00:00:02 as its sender".into(), true),
                 (
-                    Guard::Arp,
-                    "uses 192.0.2.99, bound to no client".into(),
-                    false
-                ),
-                (
-                    Guard::Arp,
-                    "names 02:00:00:00:00:02 as its sender".into(),
-                    false
+                    [2, 0, 0, 0, 0, 3],
+                    "names 02:00:00:00:00:01 as its sender".into(),
+                    true
                 ),
             ]
         );
         // The lease ends after its 600 s.
-        g.expire(600_000);
-        assert!(g.bindings.list(600_000).is_empty());
+        g.expire(now(600_000));
+        assert!(g.bindings.list(now(600_000)).is_empty());
     }
 
     #[test]
     fn reports_are_once_a_minute_per_client_and_guard_with_the_repeats() {
-        let mut g = Guards::default();
+        let mut g = guards(&[]);
+        take(&mut g, false, answer(dhcp::ACK, RELAY, SERVER), 0);
         for t in [0, 10_000, 20_000, 59_999] {
-            take(
-                &mut g,
-                true,
-                arp_frame(CLIENT, CLIENT, [192, 0, 2, 99], 2),
-                t,
-            );
+            take(&mut g, true, arp_frame(OTHER, OTHER, [192, 0, 2, 10], 2), t);
         }
         take(
             &mut g,
             true,
-            ipv4_frame(CLIENT, [192, 0, 2, 99], 6, &tcp(0x02)),
+            ipv4_frame(OTHER, [192, 0, 2, 10], 6, &tcp(0x02)),
             1,
         );
         take(
             &mut g,
             true,
-            arp_frame(CLIENT, CLIENT, [192, 0, 2, 99], 2),
+            arp_frame(OTHER, OTHER, [192, 0, 2, 10], 2),
             60_000,
         );
         let seen: Vec<_> = violations(&g)
             .into_iter()
-            .map(|v| (v.guard, v.repeats))
+            .map(|v| (v.guard, v.repeats, v.dropped))
             .collect();
-        assert_eq!(seen, [(Guard::Arp, 0), (Guard::Source, 0), (Guard::Arp, 3)]);
+        assert_eq!(
+            seen,
+            [
+                (Guard::Arp, 0, false),
+                (Guard::Source, 0, false),
+                (Guard::Arp, 3, false)
+            ]
+        );
         assert_eq!(g.after(1).len(), 2);
         assert_eq!(g.after(3), []);
     }
@@ -399,18 +458,33 @@ mod tests {
         let mut g = Guards::default();
         for i in 0..300u64 {
             let mac = [2, 0, 0, 0, (i >> 8) as u8, i as u8];
-            take(&mut g, true, arp_frame(mac, mac, [192, 0, 2, 99], 2), i);
+            take(&mut g, true, tagged(mac), i);
         }
         assert_eq!(g.record.len(), RECORD);
         assert_eq!(g.record.front().unwrap().0, 300 - RECORD as u64 + 1);
     }
 
+    /// An ARP frame from `mac` tagged for VLAN 0.
+    fn tagged(mac: [u8; 6]) -> Vec<u8> {
+        let mut f = arp_frame(mac, mac, [0; 4], 1);
+        f.splice(12..12, [0x81, 0, 0, 0]);
+        f
+    }
+
+    #[test]
+    fn a_tagged_frame_from_a_client_is_a_violation() {
+        let mut g = guards(&[42]);
+        take(&mut g, true, tagged(CLIENT), 0);
+        let v = &violations(&g)[0];
+        assert_eq!(
+            (v.guard, v.dropped, v.detail.as_str()),
+            (Guard::Tag, true, "sends frames tagged for VLAN 0")
+        );
+    }
+
     #[test]
     fn a_client_never_answers_as_a_dhcp_server() {
-        let mut g = Guards {
-            enforce: vec![42],
-            ..Guards::default()
-        };
+        let mut g = guards(&[42]);
         let offer = crate::dhcp::tests::message(2, 2, [192, 0, 2, 50], Some(60));
         take(
             &mut g,
@@ -434,14 +508,14 @@ mod tests {
             "answers as a DHCP server (OFFER for 02:00:00:00:00:01)"
         );
         assert_eq!(v[1].detail, "answers as a DHCPv6 server (message type 2)");
-        // A rogue server's ACK binds nothing.
-        assert!(g.bindings.list(0).is_empty());
+        // A client's server answers bind nothing.
+        assert!(g.bindings.list(now(0)).is_empty());
     }
 
     #[test]
     fn a_release_unbinds_the_address() {
-        let mut g = Guards::default();
-        ack(&mut g, 0);
+        let mut g = guards(&[]);
+        take(&mut g, false, answer(dhcp::ACK, RELAY, SERVER), 0);
         let mut rel = crate::dhcp::tests::message(1, dhcp::RELEASE, [0; 4], None);
         rel[12..16].copy_from_slice(&[192, 0, 2, 10]);
         take(
@@ -450,51 +524,98 @@ mod tests {
             ipv4_frame(CLIENT, [192, 0, 2, 10], 17, &udp(68, 67, &rel)),
             1,
         );
-        assert!(g.bindings.list(1).is_empty());
+        assert!(g.bindings.list(now(1)).is_empty());
         assert!(g.record.is_empty());
     }
 
     #[test]
     fn only_routers_advertisements_break_the_ra_guard() {
-        let mut g = Guards::default();
-        let ra = |lifetime, opts: &[Vec<u8>]| ipv6_frame(CLIENT, 58, &ra_body(lifetime, opts));
-        // A Thread border router: its mesh's unique local route alone.
-        take(&mut g, true, ra(0, &[rio("fdba:97ab:f6e9:1::", 64)]), 0);
-        // A prefix with neither flag configures nothing.
-        take(&mut g, true, ra(0, &[pio("2001:db8:2::", 64, 0)]), 0);
-        assert!(g.record.is_empty() && g.ra_offenders.is_empty());
+        let mut g = guards(&[]);
+        let ra = |mac, lifetime, opts: &[Vec<u8>]| ipv6_frame(mac, 58, &ra_body(lifetime, opts));
+        // A Thread border router: its mesh's unique local route and prefix.
         take(
             &mut g,
             true,
-            ra(1800, &[pio("2001:db8:1::", 64, 0xc0), rio("::", 0)]),
-            1,
+            ra(
+                CLIENT,
+                0,
+                &[rio("fdba:97ab:f6e9:1::", 64), pio("fd12:3456::", 64, 0xc0)],
+            ),
+            0,
         );
-        let v = &violations(&g)[0];
+        assert!(g.record.is_empty() && g.ra_offenders.is_empty());
+        let rdnss = vec![
+            25, 3, 0, 0, 0, 0, 0, 1, 0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53,
+        ];
+        take(&mut g, true, ra(OTHER, 0, &[rdnss]), 0);
+        take(
+            &mut g,
+            true,
+            ra(ROUTER, 1800, &[pio("2001:db8:1::", 64, 0), rio("::", 0)]),
+            0,
+        );
+        let (nh, payload) = behind(&[(0, 0)], 58, &ra_body(0, &[]));
+        take(
+            &mut g,
+            true,
+            ipv6_frame([2, 0, 0, 0, 0, 3], nh, &payload),
+            0,
+        );
+        let seen: Vec<_> = violations(&g)
+            .into_iter()
+            .map(|v| (v.detail, v.dropped))
+            .collect();
         assert_eq!(
-            (v.guard, v.dropped, v.detail.as_str()),
-            (
-                Guard::Ra,
-                false,
-                "advertises itself as a router: a default route for 1800 s, the prefix 2001:db8:1::/64, a route to ::/0"
-            )
+            seen,
+            [
+                ("advertises itself as a router: DNS servers or domains".into(), false),
+                (
+                    "advertises itself as a router: a default route for 1800 s, the prefix 2001:db8:1::/64, a route to ::/0".into(),
+                    false
+                ),
+                ("advertises itself as a router: behind an extension header".into(), false),
+            ]
         );
-        // Enforcing, the offender's next advertisements are dropped.
-        g.enforce = vec![42];
-        take(&mut g, true, ra(0, &[rio("2001:db8:3::", 48)]), 70_000);
-        assert!(violations(&g)[1].dropped);
-        assert_eq!(g.ra_offenders[&CLIENT], 70_000 + RA_OFFENDER_MS);
-        g.expire(70_000 + RA_OFFENDER_MS);
-        assert!(g.ra_offenders.is_empty());
+        // Enforcing: a default route or an extension header is dropped at
+        // once, a content-rogue one from its sender's next.
+        let mut e = guards(&[42]);
+        take(
+            &mut e,
+            true,
+            ra(OTHER, 0, &[vec![31, 1, 0, 0, 0, 0, 0, 1]]),
+            0,
+        );
+        take(&mut e, true, ra(ROUTER, 1800, &[]), 0);
+        take(
+            &mut e,
+            true,
+            ipv6_frame([2, 0, 0, 0, 0, 3], nh, &payload),
+            0,
+        );
+        take(
+            &mut e,
+            true,
+            ra(OTHER, 0, &[rio("fdba:97ab:f6e9:1::", 64)]),
+            70_000,
+        );
+        let dropped: Vec<_> = violations(&e).into_iter().map(|v| v.dropped).collect();
+        assert_eq!(dropped, [false, true, true]);
+        assert_eq!(e.ra_offenders[&OTHER], RA_OFFENDER_MS);
+        // The fourth, the offender's border-router-shaped one, is not rogue
+        // in itself: it is dropped by the offender filter, and not reported.
+        e.expire(now(RA_OFFENDER_MS + 1));
+        assert!(e.ra_offenders.is_empty());
     }
 
     #[test]
-    fn connections_come_from_bound_addresses() {
-        let mut g = Guards::default();
-        ack(&mut g, 0);
-        g.enforce = vec![42];
+    fn connections_from_another_clients_address_break_the_source_guard() {
+        let mut g = guards(&[42]);
+        take(&mut g, false, answer(dhcp::ACK, RELAY, SERVER), 0);
         for ok in [
             ipv4_frame(CLIENT, [192, 0, 2, 10], 6, &tcp(0x02)),
             ipv4_frame(CLIENT, [169, 254, 1, 1], 17, &udp(5353, 5353, &[])),
+            // Unbound (a static address, a lease the seed has not brought).
+            ipv4_frame(OTHER, [192, 0, 2, 77], 6, &tcp(0x02)),
         ] {
             take(&mut g, true, ok, 1);
         }
@@ -511,13 +632,5 @@ mod tests {
             (Guard::Source, OTHER, true, 42, "wlan5")
         );
         assert_eq!(v.detail, "uses 192.0.2.10, bound to 02:00:00:00:00:01");
-        // What a client's uplink port carries never counts against it.
-        take(
-            &mut g,
-            false,
-            ipv4_frame(OTHER, [192, 0, 2, 77], 6, &tcp(0x02)),
-            2,
-        );
-        assert_eq!(g.record.len(), 1);
     }
 }

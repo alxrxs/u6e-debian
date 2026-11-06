@@ -9,7 +9,8 @@
 //! gave last; one that does not answer keeps its last ones until they
 //! expire. A client's addresses are the union over the exporters, each
 //! address with its newest expiry, and its host name and device those of
-//! its lease that expires last.
+//! its lease that expires last. The APs' client guards are seeded from
+//! them (`state`), never before a read has worked.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
