@@ -5,8 +5,8 @@
 //! the site makes static (`bindings`), read the frames that bear on them as
 //! they reach the host (`capture`), and report each violation to the agent,
 //! which forwards it; on the VLANs the controller says to enforce on, they
-//! drop exactly the frames they report with `tc` (`enforce`), never the
-//! client. Their own user, with CAP_NET_RAW and CAP_NET_ADMIN alone (`tc`
+//! drop with `tc` (`enforce`) only frames they report, each reported as
+//! dropped, never the client. Their own user, with CAP_NET_RAW and CAP_NET_ADMIN alone (`tc`
 //! inherits them), in a sandbox (see prep-rootfs.sh).
 //!
 //!   u6e-guard serve

@@ -1,6 +1,6 @@
 //! The parts of a DHCP message (RFC 2131) the guards use: who it is for,
-//! the address it assigns, its type, the lease's length and the server that
-//! answers.
+//! the address it assigns (or a client asks for), its type, the lease's
+//! length and the server that answers.
 
 use std::net::Ipv4Addr;
 
@@ -26,6 +26,8 @@ pub struct Message {
     pub lease_s: Option<u32>,
     /// Option 54, the server's identifier.
     pub server_id: Option<Ipv4Addr>,
+    /// Option 50, the address a client asks for (or declines).
+    pub requested: Option<Ipv4Addr>,
 }
 
 /// The message in `b`, a UDP payload; only Ethernet clients.
@@ -45,6 +47,7 @@ pub fn parse(b: &[u8]) -> Option<Message> {
         kind: None,
         lease_s: None,
         server_id: None,
+        requested: None,
     };
     let mut opts = &b[OPTIONS..];
     while let Some((&code, rest)) = opts.split_first() {
@@ -62,6 +65,7 @@ pub fn parse(b: &[u8]) -> Option<Message> {
             (53, &[k]) => msg.kind = Some(k),
             (51, &[a, b, c, d]) => msg.lease_s = Some(u32::from_be_bytes([a, b, c, d])),
             (54, &[a, b, c, d]) => msg.server_id = Some(Ipv4Addr::new(a, b, c, d)),
+            (50, &[a, b, c, d]) => msg.requested = Some(Ipv4Addr::new(a, b, c, d)),
             _ => {}
         }
         opts = &rest[usize::from(len)..];
@@ -121,7 +125,27 @@ pub mod tests {
                 kind: Some(ACK),
                 lease_s: Some(86_400),
                 server_id: None,
+                requested: None,
             }
+        );
+    }
+
+    /// A client's message of `kind` naming `requested` in option 50.
+    pub fn asking(kind: u8, requested: [u8; 4]) -> Vec<u8> {
+        let mut m = message(1, kind, [0; 4], None);
+        m.pop();
+        m.extend([50, 4]);
+        m.extend(requested);
+        m.push(255);
+        m
+    }
+
+    #[test]
+    fn a_decline_names_the_address_it_declines() {
+        let m = parse(&asking(DECLINE, [192, 0, 2, 10])).unwrap();
+        assert_eq!(
+            (m.kind, m.requested),
+            (Some(DECLINE), Some(Ipv4Addr::new(192, 0, 2, 10)))
         );
     }
 

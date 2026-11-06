@@ -560,7 +560,7 @@ UNIT
 ln -sf /etc/systemd/system/u6e-guard.socket $RF/etc/systemd/system/sockets.target.wants/u6e-guard.socket
 cat > $RF/etc/systemd/system/u6e-guard.service <<'UNIT'
 [Unit]
-Description=U6E client guards: ARP inspection, rogue DHCP, RA guard and IP source guard on the Wi-Fi ports
+Description=U6E client guards: ARP inspection, rogue DHCP, RA guard, IP source guard and no VLAN tags on the Wi-Fi ports
 Requires=u6e-guard.socket
 After=u6e-guard.socket u6e-wifi.service
 

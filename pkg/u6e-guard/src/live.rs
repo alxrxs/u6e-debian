@@ -5,8 +5,11 @@
 //! frames; reporting, every frame passes and the offending ones are
 //! reported; enforcing, exactly those are reported again and dropped before
 //! the bridge, their drops counted, while a client the guards know nothing
-//! of passes. Tagged frames are the reviewer's VID-0 probe. It needs
-//! CAP_SYS_ADMIN and CAP_NET_ADMIN; without them it says so and passes.
+//! of passes, as does what a client sends from another's address without
+//! opening a connection (ICMP, a SYN-ACK, a DHCP renewal). Tagged frames are
+//! the reviewer's VID-0 probe; fragments and extension headers his RA-shape
+//! probe's, at the depths flower stops reading at. It needs CAP_SYS_ADMIN
+//! and CAP_NET_ADMIN; without them it says so and passes.
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -230,6 +233,18 @@ fn the_guards_read_and_drop_on_a_real_kernel() {
             25, 3, 0, 0, 0, 0, 0, 1, 0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53,
         ];
         let (hbh, behind_hbh) = behind(&[(0, 0)], 58, &ra_body(0, &[]));
+        let mac = |last| [2, 0, 0, 0, 0, last];
+        let v6 = |last, ext: &[(u8, u8)], next, l4: &[u8]| {
+            let (nh, payload) = behind(ext, next, l4);
+            ipv6_frame(mac(last), nh, &payload)
+        };
+        let ra_1800 = ra_body(1800, &[]);
+        let (first, dest) = ([(frame::FRAGMENT, 0)], frame::DESTINATION);
+        let deep = |n| vec![(dest, 0); n];
+        let mut more_fragments = v6(0x59, &first, 58, &ra_1800);
+        more_fragments[14 + 40 + 3] = 1;
+        let mut later_udp = ipv4_frame(mac(0x57), bound, 17, &udp(50_000, 53, &[]));
+        later_udp[14 + 7] = 1;
         let good = vec![
             arp_frame(CLIENT, CLIENT, bound, 1),
             ipv4_frame(CLIENT, bound, 6, &tcp(0x02)),
@@ -240,6 +255,13 @@ fn the_guards_read_and_drop_on_a_real_kernel() {
             ipv4_frame(STRANGER, [192, 0, 2, 77], 17, &udp(68, 67, &renew)),
             // A Thread border router.
             ipv6_frame(CLIENT, 58, &ra_body(0, &[rio("fdba:97ab:f6e9:1::", 64)])),
+            // From another's address, opening no connection.
+            ipv4_frame(ROGUE, bound, 1, &[8, 0, 0, 0, 0, 1, 0, 1]),
+            ipv4_frame(ROGUE, bound, 6, &tcp(0x12)),
+            ipv4_frame(ROGUE, bound, 17, &udp(68, 67, &renew)),
+            // DHCPv6 server ports where flower reads no ports: in a first
+            // fragment.
+            v6(0x60, &first, 17, &udp(547, 546, &[7, 0, 0, 1])),
         ];
         let bad = vec![
             arp_frame(ROGUE, ROGUE, bound, 2),
@@ -259,6 +281,25 @@ fn the_guards_read_and_drop_on_a_real_kernel() {
                 6,
                 &tcp(0x02),
             )),
+            // Advertisements flower reads no type of: an atomic fragment, a
+            // first fragment, behind 16 and 17 extension headers, a first
+            // fragment of a destination header; ICMPv6 cut short.
+            v6(0x58, &first, 58, &ra_1800),
+            more_fragments,
+            v6(0x5a, &deep(16), 58, &ra_1800),
+            v6(0x5b, &deep(17), 58, &ra_1800),
+            v6(0x5c, &first, dest, &[58, 0, 1, 4, 0, 0, 0, 0]),
+            v6(0x5f, &[], 58, &[134, 0, 0, 0]),
+            // A malformed DHCP server message; a DHCPv6 one behind an
+            // extension header, and behind 16, where flower still reads
+            // ports.
+            ipv4_frame(mac(0x5d), [192, 0, 2, 66], 17, &udp(67, 68, &[2, 1, 6])),
+            v6(0x5e, &[(0, 0)], 17, &udp(547, 546, &[7, 0, 0, 1])),
+            v6(0x61, &deep(16), 17, &udp(547, 546, &[7, 0, 0, 1])),
+            // ARP the filters cannot read, from a MAC that holds an address.
+            arp_frame(CLIENT, CLIENT, bound, 3),
+            // A later fragment of a datagram from another's address.
+            later_udp,
         ];
         let all: Vec<Vec<u8>> = good.iter().chain(&bad).cloned().collect();
         let reported = |g: &Guards| {
@@ -277,6 +318,17 @@ fn the_guards_read_and_drop_on_a_real_kernel() {
             (Guard::Ra, [2, 0, 0, 0, 0, 0x55], false),
             (Guard::Tag, [2, 0, 0, 0, 0, 0x44], false),
             (Guard::Tag, [2, 0, 0, 0, 0, 0x45], false),
+            (Guard::Ra, mac(0x58), false),
+            (Guard::Ra, mac(0x59), false),
+            (Guard::Ra, mac(0x5a), false),
+            (Guard::Ra, mac(0x5b), false),
+            (Guard::Ra, mac(0x5c), false),
+            (Guard::Ra, mac(0x5f), false),
+            (Guard::Dhcp, mac(0x5d), false),
+            (Guard::Dhcp, mac(0x5e), false),
+            (Guard::Dhcp, mac(0x61), false),
+            (Guard::Arp, CLIENT, false),
+            (Guard::Source, mac(0x57), false),
         ];
         want.sort();
 
@@ -326,7 +378,7 @@ fn the_guards_read_and_drop_on_a_real_kernel() {
                 Guard::Tag
             ]
             .map(count),
-            [1, 1, 2, 1, 2]
+            [2, 4, 8, 2, 2]
         );
 
         // A rogue advertisement shaped like a border router's passes once,
@@ -338,6 +390,15 @@ fn the_guards_read_and_drop_on_a_real_kernel() {
         sync(&g, &mut e);
         send(&client, &quiet);
         assert!(received(&out, std::slice::from_ref(&quiet)).is_empty());
+        read(&mut g, now(62_000));
+        // Within the hour, even its border-router-shaped one is dropped,
+        // and reported so.
+        let shaped = ipv6_frame(mac(0x56), 58, &ra_body(0, &[rio("fdba:97ab:f6e9:1::", 64)]));
+        g.record.clear();
+        send(&client, &shaped);
+        read(&mut g, now(130_000));
+        assert!(received(&out, std::slice::from_ref(&shaped)).is_empty());
+        assert_eq!(reported(&g), [(Guard::Ra, mac(0x56), true)]);
 
         // A binding added drops a claim of its address at once.
         let late = [192, 0, 2, 88];

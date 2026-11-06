@@ -1,29 +1,34 @@
 //! The client guards' rules. Each names only what is provably wrong, so that
-//! enforcing (`enforce`) drops exactly the frames reporting reports, and a
-//! client the guards know nothing of (a static address nobody listed, a
-//! lease from before the AP's seed) is never in the way:
+//! a client the guards know nothing of (a static address nobody listed, a
+//! lease from before the AP's seed) is never in the way, and every frame
+//! enforcing (`enforce`) drops is one they report, as dropped:
 //!
 //! - ARP inspection: no client's ARP names as its sender an address bound to
 //!   another MAC, nor, when either MAC holds an address, another MAC than
-//!   the frame's own.
-//! - Rogue DHCP: no DHCP or DHCPv6 server message comes from a client, and
-//!   on the uplink only the site's servers' acknowledgements, through its
-//!   relays, bind addresses (any other server message is reported).
+//!   the frame's own (an ARP packet the filters cannot read names none).
+//! - Rogue DHCP: no DHCP or DHCPv6 message, malformed or not, comes from a
+//!   client's server port to a client port, and on the uplink only the
+//!   site's servers' acknowledgements, through its relays, bind addresses
+//!   (any other server message is reported). A client's own release or
+//!   decline unbinds the address it gives up.
 //! - RA guard: a client's router advertisement offers no default route (its
 //!   router lifetime is 0), sits behind no extension header, names no DNS
 //!   server or domain, and no prefix or route but a unique local one (a
 //!   route of /48 or longer): what a Thread border router advertises for its
-//!   mesh, as phones and speakers on the network do.
-//! - IP source guard: no connection a client opens comes from an address
-//!   bound to another MAC.
+//!   mesh, as phones and speakers on the network do. ICMPv6 whose type the
+//!   filters cannot read (a first fragment, too many extension headers, cut
+//!   short) may hide one, and is dropped and reported too.
+//! - IP source guard: no connection a client opens (a TCP SYN, a UDP
+//!   datagram) comes from an address bound to another MAC; the rest of its
+//!   traffic, its DHCP to the servers included, is not the guard's.
 //! - VLAN tags: no client sends a tagged frame (the ports are untagged).
 //!
 //! A violation is recorded at most once a minute per client and guard, with
 //! the repeats in between, in a record of the newest [`RECORD`]; it says
 //! whether enforcing dropped the frame. A client whose advertisement broke
 //! the RA guard is remembered for an hour: enforcing, all its advertisements
-//! are dropped (a lifetime-0 rogue one is told from a border router's only
-//! by what flower cannot read).
+//! are dropped and reported (a lifetime-0 rogue one is told from a border
+//! router's only by what flower cannot read, so the first passes).
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -33,7 +38,7 @@ use u6e_proto::msg::{Event, EventKind, Guard, Violation};
 
 use crate::bindings::{Bindings, Clock};
 use crate::dhcp;
-use crate::frame::{Frame, Ra, What};
+use crate::frame::{Frame, Hidden, Ra, What};
 use crate::ports::Port;
 
 /// Violations kept for the agent.
@@ -94,7 +99,7 @@ impl Guards {
         let What::Dhcp {
             src,
             server: true,
-            msg,
+            msg: Some(msg),
         } = &frame.what
         else {
             return None;
@@ -145,9 +150,15 @@ impl Guards {
                 }
                 let lies = *sha != src
                     && (self.bindings.holds_any(src, now) || self.bindings.holds_any(*sha, now));
-                lies.then(|| {
-                    let detail = format!("names {} as its sender", mac::format(*sha));
-                    found(Guard::Arp, Some((*spa).into()), detail, true)
+                lies.then(|| match sha {
+                    [0, 0, 0, 0, 0, 0] if spa.is_unspecified() => {
+                        let detail = "sends ARP the filters cannot read".into();
+                        found(Guard::Arp, None, detail, true)
+                    }
+                    _ => {
+                        let detail = format!("names {} as its sender", mac::format(*sha));
+                        found(Guard::Arp, Some((*spa).into()), detail, true)
+                    }
                 })
             }
             What::Dhcp {
@@ -155,35 +166,65 @@ impl Guards {
                 server: true,
                 msg,
             } => {
-                let kind = msg.kind.map_or("BOOTREPLY".into(), dhcp_name);
-                let detail = format!(
-                    "answers as a DHCP server ({kind} for {})",
-                    mac::format(msg.chaddr)
-                );
+                let detail = match msg {
+                    Some(msg) => format!(
+                        "answers as a DHCP server ({} for {})",
+                        msg.kind.map_or("BOOTREPLY".into(), dhcp_name),
+                        mac::format(msg.chaddr)
+                    ),
+                    None => "sends a malformed DHCP server message".into(),
+                };
                 Some(found(Guard::Dhcp, Some((*ip).into()), detail, true))
             }
             What::Dhcp {
-                server: false, msg, ..
+                server: false,
+                msg: Some(msg),
+                ..
             } => {
-                if matches!(msg.kind, Some(dhcp::RELEASE | dhcp::DECLINE)) {
-                    self.bindings.release(msg.chaddr, msg.ciaddr, now);
+                // Only the client itself gives its address up: a release
+                // names it in ciaddr, a decline in the requested address.
+                let gives_up = match msg.kind {
+                    Some(dhcp::RELEASE) => Some(msg.ciaddr),
+                    Some(dhcp::DECLINE) => msg.requested,
+                    _ => None,
+                };
+                if let Some(ip) = gives_up.filter(|_| msg.chaddr == src) {
+                    self.bindings.release(src, ip, now);
                 }
                 None
             }
+            What::Dhcp { .. } => None,
             What::Dhcp6Server { src: ip, kind } => {
-                let detail = format!("answers as a DHCPv6 server (message type {kind})");
+                let detail = match kind {
+                    Some(k) => format!("answers as a DHCPv6 server (message type {k})"),
+                    None => "sends a malformed DHCPv6 server message".into(),
+                };
                 Some(found(Guard::Dhcp, Some((*ip).into()), detail, true))
             }
             What::Ra(ra) => {
-                let why = rogue(ra)?;
                 let offender = self
                     .ra_offenders
                     .get(&src)
                     .is_some_and(|&u| u > now.boot_ms);
+                let Some(why) = rogue(ra) else {
+                    // Its sender's advertisements are all dropped for the
+                    // hour.
+                    let detail = "advertises itself as a router again, within the hour of a rogue advertisement".into();
+                    return offender.then(|| found(Guard::Ra, None, detail, true));
+                };
                 self.ra_offenders.insert(src, now.boot_ms + RA_OFFENDER_MS);
                 let drops = offender || ra.lifetime != 0 || !ra.ext.is_empty();
                 let detail = format!("advertises itself as a router: {why}");
                 Some(found(Guard::Ra, None, detail, drops))
+            }
+            What::Hidden(h) => {
+                let what = match h {
+                    Hidden::Fragment => "a first fragment of ICMPv6 or of more extension headers",
+                    Hidden::Deep => "IPv6 behind more extension headers than the filters read",
+                    Hidden::Cut => "ICMPv6 or an extension header cut short, or ICMPv6 of type 0",
+                };
+                let detail = format!("sends {what}, which may hide a router advertisement");
+                Some(found(Guard::Ra, None, detail, true))
             }
             What::Conn { src: ip } => {
                 let other = self.bindings.owner(*ip, src, now)?;
@@ -255,6 +296,9 @@ fn rogue(ra: &Ra) -> Option<String> {
     if ra.dns {
         why.push("DNS servers or domains".into());
     }
+    if ra.malformed {
+        why.push("malformed".into());
+    }
     for (prefix, len, _) in ra.prefixes.iter().filter(|(p, ..)| !ula(p)) {
         why.push(format!("the prefix {prefix}/{len}"));
     }
@@ -311,9 +355,11 @@ pub mod tests {
         }
     }
 
+    /// Takes the frame in `bytes`, if it is one the guards look at.
     fn take(g: &mut Guards, wifi: bool, bytes: Vec<u8>, ms: u64) {
-        let f = frame::parse(&bytes).expect("a frame of interest");
-        g.take(&port(wifi, 42), &f, now(ms));
+        if let Some(f) = frame::parse(&bytes) {
+            g.take(&port(wifi, 42), &f, now(ms));
+        }
     }
 
     fn violations(g: &Guards) -> Vec<Violation> {
@@ -529,6 +575,90 @@ pub mod tests {
     }
 
     #[test]
+    fn a_decline_unbinds_the_address_it_declines() {
+        let mut g = guards(&[]);
+        take(&mut g, false, answer(dhcp::ACK, RELAY, SERVER), 0);
+        let decline = crate::dhcp::tests::asking(dhcp::DECLINE, [192, 0, 2, 10]);
+        take(
+            &mut g,
+            true,
+            ipv4_frame(CLIENT, [0; 4], 17, &udp(68, 67, &decline)),
+            1,
+        );
+        assert!(g.bindings.list(now(1)).is_empty());
+    }
+
+    #[test]
+    fn only_the_client_itself_gives_its_address_up() {
+        let mut g = guards(&[]);
+        take(&mut g, false, answer(dhcp::ACK, RELAY, SERVER), 0);
+        // Another MAC sends CLIENT's release and decline.
+        let mut rel = crate::dhcp::tests::message(1, dhcp::RELEASE, [0; 4], None);
+        rel[12..16].copy_from_slice(&[192, 0, 2, 10]);
+        let decline = crate::dhcp::tests::asking(dhcp::DECLINE, [192, 0, 2, 10]);
+        for m in [rel, decline] {
+            take(
+                &mut g,
+                true,
+                ipv4_frame(OTHER, [0; 4], 17, &udp(68, 67, &m)),
+                1,
+            );
+        }
+        assert_eq!(g.bindings.list(now(1)).len(), 1);
+    }
+
+    #[test]
+    fn a_malformed_server_message_from_a_client_is_a_violation() {
+        let mut g = guards(&[42]);
+        take(
+            &mut g,
+            true,
+            ipv4_frame(CLIENT, [192, 0, 2, 66], 17, &udp(67, 68, &[2, 1, 6])),
+            0,
+        );
+        take(&mut g, true, ipv6_frame(OTHER, 17, &udp(547, 546, &[])), 0);
+        let seen: Vec<_> = violations(&g)
+            .into_iter()
+            .map(|v| (v.guard, v.dropped, v.detail))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (
+                    Guard::Dhcp,
+                    true,
+                    "sends a malformed DHCP server message".into()
+                ),
+                (
+                    Guard::Dhcp,
+                    true,
+                    "sends a malformed DHCPv6 server message".into()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn arp_the_filters_cannot_read_breaks_the_rule_for_a_bound_mac() {
+        let mut g = guards(&[42]);
+        take(&mut g, false, answer(dhcp::ACK, RELAY, SERVER), 0);
+        // An opcode that is neither a request's nor a reply's.
+        take(&mut g, true, arp_frame(OTHER, OTHER, [192, 0, 2, 99], 3), 0);
+        assert!(g.record.is_empty());
+        take(
+            &mut g,
+            true,
+            arp_frame(CLIENT, CLIENT, [192, 0, 2, 10], 3),
+            0,
+        );
+        let v = &violations(&g)[0];
+        assert_eq!(
+            (v.guard, v.dropped, v.ip, v.detail.as_str()),
+            (Guard::Arp, true, None, "sends ARP the filters cannot read")
+        );
+    }
+
+    #[test]
     fn only_routers_advertisements_break_the_ra_guard() {
         let mut g = guards(&[]);
         let ra = |mac, lifetime, opts: &[Vec<u8>]| ipv6_frame(mac, 58, &ra_body(lifetime, opts));
@@ -598,13 +728,79 @@ pub mod tests {
             ra(OTHER, 0, &[rio("fdba:97ab:f6e9:1::", 64)]),
             70_000,
         );
-        let dropped: Vec<_> = violations(&e).into_iter().map(|v| v.dropped).collect();
-        assert_eq!(dropped, [false, true, true]);
-        assert_eq!(e.ra_offenders[&OTHER], RA_OFFENDER_MS);
         // The fourth, the offender's border-router-shaped one, is not rogue
-        // in itself: it is dropped by the offender filter, and not reported.
+        // in itself: the offender filter drops it, so it is reported.
+        let seen: Vec<_> = violations(&e)
+            .into_iter()
+            .map(|v| (v.mac, v.dropped))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (OTHER, false),
+                (ROUTER, true),
+                ([2, 0, 0, 0, 0, 3], true),
+                (OTHER, true)
+            ]
+        );
+        assert_eq!(
+            violations(&e)[3].detail,
+            "advertises itself as a router again, within the hour of a rogue advertisement"
+        );
+        // It does not make the hour start over.
+        assert_eq!(e.ra_offenders[&OTHER], RA_OFFENDER_MS);
         e.expire(now(RA_OFFENDER_MS + 1));
         assert!(e.ra_offenders.is_empty());
+        take(
+            &mut e,
+            true,
+            ra(OTHER, 0, &[rio("fdba:97ab:f6e9:1::", 64)]),
+            RA_OFFENDER_MS + 70_000,
+        );
+        assert_eq!(violations(&e).len(), 4);
+    }
+
+    #[test]
+    fn icmpv6_that_may_hide_an_advertisement_is_dropped_and_reported() {
+        let mut g = guards(&[42]);
+        let echo = [128, 0, 0, 0, 0, 1, 0, 1];
+        let (frag, first) = behind(&[(frame::FRAGMENT, 0)], frame::ICMPV6, &echo);
+        let deep = vec![(frame::DESTINATION, 0); frame::EXT_MAX + 1];
+        let (dest, deep) = behind(&deep, frame::ICMPV6, &ra_body(1800, &[]));
+        let (nh, cut) = behind(&[(frame::DESTINATION, 0)], frame::DESTINATION, &[]);
+        let (afrag, atomic) = behind(&[(frame::FRAGMENT, 0)], frame::ICMPV6, &ra_body(1800, &[]));
+        for (last, nh, l4) in [
+            (0x11, frag, first),
+            (0x12, dest, deep),
+            (0x13, nh, cut),
+            (0x14, afrag, atomic),
+        ] {
+            take(&mut g, true, ipv6_frame([2, 0, 0, 0, 0, last], nh, &l4), 0);
+        }
+        let seen: Vec<_> = violations(&g)
+            .into_iter()
+            .map(|v| (v.guard, v.dropped, v.detail))
+            .collect();
+        let hides = |what: &str| {
+            (
+                Guard::Ra,
+                true,
+                format!("sends {what}, which may hide a router advertisement"),
+            )
+        };
+        assert_eq!(
+            seen,
+            [
+                hides("a first fragment of ICMPv6 or of more extension headers"),
+                hides("IPv6 behind more extension headers than the filters read"),
+                hides("ICMPv6 or an extension header cut short, or ICMPv6 of type 0"),
+                (
+                    Guard::Ra,
+                    true,
+                    "advertises itself as a router: a default route for 1800 s, behind an extension header".into()
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -616,6 +812,16 @@ pub mod tests {
             ipv4_frame(CLIENT, [169, 254, 1, 1], 17, &udp(5353, 5353, &[])),
             // Unbound (a static address, a lease the seed has not brought).
             ipv4_frame(OTHER, [192, 0, 2, 77], 6, &tcp(0x02)),
+            // From the bound address, but no connection opened: ICMP, a
+            // SYN-ACK, a DHCP renewal (the server answers it, not the guard).
+            ipv4_frame(OTHER, [192, 0, 2, 10], 1, &[8, 0, 0, 0, 0, 1, 0, 1]),
+            ipv4_frame(OTHER, [192, 0, 2, 10], 6, &tcp(0x12)),
+            ipv4_frame(
+                OTHER,
+                [192, 0, 2, 10],
+                17,
+                &udp(68, 67, &crate::dhcp::tests::message(1, 3, [0; 4], None)),
+            ),
         ] {
             take(&mut g, true, ok, 1);
         }

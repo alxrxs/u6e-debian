@@ -366,12 +366,15 @@ pub struct Binding {
 /// On the wire: a change to it bumps [`crate::PROTOCOL`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Guard {
-    /// ARP inspection: a client's ARP may name only its own bound address.
+    /// ARP inspection: no client's ARP claims an address bound to another
+    /// client, nor, when either holds an address, names another sender.
     Arp,
-    /// Rogue DHCP: no client answers as a DHCP or DHCPv6 server, and no
-    /// other than the site's server binds an address.
+    /// Rogue DHCP: no client sends from a DHCP or DHCPv6 server port to a
+    /// client port, and no other than the site's server binds an address.
     Dhcp,
-    /// RA guard: no client advertises itself as a router or a prefix.
+    /// RA guard: no client advertises a default route, DNS servers, or a
+    /// prefix or route that is not unique local, nor sends ICMPv6 the
+    /// filters cannot read the type of.
     Ra,
     /// IP source guard: a client's new connections come from no address
     /// bound to another client.

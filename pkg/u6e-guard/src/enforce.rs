@@ -3,17 +3,22 @@
 //! nftables), whose filters drop exactly what `rules` reports, never a
 //! client:
 //!
-//! - chain 0: any VLAN-tagged frame; DHCP and DHCPv6 server messages; the
-//!   router advertisements of the clients that sent a rogue one in the last
-//!   hour, and every advertisement but one with router lifetime 0 and no
-//!   extension header (u32 reads the field; flower sees through extension
-//!   headers); a DHCP client's message always passes; ARP goes on to chain
-//!   1, IPv4 to chain 3;
+//! - chain 0: any VLAN-tagged frame; anything from a DHCP or DHCPv6 server
+//!   port to a client port; the router advertisements of the clients that
+//!   sent a rogue one in the last hour; ICMPv6 whose type flower cannot read
+//!   (a first fragment of ICMPv6 or of more extension headers, more
+//!   extension headers than it walks, a type it reads as 0); every
+//!   advertisement but one with router lifetime 0 and no extension header
+//!   (u32 reads the field; flower sees through extension headers); a DHCP
+//!   client's message always passes; ARP goes on to chain 1, IPv4 to chain
+//!   3;
 //! - chain 1: ARP whose sender address is bound, from another MAC than its
 //!   own (an address two MACs hold is either's);
 //! - chain 2: ARP from a MAC that holds an address naming another sender, or
-//!   naming as its sender a MAC that holds one;
-//! - chain 3: IPv4 from a bound address, from another MAC than its own.
+//!   naming as its sender a MAC that holds one (flower reads an ARP packet
+//!   it cannot parse as naming none);
+//! - chain 3: a TCP SYN or a UDP datagram from a bound address, from another
+//!   MAC than its own.
 //!
 //! Each guard's drops go through one standalone, counted action, so the
 //! counts outlive the filters. A binding's filters are added and removed
@@ -62,7 +67,7 @@ fn fixed() -> Vec<String> {
     };
     let lifetime_0 =
         "u32 match u8 58 0xff at 6 match u8 134 0xff at 40 match u16 0 0xffff at 46 action ok";
-    vec![
+    let mut lines = vec![
         f("802.1q", 0, 1, &format!("matchall {}", drop_by(Guard::Tag))),
         f(
             "802.1ad",
@@ -83,8 +88,29 @@ fn fixed() -> Vec<String> {
             "ipv6",
             0,
             4,
-            &format!("flower ip_proto udp src_port 547 {}", drop_by(Guard::Dhcp)),
+            &format!(
+                "flower ip_proto udp src_port 547 dst_port 546 {}",
+                drop_by(Guard::Dhcp)
+            ),
         ),
+    ];
+    // ICMPv6, or an extension header it may sit behind (hop-by-hop, routing,
+    // fragment, destination), in a first fragment; extension headers past
+    // those the dissector walks; ICMPv6 whose type it left 0.
+    let ext = ["0x00", "0x2b", "0x2c", "0x3c"];
+    let first = ext.iter().chain(&["icmpv6"]);
+    let first = first.map(|p| format!("ip_flags frag/firstfrag ip_proto {p}"));
+    let past = ext.iter().map(|p| format!("ip_flags nofrag ip_proto {p}"));
+    let untyped = ["ip_flags nofrag ip_proto icmpv6 type 0".to_owned()];
+    for m in first.chain(past).chain(untyped) {
+        lines.push(f(
+            "ipv6",
+            0,
+            6,
+            &format!("flower {m} {}", drop_by(Guard::Ra)),
+        ));
+    }
+    lines.extend([
         f("ipv6", 0, 7, lifetime_0),
         f(
             "ipv6",
@@ -101,7 +127,8 @@ fn fixed() -> Vec<String> {
         f("arp", 0, 10, "matchall action goto chain 1"),
         f("ip", 0, 11, "matchall action goto chain 3"),
         f("arp", 1, 3, "matchall action goto chain 2"),
-    ]
+    ]);
+    lines
 }
 
 /// What the block holds beyond its fixed filters, each with its handle.
@@ -143,9 +170,16 @@ fn ip_lines(add: bool, ip: Ipv4Addr, h: u32) -> Vec<String> {
                 filter("arp", 1, 2, h),
                 drop_by(Guard::Arp)
             ),
+            // A SYN without ACK, or a datagram (flower reads no flags of a
+            // TCP fragment, and knows a UDP one).
             format!(
-                "filter add {} flower src_ip {ip} {}",
+                "filter add {} flower ip_proto tcp src_ip {ip} tcp_flags 0x2/0x12 {}",
                 filter("ip", 3, 2, h),
+                drop_by(Guard::Source)
+            ),
+            format!(
+                "filter add {} flower ip_proto udp src_ip {ip} {}",
+                filter("ip", 3, 3, h),
                 drop_by(Guard::Source)
             ),
         ]
@@ -153,6 +187,7 @@ fn ip_lines(add: bool, ip: Ipv4Addr, h: u32) -> Vec<String> {
         vec![
             format!("filter del {} flower", filter("arp", 1, 2, h)),
             format!("filter del {} flower", filter("ip", 3, 2, h)),
+            format!("filter del {} flower", filter("ip", 3, 3, h)),
         ]
     }
 }
@@ -519,7 +554,7 @@ mod tests {
             &[],
         );
         (e.attached, e.held, e.actions) = state;
-        assert_eq!(next.len(), 4, "{next:#?}");
+        assert_eq!(next.len(), 5, "{next:#?}");
         assert!(
             next.iter()
                 .all(|l| l.starts_with("filter add") && l.contains("192.0.2.11"))
@@ -527,8 +562,8 @@ mod tests {
         // Its loss deletes them again, the drops first.
         let (gone, state) = e.plan(&ports, &[42], &[b(1, [192, 0, 2, 10])], &[]);
         (e.attached, e.held, e.actions) = state;
-        assert_eq!(gone.len(), 4);
-        assert!(gone[0].contains("prio 2") && gone[3].contains("prio 1"));
+        assert_eq!(gone.len(), 5);
+        assert!(gone[0].contains("prio 2") && gone[4].contains("prio 1"));
         assert!(gone.iter().all(|l| l.starts_with("filter del")));
         // Nothing changed: nothing to run.
         assert_eq!(

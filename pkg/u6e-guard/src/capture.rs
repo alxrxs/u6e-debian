@@ -8,11 +8,13 @@
 //!
 //! From a Wi-Fi port it takes every VLAN-tagged frame (its tag in the data,
 //! or taken off by the kernel before the tap, which the socket's auxiliary
-//! data then holds), ARP, IPv4 TCP SYNs and UDP datagrams (DHCP whole, the
-//! rest their headers), DHCPv6 from the servers' port, router advertisements
-//! and IPv6 behind extension headers (whole: an advertisement may hide
-//! there); from an uplink port, DHCP servers' answers. The program names the
-//! ports' interface indices, so it is made again when they change.
+//! data then holds), ARP, IPv4 TCP SYNs outside fragments and UDP datagrams
+//! and fragments (DHCP whole, the rest their headers), DHCPv6 from the
+//! servers' port, router advertisements, ICMPv6 whose type `tc` cannot
+//! read (type 0, or cut short) and IPv6 behind extension headers (whole: an
+//! advertisement may hide there); from an uplink port, DHCP servers'
+//! answers. The program names the ports' interface indices, so it is made
+//! again when they change.
 
 use std::io;
 use std::mem;
@@ -41,9 +43,11 @@ const H: u16 = 0x08;
 const B: u16 = 0x10;
 const ABS: u16 = 0x20;
 const IND: u16 = 0x40;
+const LEN: u16 = 0x80;
 const MSH: u16 = 0xa0;
 const AND: u16 = 0x50;
 const JEQ: u16 = 0x10;
+const JGE: u16 = 0x30;
 const JSET: u16 = 0x40;
 /// The interface a frame came in on, and whether the kernel took a VLAN tag
 /// off it, as absolute loads (SKF_AD_IFINDEX, SKF_AD_VLAN_TAG_PRESENT).
@@ -110,19 +114,23 @@ pub fn program(ports: &[Port]) -> Vec<libc::sock_filter> {
         Jump(JMP | JEQ, 0x86dd, "wifi6"),
         Op(RET, 0),
         Label("wifi4"),
-        Op(LD | H | ABS, 20),
-        Jump(JMP | JSET, 0x1fff, "drop"),
         Op(LDX | B | MSH, 14),
         Op(LD | B | ABS, 23),
         Jump(JMP | JEQ, 6, "tcp"),
         Jump(JMP | JEQ, 17, "udp"),
         Op(RET, 0),
+        // No fragment's flags, any fragment of a datagram (more fragments,
+        // or an offset).
         Label("tcp"),
+        Op(LD | H | ABS, 20),
+        Jump(JMP | JSET, 0x3fff, "drop"),
         Op(LD | B | IND, 14 + 13),
         Op(ALU | AND, 0x12),
         Jump(JMP | JEQ, 0x02, "short"),
         Op(RET, 0),
         Label("udp"),
+        Op(LD | H | ABS, 20),
+        Jump(JMP | JSET, 0x3fff, "short"),
         Op(LD | H | IND, 14),
         Jump(JMP | JEQ, 67, "whole"),
         Jump(JMP | JEQ, 68, "whole"),
@@ -137,9 +145,15 @@ pub fn program(ports: &[Port]) -> Vec<libc::sock_filter> {
         Jump(JMP | JEQ, 44, "whole"),
         Jump(JMP | JEQ, 60, "whole"),
         Op(RET, 0),
+        // Shorter than its 8-byte header, of type 0, or an advertisement.
         Label("icmp6"),
+        Op(LD | LEN, 0),
+        Jump(JMP | JGE, 14 + 40 + 8, "icmp6_type"),
+        Op(RET, SHORT),
+        Label("icmp6_type"),
         Op(LD | B | ABS, 54),
         Jump(JMP | JEQ, 134, "whole"),
+        Jump(JMP | JEQ, 0, "short"),
         Op(RET, 0),
         Label("udp6"),
         Op(LD | H | ABS, 54),
@@ -341,6 +355,7 @@ mod tests {
             match i.code & 0x07 {
                 LD if i.k == IFINDEX => a = ifindex,
                 LD if i.k == VLAN_TAG_PRESENT => a = u32::from(tagged),
+                LD if i.code & 0xe0 == LEN => a = pkt.len() as u32,
                 LD => {
                     let at = if i.code & 0xe0 == IND { x + i.k } else { i.k };
                     let Some(v) = load(at as usize, size) else {
@@ -358,6 +373,7 @@ mod tests {
                 JMP => {
                     let hit = match i.code & 0xf0 {
                         JEQ => a == i.k,
+                        JGE => a >= i.k,
                         JSET => a & i.k != 0,
                         c => panic!("jump {c:#x}"),
                     };
@@ -425,9 +441,17 @@ mod tests {
         // Behind an extension header, whole.
         let (nh, payload) = crate::frame::tests::behind(&[(0, 0)], 58, &ra_body(0, &[]));
         assert_eq!(run(&prog, &ipv6_frame(CLIENT, nh, &payload), 21), WHOLE);
+        // Any fragment of a datagram, its headers; no TCP fragment.
         let mut fragment = ipv4_frame(CLIENT, [192, 0, 2, 10], 17, &udp(5000, 53, &[]));
         fragment[20] = 0x01;
-        assert_eq!(run(&prog, &fragment, 10), 0);
+        assert_eq!(run(&prog, &fragment, 10), SHORT);
+        let mut first = ipv4_frame(CLIENT, [192, 0, 2, 10], 6, &tcp(0x02));
+        first[20] = 0x20;
+        assert_eq!(run(&prog, &first, 10), 0);
+        // ICMPv6 whose type tc cannot read: cut short, or of type 0.
+        assert_eq!(run(&prog, &ipv6_frame(CLIENT, 58, &[134, 0]), 10), SHORT);
+        assert_eq!(run(&prog, &ipv6_frame(CLIENT, 58, &[]), 10), SHORT);
+        assert_eq!(run(&prog, &ipv6_frame(CLIENT, 58, &[0; 8]), 10), SHORT);
         // A header shorter than the program reads: dropped, as the kernel does.
         assert_eq!(
             run(&prog, &arp_frame(CLIENT, CLIENT, [0; 4], 1)[..13], 10),
