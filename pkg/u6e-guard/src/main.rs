@@ -6,8 +6,12 @@
 //! they reach the host (`capture`), and report each violation to the agent,
 //! which forwards it; on the VLANs the controller says to enforce on, they
 //! drop with `tc` (`enforce`) only frames they report, each reported as
-//! dropped, never the client. Their own user, with CAP_NET_RAW and CAP_NET_ADMIN alone (`tc`
-//! inherits them), in a sandbox (see prep-rootfs.sh).
+//! dropped, never the client. The same socket brings them the mDNS the
+//! bridges carry, which they keep as a bounded table of the devices, the
+//! services they offer and whether they answer the queries for them
+//! (`mdns`, `services`), for the agent to read. Their own user, with
+//! CAP_NET_RAW and CAP_NET_ADMIN alone (`tc` inherits them), in a sandbox
+//! (see prep-rootfs.sh).
 //!
 //!   u6e-guard serve
 //!   u6e-guard clear
@@ -24,11 +28,11 @@ mod enforce;
 mod frame;
 #[cfg(test)]
 mod live;
-#[cfg(test)]
 mod mdns;
 mod ports;
 mod rules;
 mod serve;
+mod services;
 #[cfg(test)]
 mod testdir;
 

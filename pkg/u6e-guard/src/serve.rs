@@ -1,6 +1,7 @@
 //! The guards' one thread: it waits with `poll` for a frame, a request of
 //! the agent's or a signal to stop, and every few seconds looks at the ports
-//! again and forgets what expired. The agent is served one request per
+//! again and forgets what expired. Each mDNS message read goes to the
+//! services table (`services`) as well. The agent is served one request per
 //! connection (`u6e_proto::guard`), a member of its group only, each with a
 //! second to say what it wants. Enforcement follows every change that bears
 //! on it (bindings, the VLANs enforced on, the ports, the rogue advertisers)
@@ -23,8 +24,10 @@ use crate::bindings::Clock;
 use crate::capture::Capture;
 use crate::enforce::{self, Enforcer};
 use crate::frame;
+use crate::mdns;
 use crate::ports::{self, Port};
 use crate::rules::Guards;
+use crate::services::Table;
 
 /// Frames read at once before the socket is looked at again.
 const BURST: usize = 256;
@@ -58,6 +61,7 @@ struct Server<'a> {
     cfg: &'a Config,
     capture: Capture,
     guards: Guards,
+    services: Table,
     ports: Vec<Port>,
     by_index: HashMap<i32, Port>,
     enforcer: Enforcer,
@@ -76,6 +80,7 @@ pub fn run(cfg: &Config, listener: UnixListener, capture: Capture, stop: RawFd) 
         cfg,
         capture,
         guards: Guards::default(),
+        services: Table::default(),
         ports: Vec::new(),
         by_index: HashMap::new(),
         enforcer: Enforcer::new(cfg.tc.clone()),
@@ -142,7 +147,7 @@ impl Server<'_> {
     }
 
     /// Looks at the ports again, the capture following them, and forgets
-    /// what expired.
+    /// what expired, of the guards and of the services.
     fn maintain(&mut self) {
         match ports::scan(&self.cfg.net) {
             Ok(ports) if ports != self.ports => {
@@ -154,7 +159,9 @@ impl Server<'_> {
             Ok(_) => {}
             Err(e) => self.log_once("ports", Some(e.to_string())),
         }
-        self.guards.expire(Clock::now());
+        let now = Clock::now();
+        self.guards.expire(now);
+        self.services.expire(now.boot_ms);
     }
 
     fn read_drops(&mut self) {
@@ -179,8 +186,16 @@ impl Server<'_> {
                         }),
                         _ => frame::parse(&buf[..r.len]),
                     };
+                    let now = Clock::now();
                     if let Some(f) = f {
-                        self.guards.take(port, &f, Clock::now());
+                        self.guards.take(port, &f, now);
+                    }
+                    let frame = &buf[..r.len];
+                    if r.tag.is_none()
+                        && let (Some((_, payload)), Some(src)) =
+                            (mdns::payload(frame), mac_at(frame))
+                    {
+                        self.services.take(port, src, payload, now.boot_ms);
                     }
                 }
                 Ok(None) => return,
@@ -223,6 +238,16 @@ impl Server<'_> {
             Request::Violations { after } => Reply::Violations {
                 events: self.guards.after(after),
             },
+            Request::Services { since } => {
+                // A generation of another start of the guards means nothing.
+                let since = since.filter(|(s, _)| *s == self.started_ms).map(|(_, g)| g);
+                let (generation, services) = self.services.read(since, now.boot_ms);
+                Reply::Services {
+                    started_ms: self.started_ms,
+                    generation,
+                    services,
+                }
+            }
             Request::Seed(leases) => match check(&leases) {
                 Err(why) => Reply::Refused(why),
                 Ok(()) => {
@@ -377,6 +402,29 @@ mod tests {
             ask(&dir, &Request::Violations { after: 0 }).unwrap(),
             Reply::Violations { events: vec![] }
         );
+        // The services: whole without a place, or from another start; the
+        // changes since a place of this one.
+        let Reply::Services {
+            started_ms,
+            generation,
+            services,
+        } = ask(&dir, &Request::Services { since: None }).unwrap()
+        else {
+            panic!()
+        };
+        assert!(services.full && services.devices.is_empty());
+        let since = Some((started_ms, generation));
+        let Reply::Services { services, .. } = ask(&dir, &Request::Services { since }).unwrap()
+        else {
+            panic!()
+        };
+        assert!(!services.full);
+        let since = Some((started_ms + 1, generation));
+        let Reply::Services { services, .. } = ask(&dir, &Request::Services { since }).unwrap()
+        else {
+            panic!()
+        };
+        assert!(services.full);
         // What no VLAN is, or too much, is refused.
         let bad = GuardConfig {
             enforce: vec![4095],

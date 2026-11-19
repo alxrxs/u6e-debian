@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::msg::{Binding, Event, Guard, GuardConfig};
+use crate::msg::{Binding, Event, Guard, GuardConfig, Services};
 
 /// Where the guards listen.
 pub const SOCKET: &str = "/run/u6e-guard/sock";
@@ -21,6 +21,10 @@ pub enum Request {
     Seed(Vec<Binding>),
     /// How to run.
     Mode(GuardConfig),
+    /// What they read of mDNS: what changed since the read that answered
+    /// with `since` (the guards' start and their generation then), or the
+    /// whole table when there was none, of another start, or too old to tell.
+    Services { since: Option<(u64, u64)> },
 }
 
 /// The answer to a [`Request`].
@@ -39,6 +43,13 @@ pub enum Reply {
     /// oldest first; a gap in the numbers is what a full record dropped.
     Violations {
         events: Vec<(u64, Event)>,
+    },
+    /// The answer to [`Request::Services`]: the guards' start and the
+    /// generation this read reached, which the next asks from.
+    Services {
+        started_ms: u64,
+        generation: u64,
+        services: Services,
     },
     Done,
     Refused(String),

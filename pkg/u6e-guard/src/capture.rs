@@ -9,12 +9,14 @@
 //! From a Wi-Fi port it takes every VLAN-tagged frame (its tag in the data,
 //! or taken off by the kernel before the tap, which the socket's auxiliary
 //! data then holds), ARP, IPv4 TCP SYNs outside fragments and UDP datagrams
-//! and fragments (DHCP whole, the rest their headers), DHCPv6 from the
-//! servers' port, router advertisements, ICMPv6 whose type `tc` cannot
-//! read (type 0, or cut short) and IPv6 behind extension headers (whole: an
-//! advertisement may hide there); from an uplink port, DHCP servers'
-//! answers. The program names the ports' interface indices, so it is made
-//! again when they change.
+//! and fragments (DHCP and mDNS whole, the rest their headers), DHCPv6 from
+//! the servers' port, mDNS over IPv6 (whole), router advertisements, ICMPv6
+//! whose type `tc` cannot read (type 0, or cut short) and IPv6 behind
+//! extension headers (whole: an advertisement may hide there); from an
+//! uplink port, DHCP servers' answers and mDNS over either IP (whole). mDNS
+//! is multicast, which the NSS never offloads, so every message reaches the
+//! host bridge. The program names the ports' interface indices, so it is
+//! made again when they change.
 
 use std::io;
 use std::mem;
@@ -33,10 +35,11 @@ const PACKET_IGNORE_OUTGOING: libc::c_int = 23;
 const PACKET_AUXDATA: libc::c_int = 8;
 const TP_STATUS_VLAN_VALID: u32 = 1 << 4;
 
-/// What a frame of interest keeps: the headers alone, or a DHCP message or
-/// router advertisement whole.
+/// What a frame of interest keeps: the headers alone, or a DHCP or mDNS
+/// message or router advertisement whole.
 const SHORT: u32 = 96;
 const WHOLE: u32 = 1600;
+const MDNS: u32 = crate::mdns::PORT as u32;
 
 use Ins::{Jump, Label, Op};
 
@@ -84,6 +87,9 @@ pub fn program(ports: &[Port]) -> Vec<libc::sock_filter> {
         Op(LD | H | IND, 14),
         Jump(JMP | JEQ, 67, "whole"),
         Jump(JMP | JEQ, 68, "whole"),
+        Jump(JMP | JEQ, MDNS, "whole"),
+        Op(LD | H | IND, 16),
+        Jump(JMP | JEQ, MDNS, "whole"),
         Op(RET, SHORT),
         Label("wifi6"),
         Op(LD | B | ABS, 20),
@@ -108,10 +114,14 @@ pub fn program(ports: &[Port]) -> Vec<libc::sock_filter> {
         Label("udp6"),
         Op(LD | H | ABS, 54),
         Jump(JMP | JEQ, 547, "short"),
+        Jump(JMP | JEQ, MDNS, "whole"),
+        Op(LD | H | ABS, 56),
+        Jump(JMP | JEQ, MDNS, "whole"),
         Op(RET, 0),
         Label("uplink"),
         Op(LD | H | ABS, 12),
         Jump(JMP | JEQ, 0x0800, "uplink4"),
+        Jump(JMP | JEQ, 0x86dd, "uplink6"),
         Op(RET, 0),
         Label("uplink4"),
         Op(LD | B | ABS, 23),
@@ -123,6 +133,19 @@ pub fn program(ports: &[Port]) -> Vec<libc::sock_filter> {
         Op(LDX | B | MSH, 14),
         Op(LD | H | IND, 14),
         Jump(JMP | JEQ, 67, "whole"),
+        Jump(JMP | JEQ, MDNS, "whole"),
+        Op(LD | H | IND, 16),
+        Jump(JMP | JEQ, MDNS, "whole"),
+        Op(RET, 0),
+        Label("uplink6"),
+        Op(LD | B | ABS, 20),
+        Jump(JMP | JEQ, 17, "uplink_udp6"),
+        Op(RET, 0),
+        Label("uplink_udp6"),
+        Op(LD | H | ABS, 54),
+        Jump(JMP | JEQ, MDNS, "whole"),
+        Op(LD | H | ABS, 56),
+        Jump(JMP | JEQ, MDNS, "whole"),
         Op(RET, 0),
         Label("short"),
         Op(RET, SHORT),
@@ -312,6 +335,7 @@ mod tests {
         let ack = ipv4_frame(CLIENT, [192, 0, 2, 1], 17, &udp(67, 68, &dhcp));
         let ra = ipv6_frame(CLIENT, 58, &ra_body(0, &[]));
         let ns = ipv6_frame(CLIENT, 58, &[135, 0, 0, 0, 0, 0, 0, 0]);
+        let mdns = [0; 12];
         let cases = [
             (arp_frame(CLIENT, CLIENT, [192, 0, 2, 10], 1), [SHORT, 0]),
             (
@@ -333,6 +357,24 @@ mod tests {
             (ns, [0, 0]),
             (ipv6_frame(CLIENT, 17, &udp(547, 546, &[7])), [SHORT, 0]),
             (ipv6_frame(CLIENT, 17, &udp(546, 547, &[1])), [0, 0]),
+            // mDNS, to or from its port, over either IP.
+            (
+                ipv4_frame(CLIENT, [192, 0, 2, 10], 17, &udp(5353, 5353, &mdns)),
+                [WHOLE, WHOLE],
+            ),
+            (
+                ipv4_frame(CLIENT, [192, 0, 2, 10], 17, &udp(40_000, 5353, &mdns)),
+                [WHOLE, WHOLE],
+            ),
+            (
+                ipv6_frame(CLIENT, 17, &udp(5353, 5353, &mdns)),
+                [WHOLE, WHOLE],
+            ),
+            (
+                ipv6_frame(CLIENT, 17, &udp(5353, 40_000, &mdns)),
+                [WHOLE, WHOLE],
+            ),
+            (ipv6_frame(CLIENT, 17, &udp(5354, 40_000, &mdns)), [0, 0]),
         ];
         for (i, (pkt, [wifi, uplink])) in cases.iter().enumerate() {
             assert_eq!(run(&prog, pkt, 21), *wifi, "case {i} on a Wi-Fi port");
