@@ -17,7 +17,10 @@
 //! has acknowledged, by TCP, the bytes the agent sent after it: the uplink
 //! still carries the link. Unconfirmed within 10 s, the helper undoes it,
 //! and the same shaping is not tried again until the controller gives a
-//! new set; nor is a shaping the helper could not be asked for or refused.
+//! changed set (the same set a new session gives does not count) or the AP
+//! changes; nor is a shaping the helper could not be asked for or refused.
+//! A confirmation a session ended before expires at the next tick past its
+//! wait, between sessions too.
 //! Once a minute the helper's counters are read: a limit whose classes
 //! counted nothing while the client moved a megabyte in that direction is
 //! not enforced by the NSS, and says so.
@@ -244,10 +247,21 @@ impl Limits {
                 detail: cut(format!("refused: {why}")),
             };
         }
+        // The same set again (each session's first) does not try again a
+        // shaping that failed: only a changed set, or a changed AP, does.
+        if self.given.as_ref() != Some(&limits) {
+            self.failed = None;
+        }
         self.given = Some(limits);
-        self.failed = None;
         if let Some(snap) = last {
-            self.sync(snap, false);
+            let (spec, _) = resolve(
+                self.given.as_deref().unwrap_or_default(),
+                snap,
+                &netdevs(&self.net),
+            );
+            if self.failed.as_ref() != Some(&spec) {
+                self.sync(snap, false);
+            }
         }
         let count = |s: LimitStatus| self.states.iter().filter(|x| x.status == s).count();
         let refused = self
@@ -286,6 +300,15 @@ impl Limits {
     }
 
     fn step(&mut self, snap: &Snapshot, away: bool) {
+        // A confirmation the session ended before is expired here, as no
+        // session will look at it again.
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|p| p.since.elapsed() >= CONFIRM_WAIT)
+        {
+            self.undone();
+        }
         if self.given.is_none() || self.pending.is_some() {
             return;
         }
@@ -504,19 +527,25 @@ impl Limits {
                 other => self.note(Some(format!("the shaper's confirmation: {other:?}"))),
             }
         } else if p.since.elapsed() >= CONFIRM_WAIT {
-            self.pending = None;
-            self.failed = self.synced.take();
-            let why =
-                "undone: the controller did not hear the AP once its shaper tree was in place";
-            eprintln!("u6e-agent: rate limits: {why}");
-            for s in self
-                .states
-                .iter_mut()
-                .filter(|s| s.status == LimitStatus::Enforced)
-            {
-                s.status = LimitStatus::Refused;
-                s.detail = why.into();
-            }
+            self.undone();
+        }
+    }
+
+    /// A sync the controller did not confirm in time: the helper undoes it,
+    /// and the same shaping is not tried again until the set or the AP
+    /// changes.
+    fn undone(&mut self) {
+        self.pending = None;
+        self.failed = self.synced.take();
+        let why = "undone: the controller did not hear the AP once its shaper tree was in place";
+        eprintln!("u6e-agent: rate limits: {why}");
+        for s in self
+            .states
+            .iter_mut()
+            .filter(|s| s.status == LimitStatus::Enforced)
+        {
+            s.status = LimitStatus::Refused;
+            s.detail = why.into();
         }
     }
 }
@@ -972,8 +1001,48 @@ mod tests {
             rx.try_recv().is_err(),
             "the same shaping is not tried again"
         );
+        // A reconnect's controller gives the same set: still not.
+        l.session();
         l.command(2, set, Some(&snap()));
+        l.tick(&snap());
+        assert!(rx.try_recv().is_err(), "nor for the same set again");
+        let other = vec![limit(LimitTarget::Client(C1), None, Some(900))];
+        l.command(3, other, Some(&snap()));
         assert!(rx.recv().is_ok(), "a new set is");
+    }
+
+    #[test]
+    fn a_confirmation_the_session_left_waiting_expires_away() {
+        let t = TestDir::new();
+        let (sock, rx) = helper(&t, |req, c| {
+            if let Request::Sync(spec) = req {
+                let outcomes = spec
+                    .clients
+                    .iter()
+                    .map(|c| ok(LimitTarget::Client(c.mac)))
+                    .collect();
+                let confirm = true;
+                write_frame(c, &Reply::Synced { outcomes, confirm }).unwrap();
+            }
+        });
+        let mut l = Limits::new(sock, sysfs(&t, &DEVS));
+        let set = vec![limit(LimitTarget::Client(C1), None, Some(1_000))];
+        l.command(1, set, Some(&snap()));
+        let _ = rx.recv();
+        // The session ends before the controller acknowledged anything.
+        l.tick_away(&snap());
+        assert!(l.pending.is_some(), "it waits its time");
+        l.pending.as_mut().unwrap().since -= CONFIRM_WAIT;
+        l.tick_away(&snap());
+        assert!(l.pending.is_none());
+        assert!(l.states[0].detail.starts_with("undone"));
+        let mut roamed = snap();
+        roamed.stations[0].bss = 2;
+        l.tick_away(&roamed);
+        assert!(
+            matches!(rx.recv().unwrap(), Request::SyncAway(_)),
+            "the limits follow the AP again"
+        );
     }
 
     #[test]
