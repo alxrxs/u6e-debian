@@ -13,7 +13,9 @@
 //! link to the controller still flows through the uplink), and is undone
 //! otherwise; a sync while the agent has no controller builds no tree there.
 //! `revert`, the unit's last step whatever ended it, undoes a sync the helper
-//! died in. The state lives in /run: a reboot clears it, and the NSS with it.
+//! died in. Undoing is a rebuild: every tree and the tags are taken down and
+//! the state before is synced again from its spec (`apply::revert`). The
+//! state lives in /run: a reboot clears it, and the NSS with it.
 
 mod apply;
 mod check;

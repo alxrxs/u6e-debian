@@ -626,7 +626,8 @@ ln -sf /etc/systemd/system/u6e-guard.service $W/u6e-guard.service
 # netdev table that tags the limited clients' packets (nf_tables is loaded at
 # boot, as neither its sandbox nor u6e-capture's, whose marks need it too,
 # loads a module). A sync that built the uplink's tree waits for
-# the agent's confirmation and is undone without it; its last step undoes a
+# the agent's confirmation and is undone without it (a teardown and a
+# rebuild of the shaping before from its spec); its last step undoes a
 # sync it died in. It runs as root with CAP_NET_ADMIN alone and writes only
 # its run directory and ECM's two deceleration files; every other sandbox
 # setting is at its most restrictive but where a comment says what it needs

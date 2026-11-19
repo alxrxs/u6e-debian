@@ -624,8 +624,11 @@ pub fn teardown<H: Host>(h: &mut H) {
     }
 }
 
-/// Puts back the shaping of `prev` from nothing: what a sync that was not
-/// confirmed, or that the helper died in, did is gone whatever it was.
+/// Puts back the shaping of `prev` from nothing: every tree and the tags
+/// are taken down, then `prev`'s spec is synced as on an empty AP, so what
+/// a sync that was not confirmed, or that the helper died in, did is gone
+/// whatever it was. Every limit lapses meanwhile, not only those that sync
+/// changed, until the trees are built again.
 pub fn revert<H: Host>(h: &mut H, prev: &State) -> State {
     teardown(h);
     let from = State {
