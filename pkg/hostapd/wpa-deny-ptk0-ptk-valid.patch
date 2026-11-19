@@ -16,9 +16,9 @@ Request, the 802.1X authenticator starts, the AP disconnects it, and it
 retries the next BSS within a second while the previous entry is still
 there, so it never gets past EAP and reports "roaming too often":
 
-  wlan6: STA 20:bd:1d:c2:94:c1 IEEE 802.11: associated (aid 7)
-  wlan6: CTRL-EVENT-EAP-STARTED 20:bd:1d:c2:94:c1
-  WPA: PTK0 rekey not allowed, disconnect 20:bd:1d:c2:94:c1
+  wlan6: STA 02:00:00:00:00:01 IEEE 802.11: associated (aid 7)
+  wlan6: CTRL-EVENT-EAP-STARTED 02:00:00:00:00:01
+  WPA: PTK0 rekey not allowed, disconnect 02:00:00:00:00:01
 
 Apply the deny only when PTK_valid is set. A rekey of an installed PTK is
 still refused; a STA without one goes on to a normal 4-way handshake.
