@@ -239,10 +239,12 @@ impl Sessions {
         self.recent.entry(mac).or_default()
     }
 
-    /// What ended `session` at `at`: what came within [`CAUSE_WINDOW_MS`]
-    /// before, and in the session (a kick of an earlier one is not its).
-    fn cause(&self, mac: &[u8; 6], at: u64, session: &Session) -> End {
-        let fresh = |t: u64| t >= session.start_ms && t <= at && at - t <= CAUSE_WINDOW_MS;
+    /// What ended `session`, its end seen at `seen`: what came within
+    /// [`CAUSE_WINDOW_MS`] before, and in the session (a kick of an earlier
+    /// one is not its). A session found gone from a snapshot was last heard
+    /// before its cause came, so the window runs to when that was seen.
+    fn cause(&self, mac: &[u8; 6], seen: u64, session: &Session) -> End {
+        let fresh = |t: u64| t >= session.start_ms && t <= seen && seen - t <= CAUSE_WINDOW_MS;
         let r = self.recent.get(mac);
         match r.and_then(|r| r.action.clone()).filter(|a| fresh(a.2)) {
             Some(("kick", by, _)) => return End::Kicked { by },
@@ -545,7 +547,7 @@ impl Sessions {
             let why = if fresh {
                 End::Unobserved
             } else {
-                self.cause(&mac, at, s)
+                self.cause(&mac, at_ms, s)
             };
             self.close(mac, at, why);
         }
@@ -1443,6 +1445,28 @@ mod tests {
             Some(("host/pc1".into(), 1_900_000_000))
         );
         assert_eq!(s.identities()["host/pc1"].1, 1);
+    }
+
+    /// A client that gave up in EAP is found gone from a snapshot, the
+    /// timeout coming after it was last heard: the timeout ended it.
+    #[test]
+    fn a_timeout_after_the_client_was_last_heard_ends_its_session() {
+        let mut s = Sessions::default();
+        s.snapshot(
+            "ap1",
+            &snap(vec![station(0, 1, 0)], None),
+            &naming(),
+            T0,
+            false,
+        );
+        let timeout = EventKind::EapTimeout {
+            mac: MAC,
+            bss: 0,
+            server: false,
+        };
+        s.event("ap1", &naming(), &ev(T0 + 5000, timeout), T0 + 5000);
+        s.snapshot("ap1", &snap(Vec::new(), None), &naming(), T0 + 6000, false);
+        assert_eq!(ends(&s), [Some(End::EapTimedOut)]);
     }
 
     /// An operator's kick of an earlier session is no cause of this one's
