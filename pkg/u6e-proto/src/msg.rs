@@ -798,8 +798,9 @@ pub const CAPTURE_BYTES_MIN: u32 = 1_000_000;
 pub const CAPTURE_BYTES_MAX: u32 = 50_000_000;
 /// The shortest snaplen: an Ethernet, IPv6 and TCP header with options.
 pub const SNAPLEN_MIN: u16 = 64;
-/// The most pcapng bytes a chunk carries.
-pub const CHUNK_MAX: usize = 64 << 10;
+/// The most pcapng bytes a chunk carries: whole blocks, about 64 KiB, and
+/// one packet of the longest snaplen whatever.
+pub const CHUNK_MAX: usize = 80 << 10;
 
 /// A protocol a capture's filter keeps; ICMP is ICMP and ICMPv6.
 ///

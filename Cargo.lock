@@ -1033,6 +1033,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "u6e-capture"
+version = "1.0.0"
+dependencies = [
+ "libc",
+ "u6e-proto",
+]
+
+[[package]]
 name = "u6e-controller"
 version = "1.0.0"
 dependencies = [
