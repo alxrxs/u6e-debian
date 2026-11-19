@@ -41,10 +41,12 @@ use crate::http::{error, json_response};
 use crate::sessions::unix_ms;
 use crate::state::{Action, Shared, State};
 
-/// How long a capture's file is kept, and how much of them in all.
+/// How long a capture's file is kept, and how much of them in all: an
+/// ended capture's file at its size, a running one's at the most it may
+/// reach.
 pub const KEEP: Duration = Duration::from_secs(24 * 3600);
 pub const TOTAL_MAX: u64 = 250_000_000;
-/// The captures remembered, newest last.
+/// The captures remembered, newest last; a running one is never forgotten.
 const RECORDS_MAX: usize = 32;
 /// Past its time, how long a capture may still take to end.
 const LATE: Duration = Duration::from_secs(60);
@@ -157,8 +159,16 @@ impl Captures {
             .find(|c| c.ap == ap && c.id == id && c.running)
     }
 
+    /// What the running captures may still write, at most.
+    fn reserved(&self) -> u64 {
+        let running = self.list.iter().filter(|c| c.running);
+        running.map(|c| u64::from(c.request.max_bytes)).sum()
+    }
+
     /// A new capture on `ap` of `request` (its id set here), its empty file
-    /// made; refused while another runs there.
+    /// made, the oldest ended record forgotten if there are as many as are
+    /// kept; refused while another runs there, or when the running ones
+    /// and it could hold more than [`TOTAL_MAX`].
     pub fn start(
         &mut self,
         ap: &str,
@@ -168,6 +178,15 @@ impl Captures {
         if self.list.iter().any(|c| c.ap == ap && c.running) {
             return Err(format!("a capture runs on {ap}"));
         }
+        if self.reserved() + u64::from(request.max_bytes) > TOTAL_MAX {
+            return Err("the captures running could fill what is kept of them".into());
+        }
+        let forget = if self.list.len() < RECORDS_MAX {
+            None
+        } else {
+            let oldest_ended = self.list.iter().position(|c| !c.running);
+            Some(oldest_ended.ok_or("every capture remembered still runs")?)
+        };
         self.next_id += 1;
         request.id = self.next_id;
         let path = self
@@ -179,8 +198,7 @@ impl Captures {
             .mode(0o600)
             .open(path)
             .map_err(|e| format!("its file: {e}"))?;
-        if self.list.len() == RECORDS_MAX
-            && let Some(old) = self.list.pop_front()
+        if let Some(old) = forget.and_then(|i| self.list.remove(i))
             && let Some(p) = self.path(old.id)
         {
             let _ = fs::remove_file(p);
@@ -273,7 +291,8 @@ impl Captures {
                 gone.push(c.id);
             }
         }
-        let mut total: u64 = self.list.iter().filter(|c| c.file).map(|c| c.written).sum();
+        let kept = self.list.iter().filter(|c| c.file && !c.running);
+        let mut total: u64 = kept.map(|c| c.written).sum::<u64>() + self.reserved();
         for c in self.list.iter_mut().filter(|c| c.file && !c.running) {
             if total <= TOTAL_MAX {
                 break;
@@ -693,6 +712,39 @@ mod tests {
             })
             .collect();
         assert_eq!(c.expired(SystemTime::now()), [c.path(ids[0]).unwrap()]);
+    }
+
+    #[test]
+    fn a_running_capture_is_never_forgotten_and_holds_its_whole_size() {
+        let t = TestDir::new();
+        let mut c = Captures::open(t.path()).unwrap();
+        // The oldest record still runs when as many are kept as may be.
+        let first = c.start("ap1", None, request(600)).unwrap();
+        for _ in 1..RECORDS_MAX {
+            let r = c.start("ap2", None, request(10)).unwrap();
+            c.end("ap2", r.id, "stopped");
+        }
+        let r = c.start("ap2", None, request(10)).unwrap();
+        assert_eq!(c.list.len(), RECORDS_MAX);
+        assert!(c.get(first.id).is_some_and(|x| x.running), "it is kept");
+        assert!(c.get(first.id + 1).is_none(), "the oldest ended goes");
+        c.end("ap2", r.id, "stopped");
+
+        // An ended file goes once what a running capture may still write
+        // would take the total past the cap.
+        let mut c = Captures::open(t.path()).unwrap();
+        let done = c.start("ap1", None, request(10)).unwrap();
+        c.list.back_mut().unwrap().written = 210_000_000;
+        c.end("ap1", done.id, "stopped");
+        let mut big = request(600);
+        big.max_bytes = 50_000_000;
+        c.start("ap2", None, big.clone()).unwrap();
+        assert_eq!(c.expired(SystemTime::now()), [c.path(done.id).unwrap()]);
+        // Running captures that could hold more than the cap: no more.
+        for ap in ["ap3", "ap4", "ap5", "ap6"] {
+            c.start(ap, None, big.clone()).unwrap();
+        }
+        assert!(c.start("ap7", None, big).is_err());
     }
 
     #[test]
