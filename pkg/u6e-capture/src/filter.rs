@@ -219,15 +219,22 @@ fn body(p: &mut Vec<Ins<L>>, f: &CaptureFilter, l2: bool, keep: L) {
 }
 
 /// The program for the Wi-Fi ports `ports` (their indices): the client
-/// `mac`'s frames, once each, that `f` keeps, cut at `snaplen`.
+/// `mac`'s frames, once each, that `f` keeps, cut at `snaplen`; refused
+/// past [`MAX_PORTS`] ports, whose jumps would not reach.
 pub fn ports(
     ports: &[u32],
     mac: [u8; 6],
     f: &CaptureFilter,
     snaplen: u16,
-) -> Vec<libc::sock_filter> {
+) -> Result<Vec<libc::sock_filter>, String> {
+    if ports.len() > MAX_PORTS {
+        return Err(format!(
+            "{} Wi-Fi ports, more than a capture can read ({MAX_PORTS})",
+            ports.len()
+        ));
+    }
     let mut p = vec![Op(LD | ABS, IFINDEX)];
-    for i in ports.iter().take(MAX_PORTS) {
+    for i in ports {
         p.push(Jump(JMP | JEQ, *i, ("port", 0)));
     }
     p.extend([
@@ -242,7 +249,7 @@ pub fn ports(
     p.extend([Op(RET, 0), Label(("filter", 14))]);
     body(&mut p, f, true, ("keep", 0));
     p.extend([Label(("keep", 0)), Op(RET, u32::from(snaplen))]);
-    assemble(&p)
+    Ok(assemble(&p))
 }
 
 /// The program for the mirror netdev: the copies `f` keeps, frames or IP
@@ -350,7 +357,7 @@ pub mod tests {
 
     #[test]
     fn a_frame_is_kept_once_on_the_clients_side() {
-        let prog = ports(&[10, 11], CLIENT, &CaptureFilter::default(), 128);
+        let prog = ports(&[10, 11], CLIENT, &CaptureFilter::default(), 128).unwrap();
         let up = eth(OTHER, CLIENT, 0x0800, &ipv4(6, A, B, &ports_l4(5000, 443)));
         let down = eth(CLIENT, OTHER, 0x0800, &ipv4(6, B, A, &ports_l4(443, 5000)));
         assert_eq!(run(&prog, &up, incoming(10)), 128);
@@ -365,6 +372,17 @@ pub mod tests {
         // A MAC that matches in its first four bytes only.
         let near = eth(OTHER, [0x64, 0, 0, 0, 9, 9], 0x0806, &arp(A, B));
         assert_eq!(run(&prog, &near, incoming(10)), 0);
+    }
+
+    #[test]
+    fn a_program_names_at_most_max_ports_and_reaches_the_last() {
+        let all: Vec<u32> = (1..=MAX_PORTS as u32).collect();
+        let prog = ports(&all, CLIENT, &CaptureFilter::default(), 128).unwrap();
+        let up = eth(OTHER, CLIENT, 0x0800, &ipv4(6, A, B, &ports_l4(5000, 443)));
+        assert_eq!(run(&prog, &up, incoming(MAX_PORTS as u32)), 128);
+        let more: Vec<u32> = (1..=MAX_PORTS as u32 + 1).collect();
+        let e = ports(&more, CLIENT, &CaptureFilter::default(), 128).unwrap_err();
+        assert!(e.starts_with("129 Wi-Fi ports"), "{e}");
     }
 
     #[test]
@@ -429,7 +447,7 @@ pub mod tests {
             (filter(Some(FilterProto::Tcp), Some(80), v4a), [false; 6]),
         ];
         for (i, (f, want)) in cases.iter().enumerate() {
-            let prog = ports(&[10], CLIENT, f, 96);
+            let prog = ports(&[10], CLIENT, f, 96).unwrap();
             for (j, pkt) in all.iter().enumerate() {
                 let kept = run(&prog, pkt, incoming(10));
                 assert_eq!(kept == 96, want[j], "filter {i} ({f:?}), packet {j}");
@@ -444,7 +462,7 @@ pub mod tests {
         frag[6] = 0x00;
         frag[7] = 0x10;
         let pkt = eth(OTHER, CLIENT, 0x0800, &frag);
-        let prog = ports(&[10], CLIENT, &filter(None, Some(53), None), 64);
+        let prog = ports(&[10], CLIENT, &filter(None, Some(53), None), 64).unwrap();
         assert_eq!(run(&prog, &pkt, incoming(10)), 0);
         // The first fragment carries them.
         let mut first = ipv4(17, A, B, &ports_l4(5353, 53));

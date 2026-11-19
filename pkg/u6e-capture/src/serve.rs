@@ -309,12 +309,9 @@ impl Capture {
             .collect();
         if now != self.names {
             let idx: Vec<u32> = now.keys().copied().collect();
-            self.ports.filter(&filter::ports(
-                &idx,
-                self.req.mac,
-                &self.req.filter,
-                self.req.snaplen,
-            ))?;
+            let prog = filter::ports(&idx, self.req.mac, &self.req.filter, self.req.snaplen)
+                .map_err(io::Error::other)?;
+            self.ports.filter(&prog)?;
             self.names = now;
         }
         Ok(())

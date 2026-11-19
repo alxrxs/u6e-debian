@@ -45,14 +45,15 @@ pub enum Ins<L> {
 }
 
 /// Resolves the labels of `prog` into relative jumps. A jump goes forward,
-/// at most 255 instructions; a label jumped to must exist.
+/// at most 255 instructions; a label jumped to must exist, and each label
+/// is placed once (a second would silently move the jumps to it).
 pub fn assemble<L: Eq + Hash + Clone + Debug>(prog: &[Ins<L>]) -> Vec<libc::sock_filter> {
     let mut at = HashMap::new();
     let mut n = 0;
     for i in prog {
         match i {
             Ins::Label(l) => {
-                at.insert(l.clone(), n);
+                assert!(at.insert(l.clone(), n).is_none(), "label {l:?} twice");
             }
             _ => n += 1,
         }
@@ -179,5 +180,17 @@ mod tests {
         };
         assert_eq!(run(&prog, &[], out), 99);
         assert_eq!(run(&prog, &[], Meta::default()), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "label \"a\" twice")]
+    fn a_label_placed_twice_is_refused() {
+        assemble::<&str>(&[
+            Jump(JMP | JEQ, 7, "a"),
+            Label("a"),
+            Op(RET, 1),
+            Label("a"),
+            Op(RET, 2),
+        ]);
     }
 }
