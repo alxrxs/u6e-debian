@@ -27,9 +27,9 @@ use crate::msg::{
     AgentMsg, Band, Binding, Bss, CaptureChunk, CaptureFilter, CaptureMechanism, CaptureRequest,
     CaptureState, ClientFlows, Command, CommandKind, CommandResult, ConfigApplied, CtlMsg, Event,
     EventKind, FieldDelta, FilterProto, Flow, Flows, Guard, GuardConfig, Hello, Limit, LimitState,
-    LimitStatus, LimitTarget, Mechanism, PowerLimit, Radio, RadioApplied, RadioConfig, Rate,
-    RateMode, RecDelta, SignedConfig, Snapshot, SnapshotDelta, SpectrumFrame, Station, StationAuth,
-    Temp, Violation,
+    LimitStatus, LimitTarget, MdnsDevice, MdnsKey, MdnsOffer, MdnsQuery, Mechanism, PowerLimit,
+    Radio, RadioApplied, RadioConfig, Rate, RateMode, RecDelta, Services, SignedConfig, Snapshot,
+    SnapshotDelta, SpectrumFrame, Station, StationAuth, Temp, Violation,
 };
 
 const HOW: &str = "bump u6e_proto::PROTOCOL (pkg/u6e-proto/src/version.rs) and write the \
@@ -398,6 +398,7 @@ fn samples() -> Samples {
         };
         agent.push((name, AgentMsg::Capture(state)));
     }
+    agent.push(("Services", AgentMsg::Services(services())));
     let mut ctl = vec![
         ("SetTick", CtlMsg::SetTick { secs: 300 }),
         ("WantKey", CtlMsg::WantKey),
@@ -550,6 +551,67 @@ fn flows() -> Flows {
     }
 }
 
+fn services() -> Services {
+    let mac = [0x02, 0, 0, 0, 0, 0xc1];
+    let other = [0x02, 0, 0, 0, 0, 0xc2];
+    Services {
+        full: true,
+        now_ms: (1 << 40) + 1,
+        devices: vec![MdnsDevice {
+            mac,
+            port: "wlan5.300".into(),
+            vlan: 300,
+            wifi: true,
+            host: "Device-1.local".into(),
+            addrs: vec![
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 200)),
+                IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0xc1)),
+            ],
+            first_ms: 1 << 33,
+            last_ms: (1 << 33) + 1,
+            queries: 70_016,
+            responses: 70_017,
+        }],
+        offers: vec![MdnsOffer {
+            mac,
+            instance: "Device 1._airplay._tcp.local".into(),
+            service: "_airplay._tcp.local".into(),
+            target: "Device-1.local".into(),
+            port: 60_003,
+            txt: vec![("model".into(), "Model1,1".into())],
+            ttl_s: 70_018,
+            announced_ms: (1 << 33) + 2,
+            goodbye: true,
+            answered: 70_019,
+            missed: 70_020,
+            missed_in_row: 300,
+            answered_ms: Some((1 << 33) + 3),
+            missed_ms: None,
+            missed_by: Some(other),
+        }],
+        queries: vec![MdnsQuery {
+            mac: other,
+            name: "_airplay._tcp.local".into(),
+            qtype: 300,
+            unicast: true,
+            count: 70_021,
+            last_ms: (1 << 33) + 4,
+            answered_by: vec![mac],
+            missed_by: vec![mac, other],
+            known: vec![],
+            unanswered: 70_022,
+        }],
+        gone: vec![
+            MdnsKey::Device(other),
+            MdnsKey::Offer(other, "Device 2._raop._tcp.local".into()),
+            MdnsKey::Query(other, "_raop._tcp.local".into(), 300),
+        ],
+        packets: (1 << 33) + 5,
+        malformed: 70_023,
+        evicted: 70_024,
+    }
+}
+
 /// The golden text: one `<name> <hex>` line per message, then the hash of
 /// the sample configuration and the bytes the controller signs for it, which
 /// every end must compute alike too.
@@ -586,8 +648,10 @@ fn every_variant_has_an_instance() {
     let mut mechanisms = Vec::new();
     let mut guards = Vec::new();
     let (mut targets, mut statuses, mut captures) = (Vec::new(), Vec::new(), Vec::new());
+    let mut keys = Vec::new();
     for m in &agent {
         match m {
+            AgentMsg::Services(s) => keys.extend(s.gone.iter().cloned()),
             AgentMsg::Limits(l) => {
                 targets.extend(l.iter().map(|s| s.target.clone()));
                 statuses.extend(l.iter().map(|s| s.status));
@@ -638,6 +702,7 @@ fn every_variant_has_an_instance() {
     assert_every_variant("LimitStatus", &statuses);
     assert_every_variant("CaptureMechanism", &captures);
     assert_every_variant("FilterProto", &protos);
+    assert_every_variant("MdnsKey", &keys);
 }
 
 #[test]

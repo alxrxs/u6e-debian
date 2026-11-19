@@ -54,6 +54,10 @@ pub enum AgentMsg {
     /// has written: the answer to [`CtlMsg::CaptureStart`], and its end,
     /// however it ended.
     Capture(CaptureState),
+    /// What the client guards read of mDNS: whole at the start of each
+    /// session and after the guards restarted, then what changed, at most
+    /// every tick.
+    Services(Services),
 }
 
 /// Everything the controller sends.
@@ -910,6 +914,126 @@ pub struct CaptureState {
     pub dropped: u64,
     /// Why it started, was refused or ended.
     pub reason: String,
+}
+
+/// The most devices, offers and queries an AP's mDNS table holds
+/// (`u6e-guard`), which the controller holds of each AP too.
+pub const MDNS_DEVICES: usize = 96;
+pub const MDNS_OFFERS: usize = 256;
+pub const MDNS_QUERIES: usize = 256;
+/// The most devices each of a query's lists names, and the most addresses
+/// kept of a device.
+pub const MDNS_LISTED: usize = 8;
+pub const MDNS_ADDRS: usize = 4;
+
+/// What the AP's client guards read of the mDNS its bridges carry: the
+/// devices heard, the services they offer and the queries they send, each
+/// whole as it stands. `full` replaces what the controller holds of the AP;
+/// otherwise these are the entries that changed, and those `gone`, since the
+/// last. Times are milliseconds of the AP's boot clock and `now_ms` is the
+/// read's, so the controller times them on its own clock.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Services {
+    pub full: bool,
+    pub now_ms: u64,
+    pub devices: Vec<MdnsDevice>,
+    pub offers: Vec<MdnsOffer>,
+    pub queries: Vec<MdnsQuery>,
+    pub gone: Vec<MdnsKey>,
+    /// Since the guards started: the mDNS messages read, those that did not
+    /// read whole, and the entries dropped for room.
+    pub packets: u64,
+    pub malformed: u64,
+    pub evicted: u64,
+}
+
+/// A device heard sending mDNS, by its source MAC.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MdnsDevice {
+    pub mac: [u8; 6],
+    /// The bridge port it was last heard on and that port's VLAN; `wifi`
+    /// when the port is a BSS or a client's per-VLAN interface, else it came
+    /// over the uplink.
+    pub port: String,
+    pub vlan: u16,
+    pub wifi: bool,
+    /// The host name its address records name, and the addresses they give
+    /// (the newest [`MDNS_ADDRS`]).
+    pub host: String,
+    pub addrs: Vec<IpAddr>,
+    pub first_ms: u64,
+    pub last_ms: u64,
+    /// The queries and the responses it sent, each copy (IPv4, IPv6) one.
+    pub queries: u32,
+    pub responses: u32,
+}
+
+/// A service instance a device advertises.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MdnsOffer {
+    pub mac: [u8; 6],
+    /// The instance (`Living Room._airplay._tcp.local`), its service type
+    /// (`_airplay._tcp.local`), the host and port its SRV record names and
+    /// the TXT keys `model`, `md`, `gid`, `igl` and `gpn` it carries.
+    pub instance: String,
+    pub service: String,
+    pub target: String,
+    pub port: u16,
+    pub txt: Vec<(String, String)>,
+    /// The TTL of its last announcement or answer, and when that came; a
+    /// goodbye (TTL 0) withdrew it.
+    pub ttl_s: u32,
+    pub announced_ms: u64,
+    pub goodbye: bool,
+    /// The queries for it it answered within a second and those it missed
+    /// (neither answered nor listed as known by the asker), the misses since
+    /// its last answer, when it last answered and last missed, and who
+    /// sent the query it missed last.
+    pub answered: u32,
+    pub missed: u32,
+    pub missed_in_row: u16,
+    pub answered_ms: Option<u64>,
+    pub missed_ms: Option<u64>,
+    pub missed_by: Option<[u8; 6]>,
+}
+
+/// The queries one device sends for one name and type.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MdnsQuery {
+    pub mac: [u8; 6],
+    pub name: String,
+    pub qtype: u16,
+    /// Its last asked for a unicast answer (the QU bit), which may never
+    /// reach the host: no miss is counted against such a query.
+    pub unicast: bool,
+    pub count: u32,
+    pub last_ms: u64,
+    /// Of its last query: the devices whose offers answered it, those whose
+    /// live offers did not, and those whose offers it listed as known
+    /// answers, at most [`MDNS_LISTED`] each.
+    pub answered_by: Vec<[u8; 6]>,
+    pub missed_by: Vec<[u8; 6]>,
+    pub known: Vec<[u8; 6]>,
+    /// Its queries that listed no known answer and that nothing answered.
+    pub unanswered: u32,
+}
+
+/// What names an entry of [`Services`].
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum MdnsKey {
+    Device([u8; 6]),
+    Offer([u8; 6], String),
+    Query([u8; 6], String, u16),
 }
 
 /// The radios' stable names, as their wiphys are named on the AP: the only
