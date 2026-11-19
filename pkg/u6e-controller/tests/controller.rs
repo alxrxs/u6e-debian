@@ -38,9 +38,9 @@ use u6e_proto::config::{self, config_sha256};
 use u6e_proto::frame::{decode_frame, frame_body, write_frame};
 use u6e_proto::msg::{
     AgentMsg, Band, Binding, Bss, ClientFlows, CommandKind, CommandResult, ConfigApplied, CtlMsg,
-    Event, EventKind, FieldDelta, Flow, Flows, Guard, GuardConfig, Hello, Mechanism, Radio,
-    RadioApplied, RadioConfig, RateMode, SignedConfig, Snapshot, SnapshotDelta, SpectrumFrame,
-    Station, Temp, Violation,
+    Event, EventKind, FieldDelta, Flow, Flows, Guard, GuardConfig, Hello, MdnsDevice, MdnsOffer,
+    MdnsQuery, Mechanism, Radio, RadioApplied, RadioConfig, RateMode, Services, SignedConfig,
+    Snapshot, SnapshotDelta, SpectrumFrame, Station, Temp, Violation,
 };
 use u6e_proto::tls::{self, Identity};
 use u6e_proto::{mac, version};
@@ -4855,4 +4855,124 @@ fn without_loki_the_radius_side_is_left_out() {
     // No verdict read yet: no time of one, which an alert could take for
     // the epoch.
     assert!(metrics_of(&r, "wifi_radius_last_verdict_timestamp_seconds ").is_empty());
+}
+
+/// What a pair's AP reads of mDNS, its boot clock at 1 000 000: the phone
+/// browses for AirPlay, the left answers, the right has missed the last
+/// `missed` browses.
+fn pair_read(full: bool, missed: u16) -> Services {
+    const LEFT: [u8; 6] = [2, 0, 0, 0, 0, 0x0a];
+    const RIGHT: [u8; 6] = [2, 0, 0, 0, 0, 0x0b];
+    let device = |mac| MdnsDevice {
+        mac,
+        port: "wlan5.42".into(),
+        vlan: 42,
+        wifi: true,
+        host: String::new(),
+        addrs: Vec::new(),
+        first_ms: 0,
+        last_ms: 1_000_000,
+        queries: 1,
+        responses: 1,
+    };
+    let offer = |mac, label: &str, leader: &str, missed_in_row: u16| MdnsOffer {
+        mac,
+        instance: format!("{label}._airplay._tcp.local"),
+        service: "_airplay._tcp.local".into(),
+        target: format!("{label}.local"),
+        port: 7000,
+        txt: vec![("gid".into(), "G1".into()), ("igl".into(), leader.into())],
+        ttl_s: 4500,
+        announced_ms: 990_000,
+        goodbye: false,
+        answered: 1,
+        missed: u32::from(missed_in_row),
+        missed_in_row,
+        answered_ms: Some(990_000),
+        missed_ms: (missed_in_row > 0).then_some(999_000),
+        missed_by: (missed_in_row > 0).then_some(MAC),
+    };
+    Services {
+        full,
+        now_ms: 1_000_000,
+        devices: vec![device(MAC), device(LEFT), device(RIGHT)],
+        offers: vec![
+            offer(LEFT, "Left", "1", 0),
+            offer(RIGHT, "Right", "0", missed),
+        ],
+        queries: vec![MdnsQuery {
+            mac: MAC,
+            name: "_airplay._tcp.local".into(),
+            qtype: 12,
+            unicast: false,
+            count: 4,
+            last_ms: 999_000,
+            answered_by: vec![LEFT],
+            missed_by: if missed > 0 { vec![RIGHT] } else { vec![] },
+            known: vec![],
+            unanswered: 0,
+        }],
+        packets: 12,
+        ..Services::default()
+    }
+}
+
+/// What an AP reads of mDNS reaches the API, the metrics and the events:
+/// a stereo pair whose right speaker stops answering the phone's browses.
+#[test]
+fn services_reach_the_api_the_metrics_and_the_events() {
+    const PHONE: &str = "02:00:00:00:00:01";
+    let r = controller(Timing::default());
+    let mut a = Agent::hello(r.c.agents, KEY_AP1, "ap1");
+    let s = snapshot(1, vec![bss("wlan5", "Guest")], vec![station(MAC, 0, -54)]);
+    a.send(&AgentMsg::Key(s)).unwrap();
+    a.send(&AgentMsg::Services(pair_read(true, 0))).unwrap();
+    a.send(&AgentMsg::Services(pair_read(false, 3))).unwrap();
+    wait_for("the change", || r.c.state.read().services.events.len() == 1);
+
+    let v = json_get(r.c.http, "/api/services");
+    assert_eq!(v["devices"].as_array().unwrap().len(), 3);
+    let phone = &v["devices"][0];
+    assert_eq!(
+        (phone["mac"].as_str(), phone["band"].as_str()),
+        (Some(PHONE), Some("5"))
+    );
+    assert_eq!(phone["queries"][0]["missed_by"][0], "02:00:00:00:00:0b");
+    let group = &v["groups"][0]["members"];
+    assert_eq!(
+        (group[0]["label"].as_str(), group[0]["leader"].as_bool()),
+        (Some("Left"), Some(true))
+    );
+    assert_eq!(v["devices"][2]["offers"][0]["status"], "silent");
+    let one = json_get(r.c.http, "/api/services?device=02:00:00:00:00:0b");
+    assert_eq!(one["devices"].as_array().unwrap().len(), 2);
+    let see = json_get(
+        r.c.http,
+        &format!("/api/services/see?from={PHONE}&to=02:00:00:00:00:0b"),
+    );
+    assert_eq!(see["verdicts"][0]["outcome"], "missed");
+    let (head, _) = http_request(r.c.http, "/api/services/see?from=x&to=y", "");
+    assert!(head.starts_with("http/1.1 400"), "{head}");
+
+    let events = json_get(r.c.http, "/api/events");
+    let change = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "service")
+        .unwrap();
+    assert_eq!(
+        (change["change"].as_str(), change["by"].as_str()),
+        (Some("silent"), Some(PHONE))
+    );
+    let body = http_get(r.c.metrics, "/metrics");
+    for line in [
+        "wifi_mdns_devices{ap=\"ap1\"} 3",
+        "wifi_mdns_offers{ap=\"ap1\"} 2",
+        "wifi_mdns_offers_silent{ap=\"ap1\"} 1",
+        "wifi_mdns_packets_total{ap=\"ap1\"} 12",
+    ] {
+        assert!(body.lines().any(|l| l == line), "missing {line}\n{body}");
+    }
+    assert!(promtool_accepts(&body));
 }

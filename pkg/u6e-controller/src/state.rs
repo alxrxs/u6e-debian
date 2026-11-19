@@ -51,6 +51,7 @@ use crate::oui;
 use crate::policy::{ApImages, Blocked, ConfigId, Hold, Phase, Policy, SavedRollout};
 use crate::radius::{self, Line};
 use crate::rf::history::{self, History};
+use crate::services::{self, Services};
 use crate::sessions::{self, Sessions};
 use crate::spectrum::{self, Limits, Scan, Stopped};
 
@@ -107,6 +108,8 @@ pub enum Change {
     Limits,
     /// A capture started, moved on or ended, or its file went.
     Captures,
+    /// A service a device offers over mDNS changed.
+    Service(services::Event),
 }
 
 /// One action on one AP (or on none, when no AP was connected to carry a
@@ -614,6 +617,8 @@ pub struct State {
     pub site_limits: BTreeMap<String, Rate>,
     /// The client captures.
     pub captures: Captures,
+    /// What the APs read of mDNS.
+    pub services: Services,
 }
 
 impl State {
@@ -651,6 +656,7 @@ impl State {
             limits: RateLimits::default(),
             site_limits: BTreeMap::new(),
             captures: Captures::default(),
+            services: Services::default(),
         }
     }
 
@@ -964,6 +970,7 @@ impl State {
     fn session_ended(&mut self, ap: &str, radios: Vec<String>) {
         self.drop_pending(ap);
         self.scans_ended(ap, radios);
+        self.services.drop_ap(ap);
         let running = self
             .captures
             .list
@@ -1115,6 +1122,11 @@ impl State {
                     captures::record(self, &c, c.ended_well());
                 }
                 Some(Change::Captures)
+            }
+            AgentMsg::Services(s) => {
+                let changed = self.services.apply(ap, s, sessions::unix_ms(now));
+                self.service_events(changed);
+                None
             }
             // A Pong only proves the agent is alive.
             _ => None,
@@ -1931,6 +1943,24 @@ impl State {
         }
     }
 
+    /// Looks at the services again at `now`: a TTL that ran out is a change
+    /// no message brings.
+    pub fn services_tick(&mut self, now: SystemTime) {
+        let changed = self.services.watch(sessions::unix_ms(now));
+        self.service_events(changed);
+    }
+
+    /// Tells the UI of each change of a service, and the timeline of a
+    /// client's.
+    fn service_events(&mut self, changed: Vec<services::Event>) {
+        for e in changed {
+            if e.wifi {
+                self.sessions.service(&e);
+            }
+            self.notify(Change::Service(e));
+        }
+    }
+
     /// Drops what the sessions keep past its time, at `now`.
     pub fn sessions_tick(&mut self, now: SystemTime) {
         let aps = &self.aps;
@@ -2488,5 +2518,71 @@ mod tests {
             CtlMsg::WantFlows { full: true }
         );
         assert_eq!(s.want_full("ap9", at(60)).err(), Some(Full::NotConnected));
+    }
+
+    #[test]
+    fn a_service_change_reaches_the_ui_and_the_clients_timeline() {
+        use u6e_proto::msg::{MdnsDevice, MdnsOffer, Services as Read};
+        let mut s = state(&["ap1"]);
+        let id = s.connect("ap1", hello("ap1")).unwrap().id;
+        let mut rx = s.subscribe();
+        let speaker = [2, 0, 0, 0, 0, 2];
+        let offer = |missed_in_row| MdnsOffer {
+            mac: speaker,
+            instance: "Right._airplay._tcp.local".into(),
+            service: "_airplay._tcp.local".into(),
+            target: "Right.local".into(),
+            port: 7000,
+            txt: Vec::new(),
+            ttl_s: 4500,
+            announced_ms: 1000,
+            goodbye: false,
+            answered: 0,
+            missed: u32::from(missed_in_row),
+            missed_in_row,
+            answered_ms: None,
+            missed_ms: Some(1000),
+            missed_by: Some([2, 0, 0, 0, 0, 1]),
+        };
+        let device = MdnsDevice {
+            mac: speaker,
+            port: "wlan5.42".into(),
+            vlan: 42,
+            wifi: true,
+            host: "Right.local".into(),
+            addrs: Vec::new(),
+            first_ms: 0,
+            last_ms: 1000,
+            queries: 0,
+            responses: 1,
+        };
+        let read = |full, missed_in_row| Read {
+            full,
+            now_ms: 1000,
+            devices: vec![device.clone()],
+            offers: vec![offer(missed_in_row)],
+            ..Read::default()
+        };
+        s.apply("ap1", id, AgentMsg::Services(read(true, 0)))
+            .unwrap();
+        s.apply("ap1", id, AgentMsg::Services(read(false, 3)))
+            .unwrap();
+        let got: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let [Change::Service(e)] = &got[..] else {
+            panic!("{got:?}")
+        };
+        assert_eq!(
+            (e.mac, e.change),
+            (speaker, crate::timeline::ServiceChange::Silent)
+        );
+        let entries: Vec<_> = s.sessions.timeline.of(&speaker).collect();
+        assert!(
+            matches!(&entries[..], [e] if matches!(e.what, crate::timeline::What::Service { .. }))
+        );
+        let events = crate::view::events(&s, None, false);
+        assert_eq!(events.last().unwrap()["change"], "silent");
+        // The session's end takes the AP's table; a new one starts afresh.
+        s.disconnect("ap1", id);
+        assert!(s.services.ap("ap1").is_none());
     }
 }

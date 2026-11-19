@@ -1,8 +1,9 @@
 //! Each client's history as one ordered list: what it went through on the
 //! Wi-Fi (associations and roams, EAP's steps, a passphrase that did not
 //! match, disconnects), what RADIUS answered for it, its DHCP leases being
-//! granted and renewed, its first traffic, the operators' actions on it and
-//! the client guards' reports. Every entry is whole on its own (where, who,
+//! granted and renewed, its first traffic, the operators' actions on it,
+//! the client guards' reports and the changes of the services it offers
+//! over mDNS. Every entry is whole on its own (where, who,
 //! how long), so it reads the same once the session it belongs to is gone.
 //!
 //! Bounded: a client's entries are kept for [`KEEP`], at most [`PER_CLIENT`]
@@ -161,6 +162,29 @@ pub enum What {
         dropped: bool,
         repeats: u32,
     },
+    /// A service it offers over mDNS changed (`services`): `by` the device
+    /// whose query it missed last, `misses` its misses in a row, `silent_ms`
+    /// how long it had missed every query before it answered again.
+    Service {
+        ap: String,
+        instance: String,
+        service: String,
+        change: ServiceChange,
+        by: Option<[u8; 6]>,
+        misses: u16,
+        silent_ms: Option<u64>,
+    },
+}
+
+/// What changed of a service a device offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ServiceChange {
+    /// It said goodbye, or its TTL ran out.
+    Gone,
+    Back,
+    /// It missed [`crate::services::SILENT_AFTER`] queries in a row.
+    Silent,
+    Answering,
 }
 
 /// Every client's entries, each client's sorted by time.

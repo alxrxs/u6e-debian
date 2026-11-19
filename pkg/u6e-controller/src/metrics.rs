@@ -21,7 +21,10 @@
 //! certificates the sessions keep, as many), its expiry; the RADIUS log's
 //! reads and its newest verdict exist only when it is read. The rate limits
 //! are counted per connected AP by how they stand there, every state always
-//! exported, and an AP whose offload a capture holds back says so.
+//! exported, and an AP whose offload a capture holds back says so. What an
+//! AP's client guards read of mDNS is counted per AP alone (its devices,
+//! offers, offers not answering, messages read, unreadable and evicted),
+//! never per device or service.
 
 use std::collections::BTreeSet;
 use std::fmt::Write;
@@ -37,7 +40,9 @@ use u6e_proto::mac;
 use u6e_proto::msg::{LimitStatus, Radio, Snapshot, Station};
 
 use crate::limits::status_name;
+use crate::services::Table;
 use crate::sessions::Totals;
+use crate::sessions::unix_ms;
 use crate::spectrum::{RADIOS, Scan};
 use crate::state::{Ap, OUTCOMES, Shared, State, is_failure};
 use crate::view::{band, guard_name};
@@ -456,6 +461,7 @@ pub fn render(state: &State) -> String {
     not_as_planned(&mut m, state);
     leases(&mut m, state);
     guards(&mut m, &aps);
+    services(&mut m, state);
     identities(&mut m, state);
     radius_log(&mut m, state);
     m.family(
@@ -571,6 +577,54 @@ fn guards(m: &mut Text, aps: &[(&str, &Ap)]) {
             m.sample(&labels, *n as f64);
         }
     }
+}
+
+/// What each AP's client guards read of mDNS.
+fn services(m: &mut Text, state: &State) {
+    let now = unix_ms(SystemTime::now());
+    let tables: Vec<(&str, &Table)> = state.services.aps().collect();
+    let mut per_ap = |name, kind, help, of: &dyn Fn(&Table) -> usize| {
+        m.family(name, kind, help);
+        for &(ap, t) in &tables {
+            m.sample(&[("ap", ap)], of(t) as f64);
+        }
+    };
+    per_ap(
+        "wifi_mdns_devices",
+        GAUGE,
+        "Devices the AP's client guards heard send mDNS.",
+        &|t| t.devices.len(),
+    );
+    per_ap(
+        "wifi_mdns_offers",
+        GAUGE,
+        "Services those devices offer over mDNS.",
+        &|t| t.offers.len(),
+    );
+    per_ap(
+        "wifi_mdns_offers_silent",
+        GAUGE,
+        "Live mDNS services whose device missed the last three queries for them or more.",
+        &|t| t.silent(now),
+    );
+    per_ap(
+        "wifi_mdns_packets_total",
+        COUNTER,
+        "mDNS messages the AP's client guards read, since they started.",
+        &|t| t.packets as usize,
+    );
+    per_ap(
+        "wifi_mdns_malformed_total",
+        COUNTER,
+        "mDNS messages that did not read whole, since the guards started.",
+        &|t| t.malformed as usize,
+    );
+    per_ap(
+        "wifi_mdns_evicted_total",
+        COUNTER,
+        "mDNS table entries dropped for room, since the guards started.",
+        &|t| t.evicted as usize,
+    );
 }
 
 /// Each identity's sessions, bytes, clients and client certificate.

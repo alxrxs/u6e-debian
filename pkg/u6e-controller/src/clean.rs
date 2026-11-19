@@ -1,10 +1,10 @@
 //! What an agent sends that a person reads (its image's manifest, SSIDs,
 //! interface and radio names, identities, guards' details, hostapd's
-//! answers), cleaned of control and Unicode format characters
+//! answers, the names mDNS carries), cleaned of control and Unicode format characters
 //! (`u6e_proto::text`) before it reaches the state, so no AP, and no client
 //! through one, can reorder or hide text in the UI.
 
-use u6e_proto::msg::{AgentMsg, Bss, EventKind, Hello, Snapshot, StationAuth};
+use u6e_proto::msg::{AgentMsg, Bss, EventKind, Hello, MdnsKey, Services, Snapshot, StationAuth};
 use u6e_proto::text::{clean_in_place as clean, clean_lines};
 
 /// Cleans every string of `msg` a person reads.
@@ -33,7 +33,32 @@ pub fn agent_msg(msg: &mut AgentMsg) {
             clean(reason);
         }
         AgentMsg::ConfigApplied(c) => clean(&mut c.detail),
+        AgentMsg::Services(s) => services(s),
         _ => {}
+    }
+}
+
+/// Cleans the names a read of mDNS carries.
+fn services(s: &mut Services) {
+    for d in &mut s.devices {
+        clean(&mut d.port);
+        clean(&mut d.host);
+    }
+    for o in &mut s.offers {
+        for t in [&mut o.instance, &mut o.service, &mut o.target] {
+            clean(t);
+        }
+        for (k, v) in &mut o.txt {
+            clean(k);
+            clean(v);
+        }
+    }
+    s.queries.iter_mut().for_each(|q| clean(&mut q.name));
+    for k in &mut s.gone {
+        match k {
+            MdnsKey::Offer(_, name) | MdnsKey::Query(_, name, _) => clean(name),
+            MdnsKey::Device(_) => {}
+        }
     }
 }
 
@@ -66,6 +91,76 @@ fn auth(a: &mut StationAuth) {
 mod tests {
     use super::*;
     use u6e_proto::msg::{Event, Guard, Violation};
+
+    #[test]
+    fn the_names_mdns_carries_are_cleaned() {
+        use u6e_proto::msg::{MdnsDevice, MdnsOffer, MdnsQuery};
+        let dirty = || "Living\u{202e} Room\u{7}".to_owned();
+        let mut msg = AgentMsg::Services(Services {
+            devices: vec![MdnsDevice {
+                mac: [2, 0, 0, 0, 0, 1],
+                port: dirty(),
+                vlan: 1,
+                wifi: true,
+                host: dirty(),
+                addrs: vec![],
+                first_ms: 0,
+                last_ms: 0,
+                queries: 0,
+                responses: 0,
+            }],
+            offers: vec![MdnsOffer {
+                mac: [2, 0, 0, 0, 0, 1],
+                instance: dirty(),
+                service: dirty(),
+                target: dirty(),
+                port: 1,
+                txt: vec![(dirty(), dirty())],
+                ttl_s: 1,
+                announced_ms: 0,
+                goodbye: false,
+                answered: 0,
+                missed: 0,
+                missed_in_row: 0,
+                answered_ms: None,
+                missed_ms: None,
+                missed_by: None,
+            }],
+            queries: vec![MdnsQuery {
+                mac: [2, 0, 0, 0, 0, 1],
+                name: dirty(),
+                qtype: 12,
+                unicast: false,
+                count: 1,
+                last_ms: 0,
+                answered_by: vec![],
+                missed_by: vec![],
+                known: vec![],
+                unanswered: 0,
+            }],
+            gone: vec![MdnsKey::Offer([2, 0, 0, 0, 0, 1], dirty())],
+            ..Services::default()
+        });
+        agent_msg(&mut msg);
+        let AgentMsg::Services(s) = msg else { panic!() };
+        let d = &s.devices[0];
+        let o = &s.offers[0];
+        let all = [
+            &d.port,
+            &d.host,
+            &o.instance,
+            &o.service,
+            &o.target,
+            &o.txt[0].0,
+            &o.txt[0].1,
+            &s.queries[0].name,
+        ];
+        assert!(all.iter().all(|t| *t == "Living Room"), "{all:?}");
+        assert_eq!(
+            s.gone,
+            [MdnsKey::Offer([2, 0, 0, 0, 0, 1], "Living Room".into())]
+        );
+    }
 
     #[test]
     fn what_a_person_reads_is_cleaned() {

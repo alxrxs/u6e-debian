@@ -3,8 +3,9 @@
 //! agents' events (associations, disassociations, EAP's steps) and
 //! snapshots (who is associated, how each authenticated, their bytes), the
 //! flows (first traffic), the leases (grants and renewals, seen at the next
-//! read of the leases), RADIUS's verdicts (`radius`), the operators' actions
-//! and the client guards' reports.
+//! read of the leases), RADIUS's verdicts (`radius`), the operators' actions,
+//! the client guards' reports and the changes of the services a client
+//! offers over mDNS (`services`).
 //!
 //! A session ends with a reason. An association with another BSS while one
 //! is open, or within [`ROAM_WINDOW_MS`] of one ending elsewhere, is a roam,
@@ -676,6 +677,20 @@ impl Sessions {
         self.push(mac, at, what);
     }
 
+    /// Takes a change of a service a client offers.
+    pub fn service(&mut self, e: &crate::services::Event) {
+        let what = What::Service {
+            ap: e.ap.clone(),
+            instance: e.instance.clone(),
+            service: e.service.clone(),
+            change: e.change,
+            by: e.by,
+            misses: e.misses,
+            silent_ms: e.silent_ms,
+        };
+        self.push(e.mac, e.at_ms, what);
+    }
+
     /// Takes a read of the leases at `now_ms`: a lease new since the last
     /// read, or with a later expiry, is granted or renewed then, for the
     /// clients the Wi-Fi knows. The first read only sets what is known.
@@ -1080,6 +1095,7 @@ mod tests {
             What::FirstTraffic { .. } => "traffic",
             What::Action { .. } => "action",
             What::Guard { .. } => "guard",
+            What::Service { .. } => "service",
         };
         s.timeline.of(&MAC).map(|e| kind(&e.what)).collect()
     }

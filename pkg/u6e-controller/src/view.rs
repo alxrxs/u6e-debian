@@ -10,7 +10,9 @@
 //! (`remote_name`) once one was looked up, and the addresses its AP's client
 //! guards bind to it (`bound`); a guard's violation is an event of kind
 //! `guard` (its `guard`, `detail`, whether its frame was `dropped`, and the
-//! `repeats` since the last one reported). An associated client carries how
+//! `repeats` since the last one reported), a change of a service a device
+//! offers over mDNS one of kind `service` (`services::event_json`), on the
+//! timeline too when the device is a client. An associated client carries how
 //! it authenticated (`auth`: the method, its EAP identity and the expiry of
 //! the client certificate RADIUS last accepted for it, whether it came by a
 //! fast transition); its sessions and timeline are `history`, the clients
@@ -40,6 +42,7 @@ use u6e_proto::msg::{
 
 use crate::names;
 use crate::policy::{ConfigId, Phase};
+use crate::services;
 use crate::sessions::Session;
 use crate::state::{Action, Ap, ClientView, Rollout, State, mechanism_name, outcome_name};
 use crate::timeline::{EapStep, End, Entry, Place, What};
@@ -329,6 +332,10 @@ pub fn events(state: &State, ap: Option<&str>, admin: bool) -> Vec<Value> {
         .iter()
         .filter(|a| ap.is_none_or(|ap| a.ap.as_deref() == Some(ap)));
     out.extend(actions.map(|a| (unix_ms(a.at), action(a, admin))));
+    let changes = (state.services.events.iter())
+        .filter(|e| ap.is_none_or(|ap| e.ap == ap))
+        .map(|e| (e.at_ms, services::event_json(e)));
+    out.extend(changes);
     // Stable: one AP's events keep the order they came in.
     out.sort_by_key(|(at, _)| *at);
     out.into_iter().map(|(_, v)| v).collect()
@@ -381,6 +388,22 @@ pub fn event(ap_name: &str, ap: &Ap, ev: &Event) -> Option<Value> {
         }
     }
     Some(Value::Object(o))
+}
+
+/// Names and bands as the services' view shows them: a client's name as the
+/// controller knows it, the band of the BSS a port is (or is the per-VLAN
+/// interface of).
+impl services::Look for State {
+    fn name(&self, mac: &[u8; 6]) -> Option<String> {
+        self.identity(mac).name().map(str::to_owned)
+    }
+
+    fn band(&self, ap: &str, port: &str) -> Option<&'static str> {
+        let a = self.ap(ap)?;
+        let bss = port.split('.').next()?;
+        let b = a.naming.bsss.iter().find(|b| b.ifname == bss)?;
+        band_of(a, &b.phy)
+    }
 }
 
 /// The band of `ap`'s radio `phy`, as the AP last reported it.
@@ -1013,6 +1036,29 @@ fn entry(e: &Entry, admin: bool) -> Value {
             put("dropped", (*dropped).into());
             put("repeats", (*repeats).into());
             "guard"
+        }
+        What::Service {
+            ap,
+            instance,
+            service,
+            change,
+            by,
+            misses,
+            silent_ms,
+        } => {
+            put("ap", ap.clone().into());
+            put("instance", instance.clone().into());
+            put("label", services::instance_label(instance).into());
+            put("service", service.clone().into());
+            put("change", services::change_name(*change).into());
+            if let Some(by) = by {
+                put("by", mac::format(*by).into());
+            }
+            put("misses", (*misses).into());
+            if let Some(ms) = silent_ms {
+                put("silent_for", (*ms).into());
+            }
+            "service"
         }
     };
     o.insert("kind".into(), kind.into());

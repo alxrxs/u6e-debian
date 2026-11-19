@@ -17,7 +17,9 @@
 //! from the DHCP servers' leases, the reverse DNS of their addresses and
 //! their MACs' vendors (`identity`, `leases`, `names`, `oui`). Each
 //! client's sessions and timeline (`sessions`, `timeline`) come from all of
-//! that and from RADIUS's verdicts, read from its log (`radius`).
+//! that and from RADIUS's verdicts, read from its log (`radius`). What the
+//! APs read of mDNS shows which device offers which service and whether it
+//! answers for it (`services`).
 
 pub mod actions;
 pub mod agents;
@@ -41,6 +43,7 @@ pub mod radius;
 pub mod rf;
 pub mod rollout;
 pub mod script;
+pub mod services;
 pub mod sessions;
 pub mod spectrum;
 pub mod stage;
@@ -288,8 +291,8 @@ fn bind_local(config: &Config) -> io::Result<UnixListener> {
 }
 
 /// Gives up on the configurations the APs have not answered in
-/// `Timing::apply`, and ends the holds whose time is up, for the life of
-/// the process.
+/// `Timing::apply`, ends the holds whose time is up and looks at the
+/// services again, for the life of the process.
 async fn expire(state_of: Shared, timing: Timing) {
     let mut every = interval(timing.ping);
     loop {
@@ -297,6 +300,7 @@ async fn expire(state_of: Shared, timing: Timing) {
         let mut state = state_of.write();
         state.expire_relays(Instant::now(), timing.apply);
         state.expire_holds();
+        state.services_tick(SystemTime::now());
         drop(state);
         captures::supervise(&state_of, SystemTime::now());
     }

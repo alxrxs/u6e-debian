@@ -32,6 +32,11 @@
 //! planner's (`rf`). `GET /api/clients/{mac}/history` is a client's
 //! sessions and timeline, `GET /api/auth-problems` the clients that failed
 //! to get on in the last day; both read only what the controller holds.
+//! `GET /api/services?ap=&device=` is what the APs read of mDNS (the site's
+//! view, one AP's table, or one device and those it relates to), `GET
+//! /api/services/see?from=&to=` whether one device's queries for what
+//! another offers are answered (`services`); a service's change is an
+//! event of kind `service`.
 //!
 //! The listener is reached only through the reverse proxy that signs users
 //! in, which names the user in `X-Forwarded-Preferred-Username` and their
@@ -55,6 +60,7 @@ use tokio::time::{interval, timeout};
 use u6e_proto::mac;
 
 use crate::actions::{self, Access, Via, Web};
+use crate::services;
 use crate::spectrum::{self, Watching};
 use crate::state::{Change, Full, ROLLOUT_LOG_CAP, Shared, WatchGuard};
 use crate::view;
@@ -162,6 +168,8 @@ pub fn router(state: Shared, access: Access) -> Router {
         .route("/api/me", get(actions::me))
         .route("/api/clients/{mac}/history", get(api_history))
         .route("/api/auth-problems", get(api_auth_problems))
+        .route("/api/services", get(api_services))
+        .route("/api/services/see", get(api_services_see))
         .route("/api/clients/{mac}/kick", post(actions::kick))
         .route("/api/clients/{mac}/block", post(actions::block))
         .route("/api/clients/{mac}/unblock", post(actions::unblock))
@@ -288,6 +296,43 @@ async fn api_history(
 async fn api_auth_problems(Ext(state): Ext<Shared>) -> Response {
     let now = sessions::unix_ms(std::time::SystemTime::now());
     json_response(&view::auth_problems(&state.read(), now))
+}
+
+#[derive(Deserialize)]
+struct ServicesQuery {
+    ap: Option<String>,
+    device: Option<String>,
+}
+
+async fn api_services(Ext(state): Ext<Shared>, Query(q): Query<ServicesQuery>) -> Response {
+    let device = match q.device.as_deref().map(mac::parse) {
+        None => None,
+        Some(Some(m)) => Some(m),
+        Some(None) => return error(StatusCode::BAD_REQUEST, "not a MAC"),
+    };
+    let now = sessions::unix_ms(std::time::SystemTime::now());
+    let s = state.read();
+    json_response(&services::view(
+        &s.services,
+        q.ap.as_deref(),
+        device,
+        &*s,
+        now,
+    ))
+}
+
+#[derive(Deserialize)]
+struct SeeQuery {
+    from: String,
+    to: String,
+}
+
+async fn api_services_see(Ext(state): Ext<Shared>, Query(q): Query<SeeQuery>) -> Response {
+    let (Some(from), Some(to)) = (mac::parse(&q.from), mac::parse(&q.to)) else {
+        return error(StatusCode::BAD_REQUEST, "not a MAC");
+    };
+    let now = sessions::unix_ms(std::time::SystemTime::now());
+    json_response(&services::see_view(&state.read().services, from, to, now))
 }
 
 #[derive(Deserialize)]
@@ -642,7 +687,12 @@ async fn live(
                 let key = format!("{ap}/{radio}");
                 (false, Some(scan_state(&state, &key, None)))
             }
-            Ok(Change::Event(..) | Change::Action(_) | Change::Spectrum(..)) => (false, None),
+            Ok(Change::Service(e)) if wanted(&e.ap) => {
+                (false, Some(json!({ "events": [services::event_json(&e)] })))
+            }
+            Ok(
+                Change::Event(..) | Change::Action(_) | Change::Spectrum(..) | Change::Service(_),
+            ) => (false, None),
             // Too slow to keep up: the state is whole again with the next
             // patch, the events missed are told of.
             Err(RecvError::Lagged(_)) => (true, Some(json!({ "lost": true }))),
