@@ -133,8 +133,12 @@ mod tests {
         assert_eq!(read(&p, RESTORE), file);
         assert_eq!(nft_log(&p), "", "its marks stay");
         assert_eq!(read(&p, DEFUNCT_BY_MAC), "", "its client is left alone");
-        // Once the capture is gone, the same step puts everything back.
+        // Once the capture is gone, the same step puts everything back. A
+        // child another test thread forked shares the lock until it execs.
         drop(held);
+        while serve::try_lock(&p).unwrap().is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         restore(&p).unwrap();
         assert!(!pending(&p));
         assert!(!nft_log(&p).is_empty());

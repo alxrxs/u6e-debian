@@ -235,7 +235,6 @@ pub fn restore_from(paths: &Paths) -> Result<bool, String> {
 pub mod tests {
     use super::*;
     use crate::testdir::TestDir;
-    use std::os::unix::fs::PermissionsExt;
 
     /// ECM's switches that stop it accelerating any new connection, which
     /// a capture must leave alone.
@@ -246,15 +245,11 @@ pub mod tests {
 
     /// The AP's files as a capture finds them: ECM running, `u6e-pcc`
     /// loaded or not, and an `nft` that logs each script it is given
-    /// (`nft.log`) and fails while `nft.fail` exists.
+    /// (`nft.log`) and fails while `nft.fail` exists (`testdata/nft`).
     pub fn ap(t: &TestDir, pcc: bool) -> Paths {
         let nft = t.path().join("nft");
-        fs::write(
-            &nft,
-            "#!/bin/sh\nd=$(dirname \"$0\")\n[ -e \"$d/nft.fail\" ] && { echo 'Error: no' >&2; exit 1; }\ncat >> \"$d/nft.log\"\n",
-        )
-        .unwrap();
-        fs::set_permissions(&nft, fs::Permissions::from_mode(0o755)).unwrap();
+        let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/nft");
+        std::os::unix::fs::symlink(fake, &nft).unwrap();
         let p = Paths {
             root: t.path().into(),
             nft,

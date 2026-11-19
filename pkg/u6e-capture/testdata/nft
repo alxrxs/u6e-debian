@@ -1,0 +1,8 @@
+#!/bin/sh
+# The capture tests' nft: each test links it into its own directory, which
+# it logs every script it is given to (nft.log) and fails in while nft.fail
+# exists there. Linked, never written by a test: an executable a test wrote
+# could still be open for writing in a child another test thread forked.
+d=$(dirname "$0")
+[ -e "$d/nft.fail" ] && { echo 'Error: no' >&2; exit 1; }
+cat >> "$d/nft.log"
