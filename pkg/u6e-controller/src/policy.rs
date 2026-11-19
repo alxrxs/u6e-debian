@@ -12,14 +12,13 @@
 //! one: one not over goes on from its step, and a failed one's time still
 //! raises its alert.
 //!
-//! A save writes the whole file beside the old one, syncs it, renames it over
-//! the old one and syncs the directory: a crash at any point leaves either the
-//! old file or the new one, never a part of either. [`Store`] makes it one
-//! save at a time.
+//! A save replaces the whole file through `store::replace`: a crash at any
+//! point leaves either the old file or the new one, never a part of either.
+//! [`Store`] makes it one save at a time.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
-use std::io::{self, ErrorKind, Write};
+use std::fs;
+use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -27,6 +26,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, MutexGuard};
 use u6e_proto::mac;
+
+use crate::store;
 
 /// The clients blocked, by MAC.
 pub type Blocked = BTreeSet<[u8; 6]>;
@@ -273,20 +274,13 @@ pub fn load(path: &Path) -> io::Result<Policy> {
     })
 }
 
-/// Replaces the decisions at `path` with `policy`.
+/// Replaces the decisions at `path` with `policy` (`store::replace`).
 pub fn save(path: &Path, policy: &Policy) -> io::Result<()> {
-    let temp = write_temp(path, policy)?;
-    fs::rename(&temp, path)?;
-    let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
-    File::open(dir.unwrap_or(Path::new(".")))?.sync_all()
+    store::replace(path, &encode(policy)?, 0o644)
 }
 
-/// The new file, whole and synced, beside the one it replaces. A temporary
-/// file a crash left behind is overwritten.
-fn write_temp(path: &Path, policy: &Policy) -> io::Result<PathBuf> {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(".tmp");
-    let temp = path.with_file_name(name);
+/// The file's text for `policy`.
+fn encode(policy: &Policy) -> io::Result<Vec<u8>> {
     let configs = policy.configs.iter().map(|(ap, c)| {
         let file = ConfigFile {
             sha256: mac::hex(&c.sha256),
@@ -325,10 +319,7 @@ fn write_temp(path: &Path, policy: &Policy) -> io::Result<PathBuf> {
     };
     let mut body = serde_json::to_vec_pretty(&file).map_err(io::Error::other)?;
     body.push(b'\n');
-    let mut f = File::create(&temp)?;
-    f.write_all(&body)?;
-    f.sync_all()?;
-    Ok(temp)
+    Ok(body)
 }
 
 #[cfg(test)]
@@ -462,8 +453,8 @@ mod tests {
         let dir = Dir::new("crash");
         let path = dir.0.join("policy.json");
         save(&path, &blocked(&[1])).unwrap();
-        let temp = write_temp(&path, &blocked(&[1, 2, 3])).unwrap();
-        assert!(temp.exists());
+        let temp = store::temp_of(&path);
+        fs::write(&temp, encode(&blocked(&[1, 2, 3])).unwrap()).unwrap();
         assert_eq!(load(&path).unwrap(), blocked(&[1]));
         save(&path, &blocked(&[4])).unwrap();
         assert_eq!(load(&path).unwrap(), blocked(&[4]));

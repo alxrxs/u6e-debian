@@ -2,7 +2,8 @@
 //! of its own (`[configs] state`, 0700): the latest one for each AP, which
 //! holds the site's secrets, so every file is 0600. Each file is its format
 //! ([`FORMAT`]) and one frame (`u6e_proto::frame`), written beside the old one
-//! and renamed over it, so a crash leaves either; the bytes of each frame are
+//! and renamed over it ([`replace`], which every file of the controller's own
+//! is written through), so a crash leaves either; the bytes of each frame are
 //! wiped once used. A file of another format, or that does not decode, is
 //! not read: the controller sets it aside as `<name>.corrupt-<ms>` and goes
 //! on without it, and says so until someone removes it.
@@ -92,25 +93,40 @@ impl Store {
 
     /// Makes `name` hold `v`.
     pub fn save<T: Serialize>(&self, name: &str, v: &T) -> io::Result<()> {
-        let path = self.dir.join(name);
-        let temp = self.dir.join(format!(".{name}.new"));
         let mut bytes = MARK.to_vec();
         bytes.extend_from_slice(&FORMAT.to_le_bytes());
-        let written = write_frame(&mut bytes, v).and_then(|()| {
-            let mut f = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&temp)?;
-            f.write_all(&bytes)?;
-            f.sync_all()
-        });
+        let written =
+            write_frame(&mut bytes, v).and_then(|()| replace(&self.dir.join(name), &bytes, 0o600));
         zeroize(&mut bytes);
-        written?;
-        fs::rename(&temp, &path)?;
-        File::open(&self.dir)?.sync_all()
+        written
     }
+}
+
+/// Where [`replace`] writes the new file of `path` first.
+pub fn temp_of(path: &Path) -> PathBuf {
+    let mut name = std::ffi::OsString::from(".");
+    name.push(path.file_name().unwrap_or_default());
+    name.push(".new");
+    path.with_file_name(name)
+}
+
+/// Makes `path` hold `bytes`: written whole beside it ([`temp_of`], created
+/// with `mode`), synced, renamed over it, and the directory synced, so that a
+/// crash at any point leaves either the old file or the new one, never a part
+/// of either. A temporary file a crash left behind is overwritten.
+pub fn replace(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    let temp = temp_of(path);
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(mode)
+        .open(&temp)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    fs::rename(&temp, path)?;
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+    File::open(dir.unwrap_or(Path::new(".")))?.sync_all()
 }
 
 /// Why a file was not read.
