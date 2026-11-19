@@ -17,8 +17,9 @@
 //! client), the only label of its series, so their number is bounded by
 //! the identities the sessions keep (`sessions::IDENTITIES_MAX`): its ended
 //! sessions and its bytes (those of its open sessions counted in), its
-//! clients on now, and the expiry of the client certificate RADIUS last
-//! accepted for it; the RADIUS log's reads exist only when it is read.
+//! clients on now; per client certificate, by its common name (the
+//! certificates the sessions keep, as many), its expiry; the RADIUS log's
+//! reads and its newest verdict exist only when it is read.
 
 use std::collections::BTreeSet;
 use std::fmt::Write;
@@ -569,10 +570,10 @@ fn identities(m: &mut Text, state: &State) {
     m.family(
         "wifi_client_cert_expiry_timestamp_seconds",
         GAUGE,
-        "When the client certificate RADIUS last accepted for the identity (EAP-TLS) expires.",
+        "When an EAP-TLS client certificate RADIUS accepted expires, by its common name.",
     );
-    for (id, c) in state.sessions.certs() {
-        m.sample(&[("identity", id)], c.expires_s as f64);
+    for (cn, c) in state.sessions.certs() {
+        m.sample(&[("cn", cn)], c.expires_s as f64);
     }
 }
 
@@ -595,6 +596,12 @@ fn radius_log(m: &mut Text, state: &State) {
     if let Some(t) = h.last_ok {
         m.sample(&[], unix_seconds(t));
     }
+    m.family(
+        "wifi_radius_last_verdict_timestamp_seconds",
+        GAUGE,
+        "When the newest verdict read from RADIUS's log happened; 0 before any.",
+    );
+    m.sample(&[], h.newest_ms.map_or(0.0, |ms| ms as f64 / 1000.0));
 }
 
 /// The APs' configurations, when the controller signs them.

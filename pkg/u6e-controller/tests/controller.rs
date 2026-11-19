@@ -4189,11 +4189,11 @@ fn identity_sessions_timeline_and_auth_problems() {
     let lines = vec![
         (
             now - 5000,
-            "t|ACCEPT|host/pc1|02-00-00-00-00-01|ap1|192.0.2.16|eap|271231235959Z".to_owned(),
+            "t|ACCEPT|host/pc1|02-00-00-00-00-01|ap1|192.0.2.16|eap|271231235959Z|host/pc1".to_owned(),
         ),
         (
             now - 3000,
-            "t|REJECT|bob@example.org|02-00-00-00-00-02|ap1|192.0.2.16|Not authorized for Wi-Fi|"
+            "t|REJECT|bob=40example.org|02-00-00-00-00-02|ap1|192.0.2.16|Not authorized for Wi-Fi||"
                 .to_owned(),
         ),
     ];
@@ -4282,6 +4282,26 @@ fn identity_sessions_timeline_and_auth_problems() {
         (&json!("eap-timeout"), &json!(true))
     );
     assert_eq!(row["connected"], false);
+    // It associates again and is in EAP, not authorized: it has not got on.
+    let mut s = snapshot(
+        2,
+        bsss.clone(),
+        vec![station(MAC, 0, -54), station(failing, 0, -60)],
+    );
+    let mid_eap = u6e_proto::msg::StationAuth {
+        authorized: false,
+        ..eap_tls("bob@example.org")
+    };
+    s.auth = vec![(MAC, eap_tls("host/pc1")), (failing, mid_eap)];
+    a.send(&AgentMsg::Key(s)).unwrap();
+    wait_for("the client in EAP", || {
+        r.c.state.read().sessions.open_of(&failing).is_some()
+    });
+    let row = &json_get(r.c.http, "/api/auth-problems")["clients"][0];
+    assert_eq!(
+        (&row["connected"], row.get("connected_since")),
+        (&json!(false), None)
+    );
 
     // The client leaves: its session ends, and counts for its identity.
     let e = Event {
@@ -4298,11 +4318,19 @@ fn identity_sessions_timeline_and_auth_problems() {
     );
     assert_eq!(
         metrics_of(&r, "wifi_client_cert_expiry_timestamp_seconds{"),
-        ["wifi_client_cert_expiry_timestamp_seconds{identity=\"host/pc1\"} 1830297599"]
+        ["wifi_client_cert_expiry_timestamp_seconds{cn=\"host/pc1\"} 1830297599"]
     );
     assert_eq!(
         metrics_of(&r, "wifi_radius_log_up "),
         ["wifi_radius_log_up 1"]
+    );
+    // The newest verdict read: the reject, 3 s before the start.
+    let newest = (now - 3000) as f64 / 1000.0;
+    assert_eq!(
+        metrics_of(&r, "wifi_radius_last_verdict_timestamp_seconds "),
+        [format!(
+            "wifi_radius_last_verdict_timestamp_seconds {newest}"
+        )]
     );
     assert!(promtool_accepts(&http_get(r.c.metrics, "/metrics")));
     // A MAC that is none is refused; one never seen has no history.

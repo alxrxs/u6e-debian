@@ -638,10 +638,17 @@ impl State {
         State { sessions, ..self }
     }
 
-    /// The state reading RADIUS's log.
+    /// The state reading RADIUS's log, its newest verdict the newest its
+    /// history holds.
     pub fn with_radius(self) -> Self {
-        let radius = Some(radius::Health::default());
-        State { radius, ..self }
+        let health = radius::Health {
+            newest_ms: self.sessions.radius_newest(),
+            ..radius::Health::default()
+        };
+        State {
+            radius: Some(health),
+            ..self
+        }
     }
 
     /// The state with a saved policy's blocks, acknowledged configurations
@@ -1824,6 +1831,8 @@ impl State {
         health.up = Some(read.is_ok());
         if let Ok(lines) = read {
             health.last_ok = Some(now);
+            let newest = lines.iter().map(|l| l.at_ms).max();
+            health.newest_ms = health.newest_ms.max(newest);
             self.sessions.radius(&lines);
         }
     }

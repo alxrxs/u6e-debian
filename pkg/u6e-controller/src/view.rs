@@ -626,7 +626,10 @@ fn client_view(state: &State, c: &ClientView) -> Value {
         Some(&s.auth[i].1)
     });
     if let Some(a) = auth {
-        o["auth"] = auth_view(state, a);
+        let session = state.sessions.open_of(&st.mac);
+        let authenticated = a.authorized || session.is_some_and(|s| s.authenticated);
+        let cert = session.and_then(|s| state.sessions.session_cert(&st.mac, s));
+        o["auth"] = auth_view(a, authenticated, cert);
     }
     if let Value::Object(o) = &mut o {
         o.extend(state.identity(&st.mac).fields());
@@ -688,22 +691,24 @@ pub fn method(a: &StationAuth) -> String {
     }
 }
 
-/// A client's authentication: its `method`, its EAP `identity` (and the
-/// expiry of the certificate RADIUS last accepted for it, `cert_expires`, in
-/// milliseconds), whether its association was a fast transition (`ft`),
-/// whether hostapd has authorized it yet, and the reauthentication period
-/// RADIUS set (`reauth`, seconds).
-fn auth_view(state: &State, a: &StationAuth) -> Value {
+/// A client's authentication: its `method`, its EAP `identity`, whether its
+/// AP has authorized it in the session (`authenticated`; until then the
+/// identity is only what the client claims), the certificate it signed in
+/// with (`cert_cn`, `cert_expires` in milliseconds), whether its association
+/// was a fast transition (`ft`), and the reauthentication period RADIUS set
+/// (`reauth`, seconds).
+fn auth_view(a: &StationAuth, authenticated: bool, cert: Option<(String, u64)>) -> Value {
     let mut o = json!({
         "method": method(a),
         "ft": a.fast_transition(),
-        "authorized": a.authorized,
+        "authenticated": authenticated,
     });
     if a.kind() == AuthKind::Eap && !a.identity.is_empty() {
         o["identity"] = a.identity.clone().into();
-        if let Some(c) = state.sessions.cert(&a.identity) {
-            o["cert_expires"] = (c.expires_s * 1000).into();
-        }
+    }
+    if let Some((cn, expires_s)) = cert.filter(|_| authenticated) {
+        o["cert_cn"] = cn.into();
+        o["cert_expires"] = (expires_s * 1000).into();
     }
     if a.reauth_s > 0 {
         o["reauth"] = a.reauth_s.into();
@@ -748,7 +753,8 @@ pub fn history(state: &State, mac: &[u8; 6]) -> Value {
     });
     let latest = sessions.iter().find_map(|s| Some((s, s.auth.as_ref()?)));
     if let Some((s, a)) = latest {
-        let mut id = auth_view(state, a);
+        let cert = state.sessions.session_cert(mac, s);
+        let mut id = auth_view(a, s.authenticated, cert);
         id["vlan"] = s.place.vlan.into();
         id["connected"] = s.end_ms.is_none().into();
         o["identity"] = id;
@@ -803,7 +809,8 @@ fn session(state: &State, s: &Session) -> Value {
         o.insert("end".into(), e.into());
     }
     if let Some(a) = &s.auth {
-        o.insert("auth".into(), auth_view(state, a));
+        let cert = state.sessions.session_cert(&s.mac, s);
+        o.insert("auth".into(), auth_view(a, s.authenticated, cert));
     }
     o.insert("rx_bytes".into(), s.up_bytes.into());
     o.insert("tx_bytes".into(), s.down_bytes.into());
@@ -902,6 +909,7 @@ fn entry(e: &Entry) -> Value {
             nas,
             detail,
             cert_expires,
+            cert_cn,
         } => {
             put("accept", (*accept).into());
             put("user", user.clone().into());
@@ -910,6 +918,9 @@ fn entry(e: &Entry) -> Value {
             put("detail", detail.clone().into());
             if let Some(s) = cert_expires {
                 put("cert_expires", (s * 1000).into());
+            }
+            if let Some(cn) = cert_cn {
+                put("cert_cn", cn.clone().into());
             }
             "radius"
         }
@@ -1056,13 +1067,20 @@ pub fn auth_problems(state: &State, now_ms: u64) -> Value {
             o["user"] = r["user"].clone();
             o["radius"] = r;
         }
-        let joined = recent
-            .iter()
-            .find(|e| e.at_ms > last.at_ms && matches!(e.what, What::Joined { .. }));
+        // On only once authorized: a client mid-EAP has not got on.
+        let on = |id: u64| {
+            state
+                .sessions
+                .of(mac)
+                .any(|s| s.id == id && s.authenticated)
+        };
+        let joined = recent.iter().find(|e| {
+            e.at_ms > last.at_ms && matches!(e.what, What::Joined { session, .. } if on(session))
+        });
         if let Some(j) = joined {
             o["connected_since"] = j.at_ms.into();
         }
-        let connected = state.sessions.open_of(mac).is_some();
+        let connected = state.sessions.open_of(mac).is_some_and(|s| s.authenticated);
         o["connected"] = connected.into();
         rows.push((joined.is_none() && !connected, last.at_ms, o));
     }

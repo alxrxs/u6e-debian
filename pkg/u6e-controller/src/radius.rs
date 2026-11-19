@@ -5,22 +5,33 @@
 //! a poller reads it every [`EVERY`] into the clients' timelines
 //! (`sessions`), so without it only RADIUS's side of the story is missing.
 //!
-//! The log has a line per verdict, fields split by `|`:
+//! The log has a line per verdict, nine fields split by `|`:
 //!
-//!   time|ACCEPT or REJECT|User-Name|Calling-Station-Id|NAS name|NAS address|detail[|cert expiry]
+//!   time|ACCEPT or REJECT|User-Name|Calling-Station-Id|NAS name|NAS address|detail|cert expiry|cert CN
 //!
-//! the detail being the method on an accept and the reason on a reject, the
-//! last field (which older lines lack) the expiry of the client certificate
-//! of an EAP-TLS login, as the certificate states it (ASN.1 UTCTime or
-//! GeneralizedTime). Only lines whose Calling-Station-Id is a MAC are asked
-//! for: the Wi-Fi's (and any other NAS's that names a MAC).
+//! the detail being the method on an accept and the reason on a reject; the
+//! last two the EAP-TLS client certificate's expiry, as the certificate
+//! states it (ASN.1 UTCTime or GeneralizedTime), and its common name. What a
+//! client chooses (User-Name, the reason that may quote it, the CN) is
+//! escaped by FreeRADIUS's `%{escape:}`, every byte outside its safe set
+//! written `=XX`, so no field holds a `|`; they are read back here. A line of
+//! seven fields is one from before (unescaped, nothing after the detail); a
+//! line of any other count, or whose expiry is neither empty nor a time, is
+//! no verdict: it cannot be one the log wrote. Only lines whose
+//! Calling-Station-Id is a MAC are asked for.
 //!
 //! Each poll reads from [`LAG`] before the newest line read so far (the
-//! shipper's delay), the lines already taken skipped; the first goes on from
-//! the newest line the clients' history holds, or back [`BACKFILL`] (the
-//! history takes a line it holds already only once). A poll reads at most [`PAGES`] pages of [`PAGE`] lines, each
-//! answer at most [`BODY_MAX`] bytes within [`TIMEOUT`]; what it could not
-//! read is read at the next.
+//! shipper's delay) once it read to the end, and from the newest line itself
+//! when it stopped at [`PAGES`] pages of [`PAGE`] lines, so a flood cannot
+//! hold it in one place; the lines already taken are skipped. The first poll
+//! goes on from the newest line the clients' history holds, or back
+//! [`BACKFILL`]. Every [`RESCAN_EVERY`] the last [`RESCAN`] are read again,
+//! for lines stamped behind the cursor (the shipper stamps each with its own
+//! local time, so on the autumn clock change the repeated hour's lines land
+//! an hour early, and a shipper that was down sends its backlog late); the
+//! history takes a line it holds already only once. Each answer is at most
+//! [`BODY_MAX`] bytes within [`TIMEOUT`]; what a poll could not read is read
+//! at the next.
 
 use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
@@ -29,7 +40,7 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 use tokio::time::interval;
-use u6e_proto::mac;
+use u6e_proto::{mac, text};
 
 use crate::fetch;
 use crate::state::Shared;
@@ -40,6 +51,9 @@ pub const EVERY: Duration = Duration::from_secs(60);
 const LAG: Duration = Duration::from_secs(300);
 /// How far back the first poll reads: as long as the timelines keep.
 const BACKFILL: Duration = Duration::from_secs(7 * 24 * 3600);
+/// How often, and how far back, the log is read again.
+const RESCAN_EVERY: Duration = Duration::from_secs(3600);
+const RESCAN: Duration = Duration::from_secs(2 * 3600);
 const PAGE: usize = 1000;
 const PAGES: usize = 10;
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -62,6 +76,8 @@ pub struct Health {
     /// Whether the last read worked (`None` before the first).
     pub up: Option<bool>,
     pub last_ok: Option<SystemTime>,
+    /// When the newest verdict read happened, in Unix milliseconds.
+    pub newest_ms: Option<u64>,
 }
 
 /// One verdict.
@@ -78,50 +94,79 @@ pub struct Line {
     /// The RADIUS client's name.
     pub nas: String,
     pub detail: String,
-    /// The client certificate's expiry, Unix seconds.
+    /// The client certificate's expiry (Unix seconds) and common name.
     pub cert_expires: Option<u64>,
+    pub cert_cn: Option<String>,
 }
 
 /// The verdict of one line of the log, which Loki has at `at_ms` from the
 /// node `node`; `None` for a line that is not one.
-pub fn parse(text: &str, at_ms: u64, node: &str) -> Option<Line> {
-    let mut f = text.splitn(7, '|');
-    let _time = f.next()?;
-    let accept = match f.next()? {
+pub fn parse(line: &str, at_ms: u64, node: &str) -> Option<Line> {
+    let f: Vec<&str> = line.split('|').collect();
+    let (escaped, cert_expires, cert_cn) = match f.len() {
+        7 => (false, None, None),
+        9 => {
+            let expires = match f[7] {
+                "" => None,
+                t => Some(asn1_time(t)?),
+            };
+            let cn = Some(field(&unescape(f[8]))).filter(|cn| !cn.is_empty());
+            (true, expires, cn.filter(|_| expires.is_some()))
+        }
+        _ => return None,
+    };
+    let accept = match f[1] {
         "ACCEPT" => true,
         "REJECT" => false,
         _ => return None,
     };
-    let user = f.next()?;
-    let mac = mac::parse(&f.next()?.replace('-', ":"))?;
-    let nas = f.next()?;
-    let _nas_address = f.next()?;
-    let rest = f.next()?;
-    // A line of the shape with the expiry ends in it, or in nothing.
-    let (detail, cert_expires) = match rest.rsplit_once('|') {
-        Some((d, "")) => (d, None),
-        Some((d, e)) => match asn1_time(e) {
-            Some(t) => (d, Some(t)),
-            None => (rest, None),
-        },
-        None => (rest, None),
+    let read = |s: &str| {
+        if escaped {
+            field(&unescape(s))
+        } else {
+            field(s)
+        }
     };
     Some(Line {
         at_ms,
-        mac,
+        mac: mac::parse(&read(f[3]).replace('-', ":"))?,
         accept,
-        user: field(user),
+        user: read(f[2]),
         node: field(node),
-        nas: field(nas),
-        detail: field(detail),
+        nas: field(f[4]),
+        detail: read(f[6]),
         cert_expires,
+        cert_cn,
     })
 }
 
-/// A field as kept: one line, without control characters, within
+/// What `%{escape:}` wrote: every `=XX` a byte, as UTF-8.
+fn unescape(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = b
+            .get(i + 1..i + 3)
+            .and_then(|h| std::str::from_utf8(h).ok());
+        match hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+            Some(byte) if b[i] == b'=' => {
+                out.push(byte);
+                i += 3;
+            }
+            _ => {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A field as kept: one line, without control or format characters, within
 /// [`FIELD_MAX`] bytes.
 fn field(s: &str) -> String {
-    let mut out: String = s.chars().filter(|c| !c.is_control()).collect();
+    let mut out = text::clean(s);
     if out.len() > FIELD_MAX {
         let cut = (0..=FIELD_MAX).rev().find(|&i| out.is_char_boundary(i));
         out.truncate(cut.unwrap_or(0));
@@ -177,17 +222,19 @@ fn query(selector: &str) -> String {
     format!(r#"{selector} |~ "^[^|]*[|][A-Z]+[|][^|]*[|]{mac}[|]""#)
 }
 
-/// The lines of an answer of `query_range`, oldest first, each with its
-/// time in nanoseconds; `None` for an answer that is not one.
-fn lines(answer: &str) -> Option<Vec<(u64, Line)>> {
+/// An answer of `query_range`: how many lines it returned, and those that
+/// are verdicts, oldest first, each with its time in nanoseconds; `None` for
+/// an answer that is not one.
+fn lines(answer: &str) -> Option<(usize, Vec<(u64, Line)>)> {
     let v: Value = serde_json::from_str(answer).ok()?;
     if v["status"] != "success" {
         return None;
     }
-    let mut out = Vec::new();
+    let (mut returned, mut out) = (0, Vec::new());
     for stream in v["data"]["result"].as_array()? {
         let node = stream["stream"]["host"].as_str().unwrap_or_default();
         for pair in stream["values"].as_array()? {
+            returned += 1;
             let ns: u64 = pair[0].as_str()?.parse().ok()?;
             let Some(text) = pair[1].as_str() else {
                 continue;
@@ -198,15 +245,17 @@ fn lines(answer: &str) -> Option<Vec<(u64, Line)>> {
         }
     }
     out.sort_by_key(|(ns, _)| *ns);
-    Some(out)
+    Some((returned, out))
 }
 
 /// What the poller remembers between polls.
 struct Cursor {
     /// Where the next poll starts, in nanoseconds since the epoch.
     from_ns: u64,
-    /// The lines taken since `from_ns` less a lag, by time and hash.
+    /// The lines taken from `from_ns` on, by time and hash.
     taken: HashSet<(u64, u64)>,
+    /// When the last hours are read again next.
+    rescan_at: SystemTime,
 }
 
 fn nanos(t: SystemTime) -> u64 {
@@ -216,16 +265,8 @@ fn nanos(t: SystemTime) -> u64 {
 
 fn key(ns: u64, l: &Line) -> (u64, u64) {
     let mut h = DefaultHasher::new();
-    (
-        l.mac,
-        l.accept,
-        &l.user,
-        &l.node,
-        &l.nas,
-        &l.detail,
-        l.cert_expires,
-    )
-        .hash(&mut h);
+    let fields = (&l.user, &l.node, &l.nas, &l.detail, &l.cert_cn);
+    (l.mac, l.accept, fields, l.cert_expires).hash(&mut h);
     (ns, h.finish())
 }
 
@@ -240,15 +281,41 @@ impl Cursor {
         Cursor {
             from_ns: back.max(resume),
             taken: HashSet::new(),
+            rescan_at: now + RESCAN_EVERY,
         }
     }
 
     /// One poll at `now`: the lines not taken before, or why it failed.
     async fn poll(&mut self, s: &Settings, now: SystemTime) -> Result<Vec<Line>, String> {
-        let q = fetch::query_value(&query(&s.selector));
         let end = nanos(now);
-        let mut start = self.from_ns;
         let mut fresh = Vec::new();
+        let (reached, newest) = self.read(s, self.from_ns, end, &mut fresh).await?;
+        self.from_ns = match (reached, newest) {
+            (true, n) => n.unwrap_or(end).saturating_sub(LAG.as_nanos() as u64),
+            (false, n) => n.unwrap_or(self.from_ns),
+        }
+        .max(self.from_ns);
+        if now >= self.rescan_at {
+            let back = end.saturating_sub(RESCAN.as_nanos() as u64);
+            self.read(s, back, end, &mut fresh).await?;
+            self.rescan_at = now + RESCAN_EVERY;
+        }
+        let from = self.from_ns;
+        self.taken.retain(|(ns, _)| *ns >= from);
+        Ok(fresh)
+    }
+
+    /// The lines from `start` to `end` not taken yet, into `fresh`, at most
+    /// [`PAGES`] pages: whether it read to the end, and the newest line's
+    /// time.
+    async fn read(
+        &mut self,
+        s: &Settings,
+        mut start: u64,
+        end: u64,
+        fresh: &mut Vec<Line>,
+    ) -> Result<(bool, Option<u64>), String> {
+        let q = fetch::query_value(&query(&s.selector));
         let mut newest = None;
         for _ in 0..PAGES {
             let target = format!(
@@ -256,8 +323,7 @@ impl Cursor {
             );
             let answer =
                 fetch::get(&s.loki, &target, "application/json", BODY_MAX, TIMEOUT).await?;
-            let page = lines(&answer).ok_or("Loki's answer is not a list of lines")?;
-            let full = page.len() >= PAGE;
+            let (returned, page) = lines(&answer).ok_or("Loki's answer is not a list of lines")?;
             for (ns, l) in page {
                 newest = newest.max(Some(ns));
                 start = start.max(ns);
@@ -265,15 +331,11 @@ impl Cursor {
                     fresh.push(l);
                 }
             }
-            if !full {
-                break;
+            if returned < PAGE {
+                return Ok((true, newest));
             }
         }
-        let lag = LAG.as_nanos() as u64;
-        self.from_ns = newest.unwrap_or(end).saturating_sub(lag).max(self.from_ns);
-        let from = self.from_ns;
-        self.taken.retain(|(ns, _)| *ns >= from);
-        Ok(fresh)
+        Ok((false, newest))
     }
 }
 
@@ -305,15 +367,18 @@ pub async fn supervise(state: Shared, settings: Settings) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
-    use tokio::sync::mpsc;
 
     const MAC: [u8; 6] = [2, 0, 0, 0, 0, 0x21];
     const OLD: &str =
         "2026-11-19 17:10:51|ACCEPT|user@example.org|02-00-00-00-00-21|ap1|192.0.2.17|eap";
+    const NEW: &str = "2026-11-19 17:10:51|ACCEPT|user@example.org|02-00-00-00-00-21|ap1|\
+                       192.0.2.17|eap|271231235959Z|host/pc1.example.org";
 
-    /// The log's lines as they are, without and with the expiry.
+    /// The log's lines as they are: the old shape, and the new one with its
+    /// certificate.
     #[test]
     fn both_shapes_of_line_parse() {
         let l = parse(OLD, 1_795_101_051_000, "radius1.example.org").unwrap();
@@ -328,28 +393,85 @@ mod tests {
                 nas: "ap1".into(),
                 detail: "eap".into(),
                 cert_expires: None,
+                cert_cn: None,
             }
         );
-        let new = format!("{OLD}|271231235959Z");
-        assert_eq!(
-            parse(&new, 0, "").unwrap().cert_expires,
-            Some(1_830_297_599)
-        );
-        let l = parse(&format!("{OLD}|"), 0, "").unwrap();
-        assert_eq!((l.detail.as_str(), l.cert_expires), ("eap", None));
+        let l = parse(NEW, 0, "").unwrap();
+        assert_eq!(l.cert_expires, Some(1_830_297_599));
+        assert_eq!(l.cert_cn.as_deref(), Some("host/pc1.example.org"));
         let reject = "t|REJECT|02-00-00-00-00-21|02-00-00-00-00-21|ap1|192.0.2.16|\
-                      No Auth-Type found: rejecting the user via Post-Auth-Type = Reject|";
+                      No Auth-Type found: rejecting the user via Post-Auth-Type =3D Reject||";
         let l = parse(reject, 0, "").unwrap();
         assert!(!l.accept);
         assert_eq!(
             l.detail,
             "No Auth-Type found: rejecting the user via Post-Auth-Type = Reject"
         );
-        // A reason with a | of its own keeps it, in either shape.
-        let piped = "t|REJECT|u|02:00:00:00:00:21|ap1|192.0.2.16|bad | worse";
-        assert_eq!(parse(piped, 0, "").unwrap().detail, "bad | worse");
-        let piped = format!("{piped}|");
-        assert_eq!(parse(&piped, 0, "").unwrap().detail, "bad | worse");
+        assert_eq!((l.cert_expires, l.cert_cn), (None, None));
+    }
+
+    /// FreeRADIUS escapes what a client chose, `|` included, so an identity
+    /// holding pipes is one field and forges no other; a line of another
+    /// count, or whose expiry is not a time, is no verdict.
+    #[test]
+    fn a_piped_identity_forges_nothing() {
+        // What the log writes for User-Name `x|02-00-00-00-00-99|ap|ip|eap|
+        // 491231235959Z|host/victim`.
+        let escaped = "t|ACCEPT|x=7C02-00-00-00-00-99=7Cap=7Cip=7Ceap=7C491231235959Z=7Chost/victim|\
+                       02-00-00-00-00-21|ap1|192.0.2.16|eap||";
+        let l = parse(escaped, 0, "").unwrap();
+        assert_eq!(l.mac, MAC);
+        assert_eq!(
+            l.user,
+            "x|02-00-00-00-00-99|ap|ip|eap|491231235959Z|host/victim"
+        );
+        assert_eq!((l.cert_expires, l.cert_cn), (None, None));
+        // The same identity in a log that did not escape it: refused.
+        let raw = escaped.replace("=7C", "|");
+        assert_eq!(parse(&raw, 0, ""), None);
+        // An old line whose identity adds two fields: nine, but its
+        // "expiry" is the NAS's address.
+        let forged = "t|ACCEPT|x|02-00-00-00-00-99|ap9|02-00-00-00-00-21|ap1|192.0.2.16|eap";
+        assert_eq!(parse(forged, 0, ""), None);
+        for count in [6, 8, 10] {
+            let line = (0..count).map(|_| "eap").collect::<Vec<_>>().join("|");
+            assert_eq!(parse(&line, 0, ""), None, "{count} fields");
+        }
+    }
+
+    /// The lines FreeRADIUS 3.2.7 wrote through the role's linelog for a
+    /// User-Name holding pipes, a certificate whose CN holds `|` and `=`, a
+    /// reject whose reason and Calling-Station-Id hold `|`, and a plain
+    /// login (recorded on loopback).
+    #[test]
+    fn freeradius_lines_read_as_written() {
+        let log = [
+            "2026-11-19 20:47:11|ACCEPT|x=7C02-00-00-00-00-99=7Cap=7Cip=7Ceap=7C491231235959Z=7C\
+             host/victim|02-00-00-00-00-21|ap1|127.0.0.1|Accept||",
+            "2026-11-19 20:47:11|ACCEPT|cert-user|02-00-00-00-00-22|ap1|127.0.0.1|Accept|\
+             271231235959Z|host/a=7Cb=3Dc",
+            "2026-11-19 20:47:11|REJECT|reject-me|02-00-00-00-00-23=7Cevil|ap1|127.0.0.1|\
+             bad =7C worse =3D x||",
+            "2026-11-19 20:47:12|ACCEPT|host/laptop1|02-00-00-00-00-24|ap1|127.0.0.1|Accept||",
+        ];
+        let got: Vec<Option<Line>> = log.iter().map(|l| parse(l, 0, "")).collect();
+        let first = got[0].as_ref().unwrap();
+        assert_eq!((first.mac, first.cert_expires), (MAC, None));
+        let cert = got[1].as_ref().unwrap();
+        assert_eq!(cert.cert_cn.as_deref(), Some("host/a|b=c"));
+        assert_eq!(cert.cert_expires, Some(1_830_297_599));
+        // A Calling-Station-Id that is no MAC is no Wi-Fi client's.
+        assert_eq!(got[2], None);
+        assert_eq!(got[3].as_ref().unwrap().user, "host/laptop1");
+    }
+
+    #[test]
+    fn escapes_read_back_and_hidden_text_goes() {
+        assert_eq!(unescape("a=7Cb=3Dc=C8=98"), "a|b=cȘ");
+        // Not an escape: kept as it is.
+        assert_eq!(unescape("x=Zy=4"), "x=Zy=4");
+        let l = "t|ACCEPT|host/=E2=80=AEevil|02-00-00-00-00-21|ap1|192.0.2.16|eap||";
+        assert_eq!(parse(l, 0, "").unwrap().user, "host/evil");
     }
 
     #[test]
@@ -385,14 +507,15 @@ mod tests {
     }
 
     /// Loki's answer: two streams, out of order, and a line that is no
-    /// verdict.
+    /// verdict, which counts as returned.
     #[test]
     fn an_answer_gives_its_lines_in_time_order() {
         let answer = r#"{"status":"success","data":{"resultType":"streams","result":[
             {"stream":{"host":"r2"},"values":[["3000000","t|REJECT|u|02-00-00-00-00-21|ap1|192.0.2.16|no"]]},
             {"stream":{"host":"r1"},"values":[["1000000","t|ACCEPT|u|02-00-00-00-00-21|ap1|192.0.2.16|eap"],
                                               ["2000000","t|UNKNOWN|u|02-00-00-00-00-21|ap1|192.0.2.16|"]]}]}}"#;
-        let got = lines(answer).unwrap();
+        let (returned, got) = lines(answer).unwrap();
+        assert_eq!(returned, 3);
         let summary: Vec<_> = got
             .iter()
             .map(|(ns, l)| (*ns, l.accept, l.node.as_str()))
@@ -403,34 +526,48 @@ mod tests {
         assert_eq!(lines("<html>"), None);
     }
 
-    /// A fake Loki answering each request with the next of `answers`,
-    /// telling what it was asked.
-    async fn loki(answers: Vec<String>) -> (String, mpsc::UnboundedReceiver<String>) {
+    /// A fake Loki holding `log` (time in nanoseconds, text), answering each
+    /// `query_range` as Loki does: its lines from `start` to `end`, oldest
+    /// first, at most `limit`; every request is counted.
+    async fn loki(log: Arc<Mutex<Vec<(u64, String)>>>, asked: Arc<Mutex<Vec<String>>>) -> String {
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap().to_string();
-        let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
-            for body in answers {
+            loop {
                 let (mut s, _) = l.accept().await.unwrap();
                 let mut buf = vec![0; 8192];
                 let n = s.read(&mut buf).await.unwrap();
-                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let param = |k: &str| -> u64 {
+                    let q = req
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap()
+                        .split_once('?')
+                        .unwrap()
+                        .1;
+                    let v = q
+                        .split('&')
+                        .find_map(|kv| kv.strip_prefix(k)?.strip_prefix('='));
+                    v.unwrap().parse().unwrap()
+                };
+                let (start, end, limit) = (param("start"), param("end"), param("limit"));
+                asked.lock().unwrap().push(req.clone());
+                let values: Vec<Value> = log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(ns, _)| (start..=end).contains(ns))
+                    .take(limit as usize)
+                    .map(|(ns, l)| serde_json::json!([ns.to_string(), l]))
+                    .collect();
+                let stream = serde_json::json!({"stream": {"host": "r1"}, "values": values});
+                let body = serde_json::json!({"status": "success", "data": {"result": [stream]}});
                 let head = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n";
-                s.write_all(format!("{head}{body}").as_bytes())
-                    .await
-                    .unwrap();
+                let _ = s.write_all(format!("{head}{body}").as_bytes()).await;
             }
         });
-        (addr, rx)
-    }
-
-    fn answer(lines: &[(u64, &str)]) -> String {
-        let values: Vec<Value> = lines
-            .iter()
-            .map(|(ns, l)| serde_json::json!([ns.to_string(), l]))
-            .collect();
-        let stream = serde_json::json!({"stream": {"host": "r1"}, "values": values});
-        serde_json::json!({"status": "success", "data": {"result": [stream]}}).to_string()
+        addr
     }
 
     fn settings(loki: String) -> Settings {
@@ -440,37 +577,112 @@ mod tests {
         }
     }
 
+    fn verdict(n: u64) -> String {
+        format!("t|ACCEPT|user{n}|02-00-00-00-00-21|ap1|192.0.2.16|eap||")
+    }
+
     /// The second poll overlaps the first by the lag and takes only what
     /// is new; the query asks for the selector's lines that name a MAC.
     #[tokio::test]
     async fn overlapping_polls_take_each_line_once() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
         let ns = nanos(now);
-        let a = (ns - 60_000_000_000, OLD);
-        let b = (
-            ns - 1_000_000_000,
-            "t|REJECT|u|02-00-00-00-00-21|ap1|192.0.2.16|no",
-        );
-        let with_expiry = format!("{OLD}|271231235959Z");
-        let c = (ns + 30_000_000_000, with_expiry.as_str());
-        let (addr, mut asked) = loki(vec![answer(&[a, b]), answer(&[a, b, c])]).await;
-        let s = settings(addr);
+        let log = Arc::new(Mutex::new(vec![
+            (ns - 60_000_000_000, verdict(1)),
+            (ns - 1_000_000_000, verdict(2)),
+        ]));
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let s = settings(loki(Arc::clone(&log), Arc::clone(&asked)).await);
         let mut cursor = Cursor::new(now, None);
         assert_eq!(cursor.poll(&s, now).await.unwrap().len(), 2);
-        let req = asked.recv().await.unwrap();
+        let req = asked.lock().unwrap()[0].clone();
         let q = "GET /loki/api/v1/query_range?query=%7Bjob%3D%22radius%22%7D%20%7C~%20%22%5E";
         assert!(req.starts_with(q), "{req}");
         let backfill = ns - BACKFILL.as_nanos() as u64;
         assert!(req.contains(&format!("&start={backfill}&")), "{req}");
+        log.lock().unwrap().push((ns + 30_000_000_000, verdict(3)));
         let second = cursor
             .poll(&s, now + Duration::from_secs(60))
             .await
             .unwrap();
         assert_eq!(second.len(), 1);
-        assert_eq!(second[0].cert_expires, Some(1_830_297_599));
-        let req = asked.recv().await.unwrap();
-        let from = b.0 - LAG.as_nanos() as u64;
+        let req = asked.lock().unwrap().last().unwrap().clone();
+        let from = ns - 1_000_000_000 - LAG.as_nanos() as u64;
         assert!(req.contains(&format!("&start={from}&")), "{req}");
+    }
+
+    /// More lines inside one lag window than a poll reads: each poll goes on
+    /// where the last stopped, and every line is taken once.
+    #[tokio::test]
+    async fn a_flood_past_the_page_cap_is_read_through() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let ns = nanos(now);
+        let flood: Vec<(u64, String)> = (0..25_000u64)
+            .map(|i| (ns - 60_000_000_000 + i * 1000, verdict(i)))
+            .collect();
+        let log = Arc::new(Mutex::new(flood));
+        let s = settings(loki(log, Arc::new(Mutex::new(Vec::new()))).await);
+        let mut cursor = Cursor::new(now, None);
+        let mut taken = 0;
+        let mut polls = 0;
+        while polls < 6 {
+            polls += 1;
+            let n = cursor.poll(&s, now).await.unwrap().len();
+            if n == 0 {
+                break;
+            }
+            taken += n;
+        }
+        assert_eq!(taken, 25_000);
+        assert!(polls <= 5, "{polls} polls");
+    }
+
+    /// A line stamped behind the cursor (sent late, or in the repeated hour
+    /// of the autumn clock change) is read at the next hourly re-read.
+    #[tokio::test]
+    async fn a_line_stamped_behind_the_cursor_is_read_again_hourly() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let ns = nanos(now);
+        let log = Arc::new(Mutex::new(vec![(ns - 1_000_000_000, verdict(1))]));
+        let s = settings(loki(Arc::clone(&log), Arc::new(Mutex::new(Vec::new()))).await);
+        let mut cursor = Cursor::new(now, None);
+        assert_eq!(cursor.poll(&s, now).await.unwrap().len(), 1);
+        // An hour early, after the cursor passed.
+        let late = (ns - 3_600_000_000_000, verdict(2));
+        log.lock().unwrap().push(late);
+        log.lock().unwrap().sort();
+        let later = now + Duration::from_secs(60);
+        assert!(cursor.poll(&s, later).await.unwrap().is_empty());
+        let hour = now + RESCAN_EVERY;
+        let got = cursor.poll(&s, hour).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].user, "user2");
+    }
+
+    /// A Loki that answers nonsense, or nothing, is an error in time, and
+    /// the window it failed on is read again.
+    #[tokio::test]
+    async fn a_broken_loki_is_an_error_in_time() {
+        let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = silent.local_addr().unwrap().to_string();
+        let now = SystemTime::now();
+        let mut cursor = Cursor::new(now, None);
+        let from = cursor.from_ns;
+        let t = std::time::Instant::now();
+        let wait = Duration::from_millis(300);
+        let r = fetch::get(&addr, "/", "application/json", BODY_MAX, wait).await;
+        assert!(r.is_err());
+        assert!(t.elapsed() < Duration::from_secs(2));
+        let garbage = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = garbage.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut s, _) = garbage.accept().await.unwrap();
+            let mut buf = [0; 4096];
+            let _ = s.read(&mut buf).await;
+            let _ = s.write_all(b"HTTP/1.0 200 OK\r\n\r\n<html>").await;
+        });
+        assert!(cursor.poll(&settings(addr), now).await.is_err());
+        assert_eq!(cursor.from_ns, from);
     }
 
     /// A restarted controller reads on from what its history holds, never
@@ -483,24 +695,5 @@ mod tests {
         assert_eq!(held.from_ns, 1_799_999_000_000_000_000 - lag);
         let old = Cursor::new(now, Some(1_000));
         assert_eq!(old.from_ns, nanos(now) - BACKFILL.as_nanos() as u64);
-    }
-
-    /// A Loki that answers nonsense, or nothing, is an error in time, and
-    /// the window it failed on is read again.
-    #[tokio::test]
-    async fn a_broken_loki_is_an_error_in_time() {
-        let now = SystemTime::now();
-        let (addr, _asked) = loki(vec!["<html>".into()]).await;
-        let mut cursor = Cursor::new(now, None);
-        let from = cursor.from_ns;
-        assert!(cursor.poll(&settings(addr), now).await.is_err());
-        assert_eq!(cursor.from_ns, from);
-        let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = silent.local_addr().unwrap().to_string();
-        let t = std::time::Instant::now();
-        let wait = Duration::from_millis(300);
-        let r = fetch::get(&addr, "/", "application/json", BODY_MAX, wait).await;
-        assert!(r.is_err());
-        assert!(t.elapsed() < Duration::from_secs(2));
     }
 }

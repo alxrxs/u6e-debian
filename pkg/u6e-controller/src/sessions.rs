@@ -17,11 +17,13 @@
 //! controller, was away) ends unobserved at the time it was last heard, as
 //! does one of an AP not heard for an hour.
 //!
-//! What is kept is bounded: the sessions of the last 30 days, at most
-//! [`SESSIONS_MAX`]; the timeline's own bounds; per identity (an EAP
-//! identity, or the MAC of a MAC-authenticated client) the totals and the
-//! last client certificate expiry, of the [`IDENTITIES_MAX`] identities seen
-//! last within 30 days. It is all saved in one file (`history_path`, 0600:
+//! A session's identity (an EAP identity, or the MAC of a MAC-authenticated
+//! client) counts only once its AP authorized it in that session: until
+//! then it is only what the client claims. What is kept is bounded: the
+//! sessions of the last 30 days, at most [`SESSIONS_MAX`]; the timeline's own
+//! bounds; the totals of the [`IDENTITIES_MAX`] identities seen last within
+//! 30 days, and as many client certificates, each by its common name (never
+//! by the User-Name, which the client chooses), with its last expiry. It is all saved in one file (`history_path`, 0600:
 //! it names people), whole through `store::replace`, every
 //! [`SAVE_EVERY`] when it changed and when the controller stops; a file that
 //! does not decode is set aside as `<name>.corrupt-<ms>` and the controller
@@ -57,6 +59,9 @@ pub const ROAM_WINDOW_MS: u64 = 10_000;
 pub const CAUSE_WINDOW_MS: u64 = 30_000;
 /// A client silent this long when it went had been dropped as inactive.
 pub const INACTIVE_MS: u32 = 60_000;
+/// How long before its session began a certificate's accept may come (EAP
+/// runs before the association is reported).
+const CERT_BEFORE_MS: u64 = 120_000;
 /// An open session of an AP not heard for this long ends unobserved.
 const UNHEARD_MS: u64 = 3600 * 1000;
 /// A station that began this much later than its open session did is a
@@ -77,7 +82,7 @@ pub const SAVE_EVERY: Duration = Duration::from_secs(300);
 /// What the file starts with, and the format of what follows, raised with
 /// every change to it.
 const MARK: &[u8; 4] = b"U6CH";
-const FORMAT: u16 = 1;
+const FORMAT: u16 = 2;
 /// The largest file read: the bounds keep it far below.
 const FILE_MAX: u64 = 256 << 20;
 
@@ -92,8 +97,10 @@ pub struct Session {
     pub end_ms: Option<u64>,
     /// When its client was last heard.
     pub last_ms: u64,
-    /// How it authenticated, once its AP said.
+    /// How it authenticated, once its AP said, and whether its AP has
+    /// authorized it in this session.
     pub auth: Option<StationAuth>,
+    pub authenticated: bool,
     /// Bytes from the client and to it, as its AP counted them.
     pub up_bytes: u64,
     pub down_bytes: u64,
@@ -107,10 +114,10 @@ pub struct Session {
 }
 
 impl Session {
-    /// Who it authenticated as: its EAP identity, or its MAC when RADIUS
-    /// admitted the MAC.
+    /// Who it authenticated as, once its AP authorized it: its EAP
+    /// identity, or its MAC when RADIUS admitted the MAC.
     pub fn identity(&self) -> Option<String> {
-        let a = self.auth.as_ref()?;
+        let a = self.auth.as_ref().filter(|_| self.authenticated)?;
         match a.kind() {
             AuthKind::Eap if !a.identity.is_empty() => Some(a.identity.clone()),
             AuthKind::MacAuth => Some(mac::format(self.mac)),
@@ -129,8 +136,8 @@ pub struct Totals {
     pub seen_ms: u64,
 }
 
-/// An identity's client certificate: when it expires (Unix seconds), as
-/// RADIUS last accepted it.
+/// A client certificate, by its common name: when it expires (Unix
+/// seconds), as RADIUS last accepted it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cert {
     pub expires_s: u64,
@@ -159,9 +166,10 @@ impl Recent {
     }
 }
 
-/// What the file holds.
+/// What the file holds: the history, copied while the state is locked and
+/// encoded after.
 #[derive(Serialize, Deserialize)]
-struct Saved {
+pub struct Saved {
     next_id: u64,
     open: Vec<Session>,
     closed: Vec<Session>,
@@ -231,10 +239,10 @@ impl Sessions {
         self.recent.entry(mac).or_default()
     }
 
-    /// The cause `kind` of the client's recent past, if it came within
-    /// [`CAUSE_WINDOW_MS`] before `at`.
+    /// What ended `session` at `at`: what came within [`CAUSE_WINDOW_MS`]
+    /// before, and in the session (a kick of an earlier one is not its).
     fn cause(&self, mac: &[u8; 6], at: u64, session: &Session) -> End {
-        let fresh = |t: u64| t <= at && at - t <= CAUSE_WINDOW_MS;
+        let fresh = |t: u64| t >= session.start_ms && t <= at && at - t <= CAUSE_WINDOW_MS;
         let r = self.recent.get(mac);
         match r.and_then(|r| r.action.clone()).filter(|a| fresh(a.2)) {
             Some(("kick", by, _)) => return End::Kicked { by },
@@ -366,6 +374,7 @@ impl Sessions {
             end_ms: None,
             last_ms: at,
             auth: None,
+            authenticated: false,
             up_bytes: 0,
             down_bytes: 0,
             end: None,
@@ -508,6 +517,7 @@ impl Sessions {
                 continue;
             }
             if let Some(a) = &learnt {
+                s.authenticated |= a.authorized;
                 s.auth = Some(a.clone());
             }
             let (id, vlan) = (s.id, st.vlan);
@@ -610,14 +620,14 @@ impl Sessions {
     }
 
     /// Takes RADIUS's verdicts: each into its client's timeline, once
-    /// however often it is read, and an accepted certificate's expiry for
-    /// its identity.
+    /// however often it is read, and an accepted certificate's expiry by its
+    /// common name.
     pub fn radius(&mut self, lines: &[Line]) {
         for l in lines {
             if l.accept
-                && let Some(expires_s) = l.cert_expires
+                && let (Some(expires_s), Some(cn)) = (l.cert_expires, &l.cert_cn)
             {
-                let c = self.certs.entry(l.user.clone()).or_insert(Cert {
+                let c = self.certs.entry(cn.clone()).or_insert(Cert {
                     expires_s,
                     seen_ms: 0,
                 });
@@ -636,6 +646,7 @@ impl Sessions {
                 nas: l.nas.clone(),
                 detail: l.detail.clone(),
                 cert_expires: l.cert_expires,
+                cert_cn: l.cert_cn.clone(),
             };
             let entry = Entry {
                 at_ms: l.at_ms,
@@ -721,14 +732,33 @@ impl Sessions {
         self.open.values()
     }
 
-    /// The certificate RADIUS last accepted for `identity`.
-    pub fn cert(&self, identity: &str) -> Option<Cert> {
-        self.certs.get(identity).copied()
-    }
-
-    /// Every identity's certificate, by identity.
+    /// Every client certificate RADIUS accepted, by common name.
     pub fn certs(&self) -> &BTreeMap<String, Cert> {
         &self.certs
+    }
+
+    /// The certificate `session` of `mac` signed in with, once its AP
+    /// authorized it: the newest EAP-TLS accept of the client from shortly
+    /// before the session began (EAP comes first) to its end; its common name
+    /// and expiry (Unix seconds).
+    pub fn session_cert(&self, mac: &[u8; 6], session: &Session) -> Option<(String, u64)> {
+        if !session.authenticated {
+            return None;
+        }
+        let from = session.start_ms.saturating_sub(CERT_BEFORE_MS);
+        let to = session.end_ms.unwrap_or(u64::MAX);
+        let accepts = self.timeline.of(mac).rev();
+        accepts
+            .filter(|e| (from..=to).contains(&e.at_ms))
+            .find_map(|e| match &e.what {
+                What::Radius {
+                    accept: true,
+                    cert_expires: Some(s),
+                    cert_cn: Some(cn),
+                    ..
+                } => Some((cn.clone(), *s)),
+                _ => None,
+            })
     }
 
     /// Every identity's totals with its open sessions counted in, and how
@@ -752,19 +782,21 @@ impl Sessions {
         out
     }
 
-    /// The file's bytes.
-    pub fn encode(&self) -> io::Result<Vec<u8>> {
-        let saved = Saved {
+    /// What the file is to hold.
+    pub fn saved(&self) -> Saved {
+        Saved {
             next_id: self.next_id,
             open: self.open.values().cloned().collect(),
             closed: self.closed.iter().cloned().collect(),
             timeline: self.timeline.saved(),
             totals: self.totals.iter().map(|(i, t)| (i.clone(), *t)).collect(),
             certs: self.certs.iter().map(|(i, c)| (i.clone(), *c)).collect(),
-        };
-        let mut bytes = MARK.to_vec();
-        bytes.extend_from_slice(&FORMAT.to_le_bytes());
-        postcard::to_extend(&saved, bytes).map_err(io::Error::other)
+        }
+    }
+
+    /// The file's bytes.
+    pub fn encode(&self) -> io::Result<Vec<u8>> {
+        self.saved().encode()
     }
 
     /// What `path` holds; empty without the file. A file of another format,
@@ -787,8 +819,8 @@ impl Sessions {
             _ => None,
         };
         let Some(saved) = saved else {
-            let aside = set_aside(path)?;
-            return Ok((Sessions::default(), Some(aside)));
+            let aside = store::set_aside(path)?;
+            return Ok((Sessions::default(), Some(aside.display().to_string())));
         };
         let s = Sessions {
             open: saved.open.into_iter().map(|s| (s.mac, s)).collect(),
@@ -803,35 +835,36 @@ impl Sessions {
     }
 }
 
-/// Moves `path` aside as `<name>.corrupt-<ms>`; that name.
-fn set_aside(path: &Path) -> io::Result<String> {
-    let mut aside = path.as_os_str().to_owned();
-    aside.push(format!(".corrupt-{}", unix_ms(SystemTime::now())));
-    let aside = PathBuf::from(aside);
-    fs::rename(path, &aside)?;
-    Ok(aside.display().to_string())
+impl Saved {
+    /// The file's bytes.
+    pub fn encode(&self) -> io::Result<Vec<u8>> {
+        let mut bytes = MARK.to_vec();
+        bytes.extend_from_slice(&FORMAT.to_le_bytes());
+        postcard::to_extend(self, bytes).map_err(io::Error::other)
+    }
 }
 
 /// Saves the history at `path` if it changed, after dropping what is past
-/// its keeping; a save that fails is tried again at the next.
+/// its keeping; a save that fails is tried again at the next. The history is
+/// copied under the state's lock and encoded and written after, so the
+/// state is not held while megabytes are encoded.
 pub async fn save(state: &Shared, path: &Path) {
-    let bytes = {
+    let saved = {
         let mut s = state.write();
         s.sessions_tick(SystemTime::now());
         if !s.sessions.take_dirty() {
             return;
         }
-        s.sessions.encode()
+        s.sessions.saved()
     };
     let path = path.to_owned();
-    let written = match bytes {
-        Ok(bytes) => tokio::task::spawn_blocking(move || {
-            store::replace(&path, &bytes, 0o600).map_err(|e| format!("{}: {e}", path.display()))
-        })
-        .await
-        .unwrap_or_else(|e| Err(e.to_string())),
-        Err(e) => Err(e.to_string()),
-    };
+    let written = tokio::task::spawn_blocking(move || {
+        let bytes = saved.encode()?;
+        store::replace(&path, &bytes, 0o600)
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|r| r.map_err(|e| e.to_string()));
     if let Err(e) = written {
         eprintln!("u6e-controller: the client history could not be saved: {e}");
         state.write().sessions.dirty = true;
@@ -1305,12 +1338,18 @@ mod tests {
             node: "radius1".into(),
             nas: "ap1".into(),
             detail: if accept { "eap" } else { "no" }.into(),
+            cert_cn: cert_expires.map(|_| "host/pc1".into()),
             cert_expires,
         }
     }
 
+    fn cert(s: &Sessions, cn: &str) -> Option<u64> {
+        s.certs().get(cn).map(|c| c.expires_s)
+    }
+
     /// RADIUS's verdicts go into the timeline in time order; an accepted
-    /// certificate's expiry is its identity's, the newest accept's winning.
+    /// certificate's expiry is kept by its common name, the newest accept's
+    /// winning.
     #[test]
     fn radius_verdicts_and_certificates() {
         let mut s = Sessions::default();
@@ -1320,16 +1359,111 @@ mod tests {
             line(T0 + 1000, false, None),
         ]);
         assert_eq!(kinds(&s), ["radius", "radius", "joined"]);
-        assert_eq!(s.cert("host/pc1").unwrap().expires_s, 1_900_000_000);
+        assert_eq!(cert(&s, "host/pc1"), Some(1_900_000_000));
         // A line read again is taken once.
         s.radius(&[line(T0 + 1000, false, None)]);
         assert_eq!(kinds(&s), ["radius", "radius", "joined"]);
         assert_eq!(s.radius_newest(), Some(T0 + 4000));
         // An older line read late does not replace the newer certificate.
         s.radius(&[line(T0 + 2000, true, Some(1_800_000_000))]);
-        assert_eq!(s.cert("host/pc1").unwrap().expires_s, 1_900_000_000);
+        assert_eq!(cert(&s, "host/pc1"), Some(1_900_000_000));
         s.radius(&[line(T0 + 9000, true, Some(1_950_000_000))]);
-        assert_eq!(s.cert("host/pc1").unwrap().expires_s, 1_950_000_000);
+        assert_eq!(cert(&s, "host/pc1"), Some(1_950_000_000));
+    }
+
+    /// A client whose certificate is its own signs in as `host/victim`: the
+    /// certificate is kept by its common name, never the victim's name, and
+    /// the victim's own certificate stays as it was.
+    #[test]
+    fn a_certificate_counts_for_its_common_name_only() {
+        let mut s = Sessions::default();
+        s.radius(&[line(T0, true, Some(1_900_000_000))]);
+        let forged = Line {
+            user: "host/pc1".into(),
+            cert_cn: Some("host/attacker".into()),
+            ..line(T0 + 1000, true, Some(1_700_000_000))
+        };
+        s.radius(&[forged]);
+        assert_eq!(cert(&s, "host/pc1"), Some(1_900_000_000));
+        assert_eq!(cert(&s, "host/attacker"), Some(1_700_000_000));
+        // A line without a common name keeps no certificate.
+        let anonymous = Line {
+            cert_cn: None,
+            ..line(T0 + 2000, true, Some(1_600_000_000))
+        };
+        s.radius(&[anonymous]);
+        assert_eq!(s.certs().len(), 2);
+    }
+
+    /// A client its AP has not authorized only claims its identity: it
+    /// counts for no identity, and shows no certificate, until it is.
+    #[test]
+    fn a_claimed_identity_counts_only_once_authorized() {
+        let mut s = Sessions::default();
+        assoc(&mut s, "ap1", 0, T0);
+        let claimed = StationAuth {
+            authorized: false,
+            ..eap("host/claimed", 0)
+        };
+        s.snapshot(
+            "ap1",
+            &snap(vec![station(0, 1, 0)], Some(claimed)),
+            &naming(),
+            T0 + 1000,
+            false,
+        );
+        let cert_line = Line {
+            cert_cn: Some("host/claimed".into()),
+            ..line(T0 + 500, true, Some(1_900_000_000))
+        };
+        s.radius(&[cert_line]);
+        let open = s.open_of(&MAC).unwrap();
+        assert_eq!(open.identity(), None);
+        assert_eq!(s.session_cert(&MAC, open), None);
+        assert!(s.identities().is_empty());
+        disassoc(&mut s, "ap1", 0, T0 + 2000);
+        assert!(
+            s.identities().is_empty(),
+            "an unauthenticated session counts for nobody"
+        );
+        // Authorized, it counts, and shows the certificate it signed in with.
+        assoc(&mut s, "ap1", 0, T0 + 60_000);
+        s.snapshot(
+            "ap1",
+            &snap(vec![station(0, 1, 0)], Some(eap("host/pc1", 0))),
+            &naming(),
+            T0 + 61_000,
+            false,
+        );
+        s.radius(&[line(T0 + 59_000, true, Some(1_900_000_000))]);
+        let open = s.open_of(&MAC).unwrap();
+        assert_eq!(open.identity().as_deref(), Some("host/pc1"));
+        assert_eq!(
+            s.session_cert(&MAC, open),
+            Some(("host/pc1".into(), 1_900_000_000))
+        );
+        assert_eq!(s.identities()["host/pc1"].1, 1);
+    }
+
+    /// An operator's kick of an earlier session is no cause of this one's
+    /// end, however close in time.
+    #[test]
+    fn a_cause_must_come_within_the_session() {
+        let mut s = Sessions::default();
+        assoc(&mut s, "ap1", 0, T0);
+        act(&mut s, "kick", T0 + 1000);
+        disassoc(&mut s, "ap1", 0, T0 + 1500);
+        assoc(&mut s, "ap1", 0, T0 + 5000);
+        disassoc(&mut s, "ap1", 0, T0 + 9000);
+        assert_eq!(
+            ends(&s),
+            [
+                Some(End::Left),
+                Some(End::Kicked {
+                    by: Some("admin".into())
+                })
+            ]
+        );
     }
 
     /// First traffic and the guards' reports, once each.

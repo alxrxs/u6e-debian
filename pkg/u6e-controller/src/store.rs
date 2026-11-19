@@ -68,13 +68,9 @@ impl Store {
 
     /// Moves `name` aside, as `<name>.corrupt-<ms>`; that name.
     pub fn set_aside(&self, name: &str) -> io::Result<String> {
-        let ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis());
-        let aside = format!("{name}{ASIDE}{ms}");
-        fs::rename(self.dir.join(name), self.dir.join(&aside))?;
-        File::open(&self.dir)?.sync_all()?;
-        Ok(aside)
+        let aside = set_aside(&self.dir.join(name))?;
+        let aside = aside.file_name().unwrap_or_default().to_string_lossy();
+        Ok(aside.into_owned())
     }
 
     /// The files set aside, and when, oldest first.
@@ -100,6 +96,21 @@ impl Store {
         zeroize(&mut bytes);
         written
     }
+}
+
+/// Moves `path` aside, as `<path>.corrupt-<ms>`, and syncs its directory so
+/// the move outlives a crash; that path.
+pub fn set_aside(path: &Path) -> io::Result<PathBuf> {
+    let ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let mut aside = path.as_os_str().to_owned();
+    aside.push(format!("{ASIDE}{ms}"));
+    let aside = PathBuf::from(aside);
+    fs::rename(path, &aside)?;
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+    File::open(dir.unwrap_or(Path::new(".")))?.sync_all()?;
+    Ok(aside)
 }
 
 /// Where [`replace`] writes the new file of `path` first.

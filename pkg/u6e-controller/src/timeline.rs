@@ -123,7 +123,7 @@ pub enum What {
     /// RADIUS's verdict, as its log has it: the User-Name, the node that
     /// answered, the NAS (the RADIUS client's name), the detail (the method
     /// on an accept, the reason on a reject) and the client certificate's
-    /// expiry (Unix seconds).
+    /// expiry (Unix seconds) and common name.
     Radius {
         accept: bool,
         user: String,
@@ -131,6 +131,7 @@ pub enum What {
         nas: String,
         detail: String,
         cert_expires: Option<u64>,
+        cert_cn: Option<String>,
     },
     /// A DHCP server leased it `ip` until `expires` (Unix seconds): newly,
     /// or `renewed`.
