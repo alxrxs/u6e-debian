@@ -599,9 +599,11 @@ fn radius_log(m: &mut Text, state: &State) {
     m.family(
         "wifi_radius_last_verdict_timestamp_seconds",
         GAUGE,
-        "When the newest verdict read from RADIUS's log happened; 0 before any.",
+        "When the newest verdict read from RADIUS's log happened; absent before any.",
     );
-    m.sample(&[], h.newest_ms.map_or(0.0, |ms| ms as f64 / 1000.0));
+    if let Some(ms) = h.newest_ms {
+        m.sample(&[], ms as f64 / 1000.0);
+    }
 }
 
 /// The APs' configurations, when the controller signs them.

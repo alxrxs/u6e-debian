@@ -4402,4 +4402,7 @@ fn without_loki_the_radius_side_is_left_out() {
         metrics_of(&r, "wifi_radius_log_up "),
         ["wifi_radius_log_up 0"]
     );
+    // No verdict read yet: no time of one, which an alert could take for
+    // the epoch.
+    assert!(metrics_of(&r, "wifi_radius_last_verdict_timestamp_seconds ").is_empty());
 }
