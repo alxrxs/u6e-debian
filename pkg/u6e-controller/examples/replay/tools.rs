@@ -12,6 +12,7 @@ use u6e_proto::msg::{
     AgentMsg, CaptureChunk, CaptureMechanism, CaptureRequest, CaptureState, Limit, LimitState,
     LimitStatus, LimitTarget, Snapshot,
 };
+use u6e_proto::text;
 
 /// How each limit stands on the AP `snap` is of.
 pub fn states(limits: &[Limit], snap: &Snapshot) -> Vec<LimitState> {
@@ -23,7 +24,10 @@ pub fn states(limits: &[Limit], snap: &Snapshot) -> Vec<LimitState> {
                     None => (LimitStatus::Waiting, "not on this AP".to_owned(), (0, 0)),
                     Some(_) if m[5] == 3 && l.rate.down_kbit.is_none() => (
                         LimitStatus::NotEnforced,
-                        "its NSS class counted none of the 3145728 B it sent in a minute".into(),
+                        format!(
+                            "its NSS class counted none of the {} it sent in a minute",
+                            text::bytes(3 << 20)
+                        ),
                         (0, 0),
                     ),
                     Some(s) => {

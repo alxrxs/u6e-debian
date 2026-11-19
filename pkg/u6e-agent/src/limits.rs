@@ -445,7 +445,8 @@ impl Limits {
                     ("sent", moved(st.rx_bytes, rx0))
                 };
                 s.status = LimitStatus::NotEnforced;
-                s.detail = format!("its NSS class counted none of the {n} B it {dir} in a minute");
+                let n = text::bytes(n);
+                s.detail = format!("its NSS class counted none of the {n} it {dir} in a minute");
             } else {
                 s.status = LimitStatus::Enforced;
                 s.detail = o.detail.clone();

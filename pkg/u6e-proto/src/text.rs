@@ -2,7 +2,8 @@
 //! SSID, a guard's detail. Control characters and Unicode format characters
 //! (general category Cf: the bidirectional overrides and isolates, zero-width
 //! spaces and joiners, the byte order mark, the tag characters) are dropped,
-//! so no string can reorder or hide what is shown around it.
+//! so no string can reorder or hide what is shown around it. A byte count in
+//! such text is written as the UI writes one (`bytes`).
 
 /// The Unicode format characters (general category Cf), as ranges.
 const FORMAT: [(u32, u32); 21] = [
@@ -61,9 +62,34 @@ pub fn clean_in_place(s: &mut String) {
     }
 }
 
+/// `n` bytes as the UI writes them: SI units, one decimal under 10 of
+/// one past bytes (`3.1 MB`, `218 kB`, `30 B`).
+pub fn bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "kB", "MB", "GB", "TB"];
+    let (mut v, mut i) = (n as f64, 0);
+    while v >= 1000.0 && i < UNITS.len() - 1 {
+        v /= 1000.0;
+        i += 1;
+    }
+    if i > 0 && v < 10.0 {
+        format!("{v:.1} {}", UNITS[i])
+    } else {
+        format!("{} {}", v.round(), UNITS[i])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bytes_read_as_the_ui_writes_them() {
+        assert_eq!(bytes(30), "30 B");
+        assert_eq!(bytes(218_034), "218 kB");
+        assert_eq!(bytes(3_145_728), "3.1 MB");
+        assert_eq!(bytes(250_000_000), "250 MB");
+        assert_eq!(bytes(1_000), "1.0 kB");
+    }
 
     #[test]
     fn controls_and_format_characters_go() {

@@ -277,7 +277,7 @@ pub mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
     use u6e_proto::bpf::{Meta, run};
 
-    pub const CLIENT: [u8; 6] = [0x64, 0, 0, 0, 0, 1];
+    pub const CLIENT: [u8; 6] = [2, 0, 0, 0, 0, 1];
     pub const OTHER: [u8; 6] = [2, 0, 0, 0, 0, 2];
 
     pub fn eth(dst: [u8; 6], src: [u8; 6], ethertype: u16, payload: &[u8]) -> Vec<u8> {
@@ -370,7 +370,7 @@ pub mod tests {
         let other = eth(OTHER, [2, 0, 0, 0, 0, 3], 0x0800, &ipv4(6, A, B, &[]));
         assert_eq!(run(&prog, &other, incoming(10)), 0);
         // A MAC that matches in its first four bytes only.
-        let near = eth(OTHER, [0x64, 0, 0, 0, 9, 9], 0x0806, &arp(A, B));
+        let near = eth(OTHER, [2, 0, 0, 0, 9, 9], 0x0806, &arp(A, B));
         assert_eq!(run(&prog, &near, incoming(10)), 0);
     }
 

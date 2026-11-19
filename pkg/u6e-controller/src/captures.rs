@@ -30,11 +30,11 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use u6e_proto::mac;
 use u6e_proto::msg::{
     CaptureChunk, CaptureFilter, CaptureMechanism, CaptureRequest, CaptureState, CtlMsg,
     FilterProto,
 };
+use u6e_proto::{mac, text};
 
 use crate::actions::{Via, Web, is_admin, refusal, user};
 use crate::http::{error, json_response};
@@ -322,8 +322,11 @@ pub fn summary(c: &Capture) -> String {
         CaptureMechanism::OffOffload => "; taken off the offload",
     });
     format!(
-        "{}: {} B, {} packets, {} dropped{how}",
-        c.reason, c.written, c.packets, c.dropped
+        "{}: {}, {} packets, {} dropped{how}",
+        c.reason,
+        text::bytes(c.written),
+        c.packets,
+        c.dropped
     )
 }
 
