@@ -609,8 +609,9 @@ impl Sessions {
         }
     }
 
-    /// Takes RADIUS's verdicts: each into its client's timeline, and an
-    /// accepted certificate's expiry for its identity.
+    /// Takes RADIUS's verdicts: each into its client's timeline, once
+    /// however often it is read, and an accepted certificate's expiry for
+    /// its identity.
     pub fn radius(&mut self, lines: &[Line]) {
         for l in lines {
             if l.accept
@@ -636,8 +637,21 @@ impl Sessions {
                 detail: l.detail.clone(),
                 cert_expires: l.cert_expires,
             };
-            self.push(l.mac, l.at_ms, what);
+            let entry = Entry {
+                at_ms: l.at_ms,
+                what,
+            };
+            if !self.timeline.holds(&l.mac, &entry) {
+                self.timeline.push(l.mac, entry);
+                self.dirty = true;
+            }
         }
+    }
+
+    /// When the newest of RADIUS's verdicts kept happened: where reading
+    /// its log goes on from.
+    pub fn radius_newest(&self) -> Option<u64> {
+        self.timeline.newest(|w| matches!(w, What::Radius { .. }))
     }
 
     /// Keeps the identities seen last, [`IDENTITIES_MAX`] of each kind.
@@ -1307,6 +1321,10 @@ mod tests {
         ]);
         assert_eq!(kinds(&s), ["radius", "radius", "joined"]);
         assert_eq!(s.cert("host/pc1").unwrap().expires_s, 1_900_000_000);
+        // A line read again is taken once.
+        s.radius(&[line(T0 + 1000, false, None)]);
+        assert_eq!(kinds(&s), ["radius", "radius", "joined"]);
+        assert_eq!(s.radius_newest(), Some(T0 + 4000));
         // An older line read late does not replace the newer certificate.
         s.radius(&[line(T0 + 2000, true, Some(1_800_000_000))]);
         assert_eq!(s.cert("host/pc1").unwrap().expires_s, 1_900_000_000);

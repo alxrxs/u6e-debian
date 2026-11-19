@@ -230,6 +230,25 @@ impl Timeline {
         self.clients.get(mac).into_iter().flatten()
     }
 
+    /// Whether `mac` holds an entry equal to `entry`.
+    pub fn holds(&self, mac: &[u8; 6], entry: &Entry) -> bool {
+        let Some(list) = self.clients.get(mac) else {
+            return false;
+        };
+        let from = list.partition_point(|e| e.at_ms < entry.at_ms);
+        let same_time = list.range(from..).take_while(|e| e.at_ms == entry.at_ms);
+        same_time.into_iter().any(|e| e == entry)
+    }
+
+    /// When the newest entry `pick` picks happened, over every client.
+    pub fn newest(&self, pick: impl Fn(&What) -> bool) -> Option<u64> {
+        let all = self
+            .clients
+            .values()
+            .flat_map(|l| l.iter().rev().find(|e| pick(&e.what)));
+        all.map(|e| e.at_ms).max()
+    }
+
     /// Whether anything of `mac` is kept.
     pub fn knows(&self, mac: &[u8; 6]) -> bool {
         self.clients.contains_key(mac)

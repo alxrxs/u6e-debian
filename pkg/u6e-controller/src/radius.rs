@@ -16,8 +16,9 @@
 //! for: the Wi-Fi's (and any other NAS's that names a MAC).
 //!
 //! Each poll reads from [`LAG`] before the newest line read so far (the
-//! shipper's delay), the lines already taken skipped; the first goes back
-//! [`BACKFILL`]. A poll reads at most [`PAGES`] pages of [`PAGE`] lines, each
+//! shipper's delay), the lines already taken skipped; the first goes on from
+//! the newest line the clients' history holds, or back [`BACKFILL`] (the
+//! history takes a line it holds already only once). A poll reads at most [`PAGES`] pages of [`PAGE`] lines, each
 //! answer at most [`BODY_MAX`] bytes within [`TIMEOUT`]; what it could not
 //! read is read at the next.
 
@@ -229,9 +230,15 @@ fn key(ns: u64, l: &Line) -> (u64, u64) {
 }
 
 impl Cursor {
-    fn new(now: SystemTime) -> Self {
+    /// A cursor at `now`, going on from `resume_ms` (the newest line the
+    /// history holds), but never further back than [`BACKFILL`].
+    fn new(now: SystemTime, resume_ms: Option<u64>) -> Self {
+        let back = nanos(now).saturating_sub(BACKFILL.as_nanos() as u64);
+        let resume = resume_ms.map_or(0, |ms| {
+            (ms * 1_000_000).saturating_sub(LAG.as_nanos() as u64)
+        });
         Cursor {
-            from_ns: nanos(now).saturating_sub(BACKFILL.as_nanos() as u64),
+            from_ns: back.max(resume),
             taken: HashSet::new(),
         }
     }
@@ -274,7 +281,8 @@ impl Cursor {
 /// state; a change of whether it can be read is logged once.
 pub async fn supervise(state: Shared, settings: Settings) {
     let mut every = interval(EVERY);
-    let mut cursor = Cursor::new(SystemTime::now());
+    let resume = state.read().sessions.radius_newest();
+    let mut cursor = Cursor::new(SystemTime::now(), resume);
     loop {
         every.tick().await;
         let now = SystemTime::now();
@@ -447,7 +455,7 @@ mod tests {
         let c = (ns + 30_000_000_000, with_expiry.as_str());
         let (addr, mut asked) = loki(vec![answer(&[a, b]), answer(&[a, b, c])]).await;
         let s = settings(addr);
-        let mut cursor = Cursor::new(now);
+        let mut cursor = Cursor::new(now, None);
         assert_eq!(cursor.poll(&s, now).await.unwrap().len(), 2);
         let req = asked.recv().await.unwrap();
         let q = "GET /loki/api/v1/query_range?query=%7Bjob%3D%22radius%22%7D%20%7C~%20%22%5E";
@@ -465,13 +473,25 @@ mod tests {
         assert!(req.contains(&format!("&start={from}&")), "{req}");
     }
 
+    /// A restarted controller reads on from what its history holds, never
+    /// further back than the backfill.
+    #[test]
+    fn a_cursor_goes_on_from_the_history() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let lag = LAG.as_nanos() as u64;
+        let held = Cursor::new(now, Some(1_799_999_000_000));
+        assert_eq!(held.from_ns, 1_799_999_000_000_000_000 - lag);
+        let old = Cursor::new(now, Some(1_000));
+        assert_eq!(old.from_ns, nanos(now) - BACKFILL.as_nanos() as u64);
+    }
+
     /// A Loki that answers nonsense, or nothing, is an error in time, and
     /// the window it failed on is read again.
     #[tokio::test]
     async fn a_broken_loki_is_an_error_in_time() {
         let now = SystemTime::now();
         let (addr, _asked) = loki(vec!["<html>".into()]).await;
-        let mut cursor = Cursor::new(now);
+        let mut cursor = Cursor::new(now, None);
         let from = cursor.from_ns;
         assert!(cursor.poll(&settings(addr), now).await.is_err());
         assert_eq!(cursor.from_ns, from);
