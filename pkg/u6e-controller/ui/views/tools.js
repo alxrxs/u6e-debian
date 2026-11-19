@@ -5,7 +5,8 @@
 // enforced, with why) and its captures (one at a time on its AP, bounded in
 // time, size and snaplen, filtered by protocol, port and host; running,
 // stopped, and downloaded by admins). Both read the live view
-// (`state.limits`, `state.captures`); only admins change anything.
+// (`state.limits`, and `state.captures`, which only admins are sent); only
+// admins change anything.
 
 import { h, ago, ask, bytes, duration, hm, icon } from '../util.js';
 

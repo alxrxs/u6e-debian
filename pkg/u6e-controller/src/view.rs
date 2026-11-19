@@ -45,8 +45,9 @@ use crate::state::{Action, Ap, ClientView, Rollout, State, mechanism_name, outco
 use crate::timeline::{EapStep, End, Entry, Place, What};
 
 /// The APs and clients of the APs `wanted` says yes to, and the clients
-/// blocked, as one object, with their flows when `flows`.
-pub fn view(state: &State, wanted: impl Fn(&str) -> bool, flows: bool) -> Value {
+/// blocked, as one object, with their flows when `flows` and the captures
+/// for an `admin` (who captured whom is no one else's).
+pub fn view(state: &State, wanted: impl Fn(&str) -> bool, flows: bool, admin: bool) -> Value {
     let mut v = json!({
         "aps": aps(state, &wanted),
         "clients": clients(state, &wanted),
@@ -55,8 +56,10 @@ pub fn view(state: &State, wanted: impl Fn(&str) -> bool, flows: bool) -> Value 
         "manage": manage(state),
         "rollouts": rollouts(state, LIVE_LOG),
         "limits": crate::limits::view(state),
-        "captures": crate::captures::view(state),
     });
+    if admin {
+        v["captures"] = crate::captures::view(state);
+    }
     if flows {
         v["flows"] = self::flows(state, &wanted, None);
     }

@@ -373,13 +373,14 @@ async fn ws(Ext(web): Ext<Web>, req: HeaderMap, upgrade: WebSocketUpgrade) -> Re
         return StatusCode::FORBIDDEN.into_response();
     }
     let user = actions::user(&req);
+    let admin = actions::is_admin(&req, &web.access.admin_group);
     let scans = Gate {
         req,
         access: web.access,
     };
     upgrade
         .max_message_size(MAX_MESSAGE)
-        .on_upgrade(move |socket| live(socket, web.state, user, scans))
+        .on_upgrade(move |socket| live(socket, web.state, user, admin, scans))
 }
 
 /// Whether a socket may start scans: the headers of its handshake, judged as
@@ -474,8 +475,9 @@ fn scan_state(state: &Shared, key: &str, refused: Option<&str>) -> Value {
     json!({ "spectrum": v })
 }
 
-/// Serves one WebSocket until either end closes it.
-async fn live(mut ws: WebSocket, state: Shared, user: Option<String>, scans: Gate) {
+/// Serves one WebSocket until either end closes it; the captures only to
+/// an `admin`, as its handshake named them.
+async fn live(mut ws: WebSocket, state: Shared, user: Option<String>, admin: bool, scans: Gate) {
     let Some((names, mut flows)) = subscription(&mut ws, &state).await else {
         return;
     };
@@ -494,7 +496,7 @@ async fn live(mut ws: WebSocket, state: Shared, user: Option<String>, scans: Gat
     let mut ping = interval(SCAN_PING);
     // Subscribed first, so nothing between the key and the first patch is lost.
     let mut changes = state.read().subscribe();
-    let mut sent = view::view(&state.read(), wanted, flows);
+    let mut sent = view::view(&state.read(), wanted, flows, admin);
     if send(&mut ws, &json!({ "key": sent, "user": user }))
         .await
         .is_err()
@@ -520,7 +522,7 @@ async fn live(mut ws: WebSocket, state: Shared, user: Option<String>, scans: Gat
                         flows = show;
                         _watching_flows = watch_flows(flows);
                         // The flows come, or go, with this patch.
-                        let next = view::view(&state.read(), wanted, flows);
+                        let next = view::view(&state.read(), wanted, flows, admin);
                         if patch(&mut ws, &mut sent, next).await.is_err() {
                             return;
                         }
@@ -594,7 +596,8 @@ async fn live(mut ws: WebSocket, state: Shared, user: Option<String>, scans: Gat
                 (wanted(&ap), None)
             }
             Ok(Change::Flows(ap)) => (flows && wanted(&ap), None),
-            Ok(Change::Names | Change::Deploy | Change::Limits | Change::Captures) => (true, None),
+            Ok(Change::Names | Change::Deploy | Change::Limits) => (true, None),
+            Ok(Change::Captures) => (admin, None),
             // A block or an unblock changes the list of clients blocked.
             Ok(Change::Action(a)) if a.ap.as_deref().is_none_or(wanted) => {
                 (true, Some(json!({ "events": [view::action(&a)] })))
@@ -621,7 +624,7 @@ async fn live(mut ws: WebSocket, state: Shared, user: Option<String>, scans: Gat
         if !relevant {
             continue;
         }
-        let next = view::view(&state.read(), wanted, flows);
+        let next = view::view(&state.read(), wanted, flows, admin);
         if patch(&mut ws, &mut sent, next).await.is_err() {
             return;
         }

@@ -1940,6 +1940,37 @@ fn a_capture_is_streamed_kept_and_downloaded_by_an_admin() {
 }
 
 #[test]
+fn the_captures_are_shown_to_admins_only() {
+    let r = controller(Timing::default());
+    let admin = format!("{SAME_SITE}{ADMIN}");
+    let mut a = ap_with_client(&r, KEY_AP1, "ap1", &[]);
+    let body = r#"{"secs": 60, "max_mb": 1, "snaplen": 64, "filter": {"proto": null, "port": null, "host": null}}"#;
+    let (status, _) = post(r.c.http, &format!("{CLIENT}/capture"), &admin, body);
+    assert_eq!(status, 202);
+    assert!(matches!(a.expect(), CtlMsg::CaptureStart(_)));
+    let open = |headers: &[(&'static str, &str)]| {
+        let mut ui = Ui::open(r.c.http, headers).unwrap();
+        ui.send(&json!({"subscribe": "*"}));
+        ui
+    };
+    let mut admins = open(&ADMIN_PAGE);
+    let key = admins.recv();
+    assert_eq!(
+        key["key"]["captures"].as_array().map(Vec::len),
+        Some(1),
+        "{key}"
+    );
+    // Who captured whom, when and how is the admins' alone; the page's
+    // other viewers are never sent it, in the key or in a patch.
+    let mut viewers = open(&ADMIN_PAGE[..2]);
+    let key = viewers.recv();
+    assert!(
+        key["key"].is_object() && key["key"].get("captures").is_none(),
+        "{key}"
+    );
+}
+
+#[test]
 fn a_capture_chunk_out_of_place_stops_it_and_a_gone_link_ends_it() {
     use u6e_proto::msg::CaptureChunk;
     let r = controller(Timing::default());
