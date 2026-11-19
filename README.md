@@ -168,6 +168,8 @@ These are under test and change what an image does, so an image built without th
 
 `test/ap-image.sh` needs no access point: it checks offline, with a stub `prep-rootfs.sh`, which image `ap-image.sh` picks (an image built with `BOOT=0` is the one booted next; changed inputs or a deleted image mean a new build; `FORCE=1` reuses the kept image; a failed build stops `deploy.sh` and records nothing), and, over commits to a scratch clone, that only a change to what goes into an image changes its key (a README, test, controller or controller-only dependency change does not; an agent or helper source, agent dependency or `prep-rootfs.sh` change does).
 
+`test/helper-units.sh` needs no access point either, but root and systemd on the build host (and host builds of the helpers, `cargo build -p u6e-shaper -p u6e-capture`): it starts the `u6e-shaper@` and `u6e-capture@` units with their sandboxes exactly as `prep-rootfs.sh` writes them and checks that each one's command and last step both ran, so a sandbox systemd cannot set up (226/NAMESPACE) fails it rather than an AP. Only the binaries, the sockets' group and, where ECM is not loaded, its `/proc/sys` files are swapped for the host's; it removes everything it adds.
+
 ## Licence
 
 The scripts are GPL-2.0-only (see `LICENSE`); patches keep their authors' licences. `fw/ath11k-bdencoder` is qca-swiss-army-knife's (ISC).

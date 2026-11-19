@@ -751,7 +751,9 @@ ReadWritePaths=/run/u6e-capture /proc/sys/net/ecm/front_end_ipv4_stop /proc/sys/
 ProtectHome=yes
 PrivateTmp=yes
 ProtectProc=invisible
-ProcSubset=pid
+# ECM's switches live in /proc/sys, which ProcSubset=pid hides: the
+# ReadWritePaths above could not be mounted (226/NAMESPACE).
+ProcSubset=all
 PrivateDevices=yes
 DevicePolicy=closed
 # The packet sockets read the AP's own interfaces; nothing is sent anywhere.
