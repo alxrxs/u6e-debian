@@ -12,7 +12,9 @@
 //! none without it; in `[radius]`, the Loki the RADIUS servers' log is read
 //! from (`radius`), RADIUS's side of the clients' timelines missing without
 //! it; where the clients' sessions and timelines are kept (`history_path`,
-//! `sessions`); in `[limits]`, the site's per-SSID rate limits, which an
+//! `sessions`); where the client captures' files are kept
+//! (`captures_path`, `captures`); in `[limits]`, the site's per-SSID rate
+//! limits, which an
 //! admin's limit of the same SSID overrides (`limits`); and, in `[guards]`,
 //! the VLANs the APs' client guards
 //! enforce on (only with `[leases]`: without the seed of the leases a client
@@ -29,6 +31,7 @@
 //! admin_group = "wifi-admins"
 //! policy_path = "/var/lib/wifi-controller/policy.json"
 //! history_path = "/var/lib/wifi-controller/history"
+//! captures_path = "/var/lib/wifi-controller/captures"
 //! socket = "/run/wifi-controller/sock"
 //!
 //! [aps.ap1]
@@ -98,6 +101,8 @@ pub struct Config {
     pub policy_path: PathBuf,
     /// The clients' sessions and timelines.
     pub history_path: PathBuf,
+    /// The client captures' files.
+    pub captures_path: PathBuf,
     /// The site's rate limits, per SSID.
     pub limits: BTreeMap<String, Rate>,
     /// Where root's local commands reach the controller.
@@ -136,6 +141,8 @@ struct File {
     policy_path: PathBuf,
     #[serde(default = "default_history")]
     history_path: PathBuf,
+    #[serde(default = "default_captures")]
+    captures_path: PathBuf,
     #[serde(default = "default_socket")]
     socket: PathBuf,
     configs: Option<configs::File>,
@@ -229,6 +236,10 @@ fn default_policy() -> PathBuf {
 
 fn default_history() -> PathBuf {
     "/var/lib/wifi-controller/history".into()
+}
+
+fn default_captures() -> PathBuf {
+    "/var/lib/wifi-controller/captures".into()
 }
 
 fn default_socket() -> PathBuf {
@@ -361,6 +372,7 @@ impl Config {
             admin_group: file.admin_group,
             policy_path: file.policy_path,
             history_path: file.history_path,
+            captures_path: file.captures_path,
             limits,
             socket: file.socket,
             configs: configs.map_err(ConfigError::Section)?,
@@ -734,6 +746,10 @@ mod tests {
     fn the_sites_limits_are_per_ssid_each_once_in_range() {
         let none = Config::parse(ORIGIN).unwrap();
         assert!(none.limits.is_empty());
+        assert_eq!(
+            none.captures_path,
+            PathBuf::from("/var/lib/wifi-controller/captures")
+        );
         let text = format!(
             "{ORIGIN}[limits]\nssids = [{{ ssid = \"Guest\", down_kbit = 50000 }}, \
              {{ ssid = \"IoT\", up_kbit = 1000 }}]\n"

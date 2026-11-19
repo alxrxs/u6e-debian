@@ -1276,7 +1276,7 @@ async fn main() -> io::Result<()> {
     let config = format!(
         "listen_agents = \"127.0.0.1:0\"\nlisten_http = \"127.0.0.1:0\"\nlisten_metrics = \"127.0.0.1:0\"\n\
          public_origin = \"http://{web}\"\npolicy_path = \"{}\"\nhistory_path = \"{}\"\n\
-         socket = \"{}\"\n\
+         captures_path = \"{}\"\nsocket = \"{}\"\n\
          [aps.ap1]\npublic_key = \"{}\"\naddress = \"192.0.2.16\"\n\
          [aps.ap2]\npublic_key = \"{}\"\naddress = \"192.0.2.17\"\n{}\
          [rf]\nremote = \"{}\"\nrepo = \"{}\"\nfile = \"{}\"\n\
@@ -1288,6 +1288,7 @@ async fn main() -> io::Result<()> {
          [radius]\nloki = \"{}\"\nselector = '{{job=\"radius-auth\"}}'\n",
         policy.display(),
         history.display(),
+        managed.join("captures").display(),
         managed.join("sock").display(),
         public(KEY_AP1).map_err(io::Error::other)?,
         public(KEY_AP2).map_err(io::Error::other)?,

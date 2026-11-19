@@ -55,6 +55,7 @@ pub fn view(state: &State, wanted: impl Fn(&str) -> bool, flows: bool) -> Value 
         "manage": manage(state),
         "rollouts": rollouts(state, LIVE_LOG),
         "limits": crate::limits::view(state),
+        "captures": crate::captures::view(state),
     });
     if flows {
         v["flows"] = self::flows(state, &wanted, None);

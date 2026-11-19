@@ -7,12 +7,14 @@
 //! the agent's Hello, applies its key frames, deltas, events, flows and
 //! command and configuration results to the state, pings it, sets its tick
 //! and flow cadence from the AP's watchers, and passes on what the state
-//! queues for it (commands, requests for flows, signed configurations). After
-//! the first key frame of every connection it gives the AP the policy's
-//! blocks, all of them, since the AP keeps them in RAM only, the rate
-//! limits, all of them, which the AP keeps only until it restarts, its client
-//! guards' mode and the leases they are seeded with, and checks that it runs
-//! the latest configuration signed for it.
+//! queues for it (commands, requests for flows, signed configurations,
+//! captures); a capture's chunks are written to its file as they come, each
+//! then acknowledged (`captures`). After the first key frame of every
+//! connection it gives the AP the policy's blocks, all of them, since the AP
+//! keeps them in RAM only, the rate limits, all of them, which the AP keeps
+//! only until it restarts, its client guards' mode and the leases they are
+//! seeded with, and checks that it runs the latest configuration signed for
+//! it.
 //!
 //! Received bytes collect in a buffer and are cut into frames only when whole,
 //! so a read cancelled by another branch of the session's `select!` never
@@ -39,11 +41,11 @@ use u6e_proto::msg::{AgentMsg, CtlMsg, Hello};
 use u6e_proto::tls::{self, AllowedKeys};
 use u6e_proto::{PROTOCOL, version};
 
-use crate::clean;
 use crate::names::Lookups;
 use crate::policy::{self, Store};
 use crate::spectrum::Limits;
 use crate::state::{FLOWS_WATCHED, Registration, Shared, TICK_WATCHED};
+use crate::{captures, clean};
 
 /// Longest a handshake, or a write to a stalled peer, may take.
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
@@ -394,6 +396,7 @@ impl Session {
         let mut want_key = false;
         let mut sync = Vec::new();
         let mut setup = Vec::new();
+        let (mut chunks, mut stops) = (Vec::new(), Vec::new());
         let mut flows = false;
         while let Some((mut msg, n)) = decode_frame::<AgentMsg>(&self.conn.inbuf[used..])? {
             used += n;
@@ -405,6 +408,20 @@ impl Session {
             }
             flows |= matches!(msg, AgentMsg::Flows(_));
             let mut state = self.state.write();
+            // A capture's chunk is written once the state is let go.
+            if let AgentMsg::CaptureChunk(c) = msg {
+                match state.captures.chunk(&self.name, &c) {
+                    Ok(path) => chunks.push((path, c)),
+                    Err(why) => {
+                        if let Some(cap) = state.captures.end(&self.name, c.id, &why) {
+                            captures::record(&mut state, &cap, false);
+                            state.captures_changed();
+                        }
+                        stops.push(CtlMsg::CaptureStop { id: c.id });
+                    }
+                }
+                continue;
+            }
             if let AgentMsg::Hello(h) = &msg {
                 state
                     .check_identity(&self.name, &h.ap)
@@ -435,6 +452,10 @@ impl Session {
             self.send(msg).await?;
         }
         for msg in &setup {
+            self.send(msg).await?;
+        }
+        let written = captures::write(&self.state, &self.name, chunks).await;
+        for msg in written.iter().chain(&stops) {
             self.send(msg).await?;
         }
         if flows {

@@ -40,6 +40,7 @@ use u6e_proto::msg::{
 };
 use u6e_proto::{PROTOCOL, mac};
 
+use crate::captures::{self, Captures};
 use crate::configs::Signer;
 use crate::configs::unix_ms;
 use crate::identity::Identity;
@@ -104,6 +105,8 @@ pub enum Change {
     Bindings(String),
     /// The rate limits, or how they stand on an AP, changed.
     Limits,
+    /// A capture started, moved on or ended, or its file went.
+    Captures,
 }
 
 /// One action on one AP (or on none, when no AP was connected to carry a
@@ -609,6 +612,8 @@ pub struct State {
     /// file's per SSID.
     pub limits: RateLimits,
     pub site_limits: BTreeMap<String, Rate>,
+    /// The client captures.
+    pub captures: Captures,
 }
 
 impl State {
@@ -645,7 +650,25 @@ impl State {
             radius: None,
             limits: RateLimits::default(),
             site_limits: BTreeMap::new(),
+            captures: Captures::default(),
         }
+    }
+
+    /// The state keeping the client captures in `captures`.
+    pub fn with_captures(self, captures: Captures) -> Self {
+        State { captures, ..self }
+    }
+
+    /// Hands `msg` to the session serving `ap`; whether there is one that
+    /// took it.
+    pub fn tell(&self, ap: &str, msg: CtlMsg) -> bool {
+        let live = self.aps.get(ap).and_then(|a| a.session.as_ref());
+        live.is_some_and(|l| l.outbox.try_send(msg).is_ok())
+    }
+
+    /// Tells the UI the captures changed.
+    pub fn captures_changed(&self) {
+        self.notify(Change::Captures);
     }
 
     /// The state with the site file's per-SSID rate limits.
@@ -891,9 +914,8 @@ impl State {
             stop,
             rx_bytes: Arc::clone(&entry.rx_bytes),
         };
-        // The previous connection's commands went with it.
-        self.drop_pending(ap);
-        self.scans_ended(ap, ended);
+        // The previous connection's commands and capture went with it.
+        self.session_ended(ap, ended);
         self.notify(Change::Up(ap.to_owned()));
         Some(reg)
     }
@@ -921,8 +943,7 @@ impl State {
         entry.hello = None;
         entry.session = None;
         let ended = entry.reset_session();
-        self.drop_pending(ap);
-        self.scans_ended(ap, ended);
+        self.session_ended(ap, ended);
         self.notify(Change::Down(ap.to_owned()));
         true
     }
@@ -934,9 +955,27 @@ impl State {
         };
         entry.session = None;
         let ended = entry.reset_session();
-        self.drop_pending(ap);
-        self.scans_ended(ap, ended);
+        self.session_ended(ap, ended);
         self.notify(Change::Down(ap.to_owned()));
+    }
+
+    /// What ends with a session of `ap`: its commands, the scans of
+    /// `radios`, its capture.
+    fn session_ended(&mut self, ap: &str, radios: Vec<String>) {
+        self.drop_pending(ap);
+        self.scans_ended(ap, radios);
+        let running = self
+            .captures
+            .list
+            .iter()
+            .filter(|c| c.ap == ap && c.running);
+        let ids: Vec<u64> = running.map(|c| c.id).collect();
+        for id in ids {
+            if let Some(c) = self.captures.end(ap, id, "the AP's link went") {
+                captures::record(self, &c, false);
+                self.captures_changed();
+            }
+        }
     }
 
     /// Tells the watchers of the scans of `radios` on `ap` they ended.
@@ -1070,6 +1109,12 @@ impl State {
             AgentMsg::Limits(l) => {
                 entry.limit_states = l;
                 Some(Change::Limits)
+            }
+            AgentMsg::Capture(s) => {
+                if let Some(c) = self.captures.report(ap, s) {
+                    captures::record(self, &c, c.ended_well());
+                }
+                Some(Change::Captures)
             }
             // A Pong only proves the agent is alive.
             _ => None,

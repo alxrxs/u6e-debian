@@ -2,8 +2,9 @@
 //! key-pinned TLS of `u6e_proto::tls`, and their snapshots, flows and events
 //! become a live state in RAM, served to Prometheus (`metrics`) and to the web
 //! UI (`http`, which reads it through `view`). The UI's operators act on
-//! clients through `actions`, and limit their rates and the SSIDs' on the
-//! APs' NSS through `limits`; what must outlive the process is in `policy`.
+//! clients through `actions`, limit their rates and the SSIDs' on the APs'
+//! NSS through `limits` and capture a client's traffic through `captures`;
+//! what must outlive the process is in `policy`.
 //! The radios' spectrum scans run while the UI watches them (`spectrum`).
 //! The controller signs the live Wi-Fi configurations root's local command
 //! hands it (`local`, `configs`) with a key of its own, which the APs pin,
@@ -20,6 +21,7 @@
 
 pub mod actions;
 pub mod agents;
+pub mod captures;
 mod clean;
 pub mod config;
 pub mod configs;
@@ -55,7 +57,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use axum::Router;
 use tokio::net::{TcpListener, UnixListener};
@@ -66,6 +68,7 @@ use u6e_proto::tls::{self, AllowedKeys, Identity};
 
 use crate::actions::Access;
 use crate::agents::{Listener, Timing};
+use crate::captures::Captures;
 use crate::config::Config;
 use crate::configs::{SetAside, Signer};
 use crate::images::Images;
@@ -157,7 +160,10 @@ pub async fn start(
         .with_history(window)
         .with_leases(&config.leases)
         .with_guards(config.guards.clone())
-        .with_site_limits(config.limits.clone());
+        .with_site_limits(config.limits.clone())
+        .with_captures(Captures::open(&config.captures_path).map_err(|e| {
+            io::Error::new(e.kind(), format!("{}: {e}", config.captures_path.display()))
+        })?);
     let mut set_aside = Vec::new();
     if let Some((s, aside)) = signer(config, identity)? {
         state = state.with_signer(s);
@@ -284,13 +290,15 @@ fn bind_local(config: &Config) -> io::Result<UnixListener> {
 /// Gives up on the configurations the APs have not answered in
 /// `Timing::apply`, and ends the holds whose time is up, for the life of
 /// the process.
-async fn expire(state: Shared, timing: Timing) {
+async fn expire(state_of: Shared, timing: Timing) {
     let mut every = interval(timing.ping);
     loop {
         every.tick().await;
-        let mut state = state.write();
+        let mut state = state_of.write();
         state.expire_relays(Instant::now(), timing.apply);
         state.expire_holds();
+        drop(state);
+        captures::supervise(&state_of, SystemTime::now());
     }
 }
 

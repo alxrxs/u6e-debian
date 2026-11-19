@@ -58,7 +58,7 @@ use crate::actions::{self, Access, Via, Web};
 use crate::spectrum::{self, Watching};
 use crate::state::{Change, Full, ROLLOUT_LOG_CAP, Shared, WatchGuard};
 use crate::view;
-use crate::{limits, rf, sessions};
+use crate::{captures, limits, rf, sessions};
 
 /// How long a new WebSocket may take to say what it watches.
 const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -168,6 +168,9 @@ pub fn router(state: Shared, access: Access) -> Router {
         .route("/api/clients/{mac}/limit", post(limits::set_client))
         .route("/api/ssids/limit", post(limits::set_ssid))
         .route("/api/limits", get(api_limits))
+        .route("/api/clients/{mac}/capture", post(captures::start))
+        .route("/api/captures/{id}/stop", post(captures::stop))
+        .route("/api/captures/{id}/file", get(captures::file))
         .route("/api/config", get(api_config))
         .route("/api/manage", get(api_manage))
         .route("/api/rollouts", get(api_rollouts))
@@ -590,7 +593,7 @@ async fn live(mut ws: WebSocket, state: Shared, user: Option<String>, scans: Gat
                 (wanted(&ap), None)
             }
             Ok(Change::Flows(ap)) => (flows && wanted(&ap), None),
-            Ok(Change::Names | Change::Deploy | Change::Limits) => (true, None),
+            Ok(Change::Names | Change::Deploy | Change::Limits | Change::Captures) => (true, None),
             // A block or an unblock changes the list of clients blocked.
             Ok(Change::Action(a)) if a.ap.as_deref().is_none_or(wanted) => {
                 (true, Some(json!({ "events": [view::action(&a)] })))

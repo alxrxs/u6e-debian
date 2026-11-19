@@ -99,11 +99,13 @@ fn config_text(key: &str, ap2: bool, dir: &Path, gate_secs: u64) -> String {
         "listen_agents = \"127.0.0.1:0\"\nlisten_http = \"127.0.0.1:0\"\n\
          listen_metrics = \"127.0.0.1:0\"\nkey = \"{key}\"\n\
          public_origin = \"{ORIGIN}\"\npolicy_path = \"{}\"\nhistory_path = \"{}\"\n\
+         captures_path = \"{}\"\n\
          socket = \"{}\"\n[configs]\nsigning_key = \"{signing}\"\nstate = \"{}\"\n\
          [rollouts]\nimages = \"{}\"\ngate_secs = {gate_secs}\nroot_key = \"{root}\"\n\
          stock_password = \"{password}\"\nknown_hosts = \"{hosts}\"\n{}",
         dir.join("policy.json").display(),
         dir.join("history").display(),
+        dir.join("captures").display(),
         dir.join("sock").display(),
         dir.join("configs").display(),
         dir.join("images").display(),
@@ -1836,6 +1838,155 @@ fn rate_limits_are_kept_given_to_every_ap_and_shown() {
     assert_eq!(a.limit_syncs.len(), 4);
     let ok = "wifi_actions_total{action=\"limit\",result=\"ok\"} 1";
     assert!(metrics_of(&r, "wifi_actions_total{action=\"limit\"").contains(&ok.to_owned()));
+}
+
+/// The headers and body of an HTTP GET.
+fn http_get_full(addr: SocketAddr, path: &str, headers: &str) -> (String, Vec<u8>) {
+    let mut sock = TcpStream::connect(addr).unwrap();
+    sock.set_read_timeout(Some(WAIT)).unwrap();
+    write!(sock, "GET {path} HTTP/1.0\r\nHost: x\r\n{headers}\r\n").unwrap();
+    let mut all = Vec::new();
+    sock.read_to_end(&mut all).unwrap();
+    let at = all.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    (
+        String::from_utf8_lossy(&all[..at]).into_owned(),
+        all[at + 4..].to_vec(),
+    )
+}
+
+#[test]
+fn a_capture_is_streamed_kept_and_downloaded_by_an_admin() {
+    use u6e_proto::msg::{CaptureChunk, CaptureMechanism, CaptureState};
+    let r = controller(Timing::default());
+    let admin = format!("{SAME_SITE}{ADMIN}");
+    let mut a = ap_with_client(&r, KEY_AP1, "ap1", &[]);
+    let body = r#"{"secs": 60, "max_mb": 1, "snaplen": 128, "filter": {"proto": "tcp", "port": 443, "host": null}}"#;
+    let (status, started) = post(r.c.http, &format!("{CLIENT}/capture"), &admin, body);
+    assert_eq!(status, 202, "{started}");
+    let id: u64 = started["id"].as_str().unwrap().parse().unwrap();
+    let CtlMsg::CaptureStart(req) = a.expect() else {
+        panic!()
+    };
+    assert_eq!(
+        (req.id, req.mac, req.secs, req.max_bytes, req.snaplen),
+        (id, MAC, 60, 1_000_000, 128)
+    );
+    // One capture an AP at a time.
+    let (status, _) = post(r.c.http, &format!("{CLIENT}/capture"), &admin, body);
+    assert_eq!(status, 409);
+    let state = |running, reason: &str| {
+        AgentMsg::Capture(CaptureState {
+            id,
+            running,
+            mechanism: Some(CaptureMechanism::OffOffload),
+            bytes: 0,
+            packets: 2,
+            dropped: 0,
+            reason: reason.into(),
+        })
+    };
+    a.send(&state(true, "started")).unwrap();
+    let data = [b"\x0a\x0d\x0d\x0ahead".to_vec(), b"packets".to_vec()];
+    for (seq, d) in data.iter().enumerate() {
+        let c = CaptureChunk {
+            id,
+            seq: seq as u64,
+            data: d.clone(),
+        };
+        a.send(&AgentMsg::CaptureChunk(c)).unwrap();
+        assert_eq!(
+            a.expect(),
+            CtlMsg::CaptureAck {
+                id,
+                seq: seq as u64
+            }
+        );
+    }
+    // Stopped by an admin: the AP is told, its end comes as it ends.
+    let (status, _) = post(r.c.http, &format!("/api/captures/{id}/stop"), &admin, "");
+    assert_eq!(status, 202);
+    assert_eq!(a.expect(), CtlMsg::CaptureStop { id });
+    a.send(&state(false, "stopped")).unwrap();
+    let path = format!("/api/captures/{id}/file");
+    wait_for("the capture's end", || {
+        let s = r.c.state.read();
+        s.captures.get(id).is_some_and(|c| !c.running)
+    });
+    let (head, bytes) = http_get_full(r.c.http, &path, ADMIN);
+    assert!(head.starts_with("HTTP/1.0 200"), "{head}");
+    assert!(
+        head.to_lowercase()
+            .contains("content-disposition: attachment; filename=\"ap1-020000000001-"),
+        "{head}"
+    );
+    assert_eq!(bytes, data.concat());
+    // Not an admin, or no such capture.
+    let (head, _) = http_get_full(r.c.http, &path, "X-Forwarded-Preferred-Username: bob\r\n");
+    assert!(head.starts_with("HTTP/1.0 403"), "{head}");
+    let (head, _) = http_get_full(r.c.http, "/api/captures/1/file", ADMIN);
+    assert!(head.starts_with("HTTP/1.0 404"), "{head}");
+    // Its start, the stop asked and its end are events naming who.
+    let events = json_get(r.c.http, "/api/events");
+    let captures: Vec<&Value> = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["action"] == "capture")
+        .collect();
+    assert_eq!(captures.len(), 3, "{captures:?}");
+    assert!(captures.iter().all(|e| e["user"] == "alice"));
+    let ok = "wifi_actions_total{action=\"capture\",result=\"ok\"} 1";
+    assert!(metrics_of(&r, "wifi_actions_total{action=\"capture\"").contains(&ok.to_owned()));
+}
+
+#[test]
+fn a_capture_chunk_out_of_place_stops_it_and_a_gone_link_ends_it() {
+    use u6e_proto::msg::CaptureChunk;
+    let r = controller(Timing::default());
+    let admin = format!("{SAME_SITE}{ADMIN}");
+    let mut a = ap_with_client(&r, KEY_AP1, "ap1", &[]);
+    let body = r#"{"secs": 60, "max_mb": 1, "snaplen": 64, "filter": {"proto": null, "port": null, "host": null}}"#;
+    let (_, started) = post(r.c.http, &format!("{CLIENT}/capture"), &admin, body);
+    let id: u64 = started["id"].as_str().unwrap().parse().unwrap();
+    let _ = a.expect();
+    let c = CaptureChunk {
+        id,
+        seq: 3,
+        data: vec![1, 2, 3],
+    };
+    a.send(&AgentMsg::CaptureChunk(c)).unwrap();
+    assert_eq!(a.expect(), CtlMsg::CaptureStop { id });
+    let reason = r.c.state.read().captures.get(id).unwrap().reason.clone();
+    assert!(reason.contains("chunk 3 came where 0 was due"), "{reason}");
+    // A refused request reaches no AP: a bad protocol, a size out of range.
+    for bad in [
+        r#"{"secs": 60, "max_mb": 1, "snaplen": 64, "filter": {"proto": "sctp", "port": null, "host": null}}"#,
+        r#"{"secs": 60, "max_mb": 51, "snaplen": 64, "filter": {"proto": null, "port": null, "host": null}}"#,
+        r#"{"secs": 601, "max_mb": 1, "snaplen": 64, "filter": {"proto": null, "port": null, "host": null}}"#,
+        r#"{"secs": 60, "max_mb": 1, "snaplen": 64, "filter": "tcp"}"#,
+    ] {
+        assert_eq!(
+            post(r.c.http, &format!("{CLIENT}/capture"), &admin, bad).0,
+            400,
+            "{bad}"
+        );
+    }
+    let (status, _) = post(r.c.http, &format!("{CLIENT}/capture"), SAME_SITE, body);
+    assert_eq!(status, 403);
+    // Another capture, then the AP's link goes: it ends with it.
+    let (_, started) = post(r.c.http, &format!("{CLIENT}/capture"), &admin, body);
+    let id: u64 = started["id"].as_str().unwrap().parse().unwrap();
+    let _ = a.expect();
+    drop(a);
+    wait_for("the capture's end with its link", || {
+        r.c.state
+            .read()
+            .captures
+            .get(id)
+            .is_some_and(|c| !c.running)
+    });
+    let reason = r.c.state.read().captures.get(id).unwrap().reason.clone();
+    assert_eq!(reason, "the AP's link went");
 }
 
 #[test]

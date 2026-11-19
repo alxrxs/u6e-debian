@@ -343,9 +343,11 @@ fn controller(dir: &Path, scratch: Option<&Scratch>) -> Running {
     let mut text = format!(
         "listen_agents = \"127.0.0.1:0\"\nlisten_http = \"127.0.0.1:0\"\nlisten_metrics = \"127.0.0.1:0\"\n\
          public_origin = \"{ORIGIN}\"\npolicy_path = \"{}\"\nhistory_path = \"{}\"\n\
+         captures_path = \"{}\"\n\
          [aps.ap1]\npublic_key = \"{}\"\n[aps.ap2]\npublic_key = \"{}\"\n",
         dir.join("policy.json").display(),
         dir.join("history").display(),
+        dir.join("captures").display(),
         public(KEY_AP1),
         public(KEY_AP2),
     );
