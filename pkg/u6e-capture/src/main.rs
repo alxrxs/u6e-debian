@@ -97,3 +97,46 @@ fn host_name() -> String {
     CStr::from_bytes_until_nul(&buf)
         .map_or_else(|_| "this AP".into(), |c| c.to_string_lossy().into_owned())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::offload::tests::{ap, nft_log, pending, read};
+    use crate::offload::{Devs, take};
+    use crate::testdir::TestDir;
+    use u6e_proto::capture::RESTORE;
+    use u6e_proto::ecm::DEFUNCT_BY_MAC;
+    use u6e_proto::msg::CaptureMechanism;
+
+    /// The unit's last step of one helper runs while another helper's
+    /// capture holds the lock: it leaves that capture's flows, its marks
+    /// and its restore file as they are.
+    #[test]
+    fn a_restore_while_a_capture_runs_changes_nothing() {
+        let t = TestDir::new();
+        let p = ap(&t, false);
+        let devs = Devs::of(["wlan5", "vlan42"]);
+        take(
+            &p,
+            CaptureMechanism::OffOffload,
+            [2, 0, 0, 0, 0, 1],
+            128,
+            &devs,
+        )
+        .unwrap();
+        let _ = nft_log(&p);
+        let file = read(&p, RESTORE);
+        fs::write(p.at(DEFUNCT_BY_MAC), "").unwrap();
+        let held = serve::try_lock(&p).unwrap().expect("the capture's lock");
+        restore(&p).unwrap();
+        assert!(pending(&p));
+        assert_eq!(read(&p, RESTORE), file);
+        assert_eq!(nft_log(&p), "", "its marks stay");
+        assert_eq!(read(&p, DEFUNCT_BY_MAC), "", "its client is left alone");
+        // Once the capture is gone, the same step puts everything back.
+        drop(held);
+        restore(&p).unwrap();
+        assert!(!pending(&p));
+        assert!(!nft_log(&p).is_empty());
+    }
+}
