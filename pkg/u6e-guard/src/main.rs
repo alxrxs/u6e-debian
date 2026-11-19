@@ -24,6 +24,8 @@ mod enforce;
 mod frame;
 #[cfg(test)]
 mod live;
+#[cfg(test)]
+mod mdns;
 mod ports;
 mod rules;
 mod serve;
