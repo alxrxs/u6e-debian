@@ -230,8 +230,10 @@ pub struct Collector {
     config: ConfigHash,
     /// Each radio's channels and regulatory rules, by wiphy, and when read.
     regs: HashMap<u32, (Instant, regdomain::BandCaps, Vec<regdomain::RegRule>)>,
-    /// How each station authenticated, by MAC.
+    /// How each station authenticated, by MAC, and where among the
+    /// stations to ask about the next tick starts.
     auth: HashMap<[u8; 6], Known>,
+    ask_from: usize,
 }
 
 /// A station's authentication as hostapd answered for its association: the
@@ -273,6 +275,7 @@ impl Collector {
             config: ConfigHash::default(),
             regs: HashMap::new(),
             auth: HashMap::new(),
+            ask_from: 0,
         }
     }
 
@@ -358,11 +361,10 @@ impl Collector {
             },
         );
         self.up.retain(|bss, _| order.contains(bss));
-        let auth = authentications(&mut self.auth, &stations, |bss, mac| {
-            let h = hostapd.as_mut()?;
-            let ifname = order.get(usize::from(bss))?;
+        let auth = authentications(&mut self.auth, &stations, &mut self.ask_from, |bss, mac| {
+            let h = hostapd.as_mut().ok_or(io::ErrorKind::NotFound)?;
+            let ifname = order.get(usize::from(bss)).ok_or(io::ErrorKind::NotFound)?;
             h.try_request(ifname, &format!("STA {}", mac::format(mac)))
-                .ok()
         });
         let mut radios = radios;
         let asked = wificonf::read_asked(&self.paths.wifi);
@@ -438,15 +440,19 @@ impl Collector {
 /// The authentications of `stations` (sorted by MAC, each once), in their
 /// order: what `known` holds of each association, after asking hostapd
 /// (`ask`: a BSS's index and a MAC, its answer to `STA`) about the stations
-/// it holds nothing of, has not authorized yet, or that associated again, at
-/// most [`ASK_MAX`] of them. `known` keeps only the stations present.
+/// it holds nothing of, has not authorized yet, or that associated again: at
+/// most [`ASK_MAX`] of them, from `*from` on among them (moved on past those
+/// asked, so stations that stay unauthorized hold up no other), none more
+/// once hostapd has not answered in time. `known` keeps only the stations
+/// present.
 fn authentications(
     known: &mut HashMap<[u8; 6], Known>,
     stations: &[Station],
-    mut ask: impl FnMut(u16, [u8; 6]) -> Option<String>,
+    from: &mut usize,
+    mut ask: impl FnMut(u16, [u8; 6]) -> io::Result<String>,
 ) -> Vec<([u8; 6], StationAuth)> {
     known.retain(|mac, _| stations.binary_search_by_key(mac, |t| t.mac).is_ok());
-    let mut asked = 0;
+    let mut due = Vec::new();
     for st in stations {
         let current = known
             .get_mut(&st.mac)
@@ -462,18 +468,29 @@ fn authentications(
                 known.remove(&st.mac);
             }
         }
-        if asked == ASK_MAX {
-            continue;
-        }
-        asked += 1;
-        if let Some(auth) = ask(st.bss, st.mac).as_deref().and_then(stainfo::parse) {
-            let k = Known {
-                bss: st.bss,
-                connected_s: st.connected_s,
-                auth,
+        due.push(st);
+    }
+    if !due.is_empty() {
+        let first = *from % due.len();
+        let mut asked = 0;
+        for st in due.iter().cycle().skip(first).take(due.len().min(ASK_MAX)) {
+            let answer = match ask(st.bss, st.mac) {
+                Ok(a) => a,
+                // A busy hostapd is asked nothing more this tick.
+                Err(e) if e.kind() == io::ErrorKind::TimedOut => break,
+                Err(_) => String::new(),
             };
-            known.insert(st.mac, k);
+            asked += 1;
+            if let Some(auth) = stainfo::parse(&answer, st.mac) {
+                let k = Known {
+                    bss: st.bss,
+                    connected_s: st.connected_s,
+                    auth,
+                };
+                known.insert(st.mac, k);
+            }
         }
+        *from = first + asked;
     }
     let held = stations
         .iter()
@@ -916,15 +933,32 @@ mod tests {
     struct Answers {
         authorized: HashMap<[u8; 6], bool>,
         asked: Vec<(u16, [u8; 6])>,
+        /// The station whose question hostapd does not answer in time.
+        busy: Option<[u8; 6]>,
+        from: usize,
     }
 
     impl Answers {
-        fn ask(&mut self, bss: u16, mac: [u8; 6]) -> Option<String> {
+        fn new(authorized: HashMap<[u8; 6], bool>) -> Self {
+            Answers {
+                authorized,
+                asked: Vec::new(),
+                busy: None,
+                from: 0,
+            }
+        }
+
+        fn ask(&mut self, bss: u16, mac: [u8; 6]) -> io::Result<String> {
             self.asked.push((bss, mac));
-            let authorized = *self.authorized.get(&mac)?;
+            if self.busy == Some(mac) {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            let Some(&authorized) = self.authorized.get(&mac) else {
+                return Ok("FAIL\n".into());
+            };
             let text = include_str!("../tests/fixtures/sta-eap.txt");
             let text = text.replacen("02:00:00:00:00:22", &mac::format(mac), 1);
-            Some(if authorized {
+            Ok(if authorized {
                 text
             } else {
                 text.replace("[AUTHORIZED]", "")
@@ -939,7 +973,9 @@ mod tests {
             stations: &[Station],
         ) -> Vec<(u8, bool)> {
             self.asked.clear();
-            let auth = authentications(known, stations, |bss, mac| self.ask(bss, mac));
+            let mut from = self.from;
+            let auth = authentications(known, stations, &mut from, |bss, mac| self.ask(bss, mac));
+            self.from = from;
             auth.iter().map(|(m, a)| (m[5], a.authorized)).collect()
         }
     }
@@ -952,10 +988,7 @@ mod tests {
     fn each_association_is_asked_about_until_it_is_authorized() {
         let mut known = HashMap::new();
         let sta = |n| [2, 0, 0, 0, 0, n];
-        let mut hostapd = Answers {
-            authorized: HashMap::from([(sta(1), true), (sta(2), false)]),
-            asked: Vec::new(),
-        };
+        let mut hostapd = Answers::new(HashMap::from([(sta(1), true), (sta(2), false)]));
         let stations = [on(1, 0, 10), on(2, 0, 10), on(3, 1, 10)];
         let got = hostapd.tick(&mut known, &stations);
         assert_eq!(got, [(1, true), (2, false)]);
@@ -963,7 +996,9 @@ mod tests {
         // Only the one not authorized yet, and the one hostapd did not know.
         let stations = [on(1, 0, 25), on(2, 0, 25), on(3, 1, 25)];
         hostapd.tick(&mut known, &stations);
-        assert_eq!(hostapd.asked, [(0, sta(2)), (1, sta(3))]);
+        let mut asked = hostapd.asked.clone();
+        asked.sort_unstable();
+        assert_eq!(asked, [(0, sta(2)), (1, sta(3))]);
         hostapd.authorized.insert(sta(2), true);
         let got = hostapd.tick(&mut known, &stations);
         assert_eq!(got, [(1, true), (2, true)]);
@@ -972,7 +1007,9 @@ mod tests {
         // 1 roams to another BSS, 2 associates again on its own; 3 leaves.
         let stations = [on(1, 1, 2), on(2, 0, 3)];
         hostapd.tick(&mut known, &stations);
-        assert_eq!(hostapd.asked, [(1, sta(1)), (0, sta(2))]);
+        let mut asked = hostapd.asked.clone();
+        asked.sort_unstable();
+        assert_eq!(asked, [(0, sta(2)), (1, sta(1))]);
         assert_eq!(known.len(), 2);
     }
 
@@ -981,10 +1018,7 @@ mod tests {
     #[test]
     fn at_most_sixteen_stations_are_asked_about_a_tick() {
         let mut known = HashMap::new();
-        let mut hostapd = Answers {
-            authorized: (1..=40).map(|i| ([2, 0, 0, 0, 0, i], true)).collect(),
-            asked: Vec::new(),
-        };
+        let mut hostapd = Answers::new((1..=40).map(|i| ([2, 0, 0, 0, 0, i], true)).collect());
         let stations: Vec<Station> = (1..=40).map(|i| on(i, 0, 5)).collect();
         let held: Vec<usize> = (0..3)
             .map(|_| hostapd.tick(&mut known, &stations).len())
@@ -994,7 +1028,42 @@ mod tests {
         for st in &mut again {
             st.connected_s = 1;
         }
-        assert!(authentications(&mut known, &again, |_, _| None).is_empty());
+        let mut from = 0;
+        let no_answer = |_, _| Ok(String::new());
+        assert!(authentications(&mut known, &again, &mut from, no_answer).is_empty());
+    }
+
+    /// Stations that stay unauthorized (a client stuck in EAP) take turns:
+    /// every one is asked about within two ticks, not the same sixteen.
+    #[test]
+    fn stations_left_unauthorized_take_turns() {
+        let mut known = HashMap::new();
+        let mut hostapd = Answers::new((1..=20).map(|i| ([2, 0, 0, 0, 0, i], false)).collect());
+        let stations: Vec<Station> = (1..=20).map(|i| on(i, 0, 5)).collect();
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..2 {
+            hostapd.tick(&mut known, &stations);
+            seen.extend(hostapd.asked.iter().map(|(_, m)| m[5]));
+        }
+        assert_eq!(seen.len(), 20);
+    }
+
+    /// A hostapd that does not answer one question in time is asked nothing
+    /// more that tick.
+    #[test]
+    fn a_busy_hostapd_is_asked_nothing_more_that_tick() {
+        let mut known = HashMap::new();
+        let mut hostapd = Answers::new((1..=5).map(|i| ([2, 0, 0, 0, 0, i], true)).collect());
+        hostapd.busy = Some([2, 0, 0, 0, 0, 2]);
+        let stations: Vec<Station> = (1..=5).map(|i| on(i, 0, 5)).collect();
+        hostapd.tick(&mut known, &stations);
+        assert_eq!(hostapd.asked.len(), 2);
+        // A late answer about another station is not taken for this one.
+        let mut from = 0;
+        let late = include_str!("../tests/fixtures/sta-eap.txt");
+        let one = [on(9, 0, 5)];
+        let held = authentications(&mut HashMap::new(), &one, &mut from, |_, _| Ok(late.into()));
+        assert!(held.is_empty());
     }
 
     #[test]

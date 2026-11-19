@@ -5,7 +5,7 @@
 //! Wi-Fi configuration is known by and the controller's signature over it,
 //! and (feature `tls`, which includes `digest`) the post-quantum, key-pinned
 //! TLS configuration of the link. `guard` is the AP's own socket between the
-//! agent and its client guards.
+//! agent and its client guards; `text` cleans what a person reads of it.
 //! Each end opens with the frozen version frame of `version`, so ends of
 //! different protocols tell so before either decodes a message.
 
@@ -19,6 +19,7 @@ pub mod guard;
 pub mod local;
 pub mod mac;
 pub mod msg;
+pub mod text;
 #[cfg(feature = "tls")]
 pub mod tls;
 pub mod version;

@@ -12,15 +12,17 @@
 use std::collections::HashMap;
 
 use u6e_proto::msg::{IDENTITY_MAX, StationAuth};
+use u6e_proto::text;
 
 /// The line hostapd prints the identity on.
 const USER_NAME: &str = "dot1xAuthSessionUserName";
 
-/// The station's authentication; `None` for an answer that is not about a
-/// station (hostapd's `FAIL`, or nothing).
-pub fn parse(answer: &str) -> Option<StationAuth> {
+/// The authentication of the station `mac`; `None` for an answer that is
+/// not about it (hostapd's `FAIL`, nothing, or a late answer to an earlier
+/// question about another station).
+pub fn parse(answer: &str, mac: [u8; 6]) -> Option<StationAuth> {
     let mut lines = answer.lines();
-    u6e_proto::mac::parse(lines.next()?.trim())?;
+    (u6e_proto::mac::parse(lines.next()?.trim())? == mac).then_some(())?;
     let mut before: HashMap<&str, &str> = HashMap::new();
     let mut after: HashMap<&str, &str> = HashMap::new();
     let mut identity = None;
@@ -66,13 +68,14 @@ fn suite(s: &str) -> Option<u32> {
     parts.next().is_none().then_some(oui << 8 | u32::from(kind))
 }
 
-/// The identity as carried: hostapd's `N/A` for none is none, control
-/// characters are dropped and it is cut to [`IDENTITY_MAX`] bytes.
+/// The identity as carried: hostapd's `N/A` for none is none, control and
+/// format characters are dropped (`u6e_proto::text`) and it is cut to
+/// [`IDENTITY_MAX`] bytes.
 fn clean(s: &str) -> String {
     if s == "N/A" {
         return String::new();
     }
-    let mut out: String = s.chars().filter(|c| !c.is_control()).collect();
+    let mut out = text::clean(s);
     if out.len() > IDENTITY_MAX {
         let cut = (0..=IDENTITY_MAX).rev().find(|&i| out.is_char_boundary(i));
         out.truncate(cut.unwrap_or(0));
@@ -91,10 +94,16 @@ mod tests {
     /// An 802.1X client that roamed in by FT, in the shape hostapd's
     /// `ieee802_1x_get_mib_sta` prints (hostapd 2.13~git20261001).
     const EAP: &str = include_str!("../tests/fixtures/sta-eap.txt");
+    const PSK_MAC: [u8; 6] = [2, 0, 0, 0, 0, 0x21];
+    const EAP_MAC: [u8; 6] = [2, 0, 0, 0, 0, 0x22];
+
+    fn eap(answer: &str) -> Option<StationAuth> {
+        parse(answer, EAP_MAC)
+    }
 
     #[test]
     fn a_passphrase_client_is_mac_authenticated() {
-        let a = parse(PSK).unwrap();
+        let a = parse(PSK, PSK_MAC).unwrap();
         assert_eq!(
             a,
             StationAuth {
@@ -112,7 +121,7 @@ mod tests {
 
     #[test]
     fn an_eap_client_says_who_it_is_and_how() {
-        let a = parse(EAP).unwrap();
+        let a = eap(EAP).unwrap();
         assert_eq!(
             a,
             StationAuth {
@@ -142,11 +151,11 @@ mod tests {
                 "dot1xAuthReAuthEnabled=TRUE",
                 "dot1xAuthReAuthEnabled=FALSE",
             );
-        let a = parse(&mid).unwrap();
+        let a = eap(&mid).unwrap();
         assert!(!a.authorized);
         assert_eq!((a.eap_method, a.reauth_s), (1, 0));
         let none = EAP.replace("UserName=host/laptop1.example.org", "UserName=N/A");
-        assert_eq!(parse(&none).unwrap().identity, "");
+        assert_eq!(eap(&none).unwrap().identity, "");
     }
 
     /// An identity holding newlines adds lines, which change nothing.
@@ -156,7 +165,7 @@ mod tests {
             "UserName=host/laptop1.example.org",
             "UserName=evil\nauth_alg=0\nflags=[AUTH]\nlast_eap_type_sta=25 (PEAP)\nvlan_id=1",
         );
-        let a = parse(&forged).unwrap();
+        let a = eap(&forged).unwrap();
         assert_eq!(a.identity, "evil");
         assert_eq!((a.auth_alg, a.authorized, a.eap_method), (2, true, 13));
     }
@@ -164,17 +173,28 @@ mod tests {
     #[test]
     fn a_long_or_odd_identity_is_cut_and_cleaned() {
         let long = format!("UserName={}é", "a".repeat(IDENTITY_MAX - 1));
-        let a = parse(&EAP.replace("UserName=host/laptop1.example.org", &long)).unwrap();
+        let a = eap(&EAP.replace("UserName=host/laptop1.example.org", &long)).unwrap();
         assert_eq!(a.identity, "a".repeat(IDENTITY_MAX - 1));
-        let odd = EAP.replace("laptop1", "lap\u{7}top\u{1b}1");
-        assert_eq!(parse(&odd).unwrap().identity, "host/laptop1.example.org");
+        let odd = EAP.replace("laptop1", "lap\u{7}top\u{1b}1\u{202e}\u{200b}");
+        assert_eq!(eap(&odd).unwrap().identity, "host/laptop1.example.org");
     }
 
     #[test]
     fn what_is_not_a_station_is_none() {
         for a in ["FAIL\n", "", "flags=[AUTH]\n"] {
-            assert_eq!(parse(a), None, "{a:?}");
+            assert_eq!(eap(a), None, "{a:?}");
         }
+    }
+
+    /// An answer about another station (a late one to an earlier question)
+    /// is no answer about this one.
+    #[test]
+    fn an_answer_about_another_station_is_none() {
+        assert_eq!(parse(PSK, EAP_MAC), None);
+        assert_eq!(
+            eap(&EAP.replacen("02:00:00:00:00:22", "02:00:00:00:00:23", 1)),
+            None
+        );
     }
 
     #[test]
