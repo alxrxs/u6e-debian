@@ -8,9 +8,10 @@
 //!
 //! `serve` answers one request on the connection systemd passes as stdin
 //! (`u6e_proto::shaper`), a member of the agent's group's only. A sync keeps
-//! the state before it in a pending file until it is done; one that built a
-//! tree is done only once the agent confirms it within 20 s (its link to the
-//! controller still flows through the uplink), and is undone otherwise.
+//! the state before it in a pending file until it is done; one that built
+//! the uplink's tree is done only once the agent confirms it within 20 s (its
+//! link to the controller still flows through the uplink), and is undone
+//! otherwise; a sync while the agent has no controller builds no tree there.
 //! `revert`, the unit's last step whatever ended it, undoes a sync the helper
 //! died in. The state lives in /run: a reboot clears it, and the NSS with it.
 
@@ -83,10 +84,11 @@ fn serve(dir: &Path) -> io::Result<()> {
 fn handle<H: Host>(h: &mut H, dir: &Path, conn: &mut UnixStream, req: Request) -> io::Result<()> {
     revert_pending(h, dir)?;
     let cur: State = load(&dir.join("state"))?.unwrap_or_default();
+    let away = matches!(req, Request::SyncAway(_));
     match req {
-        Request::Sync(spec) => {
+        Request::Sync(spec) | Request::SyncAway(spec) => {
             store(&dir.join("pending"), &cur)?;
-            let synced = match apply::sync(h, &cur, &spec) {
+            let synced = match apply::sync(h, &cur, &spec, away) {
                 Ok(s) => s,
                 Err(why) => {
                     remove(&dir.join("pending"))?;
@@ -274,12 +276,12 @@ mod tests {
     fn a_sync_the_helper_died_in_is_undone_by_the_next_or_by_revert() {
         let d = Dir::new("died");
         let mut h = Fake::new();
-        let before = apply::sync(&mut h, &State::default(), &Spec::default())
+        let before = apply::sync(&mut h, &State::default(), &Spec::default(), false)
             .unwrap()
             .state;
         store(&d.0.join("pending"), &before).unwrap();
         // What the dead sync built.
-        let dead = apply::sync(&mut h, &before, &spec()).unwrap().state;
+        let dead = apply::sync(&mut h, &before, &spec(), false).unwrap().state;
         store(&d.0.join("state"), &dead).unwrap();
         assert!(!h.roots.is_empty());
         revert_pending(&mut h, &d.0).unwrap();
@@ -295,7 +297,7 @@ mod tests {
     fn counters_and_a_stray_confirm_are_answered() {
         let d = Dir::new("counters");
         let mut h = Fake::new();
-        let state = apply::sync(&mut h, &State::default(), &spec())
+        let state = apply::sync(&mut h, &State::default(), &spec(), false)
             .unwrap()
             .state;
         store(&d.0.join("state"), &state).unwrap();

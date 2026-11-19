@@ -167,7 +167,8 @@ pub trait ConfigApplier {
 /// Runs the link for the life of the process. `snapshot` is called with the
 /// sequence number of each snapshot, `flows` for each flows message,
 /// `command` for each command and `applier` for each configuration; all only
-/// while connected.
+/// while connected, but for `snapshot` with 0 between dials while rate
+/// limits are kept, which it keeps in step with the AP.
 pub fn run(
     cfg: Config,
     snapshot: impl FnMut(u64) -> Snapshot,
@@ -242,8 +243,27 @@ fn run_with(
             eprintln!("u6e-agent: link to {}: {e}", cfg.controller);
             failed = e;
         }
-        thread::sleep(backoff);
+        wait_away(backoff, &mut snapshot, &mut held);
         backoff = (backoff * 2).min(*cfg.backoff.end());
+    }
+}
+
+/// How often the rate limits kept are looked at while the controller is away.
+const AWAY_TICK: Duration = Duration::from_secs(10);
+
+/// Waits `backoff` before the next dial, the rate limits the controller gave
+/// kept in step with the AP meanwhile (a client roams, a BSS is made again).
+fn wait_away(backoff: Duration, snapshot: &mut impl FnMut(u64) -> Snapshot, held: &mut Held) {
+    let until = Instant::now() + backoff;
+    loop {
+        if held.limits.kept() {
+            held.limits.tick_away(&snapshot(0));
+        }
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        thread::sleep(left.min(AWAY_TICK));
     }
 }
 
@@ -1424,7 +1444,7 @@ mod tests {
     }
 
     /// A limit set is synced with the shaper, answered, its states sent;
-    /// a sync that built a tree is confirmed once the controller has
+    /// a sync that built the uplink's tree is confirmed once the controller has
     /// acknowledged what came after it.
     #[test]
     fn rate_limits_are_synced_their_states_sent_and_a_tree_confirmed() {

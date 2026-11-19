@@ -38,13 +38,17 @@ pub struct State {
     pub outcomes: Vec<Outcome>,
 }
 
-/// What a sync came to: the state it left, and whether it built a tree
-/// (which the agent then confirms, or the sync is undone).
+/// What a sync came to: the state it left, and whether it built the
+/// uplink's tree (which the agent then confirms, or the sync is undone: a
+/// tree there carries the agent's own link).
 #[derive(Debug)]
 pub struct Synced {
     pub state: State,
     pub built: bool,
 }
+
+/// Why a limit waits when the agent has no controller to confirm with.
+pub const UPLINK_WAITS: &str = "the uplink's tree waits for the controller's link";
 
 /// A class's rate arguments: rate and ceiling the same (a hard limit), the
 /// burst 10 ms of it, between 4 and 64 KiB.
@@ -352,7 +356,9 @@ fn place<H: Host>(
 }
 
 /// Makes the shaping `spec`'s, from `cur`.
-pub fn sync<H: Host>(h: &mut H, cur: &State, spec: &Spec) -> Result<Synced, String> {
+/// Makes the shaping `spec`'s; `away`, the agent has no controller to
+/// confirm with, so the uplink's tree is not built (its limits wait).
+pub fn sync<H: Host>(h: &mut H, cur: &State, spec: &Spec, away: bool) -> Result<Synced, String> {
     check::check(spec)?;
     let devs = h.netdevs();
     let exists = |n: &Netdev| devs.contains(n);
@@ -390,6 +396,17 @@ pub fn sync<H: Host>(h: &mut H, cur: &State, spec: &Spec) -> Result<Synced, Stri
     for (dev, major) in wanted {
         if let Some(t) = cur.trees.iter().find(|t| t.dev == dev && t.major == major) {
             trees.push(t.clone());
+            continue;
+        }
+        if away && dev.name == UPLINK {
+            for p in plans
+                .iter()
+                .filter(|p| p.trees.contains(&(dev.clone(), major)))
+            {
+                refused
+                    .entry(p.target.clone())
+                    .or_insert_with(|| UPLINK_WAITS.into());
+            }
             continue;
         }
         match build(h, &dev.name, major) {
@@ -548,7 +565,7 @@ pub fn sync<H: Host>(h: &mut H, cur: &State, spec: &Spec) -> Result<Synced, Stri
     };
     Ok(Synced {
         state,
-        built: !built.is_empty(),
+        built: built.iter().any(|(d, _)| d == UPLINK),
     })
 }
 
@@ -615,7 +632,7 @@ pub fn revert<H: Host>(h: &mut H, prev: &State) -> State {
         slots: prev.slots.clone(),
         ..State::default()
     };
-    match sync(h, &from, &prev.spec) {
+    match sync(h, &from, &prev.spec, false) {
         Ok(s) => s.state,
         Err(e) => {
             eprintln!("u6e-shaper: the shaping before could not be put back: {e}");
@@ -744,7 +761,7 @@ pub mod tests {
     const C1: &str = "02:00:00:00:00:01";
 
     fn synced(h: &mut Fake, cur: &State, s: &Spec) -> Synced {
-        sync(h, cur, s).unwrap()
+        sync(h, cur, s, false).unwrap()
     }
 
     #[test]
@@ -864,10 +881,34 @@ pub mod tests {
         s.ssids[0].vaps[0].ifindex = 40;
         s.ssids[0].ports[0].ifindex = 40;
         let out = synced(&mut h, &first.state, &s);
-        assert!(out.built && out.state.outcomes[0].ok);
+        // A BSS's tree carries no link of the agent's: nothing to confirm.
+        assert!(!out.built && out.state.outcomes[0].ok);
         assert!(
             h.roots.contains("wlan5") && h.classes.contains(&("wlan5".into(), "1:1000".into()))
         );
+    }
+
+    #[test]
+    fn away_no_uplink_tree_is_built_and_its_limits_wait() {
+        let mut h = Fake::new();
+        let out = sync(&mut h, &State::default(), &spec(), true).unwrap();
+        assert!(!out.built && h.roots.is_empty(), "{:?}", h.roots);
+        let o = &out.state.outcomes[0];
+        assert!(!o.ok && o.detail == UPLINK_WAITS, "{o:?}");
+        // A download limit needs none: it is made away too.
+        let mut down = spec();
+        down.clients[0].rate = rate(Some(30_000), None);
+        let out = sync(&mut h, &out.state, &down, true).unwrap();
+        assert!(!out.built && out.state.outcomes[0].ok);
+        assert!(h.roots.contains("wlan5") && !h.roots.contains("lan"));
+        // With the controller there, the uplink's is built, to be confirmed;
+        // away again, the tree in place is kept and its classes changed.
+        let out = synced(&mut h, &out.state, &spec());
+        assert!(out.built && h.roots.contains("lan") && out.state.outcomes[0].ok);
+        let mut slower = spec();
+        slower.clients[0].rate = rate(Some(30_000), Some(1_000));
+        let out = sync(&mut h, &out.state, &slower, true).unwrap();
+        assert!(!out.built && out.state.outcomes[0].ok && h.roots.contains("lan"));
     }
 
     #[test]
@@ -973,7 +1014,7 @@ pub mod tests {
         let mut h = Fake::new();
         let mut s = spec();
         s.ssids[0].ports.push(nd("lan", 2));
-        assert!(sync(&mut h, &State::default(), &s).is_err());
+        assert!(sync(&mut h, &State::default(), &s, false).is_err());
         assert!(h.log.is_empty() && h.decel.is_empty() && h.table.is_none());
     }
 }

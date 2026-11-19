@@ -7,16 +7,20 @@
 //! show it: a client limit on the BSSs of the SSID the client is on now, an
 //! SSID's on its BSSs, every port with its index (a netdev made again has
 //! lost its tree); a client that is not here, or an SSID with no BSS here,
-//! waits. The helper is asked again whenever that changes, only while a
-//! session is up.
+//! waits. The helper is asked again whenever that changes, also while the
+//! controller is away (between dials), so the limits follow a client that
+//! roams and a BSS made again: then the uplink's tree is not built, and a
+//! limit that needs it waits until the next session syncs again. A set that
+//! is empty starts no helper while there is nothing in place to undo.
 //!
-//! A sync that built a shaper tree is confirmed only once the controller
+//! A sync that built the uplink's tree is confirmed only once the controller
 //! has acknowledged, by TCP, the bytes the agent sent after it: the uplink
 //! still carries the link. Unconfirmed within 10 s, the helper undoes it,
 //! and the same shaping is not tried again until the controller gives a
-//! new set. Once a minute the helper's counters are read: a limit whose
-//! classes counted nothing while the client moved a megabyte in that
-//! direction is not enforced by the NSS, and says so.
+//! new set; nor is a shaping the helper could not be asked for or refused.
+//! Once a minute the helper's counters are read: a limit whose classes
+//! counted nothing while the client moved a megabyte in that direction is
+//! not enforced by the NSS, and says so.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -36,7 +40,7 @@ use u6e_proto::text;
 
 /// The longest a sync may take: a tree is about 2 ms a firmware node.
 const WAIT: Duration = Duration::from_secs(10);
-/// How long a sync that built a tree waits for the controller's
+/// How long a sync that built the uplink's tree waits for the controller's
 /// acknowledgement; the helper waits 20 s for the confirmation.
 const CONFIRM_WAIT: Duration = Duration::from_secs(10);
 const COUNT_EVERY: Duration = Duration::from_secs(60);
@@ -45,7 +49,7 @@ const COUNT_EVERY: Duration = Duration::from_secs(60);
 const UNCOUNTED: u64 = 1 << 20;
 const DETAIL_MAX: usize = 200;
 
-/// A sync that built a tree, waiting for its confirmation.
+/// A sync that built the uplink's tree, waiting for its confirmation.
 struct Pending {
     conn: UnixStream,
     since: Instant,
@@ -65,7 +69,9 @@ pub struct Limits {
     net: PathBuf,
     given: Option<Vec<Limit>>,
     synced: Option<Spec>,
-    /// A spec undone for want of a confirmation.
+    /// The last sync was made with no controller to confirm with.
+    away: bool,
+    /// A spec undone for want of a confirmation, or that failed.
     failed: Option<Spec>,
     states: Vec<LimitState>,
     /// What this session was sent last.
@@ -213,6 +219,7 @@ impl Limits {
             net,
             given: None,
             synced: None,
+            away: false,
             failed: None,
             states: Vec::new(),
             sent: None,
@@ -240,7 +247,7 @@ impl Limits {
         self.given = Some(limits);
         self.failed = None;
         if let Some(snap) = last {
-            self.sync(snap);
+            self.sync(snap, false);
         }
         let count = |s: LimitStatus| self.states.iter().filter(|x| x.status == s).count();
         let refused = self
@@ -261,9 +268,24 @@ impl Limits {
         }
     }
 
-    /// A tick: the set synced again if the AP changed under it, and counted
-    /// once a minute.
+    /// Whether the controller has given a set, which is kept.
+    pub fn kept(&self) -> bool {
+        self.given.is_some()
+    }
+
+    /// A tick in a session: the set synced again if the AP changed under
+    /// it, and counted once a minute.
     pub fn tick(&mut self, snap: &Snapshot) {
+        self.step(snap, false);
+    }
+
+    /// A tick with no session: the set synced again if the AP changed under
+    /// it, the uplink's tree left as it is.
+    pub fn tick_away(&mut self, snap: &Snapshot) {
+        self.step(snap, true);
+    }
+
+    fn step(&mut self, snap: &Snapshot, away: bool) {
         if self.given.is_none() || self.pending.is_some() {
             return;
         }
@@ -273,11 +295,12 @@ impl Limits {
             &netdevs(&self.net),
         );
         if self.synced.as_ref() != Some(&spec) && self.failed.as_ref() != Some(&spec) {
-            self.sync(snap);
-        } else if self
-            .count
-            .as_ref()
-            .is_none_or(|c| c.at.elapsed() >= COUNT_EVERY)
+            self.sync(snap, away);
+        } else if !away
+            && self
+                .count
+                .as_ref()
+                .is_none_or(|c| c.at.elapsed() >= COUNT_EVERY)
             && self
                 .states
                 .iter()
@@ -307,10 +330,24 @@ impl Limits {
         Ok((sock, reply))
     }
 
-    fn sync(&mut self, snap: &Snapshot) {
+    fn sync(&mut self, snap: &Snapshot, away: bool) {
         let given = self.given.clone().unwrap_or_default();
         let (spec, waiting) = resolve(&given, snap, &netdevs(&self.net));
-        let outcomes = match self.ask(&Request::Sync(spec.clone())) {
+        // Nothing to make and nothing a helper left to undo: none is started.
+        if given.is_empty()
+            && self.synced.is_none()
+            && !self.socket.with_file_name("state").exists()
+        {
+            self.synced = Some(spec);
+            self.states.clear();
+            return;
+        }
+        let req = if away {
+            Request::SyncAway(spec.clone())
+        } else {
+            Request::Sync(spec.clone())
+        };
+        let outcomes = match self.ask(&req) {
             Ok((conn, Reply::Synced { outcomes, confirm })) => {
                 if confirm {
                     self.pending = Some(Pending {
@@ -329,7 +366,15 @@ impl Limits {
         if let Err(e) = &outcomes {
             self.note(Some(e.clone()));
         }
-        self.synced = outcomes.is_ok().then_some(spec);
+        // A failure is not tried again every tick: the next change of the
+        // AP or of the set is.
+        if outcomes.is_ok() {
+            self.synced = Some(spec);
+        } else {
+            self.synced = None;
+            self.failed = Some(spec);
+        }
+        self.away = away;
         self.count = None;
         self.states = given
             .iter()
@@ -419,9 +464,14 @@ impl Limits {
         Some(AgentMsg::Limits(self.states.clone()))
     }
 
-    /// A new session: it is sent the states.
+    /// A new session: it is sent the states, and a sync made away is made
+    /// again, the uplink's tree with it.
     pub fn session(&mut self) {
         self.sent = None;
+        if self.away {
+            self.synced = None;
+            self.away = false;
+        }
     }
 
     /// The session sent something the controller is to acknowledge.
@@ -724,6 +774,103 @@ mod tests {
         // A new session is sent the states again.
         l.session();
         assert!(l.update().is_some());
+    }
+
+    /// A helper's answer to a sync, made away or not: every client limit
+    /// enforced, nothing to confirm.
+    fn enforced(req: &Request) -> Reply {
+        match req {
+            Request::Sync(spec) | Request::SyncAway(spec) => Reply::Synced {
+                outcomes: spec
+                    .clients
+                    .iter()
+                    .map(|c| ok(LimitTarget::Client(c.mac)))
+                    .collect(),
+                confirm: false,
+            },
+            _ => Reply::Counters(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn away_the_limits_follow_the_ap_and_the_next_session_syncs_them_again() {
+        let t = TestDir::new();
+        let (sock, rx) = helper(&t, |req, c| write_frame(c, &enforced(&req)).unwrap());
+        let mut l = Limits::new(sock, sysfs(&t, &DEVS));
+        // Nothing is kept before the controller gives a set.
+        l.tick_away(&snap());
+        assert!(!l.kept() && rx.try_recv().is_err());
+        l.command(
+            1,
+            vec![limit(LimitTarget::Client(C1), Some(1_000), Some(500))],
+            Some(&snap()),
+        );
+        assert!(matches!(rx.recv().unwrap(), Request::Sync(_)));
+        // The controller goes; the client roams to the guest SSID's BSS.
+        let mut roamed = snap();
+        roamed.stations[0].bss = 2;
+        l.tick_away(&roamed);
+        let Ok(Request::SyncAway(spec)) = rx.recv() else {
+            panic!()
+        };
+        assert_eq!(spec.ssids[spec.clients[0].ssid].ssid, "guest");
+        l.tick_away(&roamed);
+        assert!(rx.try_recv().is_err(), "nothing changed, nothing asked");
+        // The next session syncs it again, the uplink's tree with it.
+        l.session();
+        l.tick(&roamed);
+        assert!(matches!(rx.recv().unwrap(), Request::Sync(_)));
+        l.tick(&roamed);
+        assert_eq!(rx.recv().unwrap(), Request::Counters);
+    }
+
+    #[test]
+    fn a_failed_sync_is_not_tried_again_every_tick() {
+        let t = TestDir::new();
+        let (sock, rx) = helper(&t, |_, c| {
+            write_frame(c, &Reply::Refused("busy".into())).unwrap();
+        });
+        let mut l = Limits::new(sock, sysfs(&t, &DEVS));
+        let r = l.command(
+            1,
+            vec![limit(LimitTarget::Client(C1), Some(1_000), None)],
+            Some(&snap()),
+        );
+        assert!(!r.ok && r.detail.contains("busy"), "{r:?}");
+        assert!(rx.recv().is_ok());
+        for _ in 0..3 {
+            l.tick(&snap());
+            l.tick_away(&snap());
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "the helper is not started each tick"
+        );
+        // A change of the AP is tried.
+        let mut roamed = snap();
+        roamed.stations[0].bss = 2;
+        l.tick(&roamed);
+        assert!(rx.recv().is_ok());
+    }
+
+    #[test]
+    fn an_empty_set_starts_no_helper_unless_one_left_shaping_in_place() {
+        let t = TestDir::new();
+        let (sock, rx) = helper(&t, |req, c| write_frame(c, &enforced(&req)).unwrap());
+        let mut l = Limits::new(sock.clone(), sysfs(&t, &DEVS));
+        let r = l.command(1, Vec::new(), Some(&snap()));
+        assert!(
+            r.ok && r.detail == "0 enforced, 0 waiting, 0 refused",
+            "{r:?}"
+        );
+        l.tick(&snap());
+        assert!(rx.try_recv().is_err(), "no helper for nothing");
+        assert!(matches!(l.update(), Some(AgentMsg::Limits(s)) if s.is_empty()));
+        // A helper's state from before the agent restarted: it is undone.
+        fs::write(sock.with_file_name("state"), "").unwrap();
+        let mut again = Limits::new(sock, sysfs(&t, &DEVS));
+        again.command(2, Vec::new(), Some(&snap()));
+        assert!(matches!(rx.recv().unwrap(), Request::Sync(s) if s.clients.is_empty()));
     }
 
     #[test]

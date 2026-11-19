@@ -1,9 +1,9 @@
 //! The AP's own socket between the agent and its rate-limit helper
 //! (`u6e-shaper`), which only the agent's group may open: one request per
 //! connection, in the framing of `frame`, answered once; a sync that built
-//! a shaper tree then waits for the agent's [`Request::Confirm`] on the same
-//! connection, and is undone without it. Both ends ship in one image, so
-//! this is no part of [`crate::PROTOCOL`].
+//! the uplink's shaper tree then waits for the agent's [`Request::Confirm`]
+//! on the same connection, and is undone without it. Both ends ship in one
+//! image, so this is no part of [`crate::PROTOCOL`].
 
 use serde::{Deserialize, Serialize};
 
@@ -56,6 +56,10 @@ pub struct Spec {
 pub enum Request {
     /// Make the shaping `Spec`'s.
     Sync(Spec),
+    /// The same while the agent has no controller to confirm with: a limit
+    /// that needs the uplink's tree built (which could cut the agent's
+    /// link) is refused for now, so nothing is to be confirmed.
+    SyncAway(Spec),
     /// Keep the sync just made: the uplink still carries the agent's link.
     Confirm,
     /// The bytes each limit's classes passed.
@@ -76,8 +80,8 @@ pub struct Outcome {
 /// The answer to a [`Request`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Reply {
-    /// Each limit's outcome; with `confirm`, the sync built a tree and is
-    /// undone unless confirmed within [`CONFIRM_SECS`].
+    /// Each limit's outcome; with `confirm`, the sync built the uplink's
+    /// tree and is undone unless confirmed within [`CONFIRM_SECS`].
     Synced {
         outcomes: Vec<Outcome>,
         confirm: bool,
@@ -87,5 +91,6 @@ pub enum Reply {
     Refused(String),
 }
 
-/// How long a sync that built a tree waits for its [`Request::Confirm`].
+/// How long a sync that built the uplink's tree waits for its
+/// [`Request::Confirm`].
 pub const CONFIRM_SECS: u64 = 20;
