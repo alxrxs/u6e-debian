@@ -3,10 +3,10 @@
 //! deceleration, `u6e_proto::ecm`), and the AP's netdevs as sysfs lists them.
 
 use std::fs;
-use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+use u6e_proto::nft::{self, complaint};
 use u6e_proto::shaper::Netdev;
 
 pub trait Host {
@@ -38,13 +38,6 @@ impl Default for System {
     }
 }
 
-/// The first line of what a failed command printed, or how it ended.
-fn complaint(out: &std::process::Output) -> String {
-    let text = String::from_utf8_lossy(&out.stderr);
-    let first = text.lines().find(|l| !l.trim().is_empty());
-    first.map_or_else(|| out.status.to_string(), |l| l.trim().to_owned())
-}
-
 impl Host for System {
     fn tc(&mut self, args: &[String]) -> Result<String, String> {
         let out = Command::new(&self.tc)
@@ -59,25 +52,7 @@ impl Host for System {
     }
 
     fn nft(&mut self, script: &str) -> Result<(), String> {
-        let mut child = Command::new(&self.nft)
-            .args(["-f", "-"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("nft: {e}"))?;
-        let wrote = child
-            .stdin
-            .take()
-            .map(|mut s| s.write_all(script.as_bytes()));
-        let out = child.wait_with_output().map_err(|e| format!("nft: {e}"))?;
-        if let Some(Err(e)) = wrote {
-            return Err(format!("nft: {e}"));
-        }
-        if !out.status.success() {
-            return Err(complaint(&out));
-        }
-        Ok(())
+        nft::run(&self.nft, script)
     }
 
     fn sysctl(&mut self, path: &str, value: &str) -> Result<(), String> {

@@ -22,9 +22,9 @@
 //! and the ports of an SSID with an upload limit with its class.
 
 use serde::{Deserialize, Serialize};
-use u6e_proto::mac;
 use u6e_proto::msg::{CLIENT_LIMITS_MAX, LimitTarget, SSID_LIMITS_MAX};
 use u6e_proto::shaper::{Netdev, Spec};
+use u6e_proto::{mac, nft};
 
 pub const DOWN: u16 = 1;
 pub const UP: u16 = 2;
@@ -267,25 +267,19 @@ fn classid(t: u32) -> String {
     format!("{:x}:{:x}", t >> 16, t & 0xffff)
 }
 
-fn names(devs: &[String]) -> String {
-    let quoted: Vec<String> = devs.iter().map(|d| format!("\"{d}\"")).collect();
-    quoted.join(", ")
-}
-
 /// The nftables script that makes the table `t` (or no table, without a
 /// rule), whatever was there: one transaction.
 pub fn ruleset(t: &Tags) -> String {
-    let mut s = format!("table {TABLE}\ndelete table {TABLE}\n");
     if t.clients.is_empty() && t.ssids.is_empty() {
-        return s;
+        return nft::replace(TABLE, "");
     }
     let hook = |devs: &[String]| {
         format!(
             "\t\ttype filter hook ingress devices = {{ {} }} priority 0; policy accept;\n",
-            names(devs)
+            nft::devices(devs)
         )
     };
-    s += &format!("table {TABLE} {{\n");
+    let mut s = String::new();
     if !t.up_devs.is_empty() {
         s += "\tchain up {\n";
         s += &hook(&t.up_devs);
@@ -299,7 +293,7 @@ pub fn ruleset(t: &Tags) -> String {
         for (_, up, ports) in &t.ssids {
             s += &format!(
                 "\t\tiifname {{ {} }} meta priority set {}\n",
-                names(ports),
+                nft::devices(ports),
                 classid(*up)
             );
         }
@@ -317,7 +311,7 @@ pub fn ruleset(t: &Tags) -> String {
         }
         s += "\t}\n";
     }
-    s + "}\n"
+    nft::replace(TABLE, &s)
 }
 
 #[cfg(test)]
