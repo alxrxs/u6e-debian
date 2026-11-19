@@ -618,20 +618,19 @@ WantedBy=multi-user.target
 UNIT
 ln -sf /etc/systemd/system/u6e-guard.service $W/u6e-guard.service
 
-# u6e-shaper (pkg/u6e-shaper): the controller's rate limits on the NSS
-# shaper, for the agent, which can do none of it (tc and nft want
-# CAP_NET_ADMIN, ECM's deceleration is root's). Socket-activated, one helper
-# per connection, on a socket only the agent's group may open: nsshtb trees
-# on the BSSs' netdevs and the uplink, their classes, and the nftables
-# netdev table that tags the limited clients' packets (nf_tables is loaded at
-# boot, as neither its sandbox nor u6e-capture's, whose marks need it too,
-# loads a module). A sync that built the uplink's tree waits for
-# the agent's confirmation and is undone without it (a teardown and a
-# rebuild of the shaping before from its spec); its last step undoes a
-# sync it died in. It runs as root with CAP_NET_ADMIN alone and writes only
-# its run directory and ECM's two deceleration files; every other sandbox
-# setting is at its most restrictive but where a comment says what it needs
-# instead.
+# u6e-shaper (pkg/u6e-shaper): the controller's rate limits on the NSS shaper,
+# for the agent, which can do none of it (tc and nft want CAP_NET_ADMIN, ECM's
+# deceleration is root's). Socket-activated, one helper per connection, on a
+# socket only the agent's group may open: nsshtb trees on the BSSs' netdevs
+# and the uplink, their classes, and the nftables netdev table that tags the
+# limited clients' packets (nf_tables is loaded at boot, as neither its
+# sandbox nor u6e-capture's, whose marks need it too, loads a module). A sync
+# that built the uplink's tree waits for the agent's confirmation and is
+# undone without it (a teardown and a rebuild of the shaping before from its
+# spec); its last step undoes a sync it died in. It runs as root with
+# CAP_NET_ADMIN alone and writes only its run directory and ECM's two
+# deceleration files; every other sandbox setting is at its most restrictive
+# but where a comment says what it needs instead.
 install -m0755 target/aarch64-unknown-linux-musl/release/u6e-shaper $RF/usr/local/sbin/
 printf 'd /run/u6e-shaper 0750 root u6e-agent -\n' > $RF/usr/lib/tmpfiles.d/u6e-shaper.conf
 printf 'nf_tables\n' > $RF/etc/modules-load.d/u6e-shaper.conf
@@ -706,16 +705,16 @@ UNIT
 # socket only the agent's group may open. It takes the client's flows where
 # the image loads u6e-pcc by its mirror, else off the offload: a nftables
 # netdev table marks the client's frames, which ECM (patch 904) keeps on the
-# CPU, and the client is decelerated; no other client's flows are touched.
-# It always gives them back: what it changes is written first to
-# /run/u6e-capture/restore, its own deadline ends it, the runtime limit
-# below backs that up, and its last step puts back what a capture left,
-# whatever ended it (u6e-agent reports a held offload). It runs as root with
-# CAP_NET_RAW (its packet sockets) and CAP_NET_ADMIN (nft, and its sockets'
-# 2 MiB past net.core.rmem_max) alone, writes only its run directory, ECM's deceleration file and u6e-pcc's files (a
-# debugfs that holds those and nothing else); every other sandbox setting
-# is at its most restrictive but where a comment says what it needs
-# instead.
+# CPU, and the client is decelerated; no other client's flows are touched. It
+# always gives them back: what it changes is written first to
+# /run/u6e-capture/restore, its own deadline ends it, the runtime limit below
+# backs that up, and its last step puts back what a capture left, whatever
+# ended it (u6e-agent reports a held offload). It runs as root with
+# CAP_NET_RAW (its packet sockets) and CAP_NET_ADMIN (nft, and its sockets' 2
+# MiB past net.core.rmem_max) alone, writes only its run directory, ECM's
+# deceleration file and u6e-pcc's files (a debugfs that holds those and
+# nothing else); every other sandbox setting is at its most restrictive but
+# where a comment says what it needs instead.
 install -m0755 target/aarch64-unknown-linux-musl/release/u6e-capture $RF/usr/local/sbin/
 printf 'd /run/u6e-capture 0750 root u6e-agent -\n' > $RF/usr/lib/tmpfiles.d/u6e-capture.conf
 cat > $RF/etc/systemd/system/u6e-capture.socket <<'UNIT'
