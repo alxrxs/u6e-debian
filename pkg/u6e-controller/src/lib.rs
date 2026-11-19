@@ -19,6 +19,7 @@
 
 pub mod actions;
 pub mod agents;
+mod clean;
 pub mod config;
 pub mod configs;
 mod fetch;

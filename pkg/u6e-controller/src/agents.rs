@@ -15,7 +15,8 @@
 //!
 //! Received bytes collect in a buffer and are cut into frames only when whole,
 //! so a read cancelled by another branch of the session's `select!` never
-//! loses its place mid-frame.
+//! loses its place mid-frame. What a person reads of each message is cleaned
+//! first (`clean`).
 
 use std::convert::Infallible;
 use std::io::{self, ErrorKind};
@@ -37,6 +38,7 @@ use u6e_proto::msg::{AgentMsg, CtlMsg, Hello};
 use u6e_proto::tls::{self, AllowedKeys};
 use u6e_proto::{PROTOCOL, version};
 
+use crate::clean;
 use crate::names::Lookups;
 use crate::policy::{self, Store};
 use crate::spectrum::Limits;
@@ -364,7 +366,10 @@ impl Session {
             .wait_frame(decode_frame::<AgentMsg>, "Hello")
             .await?
         {
-            AgentMsg::Hello(h) => Ok(h),
+            AgentMsg::Hello(mut h) => {
+                clean::hello(&mut h);
+                Ok(h)
+            }
             _ => Err(io::Error::new(ErrorKind::InvalidData, "no Hello first")),
         }
     }
@@ -389,8 +394,9 @@ impl Session {
         let mut sync = None;
         let mut setup = Vec::new();
         let mut flows = false;
-        while let Some((msg, n)) = decode_frame::<AgentMsg>(&self.conn.inbuf[used..])? {
+        while let Some((mut msg, n)) = decode_frame::<AgentMsg>(&self.conn.inbuf[used..])? {
             used += n;
+            clean::agent_msg(&mut msg);
             self.conn.last_rx = Instant::now();
             let key = matches!(msg, AgentMsg::Key(_));
             if key {
