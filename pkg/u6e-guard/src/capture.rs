@@ -20,6 +20,11 @@ use std::io;
 use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
+use u6e_proto::bpf::{
+    ABS, ALU, AND, B, H, IFINDEX, IND, Ins, JEQ, JGE, JMP, JSET, LD, LDX, LEN, MSH, RET,
+    VLAN_TAG_PRESENT, assemble,
+};
+
 use crate::ports::Port;
 
 const ETH_P_ALL: u16 = 0x0003;
@@ -33,62 +38,7 @@ const TP_STATUS_VLAN_VALID: u32 = 1 << 4;
 const SHORT: u32 = 96;
 const WHOLE: u32 = 1600;
 
-// Classic BPF (linux/filter.h).
-const LD: u16 = 0x00;
-const LDX: u16 = 0x01;
-const ALU: u16 = 0x04;
-const JMP: u16 = 0x05;
-const RET: u16 = 0x06;
-const H: u16 = 0x08;
-const B: u16 = 0x10;
-const ABS: u16 = 0x20;
-const IND: u16 = 0x40;
-const LEN: u16 = 0x80;
-const MSH: u16 = 0xa0;
-const AND: u16 = 0x50;
-const JEQ: u16 = 0x10;
-const JGE: u16 = 0x30;
-const JSET: u16 = 0x40;
-/// The interface a frame came in on, and whether the kernel took a VLAN tag
-/// off it, as absolute loads (SKF_AD_IFINDEX, SKF_AD_VLAN_TAG_PRESENT).
-const IFINDEX: u32 = 0xffff_f000 + 8;
-const VLAN_TAG_PRESENT: u32 = 0xffff_f000 + 48;
-
-/// One instruction, its jump (if any) to a label, or a label.
-enum Ins {
-    Op(u16, u32),
-    Jump(u16, u32, &'static str),
-    Label(&'static str),
-}
-
 use Ins::{Jump, Label, Op};
-
-/// Resolves the labels of `prog` into relative jumps.
-fn assemble(prog: &[Ins]) -> Vec<libc::sock_filter> {
-    let mut at = std::collections::HashMap::new();
-    let mut n = 0;
-    for i in prog {
-        match i {
-            Label(l) => {
-                at.insert(*l, n);
-            }
-            _ => n += 1,
-        }
-    }
-    let mut out = Vec::with_capacity(n);
-    for i in prog {
-        let (code, k, jt) = match i {
-            Label(_) => continue,
-            Op(code, k) => (*code, *k, 0),
-            Jump(code, k, label) => {
-                let off = at[label] - out.len() - 1;
-                (*code, *k, u8::try_from(off).expect("a jump within 255"))
-            }
-        };
-        out.push(libc::sock_filter { code, jt, jf: 0, k });
-    }
-    out
-}
 
 /// The ports a program names at most, so its first jumps stay within the
 /// 255 instructions a classic BPF jump can skip; an AP has a few dozen.
@@ -96,7 +46,7 @@ pub const MAX_PORTS: usize = 160;
 
 /// The program for `ports` (the first [`MAX_PORTS`] of them).
 pub fn program(ports: &[Port]) -> Vec<libc::sock_filter> {
-    let mut p = vec![Op(LD | ABS, IFINDEX)];
+    let mut p: Vec<Ins<&str>> = vec![Op(LD | ABS, IFINDEX)];
     for port in ports.iter().take(MAX_PORTS) {
         let to = if port.wifi { "wifi" } else { "uplink" };
         p.push(Jump(JMP | JEQ, port.ifindex as u32, to));
@@ -327,6 +277,7 @@ impl Capture {
 mod tests {
     use super::*;
     use crate::frame::tests::*;
+    use u6e_proto::bpf::Meta;
 
     /// Runs `prog` on `pkt` arriving on `ifindex`, as the kernel does: what
     /// it keeps of the frame (0: drops it).
@@ -336,53 +287,12 @@ mod tests {
 
     /// The same, `tagged` saying whether the kernel took a tag off the frame.
     fn run_tagged(prog: &[libc::sock_filter], pkt: &[u8], ifindex: u32, tagged: bool) -> u32 {
-        let (mut a, mut x, mut pc) = (0u32, 0u32, 0usize);
-        let load = |at: usize, n: usize| -> Option<u32> {
-            Some(
-                pkt.get(at..at + n)?
-                    .iter()
-                    .fold(0, |v, b| v << 8 | u32::from(*b)),
-            )
+        let meta = Meta {
+            ifindex,
+            tagged,
+            pkttype: 0,
         };
-        loop {
-            let i = prog[pc];
-            pc += 1;
-            let size = match i.code & 0x18 {
-                H => 2,
-                B => 1,
-                _ => 4,
-            };
-            match i.code & 0x07 {
-                LD if i.k == IFINDEX => a = ifindex,
-                LD if i.k == VLAN_TAG_PRESENT => a = u32::from(tagged),
-                LD if i.code & 0xe0 == LEN => a = pkt.len() as u32,
-                LD => {
-                    let at = if i.code & 0xe0 == IND { x + i.k } else { i.k };
-                    let Some(v) = load(at as usize, size) else {
-                        return 0;
-                    };
-                    a = v;
-                }
-                LDX => {
-                    let Some(v) = load(i.k as usize, 1) else {
-                        return 0;
-                    };
-                    x = (v & 0x0f) * 4;
-                }
-                ALU => a &= i.k,
-                JMP => {
-                    let hit = match i.code & 0xf0 {
-                        JEQ => a == i.k,
-                        JGE => a >= i.k,
-                        JSET => a & i.k != 0,
-                        c => panic!("jump {c:#x}"),
-                    };
-                    pc += usize::from(if hit { i.jt } else { i.jf });
-                }
-                RET => return i.k,
-                c => panic!("class {c:#x}"),
-            }
-        }
+        u6e_proto::bpf::run(prog, pkt, meta)
     }
 
     fn ports() -> Vec<Port> {

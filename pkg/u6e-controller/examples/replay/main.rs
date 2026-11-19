@@ -780,6 +780,9 @@ impl World {
                 r.txpower_mbm = i32::from(*dbm) * 100;
                 return Some((true, format!("{dbm} dBm")));
             }
+            CommandKind::SyncLimits { limits } => {
+                return Some((true, format!("{} limits", limits.len())));
+            }
         };
         let i = self.clients.iter().position(|c| World::mac(c.last) == mac);
         let here = i.and_then(|i| {
@@ -808,7 +811,8 @@ impl World {
             }
             CommandKind::SyncBlocks { .. }
             | CommandKind::ChannelSwitch { .. }
-            | CommandKind::TxPower { .. } => unreachable!("answered above"),
+            | CommandKind::TxPower { .. }
+            | CommandKind::SyncLimits { .. } => unreachable!("answered above"),
             _ if here.is_none() => Some((false, "not associated here".into())),
             CommandKind::Kick { .. } if mac[5] == SILENT => None,
             CommandKind::Kick { .. } => {
@@ -956,6 +960,7 @@ impl World {
             clock_synced: true,
             power_limits: power_limits(),
             auth,
+            offload_held: false,
         }
     }
 }

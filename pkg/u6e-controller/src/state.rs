@@ -255,6 +255,7 @@ pub fn action_name(kind: &CommandKind) -> &'static str {
         CommandKind::SyncBlocks { .. } => "sync",
         CommandKind::ChannelSwitch { .. } => "channel",
         CommandKind::TxPower { .. } => "power",
+        CommandKind::SyncLimits { .. } => "limits",
     }
 }
 
@@ -2026,6 +2027,7 @@ mod tests {
             clock_synced: true,
             power_limits: Vec::new(),
             auth: Vec::new(),
+            offload_held: false,
         }
     }
 

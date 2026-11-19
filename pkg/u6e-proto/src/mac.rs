@@ -15,6 +15,12 @@ pub fn parse(s: &str) -> Option<[u8; 6]> {
     parts.next().is_none().then_some(out)
 }
 
+/// Whether `m` is an individual address, as every station's is: no group
+/// address (broadcast, multicast), not zero.
+pub fn is_station(m: [u8; 6]) -> bool {
+    m[0] & 1 == 0 && m != [0; 6]
+}
+
 /// The address as six lowercase pairs of hex digits joined by colons.
 pub fn format(m: [u8; 6]) -> String {
     m.map(|b| format!("{b:02x}")).join(":")

@@ -24,10 +24,12 @@ use crate::PROTOCOL;
 use crate::config::{config_sha256, payload};
 use crate::mac::hex;
 use crate::msg::{
-    AgentMsg, Band, Binding, Bss, ClientFlows, Command, CommandKind, CommandResult, ConfigApplied,
-    CtlMsg, Event, EventKind, FieldDelta, Flow, Flows, Guard, GuardConfig, Hello, Mechanism,
-    PowerLimit, Radio, RadioApplied, RadioConfig, RateMode, RecDelta, SignedConfig, Snapshot,
-    SnapshotDelta, SpectrumFrame, Station, StationAuth, Temp, Violation,
+    AgentMsg, Band, Binding, Bss, CaptureChunk, CaptureFilter, CaptureMechanism, CaptureRequest,
+    CaptureState, ClientFlows, Command, CommandKind, CommandResult, ConfigApplied, CtlMsg, Event,
+    EventKind, FieldDelta, FilterProto, Flow, Flows, Guard, GuardConfig, Hello, Limit, LimitState,
+    LimitStatus, LimitTarget, Mechanism, PowerLimit, Radio, RadioApplied, RadioConfig, Rate,
+    RateMode, RecDelta, SignedConfig, Snapshot, SnapshotDelta, SpectrumFrame, Station, StationAuth,
+    Temp, Violation,
 };
 
 const HOW: &str = "bump u6e_proto::PROTOCOL (pkg/u6e-proto/src/version.rs) and write the \
@@ -239,6 +241,7 @@ fn samples() -> Samples {
             dbm: -100,
         }],
         auth: vec![([0x02, 0, 0, 0, 0, 1], station_auth())],
+        offload_held: true,
     };
     let rec = |idx| RecDelta {
         idx,
@@ -355,6 +358,46 @@ fn samples() -> Samples {
         "GuardDrops",
         AgentMsg::GuardDrops(vec![(Guard::Arp, 1 << 40), (Guard::Tag, 70_010)]),
     ));
+    let limit_state = |target, status| LimitState {
+        target,
+        status,
+        detail: "on wlan5 and lan".into(),
+        down_bytes: 1 << 40,
+        up_bytes: (1 << 40) + 1,
+    };
+    agent.push((
+        "Limits",
+        AgentMsg::Limits(vec![
+            limit_state(LimitTarget::Client(mac), LimitStatus::Enforced),
+            limit_state(LimitTarget::Ssid("ssid-a".into()), LimitStatus::Waiting),
+            limit_state(LimitTarget::Client(mac), LimitStatus::Refused),
+            limit_state(LimitTarget::Client(mac), LimitStatus::NotEnforced),
+        ]),
+    ));
+    agent.push((
+        "CaptureChunk",
+        AgentMsg::CaptureChunk(CaptureChunk {
+            id: 1 << 42,
+            seq: (1 << 40) + 2,
+            data: vec![0x0a, 0x0d, 0x0d, 0x0a, 200],
+        }),
+    ));
+    for (name, mechanism) in [
+        ("CaptureMirror", Some(CaptureMechanism::Mirror)),
+        ("CaptureOffOffload", Some(CaptureMechanism::OffOffload)),
+        ("CaptureRefused", None),
+    ] {
+        let state = CaptureState {
+            id: 1 << 42,
+            running: mechanism.is_some(),
+            mechanism,
+            bytes: (1 << 33) + 1,
+            packets: (1 << 33) + 2,
+            dropped: 70_014,
+            reason: "started".into(),
+        };
+        agent.push((name, AgentMsg::Capture(state)));
+    }
     let mut ctl = vec![
         ("SetTick", CtlMsg::SetTick { secs: 300 }),
         ("WantKey", CtlMsg::WantKey),
@@ -397,6 +440,27 @@ fn samples() -> Samples {
                 dbm: -100,
             },
         ),
+        (
+            "SyncLimits",
+            CommandKind::SyncLimits {
+                limits: vec![
+                    Limit {
+                        target: LimitTarget::Client(mac),
+                        rate: Rate {
+                            down_kbit: Some(2_000_000),
+                            up_kbit: None,
+                        },
+                    },
+                    Limit {
+                        target: LimitTarget::Ssid("ssid-a".into()),
+                        rate: Rate {
+                            down_kbit: None,
+                            up_kbit: Some(70_015),
+                        },
+                    },
+                ],
+            },
+        ),
     ];
     for (name, kind) in commands {
         ctl.push((name, CtlMsg::Command(Command { id: 1 << 42, kind })));
@@ -415,6 +479,40 @@ fn samples() -> Samples {
         }),
     ));
     ctl.push(("SeedBindings", CtlMsg::SeedBindings(bindings())));
+    let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x300));
+    for (name, proto, port, host) in [
+        ("CaptureStartTcp", FilterProto::Tcp, Some(60_003), Some(v6)),
+        ("CaptureStartUdp", FilterProto::Udp, None, None),
+        ("CaptureStartIcmp", FilterProto::Icmp, None, None),
+        (
+            "CaptureStartArp",
+            FilterProto::Arp,
+            None,
+            Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 200))),
+        ),
+    ] {
+        let request = CaptureRequest {
+            id: 1 << 42,
+            mac,
+            secs: 600,
+            max_bytes: 50_000_000,
+            snaplen: 65_535,
+            filter: CaptureFilter {
+                proto: Some(proto),
+                port,
+                host,
+            },
+        };
+        ctl.push((name, CtlMsg::CaptureStart(request)));
+    }
+    ctl.push(("CaptureStop", CtlMsg::CaptureStop { id: 1 << 42 }));
+    ctl.push((
+        "CaptureAck",
+        CtlMsg::CaptureAck {
+            id: 1 << 42,
+            seq: (1 << 40) + 2,
+        },
+    ));
     Samples { agent, ctl }
 }
 
@@ -487,8 +585,14 @@ fn every_variant_has_an_instance() {
     let (mut bands, mut modes, mut addrs) = (Vec::new(), Vec::new(), Vec::new());
     let mut mechanisms = Vec::new();
     let mut guards = Vec::new();
+    let (mut targets, mut statuses, mut captures) = (Vec::new(), Vec::new(), Vec::new());
     for m in &agent {
         match m {
+            AgentMsg::Limits(l) => {
+                targets.extend(l.iter().map(|s| s.target.clone()));
+                statuses.extend(l.iter().map(|s| s.status));
+            }
+            AgentMsg::Capture(c) => captures.extend(c.mechanism),
             AgentMsg::Event(e) => {
                 if let EventKind::GuardViolation(v) = &e.kind {
                     guards.push(v.guard);
@@ -523,6 +627,17 @@ fn every_variant_has_an_instance() {
     assert_every_variant("CommandKind", &commands);
     assert_every_variant("Mechanism", &mechanisms);
     assert_every_variant("Guard", &guards);
+    let protos: Vec<FilterProto> = ctl
+        .iter()
+        .filter_map(|m| match m {
+            CtlMsg::CaptureStart(r) => r.filter.proto,
+            _ => None,
+        })
+        .collect();
+    assert_every_variant("LimitTarget", &targets);
+    assert_every_variant("LimitStatus", &statuses);
+    assert_every_variant("CaptureMechanism", &captures);
+    assert_every_variant("FilterProto", &protos);
 }
 
 #[test]

@@ -65,12 +65,14 @@ fn unique<'a>(mut names: impl Iterator<Item = &'a String>) -> bool {
 
 /// Whether a delta can express the change from `prev` to `next`: the same
 /// temperature zones and the same radios, which do not change while a
-/// connection lives, and the same configuration, clock state and power
-/// limits, which change so rarely that a key frame carries the new ones.
+/// connection lives, and the same configuration, clock state, power limits
+/// and offload hold, which change so rarely that a key frame carries the new
+/// ones.
 fn same_shape(prev: &Snapshot, next: &Snapshot) -> bool {
     prev.config_sha256 == next.config_sha256
         && prev.clock_synced == next.clock_synced
         && prev.power_limits == next.power_limits
+        && prev.offload_held == next.offload_held
         && prev.temps.len() == next.temps.len()
         && prev
             .temps
@@ -499,6 +501,7 @@ mod tests {
             clock_synced: true,
             power_limits: Vec::new(),
             auth: Vec::new(),
+            offload_held: false,
         };
         // Every third station authenticated over 802.1X.
         first.auth = first
@@ -683,6 +686,9 @@ mod tests {
         }
         let mut n = successor(&a);
         n.clock_synced = false;
+        assert_eq!(diff(&a, &n), None);
+        let mut n = successor(&a);
+        n.offload_held = true;
         assert_eq!(diff(&a, &n), None);
         let mut n = successor(&a);
         n.power_limits.push(PowerLimit {

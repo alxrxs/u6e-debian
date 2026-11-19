@@ -44,6 +44,16 @@ pub enum AgentMsg {
     /// The frames each guard's filters dropped since the guards started,
     /// whenever that changes and at the start of each session.
     GuardDrops(Vec<(Guard, u64)>),
+    /// How each limit of the last [`CommandKind::SyncLimits`] stands on this
+    /// AP, whenever one changes and at the start of each session.
+    Limits(Vec<LimitState>),
+    /// The next part of a capture's pcapng file, acknowledged by a
+    /// [`CtlMsg::CaptureAck`] of its `seq`.
+    CaptureChunk(CaptureChunk),
+    /// Whether a capture runs, how it takes the client's flows and what it
+    /// has written: the answer to [`CtlMsg::CaptureStart`], and its end,
+    /// however it ended.
+    Capture(CaptureState),
 }
 
 /// Everything the controller sends.
@@ -92,6 +102,18 @@ pub enum CtlMsg {
     /// replace the ones seeded before: a client whose DHCP exchange this AP
     /// did not see (it roamed in, or the AP restarted) is bound all the same.
     SeedBindings(Vec<Binding>),
+    /// Capture a client's traffic and stream it, until
+    /// [`CtlMsg::CaptureStop`], the request's own limits or the end of the
+    /// session.
+    CaptureStart(CaptureRequest),
+    CaptureStop {
+        id: u64,
+    },
+    /// The chunk `seq` of capture `id` is stored: the agent may send another.
+    CaptureAck {
+        id: u64,
+        seq: u64,
+    },
 }
 
 /// What the AP is running, sent once per connection. `manifest` is the
@@ -163,6 +185,10 @@ pub struct Snapshot {
     /// How the stations authenticated, by MAC, sorted, each one a station's:
     /// a station hostapd could not be asked about yet has none.
     pub auth: Vec<([u8; 6], StationAuth)>,
+    /// Whether the NSS offload is held back for a capture: ECM stopped, or
+    /// a capture's restore not done. A capture holds it at most 10 minutes;
+    /// longer is a restore that failed.
+    pub offload_held: bool,
 }
 
 /// The longest identity carried: RADIUS's User-Name is at most 253 bytes.
@@ -632,6 +658,12 @@ pub enum CommandKind {
         radio: Band,
         dbm: i8,
     },
+    /// Make the AP's rate limits exactly `limits` ([`check_limits`]): what
+    /// the controller sends on every change and after the first key frame of
+    /// each connection. The AP keeps them while the controller is away.
+    SyncLimits {
+        limits: Vec<Limit>,
+    },
 }
 
 /// What came of a [`Command`].
@@ -643,6 +675,240 @@ pub struct CommandResult {
     pub ok: bool,
     /// hostapd's answer, or why the command was refused.
     pub detail: String,
+}
+
+/// The slowest and the fastest a limit may be, in kbit/s.
+pub const RATE_MIN_KBIT: u32 = 64;
+pub const RATE_MAX_KBIT: u32 = 2_000_000;
+/// The most client limits, and SSID limits, an AP is given.
+pub const CLIENT_LIMITS_MAX: usize = 64;
+pub const SSID_LIMITS_MAX: usize = 16;
+/// The longest SSID.
+pub const SSID_MAX: usize = 32;
+
+/// What a limit applies to: one client, or the clients of an SSID together
+/// (on each radio of it apart: the AP shapes each radio's netdev on its own).
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum LimitTarget {
+    Client([u8; 6]),
+    Ssid(String),
+}
+
+/// The most a target may receive (`down`) and send (`up`), in kbit/s; a
+/// direction without one is not limited.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Rate {
+    pub down_kbit: Option<u32>,
+    pub up_kbit: Option<u32>,
+}
+
+impl Rate {
+    /// At least one direction, each within [`RATE_MIN_KBIT`] and
+    /// [`RATE_MAX_KBIT`].
+    pub fn valid(&self) -> bool {
+        let ok = |r: Option<u32>| r.is_none_or(|k| (RATE_MIN_KBIT..=RATE_MAX_KBIT).contains(&k));
+        (self.down_kbit.is_some() || self.up_kbit.is_some())
+            && ok(self.down_kbit)
+            && ok(self.up_kbit)
+    }
+}
+
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Limit {
+    pub target: LimitTarget,
+    pub rate: Rate,
+}
+
+/// Why `limits` cannot be a sync's: a target twice, a client's address that
+/// is no station's, an SSID empty or too long, a rate out of range, or more
+/// than [`CLIENT_LIMITS_MAX`] clients or [`SSID_LIMITS_MAX`] SSIDs.
+pub fn check_limits(limits: &[Limit]) -> Result<(), String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let (mut clients, mut ssids) = (0, 0);
+    for l in limits {
+        match &l.target {
+            LimitTarget::Client(m) if !crate::mac::is_station(*m) => {
+                return Err(format!(
+                    "{} is not a station's address",
+                    crate::mac::format(*m)
+                ));
+            }
+            LimitTarget::Client(_) => clients += 1,
+            LimitTarget::Ssid(s) if s.is_empty() || s.len() > SSID_MAX => {
+                return Err("an SSID is 1 to 32 bytes".into());
+            }
+            LimitTarget::Ssid(_) => ssids += 1,
+        }
+        if !l.rate.valid() {
+            return Err(format!(
+                "a limit is at least one direction of {RATE_MIN_KBIT} to {RATE_MAX_KBIT} kbit/s"
+            ));
+        }
+        if !seen.insert(&l.target) {
+            return Err("a target is limited twice".into());
+        }
+    }
+    if clients > CLIENT_LIMITS_MAX || ssids > SSID_LIMITS_MAX {
+        return Err(format!(
+            "at most {CLIENT_LIMITS_MAX} clients and {SSID_LIMITS_MAX} SSIDs are limited"
+        ));
+    }
+    Ok(())
+}
+
+/// How a limit stands on an AP.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LimitStatus {
+    /// Its NSS shaper classes are in place.
+    Enforced,
+    /// Nothing to shape here: the client is not on this AP, or the SSID has
+    /// no radio on it.
+    Waiting,
+    /// The shaper could not put it in place; the detail says why.
+    Refused,
+    /// In place, but its classes counted nothing while the client's own
+    /// counters show traffic in a limited direction: the NSS does not shape
+    /// it.
+    NotEnforced,
+}
+
+/// A limit's state on an AP, with the bytes its NSS classes passed since
+/// they were made, summed per direction.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LimitState {
+    pub target: LimitTarget,
+    pub status: LimitStatus,
+    pub detail: String,
+    pub down_bytes: u64,
+    pub up_bytes: u64,
+}
+
+/// The longest capture, in seconds, and its size bounds, in bytes of pcapng.
+pub const CAPTURE_SECS_MAX: u16 = 600;
+pub const CAPTURE_BYTES_MIN: u32 = 1_000_000;
+pub const CAPTURE_BYTES_MAX: u32 = 50_000_000;
+/// The shortest snaplen: an Ethernet, IPv6 and TCP header with options.
+pub const SNAPLEN_MIN: u16 = 64;
+/// The most pcapng bytes a chunk carries.
+pub const CHUNK_MAX: usize = 64 << 10;
+
+/// A protocol a capture's filter keeps; ICMP is ICMP and ICMPv6.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FilterProto {
+    Tcp,
+    Udp,
+    Icmp,
+    Arp,
+}
+
+/// What of a client's traffic a capture keeps: every field set must match.
+/// A port is either end's (of TCP or UDP, either without a protocol); a
+/// host is either end's address (with ARP, the sender's or the target's).
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CaptureFilter {
+    pub proto: Option<FilterProto>,
+    pub port: Option<u16>,
+    pub host: Option<IpAddr>,
+}
+
+/// A capture of the client `mac`'s traffic: at most `secs` seconds and
+/// `max_bytes` of pcapng, each packet cut at `snaplen` bytes.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureRequest {
+    /// Chosen by the controller; every chunk and state of it carries it.
+    pub id: u64,
+    pub mac: [u8; 6],
+    pub secs: u16,
+    pub max_bytes: u32,
+    pub snaplen: u16,
+    pub filter: CaptureFilter,
+}
+
+impl CaptureRequest {
+    /// Why the request cannot be carried out as it is, if it cannot.
+    pub fn check(&self) -> Result<(), &'static str> {
+        let f = &self.filter;
+        if !crate::mac::is_station(self.mac) {
+            return Err("not a station's address");
+        }
+        if !(1..=CAPTURE_SECS_MAX).contains(&self.secs) {
+            return Err("a capture lasts 1 to 600 s");
+        }
+        if !(CAPTURE_BYTES_MIN..=CAPTURE_BYTES_MAX).contains(&self.max_bytes) {
+            return Err("a capture is 1 to 50 MB");
+        }
+        if self.snaplen < SNAPLEN_MIN {
+            return Err("the snaplen is 64 to 65535 bytes");
+        }
+        if f.port == Some(0) {
+            return Err("port 0 is no port");
+        }
+        match f.proto {
+            Some(FilterProto::Arp | FilterProto::Icmp) if f.port.is_some() => {
+                Err("a port goes with TCP or UDP")
+            }
+            Some(FilterProto::Arp) if matches!(f.host, Some(IpAddr::V6(_))) => {
+                Err("ARP carries IPv4 addresses only")
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// A part of a capture's file; `seq` counts from 0.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureChunk {
+    pub id: u64,
+    pub seq: u64,
+    pub data: Vec<u8>,
+}
+
+/// How a capture sees a client's flows.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CaptureMechanism {
+    /// They stay offloaded, and the NSS copies each of their packets to the
+    /// host.
+    Mirror,
+    /// They are taken off the offload for the capture: the client's go back
+    /// to the AP's CPU at its start, and every new connection of the AP stays
+    /// there until it ends.
+    OffOffload,
+}
+
+/// A capture's state: `bytes` of pcapng written, `packets` in them,
+/// `dropped` packets the AP could not keep up with.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureState {
+    pub id: u64,
+    pub running: bool,
+    /// `None` when it was refused before it took the flows.
+    pub mechanism: Option<CaptureMechanism>,
+    pub bytes: u64,
+    pub packets: u64,
+    pub dropped: u64,
+    /// Why it started, was refused or ended.
+    pub reason: String,
 }
 
 /// The radios' stable names, as their wiphys are named on the AP: the only
@@ -814,6 +1080,131 @@ mod tests {
         ] {
             assert_eq!(kind(akm), want, "{akm:08x}");
         }
+    }
+
+    fn limit(target: LimitTarget, down: Option<u32>, up: Option<u32>) -> Limit {
+        Limit {
+            target,
+            rate: Rate {
+                down_kbit: down,
+                up_kbit: up,
+            },
+        }
+    }
+
+    #[test]
+    fn limits_are_checked_whole() {
+        let client = |last| LimitTarget::Client([2, 0, 0, 0, 0, last]);
+        let ssid = |s: &str| LimitTarget::Ssid(s.into());
+        let good = vec![
+            limit(client(1), Some(64), None),
+            limit(client(2), None, Some(2_000_000)),
+            limit(ssid("guest"), Some(10_000), Some(1_000)),
+        ];
+        assert_eq!(check_limits(&good), Ok(()));
+        let bad = [
+            vec![limit(client(1), None, None)],
+            vec![limit(client(1), Some(63), None)],
+            vec![limit(client(1), None, Some(2_000_001))],
+            vec![limit(client(1), Some(0), Some(100))],
+            vec![limit(
+                LimitTarget::Client([1, 0, 0, 0, 0, 1]),
+                Some(100),
+                None,
+            )],
+            vec![limit(LimitTarget::Client([0; 6]), Some(100), None)],
+            vec![limit(ssid(""), Some(100), None)],
+            vec![limit(ssid(&"x".repeat(33)), Some(100), None)],
+            vec![
+                limit(client(1), Some(100), None),
+                limit(client(1), None, Some(100)),
+            ],
+            (0..=CLIENT_LIMITS_MAX as u8)
+                .map(|l| limit(client(l + 1), Some(100), None))
+                .collect(),
+            (0..=SSID_LIMITS_MAX)
+                .map(|l| limit(ssid(&format!("s{l}")), Some(100), None))
+                .collect(),
+        ];
+        for (i, b) in bad.iter().enumerate() {
+            assert!(check_limits(b).is_err(), "case {i}");
+        }
+    }
+
+    fn request(filter: CaptureFilter) -> CaptureRequest {
+        CaptureRequest {
+            id: 1,
+            mac: [2, 0, 0, 0, 0, 1],
+            secs: 60,
+            max_bytes: 10_000_000,
+            snaplen: 128,
+            filter,
+        }
+    }
+
+    #[test]
+    fn a_capture_request_is_checked_field_by_field() {
+        let v4 = Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
+        let v6 = Some("2001:db8::1".parse().unwrap());
+        let ok = |proto, port, host| CaptureFilter { proto, port, host };
+        for f in [
+            CaptureFilter::default(),
+            ok(Some(FilterProto::Tcp), Some(443), v6),
+            ok(None, Some(53), v4),
+            ok(Some(FilterProto::Icmp), None, v6),
+            ok(Some(FilterProto::Arp), None, v4),
+        ] {
+            assert_eq!(request(f).check(), Ok(()), "{f:?}");
+        }
+        for f in [
+            ok(Some(FilterProto::Arp), Some(53), None),
+            ok(Some(FilterProto::Icmp), Some(53), None),
+            ok(Some(FilterProto::Arp), None, v6),
+            ok(None, Some(0), None),
+        ] {
+            assert!(request(f).check().is_err(), "{f:?}");
+        }
+        let base = request(CaptureFilter::default());
+        let bad = [
+            CaptureRequest {
+                mac: [0xff; 6],
+                ..base.clone()
+            },
+            CaptureRequest {
+                mac: [0x01, 0, 0x5e, 0, 0, 1],
+                ..base.clone()
+            },
+            CaptureRequest {
+                secs: 0,
+                ..base.clone()
+            },
+            CaptureRequest {
+                secs: CAPTURE_SECS_MAX + 1,
+                ..base.clone()
+            },
+            CaptureRequest {
+                max_bytes: CAPTURE_BYTES_MIN - 1,
+                ..base.clone()
+            },
+            CaptureRequest {
+                max_bytes: CAPTURE_BYTES_MAX + 1,
+                ..base.clone()
+            },
+            CaptureRequest {
+                snaplen: SNAPLEN_MIN - 1,
+                ..base.clone()
+            },
+        ];
+        for b in bad {
+            assert!(b.check().is_err(), "{b:?}");
+        }
+        let edges = CaptureRequest {
+            secs: CAPTURE_SECS_MAX,
+            max_bytes: CAPTURE_BYTES_MAX,
+            snaplen: u16::MAX,
+            ..base
+        };
+        assert_eq!(edges.check(), Ok(()));
     }
 
     #[test]

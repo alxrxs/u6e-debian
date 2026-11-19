@@ -1110,6 +1110,7 @@ mod tests {
                 clock_synced: true,
                 power_limits: limits(),
                 auth: Vec::new(),
+                offload_held: false,
             }
         };
         (snap(0), snap(1))

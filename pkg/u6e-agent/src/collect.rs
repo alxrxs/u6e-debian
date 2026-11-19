@@ -21,8 +21,8 @@ use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-use u6e_proto::mac;
 use u6e_proto::msg::{Bss, Flows, Radio, Snapshot, Station, StationAuth, Temp};
+use u6e_proto::{capture, mac};
 
 use crate::ecm;
 use crate::kmsg::{self, Kmsg};
@@ -417,6 +417,7 @@ impl Collector {
             clock_synced: root.join(&wificonf::SYNCHRONIZED[1..]).exists(),
             power_limits,
             auth,
+            offload_held: offload_held(root),
         }
     }
 
@@ -507,6 +508,13 @@ fn radio_up(status: io::Result<String>, last: Option<bool>) -> bool {
         Err(e) if e.kind() == io::ErrorKind::TimedOut => last.unwrap_or(false),
         Err(_) => false,
     }
+}
+
+/// Whether a capture holds the NSS offload back: ECM stopped for either
+/// address family, or a capture's restore not done.
+fn offload_held(root: &Path) -> bool {
+    let stopped = |p: &str| fs::read_to_string(root.join(&p[1..])).is_ok_and(|v| v.trim() != "0");
+    capture::ECM_STOP.iter().any(|p| stopped(p)) || root.join(&capture::RESTORE[1..]).exists()
 }
 
 fn first_field(path: &Path) -> Option<f64> {
@@ -1493,6 +1501,20 @@ mod tests {
         fs::create_dir_all(synced.parent().unwrap()).unwrap();
         fs::write(&synced, "").unwrap();
         assert!(c.snapshot(14).clock_synced);
+
+        // The offload, held while ECM is stopped or a restore is pending.
+        assert!(!c.snapshot(15).offload_held);
+        let [v4, v6] = capture::ECM_STOP.map(|p| paths.root.join(&p[1..]));
+        fs::create_dir_all(v4.parent().unwrap()).unwrap();
+        fs::write(&v4, "0\n").unwrap();
+        fs::write(&v6, "1\n").unwrap();
+        assert!(c.snapshot(16).offload_held);
+        fs::write(&v6, "0\n").unwrap();
+        assert!(!c.snapshot(17).offload_held);
+        let restore = paths.root.join(&capture::RESTORE[1..]);
+        fs::create_dir_all(restore.parent().unwrap()).unwrap();
+        fs::write(&restore, "").unwrap();
+        assert!(c.snapshot(18).offload_held);
     }
 
     /// The flows come from the ECM device under the root; without it there

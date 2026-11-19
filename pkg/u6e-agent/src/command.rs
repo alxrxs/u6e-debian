@@ -146,6 +146,8 @@ impl Commands {
                 },
             ),
             CommandKind::TxPower { radio, dbm } => self.radios.power(radio, dbm),
+            // The link's session carries a sync out, with the shaper (`limits`).
+            CommandKind::SyncLimits { .. } => Err("rate limits are the link's to sync".into()),
             CommandKind::Steer {
                 mac,
                 target_bssid,
@@ -350,15 +352,10 @@ pub fn reassert(h: &mut Hostapd, blocks: &Blocks, dir: &Path) {
     }
 }
 
-/// An individual address: hostapd deauthenticates every station on
-/// `DEAUTHENTICATE ff:ff:ff:ff:ff:ff`, and no station has a group address.
-fn station_address(m: [u8; 6]) -> bool {
-    m[0] & 1 == 0 && m != [0; 6]
-}
-
-/// `m`, refused unless it is a station's address.
+/// `m`, refused unless it is a station's address: hostapd deauthenticates
+/// every station on `DEAUTHENTICATE ff:ff:ff:ff:ff:ff`.
 fn station(m: [u8; 6]) -> Result<[u8; 6], String> {
-    if station_address(m) {
+    if mac::is_station(m) {
         Ok(m)
     } else {
         Err("not a station address".into())
@@ -682,6 +679,7 @@ mod tests {
             clock_synced: true,
             power_limits: Vec::new(),
             auth: Vec::new(),
+            offload_held: false,
         }
     }
 

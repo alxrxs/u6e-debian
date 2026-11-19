@@ -1063,6 +1063,7 @@ mod tests {
             clock_synced: true,
             power_limits: Vec::new(),
             auth,
+            offload_held: false,
         }
     }
 
