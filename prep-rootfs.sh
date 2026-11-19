@@ -287,7 +287,10 @@ fi
 # u6e-nss its ECM state device, systemd opens the root-only NSS load file
 # for it, u6e-spectral (below) runs the radios' spectral scans for it on a
 # socket of that group's, its config helper (below) installs Wi-Fi
-# configurations and sets transmit power for it on another, and it asks for
+# configurations and sets transmit power for it on another, u6e-shaper and
+# u6e-capture (below) put its rate limits on the NSS and capture a client for
+# it on two more (it reads whether a capture holds the offload back: ECM's
+# switches and u6e-capture's restore file), and it asks for
 # u6e-arm/u6e-fallback by a file (below) rather than starting them. Every
 # sandbox setting is at its most restrictive but where a comment says what
 # the agent's work needs instead.
@@ -346,9 +349,9 @@ RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
-# hostapd's control sockets, its own, u6e-spectral's and the config helper's
-# (UNIX), nl80211 (NETLINK), the peer exchange, the controller link and the
-# gateway check (INET, INET6).
+# hostapd's control sockets, its own, u6e-spectral's, the config helper's,
+# u6e-shaper's and u6e-capture's (UNIX), nl80211 (NETLINK), the peer
+# exchange, the controller link and the gateway check (INET, INET6).
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 SystemCallArchitectures=native
 SystemCallErrorNumber=EPERM
@@ -614,6 +617,168 @@ SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @privile
 WantedBy=multi-user.target
 UNIT
 ln -sf /etc/systemd/system/u6e-guard.service $W/u6e-guard.service
+
+# u6e-shaper (pkg/u6e-shaper): the controller's rate limits on the NSS
+# shaper, for the agent, which can do none of it (tc and nft want
+# CAP_NET_ADMIN, ECM's deceleration is root's). Socket-activated, one helper
+# per connection, on a socket only the agent's group may open: nsshtb trees
+# on the BSSs' netdevs and the uplink, their classes, and the nftables
+# netdev table that tags the limited clients' packets (nf_tables is loaded at
+# boot, as the sandbox loads no module). A sync that built a tree waits for
+# the agent's confirmation and is undone without it; its last step undoes a
+# sync it died in. It runs as root with CAP_NET_ADMIN alone and writes only
+# its run directory and ECM's two deceleration files; every other sandbox
+# setting is at its most restrictive but where a comment says what it needs
+# instead.
+install -m0755 target/aarch64-unknown-linux-musl/release/u6e-shaper $RF/usr/local/sbin/
+printf 'd /run/u6e-shaper 0750 root u6e-agent -\n' > $RF/usr/lib/tmpfiles.d/u6e-shaper.conf
+printf 'nf_tables\n' > $RF/etc/modules-load.d/u6e-shaper.conf
+cat > $RF/etc/systemd/system/u6e-shaper.socket <<'UNIT'
+[Unit]
+Description=U6E rate-limit helper socket, for u6e-agent
+
+[Socket]
+ListenStream=/run/u6e-shaper/sock
+SocketUser=root
+SocketGroup=u6e-agent
+SocketMode=0660
+Accept=yes
+MaxConnections=4
+
+[Install]
+WantedBy=sockets.target
+UNIT
+ln -sf /etc/systemd/system/u6e-shaper.socket $RF/etc/systemd/system/sockets.target.wants/u6e-shaper.socket
+cat > $RF/etc/systemd/system/u6e-shaper@.service <<'UNIT'
+[Unit]
+Description=U6E rate-limit helper: the NSS shaper for u6e-agent
+
+[Service]
+ExecStart=/usr/local/sbin/u6e-shaper serve
+ExecStopPost=/usr/local/sbin/u6e-shaper revert
+StandardInput=socket
+StandardOutput=journal
+StandardError=journal
+# A sync, and the 20 s its confirmation may take.
+RuntimeMaxSec=1min
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=
+NoNewPrivileges=yes
+UMask=0077
+KeyringMode=private
+ProtectSystem=strict
+ReadWritePaths=/run/u6e-shaper /proc/sys/net/ecm/defunct_by_mac /proc/sys/net/ecm/defunct_by_iface
+ProtectHome=yes
+PrivateTmp=yes
+ProtectProc=invisible
+# tc reads its clock's rate from /proc/net/psched.
+ProcSubset=all
+PrivateDevices=yes
+DevicePolicy=closed
+# tc and nft act on the AP's own interfaces; nothing is sent anywhere.
+IPAddressDeny=any
+PrivateIPC=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=strict
+PrivateMounts=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# The agent's connection (UNIX), tc and nft (NETLINK).
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+SystemCallFilter=@system-service
+SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @privileged @raw-io @reboot @resources @swap memfd_create
+UNIT
+
+# u6e-capture (pkg/u6e-capture): a client's capture for the agent, which may
+# open no packet socket and take no client's flows from the NSS offload.
+# Socket-activated, one helper per connection, one capture at a time, on a
+# socket only the agent's group may open. It takes the client's flows where
+# the image loads u6e-pcc by its mirror, else by stopping ECM and
+# decelerating the client, and always gives them back: what it changes is
+# written first to /run/u6e-capture/restore, its own deadline ends it, the
+# runtime limit below backs that up, and its last step puts back what a
+# capture left, whatever ended it (u6e-agent reports a held offload). It runs
+# as root with CAP_NET_RAW alone, writes only its run directory, ECM's stop
+# switches and deceleration file and u6e-pcc's files (a debugfs that holds
+# those and nothing else); every other sandbox setting is at its most
+# restrictive but where a comment says what it needs instead.
+install -m0755 target/aarch64-unknown-linux-musl/release/u6e-capture $RF/usr/local/sbin/
+printf 'd /run/u6e-capture 0750 root u6e-agent -\n' > $RF/usr/lib/tmpfiles.d/u6e-capture.conf
+cat > $RF/etc/systemd/system/u6e-capture.socket <<'UNIT'
+[Unit]
+Description=U6E capture helper socket, for u6e-agent
+
+[Socket]
+ListenStream=/run/u6e-capture/sock
+SocketUser=root
+SocketGroup=u6e-agent
+SocketMode=0660
+Accept=yes
+MaxConnections=4
+
+[Install]
+WantedBy=sockets.target
+UNIT
+ln -sf /etc/systemd/system/u6e-capture.socket $RF/etc/systemd/system/sockets.target.wants/u6e-capture.socket
+cat > $RF/etc/systemd/system/u6e-capture@.service <<'UNIT'
+[Unit]
+Description=U6E capture helper: one client's capture for u6e-agent
+
+[Service]
+ExecStart=/usr/local/sbin/u6e-capture serve
+ExecStopPost=/usr/local/sbin/u6e-capture restore
+StandardInput=socket
+StandardOutput=journal
+StandardError=journal
+# A capture's longest (10 minutes) and its end.
+RuntimeMaxSec=11min
+CapabilityBoundingSet=CAP_NET_RAW
+AmbientCapabilities=
+NoNewPrivileges=yes
+UMask=0077
+KeyringMode=private
+ProtectSystem=strict
+ReadWritePaths=/run/u6e-capture /proc/sys/net/ecm/front_end_ipv4_stop /proc/sys/net/ecm/front_end_ipv6_stop /proc/sys/net/ecm/defunct_by_mac
+ProtectHome=yes
+PrivateTmp=yes
+ProtectProc=invisible
+ProcSubset=pid
+PrivateDevices=yes
+DevicePolicy=closed
+# The packet sockets read the AP's own interfaces; nothing is sent anywhere.
+IPAddressDeny=any
+PrivateIPC=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=strict
+PrivateMounts=yes
+TemporaryFileSystem=/sys/kernel/debug:ro
+BindPaths=-/sys/kernel/debug/u6e-pcc
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# The agent's connection (UNIX), the packets (PACKET), the interfaces'
+# names and indices (NETLINK).
+RestrictAddressFamilies=AF_UNIX AF_PACKET AF_NETLINK
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+SystemCallFilter=@system-service
+SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @privileged @raw-io @reboot @resources @swap memfd_create
+UNIT
 
 # The boot that brought this image up was one-shot: U-Boot disarmed it before
 # starting us. u6e-arm re-arms it from the steps go8.sh staged, or with "disarm"
@@ -908,8 +1073,9 @@ else
 fi
 NSS
 # U6E_PCC=1 (site.conf, experimental): u6e-nss also loads u6e-pcc, which
-# keeps every DNS connection on the CPU and stays until reboot; otherwise
-# the module ships but nothing loads it.
+# keeps every DNS connection on the CPU and stays until reboot, and
+# u6e-capture then has the NSS mirror a client's flows rather than take them
+# off the offload; otherwise the module ships but nothing loads it.
 if [ "${U6E_PCC:-0}" = 1 ]; then
 	cat >> $RF/usr/local/sbin/u6e-nss <<'PCC'
 # One client's capture (nss/u6e-pcc): the mirror instance mirror.0, then

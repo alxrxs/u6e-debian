@@ -99,7 +99,8 @@ deb=pkg/netlogd/out/systemd-netlogd_${netlogd}_arm64.deb
 [ -f "$deb" ] || step netlogd "$netlogd" arm64 "$deb" 'rm -rf pkg/netlogd/work && pkg/netlogd/build.sh' pkg/netlogd pkg/fetch-debian.sh
 step rootfs "$hostapd/$iproute2/$netlogd/$(head_of . HEAD:mkrootfs.sh)" arm64 rootfs 'rm -rf rootfs && ./mkrootfs.sh' \
 	mkrootfs.sh pkg/hostapd/out pkg/iproute2-nss/out pkg/netlogd/out
-# u6e-agent, u6e-spectral and u6e-guard: static arm64 binaries from the cargo workspace,
+# u6e-agent and its helpers (u6e-spectral, u6e-guard, u6e-shaper, u6e-capture):
+# static arm64 binaries from the cargo workspace,
 # cross-built here (cargo-zigbuild: zig is the C toolchain for musl crates such
 # as aws-lc-sys), only by the pinned toolchain: any other builds another binary.
 export PATH=$PATH:$HOME/.cargo/bin
@@ -110,11 +111,12 @@ rust=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
 	fail "zig $ZIG_VERSION needed (toolchain.env), found: $(zig version 2>&1)"
 [ "$(cargo-zigbuild --version 2>/dev/null)" = "cargo-zigbuild $CARGO_ZIGBUILD_VERSION" ] ||
 	fail "cargo-zigbuild $CARGO_ZIGBUILD_VERSION needed (toolchain.env), found: $(cargo-zigbuild --version 2>&1)"
-for b in u6e-agent u6e-spectral u6e-guard; do
+for b in u6e-agent u6e-spectral u6e-guard u6e-shaper u6e-capture; do
 	[ -x target/aarch64-unknown-linux-musl/release/$b ] || rm -f stamps/agent
 done
-step agent "$(head_of . HEAD:Cargo.toml)/$(head_of . HEAD:Cargo.lock)/$(head_of . HEAD:.cargo)/$(head_of . HEAD:rust-toolchain.toml)/$(head_of . HEAD:toolchain.env)/$(head_of . HEAD:pkg/u6e-agent)/$(head_of . HEAD:pkg/u6e-spectral)/$(head_of . HEAD:pkg/u6e-guard)/$(head_of . HEAD:pkg/u6e-proto)" \
-	cargo zigbuild --release --locked --target aarch64-unknown-linux-musl -p u6e-agent -p u6e-spectral -p u6e-guard
+step agent "$(head_of . HEAD:Cargo.toml)/$(head_of . HEAD:Cargo.lock)/$(head_of . HEAD:.cargo)/$(head_of . HEAD:rust-toolchain.toml)/$(head_of . HEAD:toolchain.env)/$(head_of . HEAD:pkg/u6e-agent)/$(head_of . HEAD:pkg/u6e-spectral)/$(head_of . HEAD:pkg/u6e-guard)/$(head_of . HEAD:pkg/u6e-shaper)/$(head_of . HEAD:pkg/u6e-capture)/$(head_of . HEAD:pkg/u6e-proto)" \
+	cargo zigbuild --release --locked --target aarch64-unknown-linux-musl -p u6e-agent -p u6e-spectral -p u6e-guard \
+	-p u6e-shaper -p u6e-capture
 
 if [ $# = 0 ]; then
 	read -ra aps <<<"$U6E_APS"

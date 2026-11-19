@@ -90,6 +90,10 @@ echo >> pkg/u6e-spectral/tests/fixtures/radio5-80mhz.relay
 key "a spectrum helper test fixture" same pkg/u6e-spectral/tests/fixtures/radio5-80mhz.relay
 echo >> pkg/u6e-spectral/src/main.rs
 key "a spectrum helper source change" new pkg/u6e-spectral/src/main.rs
+echo >> pkg/u6e-shaper/src/main.rs
+key "a rate-limit helper source change" new pkg/u6e-shaper/src/main.rs
+echo >> pkg/u6e-capture/src/main.rs
+key "a capture helper source change" new pkg/u6e-capture/src/main.rs
 echo >> prep-rootfs.sh
 key "a prep-rootfs.sh change" new prep-rootfs.sh
 exit $bad
