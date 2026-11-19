@@ -75,7 +75,8 @@ function words(e) {
       const node = e.node ? ` (${e.node})` : '';
       if (!e.accept) return { tone: 'bad', text: [`RADIUS${node} rejected ${e.user}: ${e.detail}`] };
       const cert = e.cert_expires ? certificate(e.cert_expires) : null;
-      return { tone: 'ok', text: [`RADIUS${node} accepted ${e.user}`, h('span', { class: 'muted' }, ` · ${e.detail}${cert ? `, its certificate ${cert.text}` : ''}`)] };
+      const its = cert ? `, certificate ${e.cert_cn} ${cert.text}` : '';
+      return { tone: 'ok', text: [`RADIUS${node} accepted ${e.user}`, h('span', { class: 'muted' }, ` · ${e.detail}${its}`)] };
     }
     case 'lease':
       return { tone: '', text: [`DHCP ${e.renewed ? 'renewed' : 'leased'} `, h('span', { class: 'mono' }, e.ip), h('span', { class: 'muted' }, ` · until ${when(e.expires)}`)] };
@@ -124,7 +125,8 @@ export function sessionsTable(list) {
     ['AP', 'p2', (s) => [s.ap, h('small', {}, s.bss)]],
     ['SSID', 'p3', (s) => [s.ssid, s.band ? h('small', {}, bandName(s.band)) : null]],
     ['VLAN', 'num p3', (s) => String(s.vlan || '–')],
-    ['Signed in', 'p2', (s) => [s.auth?.method || '–', s.auth?.identity ? h('small', {}, s.auth.identity) : null]],
+    ['Signed in', 'p2', (s) => [s.auth?.method || '–', s.auth?.identity
+      ? h('small', {}, s.auth.authenticated ? s.auth.identity : `${s.auth.identity}, claimed only`) : null]],
     ['Down / up', 'num p3', (s) => [bytes(s.tx_bytes), h('small', {}, bytes(s.rx_bytes))]],
     ['Ended', 'wrap', (s) => (s.end === undefined ? h('span', { class: 'chip ok' }, 'Connected') : ended(s))],
   ];

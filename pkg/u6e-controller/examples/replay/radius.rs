@@ -18,7 +18,7 @@ use crate::{BSSS, World};
 
 /// How each client of `ssid-a` signs in, by the last byte of its MAC: its
 /// EAP identity, method and, for EAP-TLS, its certificate's days left.
-const EAP: [(u8, &str, u8, Option<i64>); 7] = [
+const EAP: [(u8, &str, u8, Option<i64>); 8] = [
     (1, "host/pixel-8", 13, Some(410)),
     (2, "host/macbook-air", 13, Some(20)),
     (3, "iphone-15@example.org", 13, Some(180)),
@@ -26,6 +26,7 @@ const EAP: [(u8, &str, u8, Option<i64>); 7] = [
     (5, "anonymous@example.org", 25, None),
     (8, "host/workstation", 13, Some(95)),
     (10, "bob@example.org", 25, None),
+    (11, "carol@example.org", 25, None),
 ];
 /// The device whose MAC RADIUS does not know.
 pub const UNKNOWN: u8 = 13;
@@ -61,6 +62,21 @@ pub fn auth(last: u8, bss: usize, ft: bool) -> StationAuth {
         eap_method,
         reauth_s: 0,
     }
+}
+
+/// `s` as FreeRADIUS's `%{escape:}` writes it: every byte outside its safe
+/// characters (ASCII letters, digits, `@.-_: /`) as `=XX`.
+fn escape(s: &str) -> String {
+    let safe = |b: u8| b.is_ascii_alphanumeric() || b"@.-_: /".contains(&b);
+    s.bytes()
+        .map(|b| {
+            if safe(b) {
+                char::from(b).to_string()
+            } else {
+                format!("={b:02X}")
+            }
+        })
+        .collect()
 }
 
 /// An X.509 UTCTime, `YYMMDDHHMMSSZ`, of Unix seconds `s`.
@@ -119,18 +135,20 @@ impl Log {
     }
 
     /// A line of the client `last` through AP `ap`: its verdict, User-Name,
-    /// detail and certificate expiry.
+    /// detail, certificate expiry and common name, what a client chose
+    /// escaped as FreeRADIUS's `%{escape:}` writes it.
     fn push(
         &mut self,
         at_ms: u64,
         last: u8,
         ap: usize,
-        [verdict, user, detail, expiry]: [&str; 4],
+        [verdict, user, detail, expiry, cn]: [&str; 5],
     ) {
         let station = World::mac(last).map(|b| format!("{b:02X}")).join("-");
+        let (user, detail, cn) = (escape(user), escape(detail), escape(cn));
         // The time field is the log's own; the controller reads Loki's.
         let line = format!(
-            "{}|{verdict}|{user}|{station}|ap{}|192.0.2.{}|{detail}|{expiry}",
+            "{}|{verdict}|{user}|{station}|ap{}|192.0.2.{}|{detail}|{expiry}|{cn}",
             at_ms / 1000,
             ap + 1,
             16 + ap
@@ -146,7 +164,7 @@ impl Log {
     pub fn accept(&mut self, at_ms: u64, last: u8, ap: usize, ssid: &str) {
         if ssid == "ssid-b" {
             let user = World::mac(last).map(|b| format!("{b:02x}")).join("-");
-            return self.push(at_ms, last, ap, ["ACCEPT", &user, "PAP", ""]);
+            return self.push(at_ms, last, ap, ["ACCEPT", &user, "PAP", "", ""]);
         }
         let Some(&(_, user, _, days)) = EAP.iter().find(|e| e.0 == last) else {
             return;
@@ -155,20 +173,22 @@ impl Log {
             let s = (self.start_ms / 1000) as i64 + d * 86_400;
             utc_time(s.max(0) as u64)
         });
-        self.push(at_ms, last, ap, ["ACCEPT", user, "eap", &expiry]);
+        // An EAP-TLS client's certificate is issued to its identity.
+        let cn = if days.is_some() { user } else { "" };
+        self.push(at_ms, last, ap, ["ACCEPT", user, "eap", &expiry, cn]);
     }
 
     /// RADIUS rejected the client `last`, for `why`.
     pub fn reject(&mut self, at_ms: u64, last: u8, ap: usize, why: &str) {
         let user = EAP.iter().find(|e| e.0 == last).map_or("", |e| e.1);
-        self.push(at_ms, last, ap, ["REJECT", user, why, ""]);
+        self.push(at_ms, last, ap, ["REJECT", user, why, "", ""]);
     }
 
     /// The device RADIUS does not know tried MAC authentication.
     pub fn unknown(&mut self, at_ms: u64, ap: usize) {
         let user = World::mac(UNKNOWN).map(|b| format!("{b:02x}")).join("-");
         let why = "No Auth-Type found: rejecting the user via Post-Auth-Type = Reject";
-        self.push(at_ms, UNKNOWN, ap, ["REJECT", &user, why, ""]);
+        self.push(at_ms, UNKNOWN, ap, ["REJECT", &user, why, "", ""]);
     }
 
     /// Loki's answer to `query_range` from `start` to `end` (nanoseconds),

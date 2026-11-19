@@ -701,7 +701,8 @@ table.conns { font-size: 12.5px; }
 @media (max-width: 720px) {
   .bar { gap: 10px; padding: 0 12px; height: auto; min-height: 52px; flex-wrap: wrap; }
   .brand span { display: none; }
-  .tabs { order: 3; width: calc(100% + 24px); height: 40px; margin: 0 -12px; padding: 0 4px; gap: 0; border-top: 1px solid var(--rule-2); overflow-x: auto; scrollbar-width: none; }
+  /* The tabs scroll sideways; the faded edge says there are more. */
+  .tabs { order: 3; width: calc(100% + 24px); height: 40px; margin: 0 -12px; padding: 0 22px 0 4px; gap: 0; border-top: 1px solid var(--rule-2); overflow-x: auto; scrollbar-width: none; -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent); mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent); }
   .tabs a { flex: 1 0 auto; justify-content: center; padding: 0 5px; font-size: 13px; }
   .session { gap: 10px; }
   .user { max-width: 12ch; }

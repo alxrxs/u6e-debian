@@ -35,23 +35,31 @@ function reading(label, value, detail, cls) {
   return h('div', {}, h('dt', {}, label), h('dd', { class: cls }, value, detail ? h('small', {}, detail) : null));
 }
 
+/** A fact of the client: its label, its value and a note beside it. */
+function fact(label, value, detail) {
+  return h('div', {}, h('dt', {}, label), h('dd', {}, value, detail ? h('small', {}, ' ', detail) : null));
+}
+
 /** How it signed in (`id`: the live client's `auth`, or its last
  * session's): the method and identity, and the client certificate RADIUS
  * last accepted for it. */
 function signInFacts(id) {
   if (!id) return [];
-  const fact = (label, value, detail) => h('div', {}, h('dt', {}, label), h('dd', {}, value, detail ? h('small', {}, ` ${detail}`) : null));
-  const how = [id.ft ? 'came by fast transition' : null, id.authorized === false ? 'not authorized yet' : null].filter(Boolean).join(', ');
   const cert = id.cert_expires ? certificate(id.cert_expires) : null;
+  // Until its AP authorizes it, the identity is only what the client claims.
+  if (!id.authenticated) {
+    return [fact('Signing in', id.identity ? `${id.method}, claiming ${id.identity}` : id.method,
+      h('span', { class: 'chip warn' }, 'not authenticated'))];
+  }
   return [
-    fact('Signed in', id.identity ? `${id.method} as ${id.identity}` : id.method, how),
-    cert ? fact('Certificate', cert.tone ? h('span', { class: `chip ${cert.tone}` }, cert.text) : cert.text, `on ${new Date(id.cert_expires).toLocaleDateString()}`) : null,
+    fact('Signed in', id.identity ? `${id.method} as ${id.identity}` : id.method, id.ft ? 'came by fast transition' : ''),
+    cert ? fact('Certificate', cert.tone ? h('span', { class: `chip ${cert.tone}` }, cert.text) : cert.text,
+      `${id.cert_cn}, on ${new Date(id.cert_expires).toLocaleDateString()}`) : null,
   ];
 }
 
 /** What names the client, each source of it that it has. */
 function identityFacts(c) {
-  const fact = (label, value, detail) => h('div', {}, h('dt', {}, label), h('dd', {}, value, detail ? h('small', {}, ` ${detail}`) : null));
   const until = (ms) => (dayOf(ms) === 'Today' ? `until ${hm(ms)}` : `until ${dayOf(ms)}, ${hm(ms)}`);
   return [
     c.device ? fact('Device', c.device, 'as the DHCP server knows it') : null,

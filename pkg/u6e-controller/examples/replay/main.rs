@@ -220,6 +220,8 @@ const SILENT: u8 = 6;
 /// one to move.
 const REJOIN_S: f64 = 6.0;
 const STEER_S: f64 = 3.0;
+/// How long a client stuck in EAP stays associated before hostapd gives up.
+const EAP_GIVE_UP_S: f64 = 25.0;
 
 /// One simulated client: where it is, how it is heard, and its counters.
 struct Client {
@@ -244,6 +246,8 @@ struct Client {
     idle_s: f64,
     /// Its association was a fast transition.
     ft: bool,
+    /// Whether its AP has authorized it (one stuck in EAP is not).
+    authorized: bool,
 }
 
 /// What the script does at a moment of its cycle.
@@ -252,8 +256,10 @@ enum Act {
     Join(u8, usize, usize, f64),
     Leave(u8),
     EapFail(u8, usize, usize),
-    /// A client stops answering EAP on an AP, never reaching RADIUS.
+    /// A client associates with an AP, claims an identity and stops
+    /// answering EAP, never reaching RADIUS (`GiveUp`, a few seconds on).
     EapTimeout(u8, usize, usize),
+    GiveUp(u8, usize, usize),
     /// A client gives a passphrase that does not match.
     PskMismatch(u8, usize, usize),
     /// The device RADIUS does not know tries MAC authentication on an AP,
@@ -336,6 +342,7 @@ fn client(
         rx_airtime_us: 0.0,
         idle_s: 0.0,
         ft: false,
+        authorized: true,
     }
 }
 
@@ -423,6 +430,7 @@ impl World {
                 client(8, RateMode::He, 2, 90e6, Some((1, 3, -56.0))),
                 client(9, RateMode::Ht, 1, 30e3, Some((0, 0, -66.0))),
                 client(10, RateMode::He, 2, 2e6, None),
+                client(11, RateMode::He, 2, 1e6, None),
             ],
             blocked: BTreeSet::new(),
             homes: BTreeMap::new(),
@@ -530,8 +538,28 @@ impl World {
                 self.event(ap, EventKind::EapFail { mac, bss });
             }
             Act::EapTimeout(last, ap, bss) => {
+                let Some(i) = find(self, last) else { return };
+                let c = &mut self.clients[i];
+                *c = client(c.last, c.phy, c.nss, c.traffic, Some((ap, bss, -64.0)));
+                c.since = self.t;
+                c.authorized = false;
+                let mac = World::mac(last);
+                self.event(
+                    ap,
+                    EventKind::EapStart {
+                        mac,
+                        bss: bss as u16,
+                    },
+                );
+                self.later
+                    .push((self.t + EAP_GIVE_UP_S, Act::GiveUp(last, ap, bss)));
+            }
+            // hostapd reports no disassociation of a client it never
+            // authorized.
+            Act::GiveUp(last, ap, bss) => {
+                let Some(i) = find(self, last) else { return };
+                self.clients[i].at = None;
                 let (mac, bss) = (World::mac(last), bss as u16);
-                self.event(ap, EventKind::EapStart { mac, bss });
                 let server = false;
                 self.event(ap, EventKind::EapTimeout { mac, bss, server });
             }
@@ -695,7 +723,7 @@ impl World {
                 let traffic = flows::Traffic {
                     mac: World::mac(c.last),
                     last: c.last,
-                    conns: PROFILES[usize::from(c.last) - 1].1,
+                    conns: PROFILES.get(usize::from(c.last) - 1).map_or(3, |p| p.1),
                     down: c.tx_bytes,
                     up: c.rx_bytes,
                     connected_s: t - c.since,
@@ -892,7 +920,9 @@ impl World {
             .iter()
             .filter_map(|c| {
                 let (x, bss) = c.at?;
-                (x == ap).then(|| (World::mac(c.last), radius::auth(c.last, bss, c.ft)))
+                let mut auth = radius::auth(c.last, bss, c.ft);
+                auth.authorized = c.authorized;
+                (x == ap).then(|| (World::mac(c.last), auth))
             })
             .collect();
         auth.sort_by_key(|(m, _)| *m);
