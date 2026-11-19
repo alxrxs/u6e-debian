@@ -337,10 +337,12 @@ impl Sessions {
             }
             EventKind::EapFail { mac, .. } => {
                 self.recent(*mac).failure = Some((End::EapFailed, at));
+                self.late_cause(*mac, ap, at, End::EapFailed);
                 self.push(*mac, at, eap(EapStep::Failed));
             }
             EventKind::EapTimeout { mac, server, .. } => {
                 self.recent(*mac).failure = Some((End::EapTimedOut, at));
+                self.late_cause(*mac, ap, at, End::EapTimedOut);
                 let step = EapStep::TimedOut { server: *server };
                 self.push(*mac, at, eap(step));
             }
@@ -360,6 +362,37 @@ impl Sessions {
             }
             _ => {}
         }
+    }
+
+    /// A failure of `mac` on `ap` at `at` heard after its session there was
+    /// found gone (the AP's snapshot came first): the session that ended
+    /// there within [`CAUSE_WINDOW_MS`] before, as having left or gone
+    /// quiet, ended by it, its `Ended` entry too.
+    fn late_cause(&mut self, mac: [u8; 6], ap: &str, at: u64, why: End) {
+        if self.open.get(&mac).is_some_and(|s| s.place.ap == ap) {
+            return;
+        }
+        let ended = self
+            .closed
+            .iter_mut()
+            .rev()
+            .take_while(|s| s.end_ms.is_some_and(|e| e + CAUSE_WINDOW_MS >= at))
+            .find(|s| s.mac == mac)
+            .filter(|s| s.place.ap == ap && s.end_ms.is_some_and(|e| e <= at))
+            .filter(|s| matches!(s.end, Some(End::Left | End::Inactive)));
+        let Some(s) = ended else {
+            return;
+        };
+        s.end = Some(why.clone());
+        let id = s.id;
+        let pick = |w: &What| matches!(w, What::Ended { session, .. } if *session == id);
+        self.timeline.edit(&mac, pick, |w| {
+            if let What::Ended { why: was, .. } = w {
+                *was = why;
+            }
+            true
+        });
+        self.dirty = true;
     }
 
     /// The client `mac` associated at `place`, beginning at `began` (heard
@@ -1610,6 +1643,49 @@ mod tests {
         s.event("ap1", &naming(), &ev(T0 + 5000, timeout), T0 + 5000);
         s.snapshot("ap1", &snap(Vec::new(), None), &naming(), T0 + 6000, false);
         assert_eq!(ends(&s), [Some(End::EapTimedOut)]);
+    }
+
+    /// The snapshot that no longer lists a client that gave up in EAP comes
+    /// before the timeout: the timeout still ended its session, in the
+    /// timeline too; one heard too late, or after the client left another
+    /// AP, ends nothing.
+    #[test]
+    fn a_timeout_heard_after_the_session_was_found_gone_ends_it() {
+        let mut s = Sessions::default();
+        s.snapshot(
+            "ap1",
+            &snap(vec![station(0, 1, 0)], None),
+            &naming(),
+            T0,
+            false,
+        );
+        s.snapshot("ap1", &snap(Vec::new(), None), &naming(), T0 + 6000, false);
+        assert_eq!(ends(&s), [Some(End::Left)]);
+        let timeout = |at| {
+            let kind = EventKind::EapTimeout {
+                mac: MAC,
+                bss: 0,
+                server: false,
+            };
+            ev(at, kind)
+        };
+        s.event("ap1", &naming(), &timeout(T0 + 7000), T0 + 7000);
+        assert_eq!(ends(&s), [Some(End::EapTimedOut)]);
+        let why = s.timeline.of(&MAC).find_map(|e| match &e.what {
+            What::Ended { why, .. } => Some(why.clone()),
+            _ => None,
+        });
+        assert_eq!(why, Some(End::EapTimedOut));
+        // Left another AP, and a timeout heard long after: both left.
+        assoc(&mut s, "ap2", 1, T0 + 100_000);
+        disassoc(&mut s, "ap2", 1, T0 + 101_000);
+        s.event("ap1", &naming(), &timeout(T0 + 102_000), T0 + 102_000);
+        assoc(&mut s, "ap1", 0, T0 + 200_000);
+        disassoc(&mut s, "ap1", 0, T0 + 201_000);
+        let late = T0 + 201_000 + CAUSE_WINDOW_MS + 1;
+        s.event("ap1", &naming(), &timeout(late), late);
+        let newest_first = [Some(End::Left), Some(End::Left), Some(End::EapTimedOut)];
+        assert_eq!(ends(&s), newest_first);
     }
 
     /// An operator's kick of an earlier session is no cause of this one's
