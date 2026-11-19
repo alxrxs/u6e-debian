@@ -20,18 +20,24 @@
 //! no verdict: it cannot be one the log wrote. Only lines whose
 //! Calling-Station-Id is a MAC are asked for.
 //!
-//! Each poll reads from [`LAG`] before the newest line read so far (the
-//! shipper's delay) once it read to the end, and from the newest line itself
-//! when it stopped at [`PAGES`] pages of [`PAGE`] lines, so a flood cannot
-//! hold it in one place; the lines already taken are skipped. The first poll
-//! goes on from the newest line the clients' history holds, or back
-//! [`BACKFILL`]. Every [`RESCAN_EVERY`] the last [`RESCAN`] are read again,
-//! for lines stamped behind the cursor (the shipper stamps each with its own
-//! local time, so on the autumn clock change the repeated hour's lines land
-//! an hour early, and a shipper that was down sends its backlog late); the
-//! history takes a line it holds already only once. Each answer is at most
-//! [`BODY_MAX`] bytes within [`TIMEOUT`]; what a poll could not read is read
-//! at the next.
+//! A page goes on from the newest line Loki returned, a verdict or not, so
+//! lines that are none (which an unauthenticated client can make) cannot
+//! hold the reader in place; a full page of a single instant (the shipper
+//! stamps whole seconds, and Loki pages by time alone) goes on a nanosecond
+//! past it, the instant's rest unread, said in the journal. Each poll reads
+//! from [`LAG`] before the newest line returned (the shipper's delay) once it
+//! read to the end, and from where it stopped when it stopped at [`PAGES`]
+//! pages of [`PAGE`] lines, so a flood cannot hold it in place either. The
+//! first poll goes on from the newest line the clients' history holds, or
+//! back [`BACKFILL`]. Every [`RESCAN_EVERY`] the last [`RESCAN`] are read
+//! again, for lines stamped behind the cursor (the shipper stamps each with
+//! its own local time, so on the autumn clock change the repeated hour's
+//! lines land an hour early, and a shipper that was down sends its backlog
+//! late). A line is handed over once: the lines delivered over the rescan's
+//! window and the cursor's are remembered (at most [`TAKEN_MAX`]), and only
+//! once the whole poll worked, so a poll that fails part way hands its lines
+//! over at the next. Each answer is at most [`BODY_MAX`] bytes within
+//! [`TIMEOUT`].
 
 use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
@@ -56,6 +62,8 @@ const RESCAN_EVERY: Duration = Duration::from_secs(3600);
 const RESCAN: Duration = Duration::from_secs(2 * 3600);
 const PAGE: usize = 1000;
 const PAGES: usize = 10;
+/// The most lines remembered as delivered.
+const TAKEN_MAX: usize = 200_000;
 const TIMEOUT: Duration = Duration::from_secs(10);
 const BODY_MAX: usize = 4 << 20;
 /// The longest field kept of a line: User-Name's own limit.
@@ -108,7 +116,7 @@ pub fn parse(line: &str, at_ms: u64, node: &str) -> Option<Line> {
         9 => {
             let expires = match f[7] {
                 "" => None,
-                t => Some(asn1_time(t)?),
+                t => Some(asn1_time(&unescape(t))?),
             };
             let cn = Some(field(&unescape(f[8]))).filter(|cn| !cn.is_empty());
             (true, expires, cn.filter(|_| expires.is_some()))
@@ -222,40 +230,69 @@ fn query(selector: &str) -> String {
     format!(r#"{selector} |~ "^[^|]*[|][A-Z]+[|][^|]*[|]{mac}[|]""#)
 }
 
-/// An answer of `query_range`: how many lines it returned, and those that
-/// are verdicts, oldest first, each with its time in nanoseconds; `None` for
-/// an answer that is not one.
-fn lines(answer: &str) -> Option<(usize, Vec<(u64, Line)>)> {
+/// One answer of `query_range`.
+struct Page {
+    /// How many lines Loki returned, verdicts or not, and the newest one's
+    /// time in nanoseconds: what paging goes on from.
+    returned: usize,
+    newest: Option<u64>,
+    /// The lines that are verdicts, oldest first, each with its time.
+    verdicts: Vec<(u64, Line)>,
+}
+
+/// An answer of `query_range`; `None` for an answer that is not one.
+fn lines(answer: &str) -> Option<Page> {
     let v: Value = serde_json::from_str(answer).ok()?;
     if v["status"] != "success" {
         return None;
     }
-    let (mut returned, mut out) = (0, Vec::new());
+    let mut page = Page {
+        returned: 0,
+        newest: None,
+        verdicts: Vec::new(),
+    };
     for stream in v["data"]["result"].as_array()? {
         let node = stream["stream"]["host"].as_str().unwrap_or_default();
         for pair in stream["values"].as_array()? {
-            returned += 1;
             let ns: u64 = pair[0].as_str()?.parse().ok()?;
+            page.returned += 1;
+            page.newest = page.newest.max(Some(ns));
             let Some(text) = pair[1].as_str() else {
                 continue;
             };
             if let Some(l) = parse(text, ns / 1_000_000, node) {
-                out.push((ns, l));
+                page.verdicts.push((ns, l));
             }
         }
     }
-    out.sort_by_key(|(ns, _)| *ns);
-    Some((returned, out))
+    page.verdicts.sort_by_key(|(ns, _)| *ns);
+    Some(page)
 }
 
 /// What the poller remembers between polls.
 struct Cursor {
     /// Where the next poll starts, in nanoseconds since the epoch.
     from_ns: u64,
-    /// The lines taken from `from_ns` on, by time and hash.
+    /// The lines delivered from `from_ns` on and over the last [`RESCAN`],
+    /// by time and hash, at most [`TAKEN_MAX`]: what is never handed over
+    /// twice.
     taken: HashSet<(u64, u64)>,
     /// When the last hours are read again next.
     rescan_at: SystemTime,
+    /// The instants stepped past over the same span as `taken`: each
+    /// held more lines than a page, whose rest Loki cannot be asked for.
+    skipped: HashSet<u64>,
+    /// How many instants were stepped past since the start.
+    skips: u64,
+}
+
+/// What one read of a window found: whether it reached the window's end,
+/// where reading goes on from, and the instants it stepped past, oldest
+/// first, which the cursor never goes back to.
+struct Read {
+    reached: bool,
+    next_ns: u64,
+    stepped: Vec<u64>,
 }
 
 fn nanos(t: SystemTime) -> u64 {
@@ -282,40 +319,81 @@ impl Cursor {
             from_ns: back.max(resume),
             taken: HashSet::new(),
             rescan_at: now + RESCAN_EVERY,
+            skipped: HashSet::new(),
+            skips: 0,
         }
     }
 
-    /// One poll at `now`: the lines not taken before, or why it failed.
+    /// One poll at `now`: the lines not delivered before, or why it failed.
+    /// What it read is kept as delivered only when the whole poll worked, so
+    /// a poll that fails part way hands its lines over at the next.
     async fn poll(&mut self, s: &Settings, now: SystemTime) -> Result<Vec<Line>, String> {
         let end = nanos(now);
-        let mut fresh = Vec::new();
-        let (reached, newest) = self.read(s, self.from_ns, end, &mut fresh).await?;
-        self.from_ns = match (reached, newest) {
-            (true, n) => n.unwrap_or(end).saturating_sub(LAG.as_nanos() as u64),
-            (false, n) => n.unwrap_or(self.from_ns),
-        }
-        .max(self.from_ns);
+        let (mut new, mut fresh) = (HashSet::new(), Vec::new());
+        let read = self
+            .read(s, self.from_ns, end, &mut new, &mut fresh)
+            .await?;
+        let mut stepped = read.stepped.clone();
         if now >= self.rescan_at {
             let back = end.saturating_sub(RESCAN.as_nanos() as u64);
-            self.read(s, back, end, &mut fresh).await?;
+            stepped.extend(self.read(s, back, end, &mut new, &mut fresh).await?.stepped);
             self.rescan_at = now + RESCAN_EVERY;
         }
-        let from = self.from_ns;
-        self.taken.retain(|(ns, _)| *ns >= from);
+        self.taken.extend(new);
+        let stepped = stepped
+            .into_iter()
+            .filter(|&t| self.skipped.insert(t))
+            .count();
+        if stepped > 0 {
+            self.skips += stepped as u64;
+            eprintln!(
+                "u6e-controller: RADIUS log: stepped past {stepped} instants of more than \
+                 {PAGE} lines, whose rest Loki cannot page to ({} since start)",
+                self.skips
+            );
+        }
+        let lag = if read.reached {
+            LAG.as_nanos() as u64
+        } else {
+            0
+        };
+        let past = read.stepped.last().map_or(0, |t| t + 1);
+        let next = read.next_ns.saturating_sub(lag).max(past);
+        self.from_ns = self.from_ns.max(next);
+        self.prune(end);
         Ok(fresh)
     }
 
-    /// The lines from `start` to `end` not taken yet, into `fresh`, at most
-    /// [`PAGES`] pages: whether it read to the end, and the newest line's
-    /// time.
+    /// Keeps what may be read again: from `from_ns` on, and the last
+    /// [`RESCAN`]; at most [`TAKEN_MAX`], the oldest dropped first.
+    fn prune(&mut self, end: u64) {
+        let cutoff = self
+            .from_ns
+            .min(end.saturating_sub(RESCAN.as_nanos() as u64));
+        self.taken.retain(|(ns, _)| *ns >= cutoff);
+        self.skipped.retain(|ns| *ns >= cutoff);
+        if let Some(excess) = self.taken.len().checked_sub(TAKEN_MAX).filter(|&n| n > 0) {
+            let mut times: Vec<u64> = self.taken.iter().map(|(ns, _)| *ns).collect();
+            let (_, &mut oldest_kept, _) = times.select_nth_unstable(excess);
+            self.taken.retain(|(ns, _)| *ns >= oldest_kept);
+        }
+    }
+
+    /// The lines from `start` to `end` neither delivered nor in `new`,
+    /// into `fresh` (their keys into `new`), at most [`PAGES`] pages. A page
+    /// goes on from the newest line returned, a verdict or not; a full page
+    /// of one instant (Loki pages by time alone, so the rest of it cannot be
+    /// asked for) goes on a nanosecond past it.
     async fn read(
-        &mut self,
+        &self,
         s: &Settings,
         mut start: u64,
         end: u64,
+        new: &mut HashSet<(u64, u64)>,
         fresh: &mut Vec<Line>,
-    ) -> Result<(bool, Option<u64>), String> {
+    ) -> Result<Read, String> {
         let q = fetch::query_value(&query(&s.selector));
+        let mut stepped = Vec::new();
         let mut newest = None;
         for _ in 0..PAGES {
             let target = format!(
@@ -323,19 +401,35 @@ impl Cursor {
             );
             let answer =
                 fetch::get(&s.loki, &target, "application/json", BODY_MAX, TIMEOUT).await?;
-            let (returned, page) = lines(&answer).ok_or("Loki's answer is not a list of lines")?;
-            for (ns, l) in page {
-                newest = newest.max(Some(ns));
-                start = start.max(ns);
-                if self.taken.insert(key(ns, &l)) {
+            let page = lines(&answer).ok_or("Loki's answer is not a list of lines")?;
+            for (ns, l) in page.verdicts {
+                let k = key(ns, &l);
+                if !self.taken.contains(&k) && new.insert(k) {
                     fresh.push(l);
                 }
             }
-            if returned < PAGE {
-                return Ok((true, newest));
+            newest = newest.max(page.newest);
+            if page.returned < PAGE {
+                let next_ns = newest.unwrap_or(end).max(start);
+                return Ok(Read {
+                    reached: true,
+                    next_ns,
+                    stepped,
+                });
+            }
+            match page.newest.filter(|&n| n > start) {
+                Some(n) => start = n,
+                None => {
+                    stepped.push(start);
+                    start += 1;
+                }
             }
         }
-        Ok((false, newest))
+        Ok(Read {
+            reached: false,
+            next_ns: start,
+            stepped,
+        })
     }
 }
 
@@ -433,6 +527,15 @@ mod tests {
         // "expiry" is the NAS's address.
         let forged = "t|ACCEPT|x|02-00-00-00-00-99|ap9|02-00-00-00-00-21|ap1|192.0.2.16|eap";
         assert_eq!(parse(forged, 0, ""), None);
+        // The expiry is escaped too (a client's certificate states it): read
+        // back, and a pipe in it splits nothing.
+        let expiry = "t|REJECT|u|02-00-00-00-00-21|ap1|192.0.2.16|bad|27123123=35959Z|cn";
+        assert_eq!(
+            parse(expiry, 0, "").unwrap().cert_expires,
+            Some(1_830_297_599)
+        );
+        let piped = "t|REJECT|u|02-00-00-00-00-21|ap1|192.0.2.16|bad|27=7C1231235959Z|cn";
+        assert_eq!(parse(piped, 0, ""), None);
         for count in [6, 8, 10] {
             let line = (0..count).map(|_| "eap").collect::<Vec<_>>().join("|");
             assert_eq!(parse(&line, 0, ""), None, "{count} fields");
@@ -514,22 +617,28 @@ mod tests {
             {"stream":{"host":"r2"},"values":[["3000000","t|REJECT|u|02-00-00-00-00-21|ap1|192.0.2.16|no"]]},
             {"stream":{"host":"r1"},"values":[["1000000","t|ACCEPT|u|02-00-00-00-00-21|ap1|192.0.2.16|eap"],
                                               ["2000000","t|UNKNOWN|u|02-00-00-00-00-21|ap1|192.0.2.16|"]]}]}}"#;
-        let (returned, got) = lines(answer).unwrap();
-        assert_eq!(returned, 3);
-        let summary: Vec<_> = got
+        let page = lines(answer).unwrap();
+        assert_eq!((page.returned, page.newest), (3, Some(3_000_000)));
+        let summary: Vec<_> = page
+            .verdicts
             .iter()
             .map(|(ns, l)| (*ns, l.accept, l.node.as_str()))
             .collect();
         assert_eq!(summary, [(1_000_000, true, "r1"), (3_000_000, false, "r2")]);
-        assert_eq!(got[0].1.at_ms, 1);
-        assert_eq!(lines(r#"{"status":"error"}"#), None);
-        assert_eq!(lines("<html>"), None);
+        assert_eq!(page.verdicts[0].1.at_ms, 1);
+        assert!(lines(r#"{"status":"error"}"#).is_none());
+        assert!(lines("<html>").is_none());
     }
 
     /// A fake Loki holding `log` (time in nanoseconds, text), answering each
     /// `query_range` as Loki does: its lines from `start` to `end`, oldest
-    /// first, at most `limit`; every request is counted.
-    async fn loki(log: Arc<Mutex<Vec<(u64, String)>>>, asked: Arc<Mutex<Vec<String>>>) -> String {
+    /// first, at most `limit`; every request is counted, and the requests
+    /// numbered in `fail` (from 1) get an answer that is none.
+    async fn loki_failing(
+        log: Arc<Mutex<Vec<(u64, String)>>>,
+        asked: Arc<Mutex<Vec<String>>>,
+        fail: &'static [usize],
+    ) -> String {
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap().to_string();
         tokio::spawn(async move {
@@ -553,6 +662,10 @@ mod tests {
                 };
                 let (start, end, limit) = (param("start"), param("end"), param("limit"));
                 asked.lock().unwrap().push(req.clone());
+                if fail.contains(&asked.lock().unwrap().len()) {
+                    let _ = s.write_all(b"HTTP/1.0 200 OK\r\n\r\n<html>").await;
+                    continue;
+                }
                 let values: Vec<Value> = log
                     .lock()
                     .unwrap()
@@ -568,6 +681,10 @@ mod tests {
             }
         });
         addr
+    }
+
+    async fn loki(log: Arc<Mutex<Vec<(u64, String)>>>, asked: Arc<Mutex<Vec<String>>>) -> String {
+        loki_failing(log, asked, &[]).await
     }
 
     fn settings(loki: String) -> Settings {
@@ -611,14 +728,15 @@ mod tests {
         assert!(req.contains(&format!("&start={from}&")), "{req}");
     }
 
-    /// More lines inside one lag window than a poll reads: each poll goes on
-    /// where the last stopped, and every line is taken once.
+    /// More lines inside one lag window than a poll reads, 900 in each
+    /// second as the shipper stamps them: each poll goes on where the last
+    /// stopped, and every line is taken once.
     #[tokio::test]
     async fn a_flood_past_the_page_cap_is_read_through() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
         let ns = nanos(now);
         let flood: Vec<(u64, String)> = (0..25_000u64)
-            .map(|i| (ns - 60_000_000_000 + i * 1000, verdict(i)))
+            .map(|i| (ns - 60_000_000_000 + i / 900 * 1_000_000_000, verdict(i)))
             .collect();
         let log = Arc::new(Mutex::new(flood));
         let s = settings(loki(log, Arc::new(Mutex::new(Vec::new()))).await);
@@ -635,6 +753,91 @@ mod tests {
         }
         assert_eq!(taken, 25_000);
         assert!(polls <= 5, "{polls} polls");
+    }
+
+    /// Lines that match the query and are no verdict (a client can make
+    /// them: this one's escaped fields are one too many) fill whole pages;
+    /// the reader goes past them to the verdict after.
+    #[tokio::test]
+    async fn lines_that_are_no_verdict_cannot_hold_the_reader() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let ns = nanos(now);
+        let junk = |i: u64| format!("t|REJECT|u{i}|02-00-00-00-00-21|ap1|192.0.2.16|bad|1|2|cn");
+        let mut log: Vec<(u64, String)> = (0..1500u64)
+            .map(|i| (ns - 120_000_000_000 + i / 600 * 1_000_000_000, junk(i)))
+            .collect();
+        log.push((ns - 1_000_000_000, verdict(7)));
+        let s = settings(loki(Arc::new(Mutex::new(log)), Arc::new(Mutex::new(Vec::new()))).await);
+        let mut cursor = Cursor::new(now, None);
+        let got = cursor.poll(&s, now).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].user, "user7");
+    }
+
+    /// More lines in one second (as the shipper stamps them) than a page
+    /// holds: the reader steps past that instant, its rest unread, counts
+    /// the step, reads on to the verdict after, and never steps there again.
+    #[tokio::test]
+    async fn a_full_page_of_one_instant_is_stepped_past() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let ns = nanos(now);
+        let sec = ns - 120_000_000_000;
+        let mut log: Vec<(u64, String)> = (0..1200u64).map(|i| (sec, verdict(i))).collect();
+        log.push((ns - 1_000_000_000, verdict(99_999)));
+        let s = settings(loki(Arc::new(Mutex::new(log)), Arc::new(Mutex::new(Vec::new()))).await);
+        let mut cursor = Cursor::new(now, None);
+        let mut got = 0;
+        for i in 0..5 {
+            got += cursor
+                .poll(&s, now + Duration::from_secs(60 * i))
+                .await
+                .unwrap()
+                .len();
+        }
+        // The first page of the instant, and the verdict after it.
+        assert_eq!(got, 1001);
+        assert_eq!(cursor.skips, 1);
+        // The hourly re-read steps past it again, and neither counts it
+        // nor hands anything over twice.
+        let hour = now + RESCAN_EVERY;
+        assert!(cursor.poll(&s, hour).await.unwrap().is_empty());
+        assert_eq!(cursor.skips, 1);
+    }
+
+    /// A poll that fails part way keeps nothing as delivered: the next one
+    /// hands its lines over.
+    #[tokio::test]
+    async fn a_poll_that_fails_part_way_hands_its_lines_over_at_the_next() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let ns = nanos(now);
+        let log: Vec<(u64, String)> = (0..1500u64)
+            .map(|i| (ns - 120_000_000_000 + i * 1_000_000, verdict(i)))
+            .collect();
+        let log = Arc::new(Mutex::new(log));
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let s = settings(loki_failing(log, asked, &[2]).await);
+        let mut cursor = Cursor::new(now, None);
+        assert!(cursor.poll(&s, now).await.is_err());
+        let got = cursor.poll(&s, now).await.unwrap();
+        assert_eq!(got.len(), 1500);
+    }
+
+    /// The hourly re-read hands over only what was not delivered before.
+    #[tokio::test]
+    async fn the_hourly_reread_hands_over_nothing_twice() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let ns = nanos(now);
+        let log = Arc::new(Mutex::new(vec![(ns - 1_000_000_000, verdict(1))]));
+        let s = settings(loki(Arc::clone(&log), Arc::new(Mutex::new(Vec::new()))).await);
+        let mut cursor = Cursor::new(now, None);
+        assert_eq!(cursor.poll(&s, now).await.unwrap().len(), 1);
+        log.lock()
+            .unwrap()
+            .push((ns + 1_200_000_000_000, verdict(2)));
+        let t = now + Duration::from_secs(1260);
+        assert_eq!(cursor.poll(&s, t).await.unwrap().len(), 1);
+        let hour = now + RESCAN_EVERY;
+        assert!(cursor.poll(&s, hour).await.unwrap().is_empty());
     }
 
     /// A line stamped behind the cursor (sent late, or in the repeated hour
