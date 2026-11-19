@@ -2,7 +2,8 @@
 //! key-pinned TLS of `u6e_proto::tls`, and their snapshots, flows and events
 //! become a live state in RAM, served to Prometheus (`metrics`) and to the web
 //! UI (`http`, which reads it through `view`). The UI's operators act on
-//! clients through `actions`; what must outlive the process is in `policy`.
+//! clients through `actions`, and limit their rates and the SSIDs' on the
+//! APs' NSS through `limits`; what must outlive the process is in `policy`.
 //! The radios' spectrum scans run while the UI watches them (`spectrum`).
 //! The controller signs the live Wi-Fi configurations root's local command
 //! hands it (`local`, `configs`) with a key of its own, which the APs pin,
@@ -28,6 +29,7 @@ pub mod http;
 pub mod identity;
 pub mod images;
 pub mod leases;
+pub mod limits;
 pub mod local;
 pub mod metrics;
 pub mod names;
@@ -154,7 +156,8 @@ pub async fn start(
         .with_spectrum(timing.spectrum)
         .with_history(window)
         .with_leases(&config.leases)
-        .with_guards(config.guards.clone());
+        .with_guards(config.guards.clone())
+        .with_site_limits(config.limits.clone());
     let mut set_aside = Vec::new();
     if let Some((s, aside)) = signer(config, identity)? {
         state = state.with_signer(s);

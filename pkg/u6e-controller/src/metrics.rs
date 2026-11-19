@@ -19,7 +19,9 @@
 //! sessions and its bytes (those of its open sessions counted in), its
 //! clients on now; per client certificate, by its common name (the
 //! certificates the sessions keep, as many), its expiry; the RADIUS log's
-//! reads and its newest verdict exist only when it is read.
+//! reads and its newest verdict exist only when it is read. The rate limits
+//! are counted per connected AP by how they stand there, every state always
+//! exported, and an AP whose offload a capture holds back says so.
 
 use std::collections::BTreeSet;
 use std::fmt::Write;
@@ -32,16 +34,33 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use u6e_proto::PROTOCOL;
 use u6e_proto::mac;
-use u6e_proto::msg::{Radio, Snapshot, Station};
+use u6e_proto::msg::{LimitStatus, Radio, Snapshot, Station};
 
+use crate::limits::status_name;
 use crate::sessions::Totals;
 use crate::spectrum::{RADIOS, Scan};
 use crate::state::{Ap, OUTCOMES, Shared, State, is_failure};
 use crate::view::{band, guard_name};
 
 /// The operator's actions and their results, every pair always exported.
-const ACTIONS: [&str; 4] = ["kick", "block", "unblock", "steer"];
+const ACTIONS: [&str; 8] = [
+    "kick",
+    "block",
+    "unblock",
+    "steer",
+    "limit",
+    "unlimit",
+    "ssid-limit",
+    "capture",
+];
 const RESULTS: [&str; 3] = ["ok", "failed", "timeout"];
+/// The states a limit has on an AP, every one always exported.
+const LIMIT_STATUSES: [LimitStatus; 4] = [
+    LimitStatus::Enforced,
+    LimitStatus::Waiting,
+    LimitStatus::Refused,
+    LimitStatus::NotEnforced,
+];
 
 const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
@@ -301,6 +320,14 @@ pub fn render(state: &State) -> String {
         m.sample(&[("ap", ap)], f64::from(s.mem_avail_kb) * 1024.0);
     }
     m.family(
+        "wifi_offload_held",
+        GAUGE,
+        "1 while a capture holds the AP's NSS offload back (ECM stopped, or its restore not done).",
+    );
+    for &(ap, s) in &snaps {
+        m.sample(&[("ap", ap)], f64::from(u8::from(s.offload_held)));
+    }
+    m.family(
         "wifi_ap_nss_load_ratio",
         GAUGE,
         "Load of the AP's network processor, 0 to 1.",
@@ -437,6 +464,21 @@ pub fn render(state: &State) -> String {
         "Clients the operator blocked on every AP.",
     );
     m.sample(&[], state.blocked.len() as f64);
+    m.family(
+        "wifi_limits",
+        GAUGE,
+        "Rate limits on each connected AP, by how they stand there.",
+    );
+    for (name, ap) in state.aps().filter(|(_, a)| a.is_up()) {
+        for status in LIMIT_STATUSES {
+            let n = ap
+                .limit_states
+                .iter()
+                .filter(|s| s.status == status)
+                .count();
+            m.sample(&[("ap", name), ("status", status_name(status))], n as f64);
+        }
+    }
     m.family(
         "wifi_actions_total",
         COUNTER,

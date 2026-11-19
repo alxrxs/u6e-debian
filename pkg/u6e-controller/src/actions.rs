@@ -19,7 +19,8 @@
 //! A kick or a steer goes to the AP the client is on. A block or an unblock
 //! is saved in the policy first, so that what an AP is told is what a restart
 //! tells it again, then sent to every connected AP; an AP that is away is
-//! given the whole policy when it reconnects. Each AP's result is awaited for
+//! given the whole policy when it reconnects. A rate limit's change goes the
+//! same way (`limits`). Each AP's result is awaited for
 //! `Timing::command` (504 past it), and each is an event and a journal line.
 //! An upgrade is answered once the policy file holds it (202 with its id;
 //! 409 when it cannot start); how it goes is in `/api/rollouts` and the
@@ -42,10 +43,10 @@ use u6e_proto::msg::CommandKind;
 use crate::config::Config;
 use crate::http::{error, json_response};
 use crate::images::image_name;
-use crate::policy::{self, Store};
+use crate::policy::{self, Policy, Store};
 use crate::rf::{self, Planner};
 use crate::rollout::Engine;
-use crate::state::{Action, Shared, Waiter, action_name};
+use crate::state::{Action, Shared, State, Waiter, action_name};
 
 /// The user the sign-in proxy names.
 pub const USER_HEADER: &str = "x-forwarded-preferred-username";
@@ -277,16 +278,22 @@ async fn act(
         state: &web.state,
         user: who,
         action: action_name(&kind),
-        mac,
+        mac: Some(mac),
+        about: String::new(),
     };
-    if matches!(
-        kind,
-        CommandKind::Block { .. } | CommandKind::Unblock { .. }
-    ) {
-        ctx.everywhere(&web.access, kind).await
-    } else {
-        ctx.where_it_is(&web.access, kind).await
-    }
+    let blocking = match kind {
+        CommandKind::Block { .. } => true,
+        CommandKind::Unblock { .. } => false,
+        _ => return ctx.where_it_is(&web.access, kind).await,
+    };
+    let change = |p: &mut Policy| {
+        Ok(if blocking {
+            p.blocked.insert(mac)
+        } else {
+            p.blocked.remove(&mac)
+        })
+    };
+    ctx.everywhere(&web.access, |_| kind, change).await
 }
 
 /// How a command sent to one AP ended.
@@ -343,12 +350,15 @@ async fn send(state: &Shared, ap: &str, kind: CommandKind, timeout: Duration) ->
     }
 }
 
-/// One action being taken.
-struct Ctx<'a> {
-    state: &'a Shared,
-    user: Option<String>,
-    action: &'static str,
-    mac: [u8; 6],
+/// One action being taken: by whom, on which client (if one), and what it
+/// asks, which leads each detail it records (when there is more to say than
+/// the action's name).
+pub(crate) struct Ctx<'a> {
+    pub state: &'a Shared,
+    pub user: Option<String>,
+    pub action: &'static str,
+    pub mac: Option<[u8; 6]>,
+    pub about: String,
 }
 
 impl Ctx<'_> {
@@ -358,11 +368,16 @@ impl Ctx<'_> {
         if let Some(ap) = ap {
             v["ap"] = ap.into();
         }
+        let detail = if self.about.is_empty() {
+            detail
+        } else {
+            format!("{}: {detail}", self.about)
+        };
         self.state.write().record(Action {
             at: SystemTime::now(),
             user: self.user.clone(),
             action: self.action,
-            mac: Some(self.mac),
+            mac: self.mac,
             ap: ap.map(str::to_owned),
             ok,
             detail,
@@ -383,7 +398,7 @@ impl Ctx<'_> {
         let clients = self.state.read().clients();
         let Some(ap) = clients
             .into_iter()
-            .find(|c| c.station.mac == self.mac)
+            .find(|c| Some(c.station.mac) == self.mac)
             .map(|c| c.ap)
         else {
             self.record(None, false, "not associated".into());
@@ -396,11 +411,22 @@ impl Ctx<'_> {
         (out.status(), json_response(&body)).into_response()
     }
 
-    /// A block or an unblock: saved, then sent to every connected AP.
-    async fn everywhere(&self, access: &Access, kind: CommandKind) -> Response {
-        let blocking = matches!(kind, CommandKind::Block { .. });
-        let aps = match self.save(access, blocking).await {
-            Ok(aps) => aps,
+    /// A change of the policy (`change` makes it, and says whether it
+    /// changed anything or why it may not be made): saved, then the
+    /// command `kind` makes of the state then sent to every connected AP.
+    pub(crate) async fn everywhere(
+        &self,
+        access: &Access,
+        kind: impl FnOnce(&State) -> CommandKind,
+        change: impl FnOnce(&mut Policy) -> Result<bool, String>,
+    ) -> Response {
+        let (aps, kind) = match self.save(access, kind, change).await {
+            Ok(Ok(done)) => done,
+            Ok(Err(why)) => {
+                self.record(None, false, why.clone());
+                self.count("failed");
+                return error(StatusCode::CONFLICT, &why);
+            }
             Err(e) => {
                 let detail = format!("the policy was not saved: {e}");
                 self.record(None, false, detail.clone());
@@ -437,22 +463,25 @@ impl Ctx<'_> {
         (status.unwrap_or(StatusCode::OK), json_response(&body)).into_response()
     }
 
-    /// Saves the client as blocked or not, one save at a time, and takes it
-    /// into the state; the APs connected then, which are to be told.
-    async fn save(&self, access: &Access, blocking: bool) -> std::io::Result<Vec<String>> {
+    /// Makes `change` to the policy, one save at a time, and takes it into
+    /// the state; the APs connected then, which are to be told, and what.
+    async fn save(
+        &self,
+        access: &Access,
+        kind: impl FnOnce(&State) -> CommandKind,
+        change: impl FnOnce(&mut Policy) -> Result<bool, String>,
+    ) -> std::io::Result<Result<(Vec<String>, CommandKind), String>> {
         let path = access.policy.lock().await;
         let mut next = self.state.read().policy();
-        let changed = if blocking {
-            next.blocked.insert(self.mac)
-        } else {
-            next.blocked.remove(&self.mac)
-        };
-        if changed {
-            policy::write(&path, next.clone()).await?;
+        match change(&mut next) {
+            Ok(true) => policy::write(&path, next.clone()).await?,
+            Ok(false) => {}
+            Err(why) => return Ok(Err(why)),
         }
         let mut state = self.state.write();
         state.blocked = next.blocked;
-        Ok(state.connected())
+        state.limits = next.limits;
+        Ok(Ok((state.connected(), kind(&state))))
     }
 }
 

@@ -35,7 +35,8 @@ use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
 use u6e_proto::delta::{self, Gap};
 use u6e_proto::msg::{
     AgentMsg, Band, Binding, Bss, Command, CommandKind, CommandResult, ConfigApplied, CtlMsg,
-    Event, EventKind, Flows, Guard, GuardConfig, Hello, Mechanism, RadioConfig, Snapshot, Station,
+    Event, EventKind, Flows, Guard, GuardConfig, Hello, LimitState, Mechanism, RadioConfig, Rate,
+    Snapshot, Station,
 };
 use u6e_proto::{PROTOCOL, mac};
 
@@ -43,6 +44,7 @@ use crate::configs::Signer;
 use crate::configs::unix_ms;
 use crate::identity::Identity;
 use crate::leases::{Lease, Leases};
+use crate::limits::{self, RateLimits};
 use crate::names::{self, Names};
 use crate::oui;
 use crate::policy::{ApImages, Blocked, ConfigId, Hold, Phase, Policy, SavedRollout};
@@ -100,6 +102,8 @@ pub enum Change {
     Deploy,
     /// The AP's client guards' bindings changed.
     Bindings(String),
+    /// The rate limits, or how they stand on an AP, changed.
+    Limits,
 }
 
 /// One action on one AP (or on none, when no AP was connected to carry a
@@ -274,9 +278,9 @@ pub struct NotAsPlanned {
 pub enum Waiter {
     /// An operator's request.
     Reply(oneshot::Sender<CommandResult>),
-    /// Nobody: the policy's blocks given to an AP that reconnected, whose
-    /// failure is only logged.
-    Resent,
+    /// Nobody: the policy's blocks or limits (as it names them) given to an
+    /// AP that reconnected, whose failure is only logged.
+    Resent(&'static str),
 }
 
 struct Pending {
@@ -346,6 +350,8 @@ pub struct Ap {
     pub violations: BTreeMap<(Guard, u16), u64>,
     /// The frames its client guards dropped, by guard, since they started.
     pub guard_drops: Vec<(Guard, u64)>,
+    /// How each rate limit stands on it, only while connected.
+    pub limit_states: Vec<LimitState>,
     rx_bytes: Arc<AtomicU64>,
     watchers: usize,
     tick: watch::Sender<u16>,
@@ -394,6 +400,7 @@ impl Ap {
             bindings: Vec::new(),
             violations: BTreeMap::new(),
             guard_drops: Vec::new(),
+            limit_states: Vec::new(),
             rx_bytes: Arc::new(AtomicU64::new(0)),
             watchers: 0,
             tick: watch::Sender::new(TICK_IDLE),
@@ -471,6 +478,7 @@ impl Ap {
         self.connected_since = None;
         self.flows = None;
         self.bindings.clear();
+        self.limit_states.clear();
         self.full.clear();
         let scans = self.scans.iter_mut();
         let ended =
@@ -597,6 +605,10 @@ pub struct State {
     pub sessions: Sessions,
     /// How the reads of RADIUS's log go, when it is read.
     pub radius: Option<radius::Health>,
+    /// The rate limits admins set (kept in the policy), and the site
+    /// file's per SSID.
+    pub limits: RateLimits,
+    pub site_limits: BTreeMap<String, Rate>,
 }
 
 impl State {
@@ -631,6 +643,16 @@ impl State {
             history: History::new(history::WINDOW),
             sessions: Sessions::default(),
             radius: None,
+            limits: RateLimits::default(),
+            site_limits: BTreeMap::new(),
+        }
+    }
+
+    /// The state with the site file's per-SSID rate limits.
+    pub fn with_site_limits(self, site_limits: BTreeMap<String, Rate>) -> Self {
+        State {
+            site_limits,
+            ..self
         }
     }
 
@@ -690,6 +712,7 @@ impl State {
         holds.retain(|ap, _| self.aps.contains_key(ap));
         State {
             blocked: policy.blocked,
+            limits: policy.limits,
             images,
             holds,
             rollouts: rollouts.collect(),
@@ -742,6 +765,7 @@ impl State {
         });
         Policy {
             blocked: self.blocked.clone(),
+            limits: self.limits.clone(),
             configs: acked.collect(),
             images: self.images.clone(),
             rollouts: rollouts.collect(),
@@ -1043,6 +1067,10 @@ impl State {
                 entry.guard_drops = d;
                 None
             }
+            AgentMsg::Limits(l) => {
+                entry.limit_states = l;
+                Some(Change::Limits)
+            }
             // A Pong only proves the agent is alive.
             _ => None,
         };
@@ -1098,10 +1126,10 @@ impl State {
             Waiter::Reply(tx) => {
                 let _ = tx.send(r);
             }
-            Waiter::Resent if r.ok => {}
-            Waiter::Resent => {
+            Waiter::Resent(_) if r.ok => {}
+            Waiter::Resent(what) => {
                 eprintln!(
-                    "u6e-controller: {ap}: the policy's blocks failed: {}",
+                    "u6e-controller: {ap}: the policy's {what} failed: {}",
                     r.detail
                 );
             }
@@ -1135,16 +1163,36 @@ impl State {
     /// its session `id` to send: all of them at once, so that a client
     /// unblocked while the AP could not be told is let on there too.
     pub fn sync_blocks(&mut self, ap: &str, id: u64) -> Option<CtlMsg> {
+        let macs = self.blocked.iter().copied().collect();
+        self.resend(ap, id, "blocks", CommandKind::SyncBlocks { macs })
+    }
+
+    /// The command that makes a reconnected AP's rate limits the effective
+    /// set, for its session `id` to send: an agent restarted with its AP
+    /// holds none.
+    pub fn sync_limits(&mut self, ap: &str, id: u64) -> Option<CtlMsg> {
+        let kind = limits::sync(self);
+        self.resend(ap, id, "limits", kind)
+    }
+
+    /// `kind` as a command for session `id` of `ap` to send, its failure
+    /// only logged, as the policy's `what`.
+    fn resend(
+        &mut self,
+        ap: &str,
+        id: u64,
+        what: &'static str,
+        kind: CommandKind,
+    ) -> Option<CtlMsg> {
         self.live(ap, id)?;
         self.next_command += 1;
-        let macs = self.blocked.iter().copied().collect();
         let cmd = Command {
             id: self.next_command,
-            kind: CommandKind::SyncBlocks { macs },
+            kind,
         };
         let pending = Pending {
             ap: ap.to_owned(),
-            waiter: Waiter::Resent,
+            waiter: Waiter::Resent(what),
             radio: false,
         };
         self.pending.insert(cmd.id, pending);

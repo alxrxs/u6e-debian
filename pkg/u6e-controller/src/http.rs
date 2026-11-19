@@ -58,7 +58,7 @@ use crate::actions::{self, Access, Via, Web};
 use crate::spectrum::{self, Watching};
 use crate::state::{Change, Full, ROLLOUT_LOG_CAP, Shared, WatchGuard};
 use crate::view;
-use crate::{rf, sessions};
+use crate::{limits, rf, sessions};
 
 /// How long a new WebSocket may take to say what it watches.
 const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -165,6 +165,9 @@ pub fn router(state: Shared, access: Access) -> Router {
         .route("/api/clients/{mac}/block", post(actions::block))
         .route("/api/clients/{mac}/unblock", post(actions::unblock))
         .route("/api/clients/{mac}/steer", post(actions::steer))
+        .route("/api/clients/{mac}/limit", post(limits::set_client))
+        .route("/api/ssids/limit", post(limits::set_ssid))
+        .route("/api/limits", get(api_limits))
         .route("/api/config", get(api_config))
         .route("/api/manage", get(api_manage))
         .route("/api/rollouts", get(api_rollouts))
@@ -239,6 +242,10 @@ pub(crate) fn json_response(v: &Value) -> Response {
         (header::CACHE_CONTROL, "no-store"),
     ];
     (headers, v.to_string()).into_response()
+}
+
+async fn api_limits(Ext(state): Ext<Shared>) -> Response {
+    json_response(&limits::view(&state.read()))
 }
 
 async fn api_aps(Ext(state): Ext<Shared>) -> Response {
@@ -583,7 +590,7 @@ async fn live(mut ws: WebSocket, state: Shared, user: Option<String>, scans: Gat
                 (wanted(&ap), None)
             }
             Ok(Change::Flows(ap)) => (flows && wanted(&ap), None),
-            Ok(Change::Names | Change::Deploy) => (true, None),
+            Ok(Change::Names | Change::Deploy | Change::Limits) => (true, None),
             // A block or an unblock changes the list of clients blocked.
             Ok(Change::Action(a)) if a.ap.as_deref().is_none_or(wanted) => {
                 (true, Some(json!({ "events": [view::action(&a)] })))

@@ -1,10 +1,13 @@
 //! The operator's decisions that outlive the controller: the clients it
-//! blocked, and the Wi-Fi configuration each AP last acknowledged, by its hash
-//! and sequence number (never its text). `policy.json` is
-//! `{"blocked": ["02:00:00:00:00:01", ...], "configs": {"ap1": {"sha256":
-//! "<64 hex>", "seq": 1792929600000}}, "images": {"ap1": {"running": "<id>"}},
+//! blocked, the rate limits admins set, and the Wi-Fi configuration each AP
+//! last acknowledged, by its hash and sequence number (never its text).
+//! `policy.json` is `{"blocked": ["02:00:00:00:00:01", ...], "limits":
+//! {"clients": {"02:00:00:00:00:01": {"down_kbit": 20000, "up_kbit": null}},
+//! "ssids": {"guest": {...}}}, "configs": {"ap1": {"sha256": "<64 hex>",
+//! "seq": 1792929600000}}, "images": {"ap1": {"running": "<id>"}},
 //! "rollouts": [...], "next_rollout": 7}`. An AP keeps its blocks in RAM
-//! only, so this file is what every AP is given again when it connects. The
+//! only, and its limits until it restarts, so this file is what every AP is
+//! given again when it connects. The
 //! image each AP runs is kept (and, after a rollout that failed part way, the
 //! other one it may run), which is what a rollout of it rolls back to; and
 //! the recent rollouts, each with the step it is at, its gate's verdict and
@@ -26,7 +29,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, MutexGuard};
 use u6e_proto::mac;
+use u6e_proto::msg::{Rate, check_limits};
 
+use crate::limits::RateLimits;
 use crate::store;
 
 /// The clients blocked, by MAC.
@@ -47,6 +52,8 @@ pub struct ConfigId {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Policy {
     pub blocked: Blocked,
+    /// The rate limits admins set.
+    pub limits: RateLimits,
     /// The configuration each AP last acknowledged, by AP.
     pub configs: BTreeMap<String, ConfigId>,
     /// The images each AP runs, by AP.
@@ -121,6 +128,8 @@ pub struct SavedRollout {
 #[serde(deny_unknown_fields)]
 struct PolicyFile {
     blocked: Vec<String>,
+    #[serde(default, skip_serializing_if = "LimitsFile::is_empty")]
+    limits: LimitsFile,
     // None until an AP acknowledged a configuration, as in a file from
     // before the controller relayed them.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -137,6 +146,21 @@ struct PolicyFile {
 
 fn is_zero(n: &u64) -> bool {
     *n == 0
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LimitsFile {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    clients: BTreeMap<String, Rate>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    ssids: BTreeMap<String, Rate>,
+}
+
+impl LimitsFile {
+    fn is_empty(&self) -> bool {
+        self.clients.is_empty() && self.ssids.is_empty()
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -234,6 +258,22 @@ pub fn load(path: &Path) -> io::Result<Policy> {
         .iter()
         .map(|m| mac::parse(m).ok_or_else(|| invalid(format!("blocked: {m:?} is not a MAC"))))
         .collect::<io::Result<_>>()?;
+    let clients = file
+        .limits
+        .clients
+        .into_iter()
+        .map(|(m, r)| {
+            let m = mac::parse(&m).filter(|m| mac::is_station(*m));
+            m.map(|m| (m, r))
+                .ok_or_else(|| invalid("limits.clients: a key is no station's MAC".into()))
+        })
+        .collect::<io::Result<_>>()?;
+    let limits = RateLimits {
+        clients,
+        ssids: file.limits.ssids,
+    };
+    check_limits(&limits.effective(&BTreeMap::new()))
+        .map_err(|why| invalid(format!("limits: {why}")))?;
     let configs = file
         .configs
         .into_iter()
@@ -266,6 +306,7 @@ pub fn load(path: &Path) -> io::Result<Policy> {
     });
     Ok(Policy {
         blocked,
+        limits,
         configs,
         images: file.images,
         rollouts: rollouts.collect(),
@@ -309,8 +350,18 @@ fn encode(policy: &Policy) -> io::Result<Vec<u8>> {
             at: millis(at),
         }),
     });
+    let limits = LimitsFile {
+        clients: policy
+            .limits
+            .clients
+            .iter()
+            .map(|(m, r)| (mac::format(*m), *r))
+            .collect(),
+        ssids: policy.limits.ssids.clone(),
+    };
     let file = PolicyFile {
         blocked: policy.blocked.iter().map(|m| mac::format(*m)).collect(),
+        limits,
         configs: configs.collect(),
         images: policy.images.clone(),
         rollouts: rollouts.collect(),
@@ -421,6 +472,47 @@ mod tests {
         );
         save(&path, &Policy::default()).unwrap();
         assert_eq!(load(&path).unwrap(), Policy::default());
+    }
+
+    #[test]
+    fn limits_are_kept_and_a_bad_one_refused() {
+        let dir = Dir::new("limits");
+        let path = dir.0.join("policy.json");
+        let mut p = blocked(&[]);
+        let rate = |down, up| Rate {
+            down_kbit: down,
+            up_kbit: up,
+        };
+        p.limits
+            .clients
+            .insert([2, 0, 0, 0, 0, 1], rate(Some(20_000), None));
+        p.limits
+            .ssids
+            .insert("guest".into(), rate(None, Some(1_000)));
+        save(&path, &p).unwrap();
+        assert_eq!(load(&path).unwrap(), p);
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            v["limits"],
+            serde_json::json!({
+                "clients": {"02:00:00:00:00:01": {"down_kbit": 20000, "up_kbit": null}},
+                "ssids": {"guest": {"down_kbit": null, "up_kbit": 1000}},
+            })
+        );
+        for bad in [
+            r#"{"blocked": [], "limits": {"clients": {"ff:ff:ff:ff:ff:ff": {"down_kbit": 100, "up_kbit": null}}}}"#,
+            r#"{"blocked": [], "limits": {"clients": {"02:00:00:00:00:01": {"down_kbit": null, "up_kbit": null}}}}"#,
+            r#"{"blocked": [], "limits": {"ssids": {"guest": {"down_kbit": 1, "up_kbit": null}}}}"#,
+            r#"{"blocked": [], "limits": {"other": {}}}"#,
+        ] {
+            fs::write(&path, bad).unwrap();
+            assert_eq!(
+                load(&path).unwrap_err().kind(),
+                ErrorKind::InvalidData,
+                "{bad}"
+            );
+        }
     }
 
     /// A file written before the controller relayed configurations.

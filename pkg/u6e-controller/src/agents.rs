@@ -9,7 +9,8 @@
 //! and flow cadence from the AP's watchers, and passes on what the state
 //! queues for it (commands, requests for flows, signed configurations). After
 //! the first key frame of every connection it gives the AP the policy's
-//! blocks, all of them, since the AP keeps them in RAM only, its client
+//! blocks, all of them, since the AP keeps them in RAM only, the rate
+//! limits, all of them, which the AP keeps only until it restarts, its client
 //! guards' mode and the leases they are seeded with, and checks that it runs
 //! the latest configuration signed for it.
 //!
@@ -391,7 +392,7 @@ impl Session {
     async fn process(&mut self) -> io::Result<()> {
         let mut used = 0;
         let mut want_key = false;
-        let mut sync = None;
+        let mut sync = Vec::new();
         let mut setup = Vec::new();
         let mut flows = false;
         while let Some((mut msg, n)) = decode_frame::<AgentMsg>(&self.conn.inbuf[used..])? {
@@ -412,7 +413,8 @@ impl Session {
             let gap = state.apply(&self.name, self.id, msg).is_err();
             if key && !gap && !self.synced {
                 self.synced = true;
-                sync = state.sync_blocks(&self.name, self.id);
+                sync.extend(state.sync_blocks(&self.name, self.id));
+                sync.extend(state.sync_limits(&self.name, self.id));
                 setup = state.guard_setup(&self.name, self.id);
                 state.check_installed(&self.name, self.id);
             }
@@ -429,7 +431,7 @@ impl Session {
         if want_key {
             self.send(&CtlMsg::WantKey).await?;
         }
-        if let Some(msg) = &sync {
+        for msg in &sync {
             self.send(msg).await?;
         }
         for msg in &setup {

@@ -12,7 +12,9 @@
 //! none without it; in `[radius]`, the Loki the RADIUS servers' log is read
 //! from (`radius`), RADIUS's side of the clients' timelines missing without
 //! it; where the clients' sessions and timelines are kept (`history_path`,
-//! `sessions`); and, in `[guards]`, the VLANs the APs' client guards
+//! `sessions`); in `[limits]`, the site's per-SSID rate limits, which an
+//! admin's limit of the same SSID overrides (`limits`); and, in `[guards]`,
+//! the VLANs the APs' client guards
 //! enforce on (only with `[leases]`: without the seed of the leases a client
 //! that roamed in is unknown to its new AP), the clients with a static
 //! address, and the site's DHCP servers and relays, whose acknowledgements
@@ -49,6 +51,9 @@
 //! loki = "logs.example.org:3100"
 //! selector = '{job="radius-auth"}'
 //!
+//! [limits]
+//! ssids = [{ ssid = "guest", down_kbit = 50000, up_kbit = 10000 }]
+//!
 //! [guards]
 //! enforce = [42]
 //! static = [{ mac = "02:00:00:00:00:01", ip = "192.0.2.5" }]
@@ -63,7 +68,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 use u6e_proto::mac;
-use u6e_proto::msg::{Binding, GuardConfig};
+use u6e_proto::msg::{Binding, GuardConfig, Limit, LimitTarget, Rate, check_limits};
 
 use crate::{configs, radius, rf, rollout};
 
@@ -93,6 +98,8 @@ pub struct Config {
     pub policy_path: PathBuf,
     /// The clients' sessions and timelines.
     pub history_path: PathBuf,
+    /// The site's rate limits, per SSID.
+    pub limits: BTreeMap<String, Rate>,
     /// Where root's local commands reach the controller.
     pub socket: PathBuf,
     /// The signing of live configurations, if it is on.
@@ -137,6 +144,22 @@ struct File {
     leases: Option<LeasesFile>,
     radius: Option<RadiusFile>,
     guards: Option<GuardsFile>,
+    limits: Option<LimitsFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LimitsFile {
+    #[serde(default)]
+    ssids: Vec<SsidLimitFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SsidLimitFile {
+    ssid: String,
+    down_kbit: Option<u32>,
+    up_kbit: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -244,6 +267,8 @@ pub enum ConfigError {
     Radius(String),
     /// `[guards]` names no VLAN, or no client's MAC: which.
     Guards(String),
+    /// A `[limits]` SSID is named twice, or its rate is out of range.
+    Limits(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -264,6 +289,7 @@ impl fmt::Display for ConfigError {
             Self::BadExporter(e) => write!(f, "leases.exporters: {e:?} is not host:port"),
             Self::Radius(e) => write!(f, "radius: {e}"),
             Self::Guards(e) => write!(f, "guards: {e}"),
+            Self::Limits(e) => write!(f, "limits: {e}"),
         }
     }
 }
@@ -322,6 +348,7 @@ impl Config {
         let guards = file
             .guards
             .map_or_else(|| Ok(GuardConfig::default()), guards)?;
+        let limits = file.limits.map_or_else(|| Ok(BTreeMap::new()), limits)?;
         Ok(Config {
             listen_agents: file.listen_agents,
             listen_http: file.listen_http,
@@ -334,6 +361,7 @@ impl Config {
             admin_group: file.admin_group,
             policy_path: file.policy_path,
             history_path: file.history_path,
+            limits,
             socket: file.socket,
             configs: configs.map_err(ConfigError::Section)?,
             rollouts: rollouts.map_err(ConfigError::Section)?,
@@ -362,6 +390,35 @@ fn radius_settings(file: RadiusFile) -> Result<radius::Settings, ConfigError> {
         loki: file.loki,
         selector: file.selector,
     })
+}
+
+/// The limits' section, checked: each SSID once, each rate as an AP takes
+/// it.
+fn limits(file: LimitsFile) -> Result<BTreeMap<String, Rate>, ConfigError> {
+    let mut out = BTreeMap::new();
+    for s in file.ssids {
+        let rate = Rate {
+            down_kbit: s.down_kbit,
+            up_kbit: s.up_kbit,
+        };
+        let set = [Limit {
+            target: LimitTarget::Ssid(s.ssid.clone()),
+            rate,
+        }];
+        check_limits(&set).map_err(|e| ConfigError::Limits(format!("{:?}: {e}", s.ssid)))?;
+        if out.insert(s.ssid.clone(), rate).is_some() {
+            return Err(ConfigError::Limits(format!("{:?} is named twice", s.ssid)));
+        }
+    }
+    let all: Vec<Limit> = out
+        .iter()
+        .map(|(s, r)| Limit {
+            target: LimitTarget::Ssid(s.clone()),
+            rate: *r,
+        })
+        .collect();
+    check_limits(&all).map_err(ConfigError::Limits)?;
+    Ok(out)
 }
 
 /// The guards' section, checked: real VLANs, each once, and unicast MACs.
@@ -670,6 +727,38 @@ mod tests {
                 matches!(radius(loki, selector), Err(ConfigError::Radius(_))),
                 "{loki} {selector}"
             );
+        }
+    }
+
+    #[test]
+    fn the_sites_limits_are_per_ssid_each_once_in_range() {
+        let none = Config::parse(ORIGIN).unwrap();
+        assert!(none.limits.is_empty());
+        let text = format!(
+            "{ORIGIN}[limits]\nssids = [{{ ssid = \"Guest\", down_kbit = 50000 }}, \
+             {{ ssid = \"IoT\", up_kbit = 1000 }}]\n"
+        );
+        let l = Config::parse(&text).unwrap().limits;
+        let rate = |down, up| Rate {
+            down_kbit: down,
+            up_kbit: up,
+        };
+        assert_eq!(
+            l,
+            BTreeMap::from([
+                ("Guest".to_owned(), rate(Some(50_000), None)),
+                ("IoT".to_owned(), rate(None, Some(1_000))),
+            ])
+        );
+        for bad in [
+            "ssids = [{ ssid = \"Guest\" }]",
+            "ssids = [{ ssid = \"Guest\", down_kbit = 10 }]",
+            "ssids = [{ ssid = \"\", down_kbit = 1000 }]",
+            "ssids = [{ ssid = \"G\", down_kbit = 1000 }, { ssid = \"G\", up_kbit = 1000 }]",
+            "ssids = [{ ssid = \"G\", down_kbit = 1000, other = 1 }]",
+        ] {
+            let text = format!("{ORIGIN}[limits]\n{bad}\n");
+            assert!(Config::parse(&text).is_err(), "{bad}");
         }
     }
 

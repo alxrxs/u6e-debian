@@ -268,6 +268,8 @@ struct Agent {
     buf: Vec<u8>,
     /// The blocks each sync the controller sent set, answered.
     syncs: Vec<Vec<[u8; 6]>>,
+    /// The rate limits of each sync of them, in order, answered.
+    limit_syncs: Vec<Vec<u6e_proto::msg::Limit>>,
     /// The client guards' modes and seeds the controller sent.
     guards: Vec<CtlMsg>,
 }
@@ -289,6 +291,7 @@ impl Agent {
             sock,
             buf: Vec::new(),
             syncs: Vec::new(),
+            limit_syncs: Vec::new(),
             guards: Vec::new(),
         })
     }
@@ -329,8 +332,8 @@ impl Agent {
         self.send_bytes(&out)
     }
 
-    /// Asserts the agent is sent nothing but pings, syncs and the client
-    /// guards' setup for `wait`.
+    /// Asserts the agent is sent nothing but pings, syncs (of the blocks,
+    /// of the limits) and the client guards' setup for `wait`.
     fn hears_nothing(&mut self, wait: Duration) {
         self.sock.set_read_timeout(Some(wait)).unwrap();
         let start = Instant::now();
@@ -341,6 +344,13 @@ impl Agent {
                     id,
                     kind: CommandKind::SyncBlocks { .. },
                 })) => self.reply(id, true, "synced"),
+                Ok(CtlMsg::Command(u6e_proto::msg::Command {
+                    id,
+                    kind: CommandKind::SyncLimits { limits },
+                })) => {
+                    self.limit_syncs.push(limits);
+                    self.reply(id, true, "synced");
+                }
                 Ok(msg @ (CtlMsg::Guards(_) | CtlMsg::SeedBindings(_))) => self.guards.push(msg),
                 Ok(msg) => panic!("the agent was sent {msg:?}"),
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -396,15 +406,19 @@ impl Agent {
                 Err(e) => return assert_eq!(e.kind(), ErrorKind::UnexpectedEof, "{e}"),
                 Ok(body) => match ctl_of(&body) {
                     Some(CtlMsg::Guards(_) | CtlMsg::SeedBindings(_)) => {}
+                    Some(CtlMsg::Command(u6e_proto::msg::Command {
+                        kind: CommandKind::SyncLimits { .. },
+                        ..
+                    })) => {}
                     _ => panic!("a frame of {} B, not the end", body.len()),
                 },
             }
         }
     }
 
-    /// The next message other than a ping or a sync of the blocks, which
-    /// are answered (the sync's list kept in `syncs`), or the client guards'
-    /// setup (kept in `guards`).
+    /// The next message other than a ping or a sync of the blocks or the
+    /// limits, which are answered (each sync's list kept in `syncs` or
+    /// `limit_syncs`), or the client guards' setup (kept in `guards`).
     fn expect(&mut self) -> CtlMsg {
         let start = Instant::now();
         loop {
@@ -415,6 +429,10 @@ impl Agent {
                 CtlMsg::Command(c) => match c.kind {
                     CommandKind::SyncBlocks { macs } => {
                         self.syncs.push(macs);
+                        self.reply(c.id, true, "synced");
+                    }
+                    CommandKind::SyncLimits { limits } => {
+                        self.limit_syncs.push(limits);
                         self.reply(c.id, true, "synced");
                     }
                     kind => return CtlMsg::Command(u6e_proto::msg::Command { id: c.id, kind }),
@@ -439,6 +457,13 @@ impl Agent {
                 }) => {
                     self.reply(id, true, "synced");
                     return macs;
+                }
+                CtlMsg::Command(u6e_proto::msg::Command {
+                    id,
+                    kind: CommandKind::SyncLimits { limits },
+                }) => {
+                    self.limit_syncs.push(limits);
+                    self.reply(id, true, "synced");
                 }
                 msg @ (CtlMsg::Guards(_) | CtlMsg::SeedBindings(_)) => self.guards.push(msg),
                 other => panic!("{other:?} before the sync of the blocks"),
@@ -816,6 +841,10 @@ fn second_connection_replaces_first() {
     loop {
         match first.recv() {
             Ok(CtlMsg::Ping(_) | CtlMsg::Guards(_) | CtlMsg::SeedBindings(_)) => {}
+            Ok(CtlMsg::Command(u6e_proto::msg::Command {
+                kind: CommandKind::SyncLimits { .. },
+                ..
+            })) => {}
             Ok(other) => panic!("unexpected {other:?}"),
             Err(_) => break,
         }
@@ -1669,6 +1698,146 @@ fn actions_require_wifi_admins() {
 /// Review focus 1: a client blocked, and another unblocked, while its AP is
 /// away is blocked (and let on) when the AP comes back, by the one sync that
 /// makes the AP's blocks the policy's.
+/// The limits an AP is given: each target and its rates.
+fn given(limits: &[u6e_proto::msg::Limit]) -> Vec<(String, Option<u32>, Option<u32>)> {
+    use u6e_proto::msg::LimitTarget;
+    let name = |t: &LimitTarget| match t {
+        LimitTarget::Client(m) => mac::format(*m),
+        LimitTarget::Ssid(s) => format!("ssid:{s}"),
+    };
+    let one = |l: &u6e_proto::msg::Limit| (name(&l.target), l.rate.down_kbit, l.rate.up_kbit);
+    limits.iter().map(one).collect()
+}
+
+#[test]
+fn rate_limits_are_kept_given_to_every_ap_and_shown() {
+    use u6e_proto::msg::{LimitState, LimitStatus, LimitTarget};
+    let dir = TempDir::new("limits");
+    let site = "\n[limits]\nssids = [{ ssid = \"Guest\", down_kbit = 50000 }]\n";
+    let r = configured(
+        Timing::default(),
+        &dir.0,
+        420,
+        Arc::new(FakeStage::default()),
+        site,
+    );
+    let admin = format!("{SAME_SITE}{ADMIN}");
+    let mut a = ap_with_client(&r, KEY_AP1, "ap1", &[]);
+    a.hears_nothing(Duration::from_millis(300));
+    let guest = ("ssid:Guest".to_owned(), Some(50_000), None);
+    assert_eq!(
+        a.limit_syncs.iter().map(|l| given(l)).collect::<Vec<_>>(),
+        [vec![guest.clone()]]
+    );
+
+    // A client's limit: saved, given to the AP, answered with its result.
+    let limit = format!("{CLIENT}/limit");
+    let t = {
+        let (admin, limit) = (admin.clone(), limit.clone());
+        thread::spawn(move || {
+            post(
+                r.c.http,
+                &limit,
+                &admin,
+                r#"{"down_kbit": 20000, "up_kbit": null}"#,
+            )
+        })
+    };
+    wait_for("the AP given the new set", || {
+        a.hears_nothing(Duration::from_millis(50));
+        a.limit_syncs.len() == 2
+    });
+    let (status, body) = t.join().unwrap();
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["results"][0]["ok"], true);
+    let client = ("02:00:00:00:00:01".to_owned(), Some(20_000), None);
+    assert_eq!(given(&a.limit_syncs[1]), [guest.clone(), client.clone()]);
+    let saved: Value =
+        serde_json::from_str(&fs::read_to_string(dir.0.join("policy.json")).unwrap()).unwrap();
+    assert_eq!(
+        saved["limits"],
+        json!({"clients": {"02:00:00:00:00:01": {"down_kbit": 20000, "up_kbit": null}}})
+    );
+
+    // How it stands on the AP, as the AP says.
+    let state = LimitState {
+        target: LimitTarget::Client(MAC),
+        status: LimitStatus::Enforced,
+        detail: "download on wlan5".into(),
+        down_bytes: 1234,
+        up_bytes: 0,
+    };
+    a.send(&AgentMsg::Limits(vec![state])).unwrap();
+    wait_for("the AP's states", || {
+        let v: Value = serde_json::from_str(&http_get(r.c.http, "/api/limits")).unwrap();
+        v["states"]["ap1"]["02:00:00:00:00:01"]["status"] == "enforced"
+    });
+    let v: Value = serde_json::from_str(&http_get(r.c.http, "/api/limits")).unwrap();
+    assert_eq!(
+        v["site"],
+        json!({"Guest": {"down_kbit": 50000, "up_kbit": null}})
+    );
+    assert!(
+        metrics_of(&r, "wifi_limits{")
+            .contains(&"wifi_limits{ap=\"ap1\",status=\"enforced\"} 1".to_owned())
+    );
+
+    // An admin's SSID limit overrides the site file's; cleared, it is back.
+    let ssid = |body: &'static str| {
+        let admin = admin.clone();
+        thread::spawn(move || post(r.c.http, "/api/ssids/limit", &admin, body))
+    };
+    let t = ssid(r#"{"ssid": "Guest", "down_kbit": 10000, "up_kbit": 2000}"#);
+    wait_for("the override", || {
+        a.hears_nothing(Duration::from_millis(50));
+        a.limit_syncs.len() == 3
+    });
+    assert_eq!(t.join().unwrap().0, 200);
+    assert_eq!(
+        given(&a.limit_syncs[2])[0],
+        ("ssid:Guest".to_owned(), Some(10_000), Some(2_000))
+    );
+    let t = ssid(r#"{"ssid": "Guest", "down_kbit": null, "up_kbit": null}"#);
+    wait_for("the site's again", || {
+        a.hears_nothing(Duration::from_millis(50));
+        a.limit_syncs.len() == 4
+    });
+    assert_eq!(t.join().unwrap().0, 200);
+    assert_eq!(given(&a.limit_syncs[3]), [guest, client]);
+
+    // Refused: not an admin, from another site, a body that is no rate, a
+    // rate out of range; none reaches the AP.
+    let user = "X-Forwarded-Preferred-Username: bob\r\n";
+    let cases = [
+        (
+            format!("{SAME_SITE}{user}"),
+            r#"{"down_kbit": 100, "up_kbit": null}"#,
+            403,
+        ),
+        (
+            format!("Content-Type: application/json\r\n{ADMIN}"),
+            r#"{"down_kbit": 100, "up_kbit": null}"#,
+            403,
+        ),
+        (admin.clone(), r#"{"down": 100}"#, 400),
+        (admin.clone(), r#"{"down_kbit": 10, "up_kbit": null}"#, 400),
+    ];
+    for (headers, body, want) in cases {
+        assert_eq!(post(r.c.http, &limit, &headers, body).0, want, "{body}");
+    }
+    let (status, _) = post(
+        r.c.http,
+        "/api/clients/ff:ff:ff:ff:ff:ff/limit",
+        &admin,
+        r#"{"down_kbit": 100, "up_kbit": null}"#,
+    );
+    assert_eq!(status, 400);
+    a.hears_nothing(Duration::from_millis(200));
+    assert_eq!(a.limit_syncs.len(), 4);
+    let ok = "wifi_actions_total{action=\"limit\",result=\"ok\"} 1";
+    assert!(metrics_of(&r, "wifi_actions_total{action=\"limit\"").contains(&ok.to_owned()));
+}
+
 #[test]
 fn block_resent_on_reconnect() {
     let r = controller(Timing::default());

@@ -54,6 +54,7 @@ pub fn view(state: &State, wanted: impl Fn(&str) -> bool, flows: bool) -> Value 
         "config": config(state),
         "manage": manage(state),
         "rollouts": rollouts(state, LIVE_LOG),
+        "limits": crate::limits::view(state),
     });
     if flows {
         v["flows"] = self::flows(state, &wanted, None);
@@ -513,6 +514,7 @@ fn ap_view(ap: &Ap) -> Value {
         o.insert("load".into(), (f64::from(s.load_milli) / 1000.0).into());
         o.insert("mem_kb".into(), s.mem_avail_kb.into());
         o.insert("nss".into(), s.nss_load_pct.into());
+        o.insert("offload_held".into(), s.offload_held.into());
         let temps = s
             .temps
             .iter()
