@@ -8,7 +8,8 @@
 //! of the flows a UI watches (`names`); the client guards' mode, given each
 //! AP after its first key frame with the leases they are seeded with (seeded
 //! again whenever the leases change), and each AP's bindings and violations;
-//! the live Wi-Fi
+//! the clients' sessions and timelines (`sessions`), fed from all of it and
+//! from RADIUS's verdicts (`radius`); the live Wi-Fi
 //! configurations, signed here (`configs`) for the AP whose configured host
 //! name they name and known here by hash only once sent (each AP's last
 //! acknowledged one kept on disk too), the latest one of each AP signed again
@@ -45,7 +46,9 @@ use crate::leases::{Lease, Leases};
 use crate::names::{self, Names};
 use crate::oui;
 use crate::policy::{ApImages, Blocked, ConfigId, Hold, Phase, Policy, SavedRollout};
+use crate::radius::{self, Line};
 use crate::rf::history::{self, History};
+use crate::sessions::{self, Sessions};
 use crate::spectrum::{self, Limits, Scan, Stopped};
 
 /// Events kept per AP, newest last.
@@ -589,6 +592,10 @@ pub struct State {
     policy_dirty: bool,
     /// What each radio's snapshots said over the RF planner's window.
     pub history: History,
+    /// The clients' sessions and timelines.
+    pub sessions: Sessions,
+    /// How the reads of RADIUS's log go, when it is read.
+    pub radius: Option<radius::Health>,
 }
 
 impl State {
@@ -621,7 +628,20 @@ impl State {
             rollout_counts: BTreeMap::new(),
             policy_dirty: false,
             history: History::new(history::WINDOW),
+            sessions: Sessions::default(),
+            radius: None,
         }
+    }
+
+    /// The state going on from the sessions and timelines `sessions`.
+    pub fn with_sessions(self, sessions: Sessions) -> Self {
+        State { sessions, ..self }
+    }
+
+    /// The state reading RADIUS's log.
+    pub fn with_radius(self) -> Self {
+        let radius = Some(radius::Health::default());
+        State { radius, ..self }
     }
 
     /// The state with a saved policy's blocks, acknowledged configurations
@@ -916,6 +936,8 @@ impl State {
         };
         let now = SystemTime::now();
         entry.last_seen = Some(now);
+        // The first snapshot of a session of the AP's link.
+        let fresh = entry.snapshot.is_none();
         let change = match msg {
             AgentMsg::Hello(h) => {
                 entry.hello = Some(h);
@@ -1022,6 +1044,23 @@ impl State {
                 (&a.previous, &a.snapshot, a.snapshot_at)
         {
             self.history.observe(ap, prev, *then, now, at);
+        }
+        let now_ms = sessions::unix_ms(now);
+        if let Some(a) = self.aps.get(ap) {
+            match &change {
+                Some(Change::Event(_, ev)) => self.sessions.event(ap, &a.naming, ev, now_ms),
+                Some(Change::Snapshot(_)) => {
+                    if let Some(snap) = &a.snapshot {
+                        self.sessions.snapshot(ap, snap, &a.naming, now_ms, fresh);
+                    }
+                }
+                Some(Change::Flows(_)) => {
+                    if let Some((f, _)) = &a.flows {
+                        self.sessions.flows(ap, f, now_ms);
+                    }
+                }
+                _ => {}
+            }
         }
         if let Some(c) = change {
             self.notify(c);
@@ -1198,6 +1237,7 @@ impl State {
         if self.actions.len() == ACTIONS_CAP {
             self.actions.pop_front();
         }
+        self.sessions.action(&action);
         self.actions.push_back(action.clone());
         self.notify(Change::Action(action));
     }
@@ -1767,12 +1807,32 @@ impl State {
         if !self.leases.take(exporter, read, now) {
             return;
         }
+        self.sessions.leases(&self.leases, sessions::unix_ms(now));
         let Some(seed) = self.seed() else { return };
         for live in self.aps.values().filter_map(|a| a.session.as_ref()) {
             // A session that far behind is stalled; its next one is seeded.
             let _ = live.outbox.try_send(CtlMsg::SeedBindings(seed.clone()));
         }
         self.notify(Change::Names);
+    }
+
+    /// Takes a read of RADIUS's log at `now`: its new lines, or a failure.
+    pub fn take_radius(&mut self, read: Result<Vec<Line>, ()>, now: SystemTime) {
+        let Some(health) = &mut self.radius else {
+            return;
+        };
+        health.up = Some(read.is_ok());
+        if let Ok(lines) = read {
+            health.last_ok = Some(now);
+            self.sessions.radius(&lines);
+        }
+    }
+
+    /// Drops what the sessions keep past its time, at `now`.
+    pub fn sessions_tick(&mut self, now: SystemTime) {
+        let aps = &self.aps;
+        let up = |ap: &str| aps.get(ap).is_some_and(Ap::is_up);
+        self.sessions.tick(sessions::unix_ms(now), up);
     }
 
     /// The DNS name of `ip`, as last looked up.

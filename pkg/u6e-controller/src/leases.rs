@@ -4,25 +4,23 @@
 //! subnet_id}` sample per active lease, its value the lease's expiry. The
 //! controller never speaks to the DHCP servers themselves.
 //!
-//! Every [`EVERY`] each exporter is read over plain HTTP/1.0 (no chunking,
-//! the body ends with the connection) and its leases replace the ones it
-//! gave last; one that does not answer keeps its last ones until they
-//! expire. A client's addresses are the union over the exporters, each
-//! address with its newest expiry, and its host name and device those of
-//! its lease that expires last. The APs' client guards are seeded from
-//! them (`state`), never before a read has worked.
+//! Every [`EVERY`] each exporter is read over plain HTTP/1.0 (`fetch`) and
+//! its leases replace the ones it gave last; one that does not answer keeps
+//! its last ones until they expire. A client's addresses are the union over
+//! the exporters, each address with its newest expiry, and its host name and
+//! device those of its lease that expires last. The APs' client guards are
+//! seeded from them (`state`), never before a read has worked; the clients'
+//! timelines (`sessions`) take a lease new or renewed since the last read.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::time::{interval, timeout};
+use tokio::time::interval;
 use u6e_proto::mac;
 
-use crate::names;
 use crate::state::Shared;
+use crate::{fetch, names};
 
 /// The family that carries the leases.
 pub const FAMILY: &str = "kea_lease_expiry_timestamp_seconds";
@@ -278,49 +276,13 @@ pub async fn supervise(state: Shared, exporters: Vec<String>) {
 
 /// The exposition of the exporter at `address` (`host:port`).
 pub async fn read(address: &str) -> Result<String, String> {
-    timeout(TIMEOUT, fetch(address))
-        .await
-        .map_err(|_| "no answer in 10 s".to_owned())?
-}
-
-async fn fetch(address: &str) -> Result<String, String> {
-    let host = address.rsplit_once(':').map_or(address, |(h, _)| h);
-    let mut sock = TcpStream::connect(address)
-        .await
-        .map_err(|e| e.to_string())?;
-    let ask = format!("GET /metrics HTTP/1.0\r\nHost: {host}\r\nAccept: text/plain\r\n\r\n");
-    sock.write_all(ask.as_bytes())
-        .await
-        .map_err(|e| e.to_string())?;
-    let mut body = Vec::new();
-    let read = (&mut sock)
-        .take(BODY_MAX as u64 + 1)
-        .read_to_end(&mut body)
-        .await;
-    read.map_err(|e| e.to_string())?;
-    if body.len() > BODY_MAX {
-        return Err("the exposition is over 16 MiB".into());
-    }
-    let text = String::from_utf8(body).map_err(|_| "the answer is not UTF-8".to_owned())?;
-    let (head, body) = text.split_once("\r\n\r\n").ok_or("no end of the headers")?;
-    let mut lines = head.lines();
-    let status = lines.next().unwrap_or_default();
-    if status.split_whitespace().nth(1) != Some("200") {
-        return Err(format!("answered {status:?}"));
-    }
-    let encoded = lines.any(|l| {
-        let l = l.to_ascii_lowercase();
-        l.starts_with("transfer-encoding:") || l.starts_with("content-encoding:")
-    });
-    if encoded {
-        return Err("the body is encoded".into());
-    }
-    Ok(body.to_owned())
+    fetch::get(address, "/metrics", "text/plain", BODY_MAX, TIMEOUT).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// The exporter's own spelling: labels sorted by name, the value in
     /// exponent form, a host name with its root dot.

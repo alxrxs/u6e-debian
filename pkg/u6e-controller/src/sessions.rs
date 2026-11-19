@@ -1,0 +1,1419 @@
+//! The clients' sessions, one per association with a BSS, and their
+//! timeline (`timeline`), built from what the controller already hears: the
+//! agents' events (associations, disassociations, EAP's steps) and
+//! snapshots (who is associated, how each authenticated, their bytes), the
+//! flows (first traffic), the leases (grants and renewals, seen at the next
+//! read of the leases), RADIUS's verdicts (`radius`), the operators' actions
+//! and the client guards' reports.
+//!
+//! A session ends with a reason. An association with another BSS while one
+//! is open, or within [`ROAM_WINDOW_MS`] of one ending elsewhere, is a roam,
+//! and the new session's `Joined` says where from (and whether it was a fast
+//! transition, once its AP says how it authenticated). A disassociation is a
+//! kick or a block when an operator's came within [`CAUSE_WINDOW_MS`], EAP's
+//! failure or timeout when one did, inactivity when the client had been
+//! silent past [`INACTIVE_MS`], and otherwise the client leaving. A session
+//! whose client was gone when its AP was heard again (its link, or the
+//! controller, was away) ends unobserved at the time it was last heard, as
+//! does one of an AP not heard for an hour.
+//!
+//! What is kept is bounded: the sessions of the last 30 days, at most
+//! [`SESSIONS_MAX`]; the timeline's own bounds; per identity (an EAP
+//! identity, or the MAC of a MAC-authenticated client) the totals and the
+//! last client certificate expiry, of the [`IDENTITIES_MAX`] identities seen
+//! last within 30 days. It is all saved in one file (`history_path`, 0600:
+//! it names people), whole through `store::replace`, every
+//! [`SAVE_EVERY`] when it changed and when the controller stops; a file that
+//! does not decode is set aside as `<name>.corrupt-<ms>` and the controller
+//! starts without it.
+
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::fs;
+use std::io::{self, ErrorKind};
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+use tokio::time::interval;
+use u6e_proto::mac;
+use u6e_proto::msg::{AuthKind, Band, Event, EventKind, Flows, Snapshot, StationAuth};
+
+use crate::leases::Leases;
+use crate::radius::Line;
+use crate::state::{Action, Naming, Shared};
+use crate::store;
+use crate::timeline::{EapStep, End, Entry, Place, Roam, Timeline, What};
+
+const DAY_MS: u64 = 24 * 3600 * 1000;
+/// How long ended sessions are kept, and how many at most.
+pub const SESSIONS_KEEP_MS: u64 = 30 * DAY_MS;
+pub const SESSIONS_MAX: usize = 10_000;
+/// An association elsewhere this soon after a session ended makes the end a
+/// roam.
+pub const ROAM_WINDOW_MS: u64 = 10_000;
+/// An operator's action, or EAP's failure, this soon before a
+/// disassociation is its cause.
+pub const CAUSE_WINDOW_MS: u64 = 30_000;
+/// A client silent this long when it went had been dropped as inactive.
+pub const INACTIVE_MS: u32 = 60_000;
+/// An open session of an AP not heard for this long ends unobserved.
+const UNHEARD_MS: u64 = 3600 * 1000;
+/// A station that began this much later than its open session did is a
+/// new association the events did not tell of (AP-STA-CONNECTED comes after
+/// EAP, which may take this long).
+const REASSOCIATED_MS: u64 = 60_000;
+/// An AP's event time this far from the controller's clock is the AP's
+/// unsynchronized clock (it boots at its image's build time): the event is
+/// timed when it arrives.
+const SKEW_MS: u64 = 5 * 60 * 1000;
+/// The identities whose totals and certificate expiry are kept.
+pub const IDENTITIES_MAX: usize = 256;
+const IDENTITY_KEEP_MS: u64 = 30 * DAY_MS;
+/// The clients whose recent causes are kept, at most.
+const RECENT_MAX: usize = 4096;
+/// How often the history is saved, when it changed.
+pub const SAVE_EVERY: Duration = Duration::from_secs(300);
+/// What the file starts with, and the format of what follows, raised with
+/// every change to it.
+const MARK: &[u8; 4] = b"U6CH";
+const FORMAT: u16 = 1;
+/// The largest file read: the bounds keep it far below.
+const FILE_MAX: u64 = 256 << 20;
+
+/// One association of a client with a BSS.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Session {
+    pub id: u64,
+    pub mac: [u8; 6],
+    pub place: Place,
+    pub start_ms: u64,
+    /// When it ended; `None` while it is open.
+    pub end_ms: Option<u64>,
+    /// When its client was last heard.
+    pub last_ms: u64,
+    /// How it authenticated, once its AP said.
+    pub auth: Option<StationAuth>,
+    /// Bytes from the client and to it, as its AP counted them.
+    pub up_bytes: u64,
+    pub down_bytes: u64,
+    pub end: Option<End>,
+    /// The AP it roamed in from.
+    pub from: Option<String>,
+    /// Whether its first traffic was seen.
+    traffic: bool,
+    /// How long its client had been silent when last heard of.
+    inactive_ms: u32,
+}
+
+impl Session {
+    /// Who it authenticated as: its EAP identity, or its MAC when RADIUS
+    /// admitted the MAC.
+    pub fn identity(&self) -> Option<String> {
+        let a = self.auth.as_ref()?;
+        match a.kind() {
+            AuthKind::Eap if !a.identity.is_empty() => Some(a.identity.clone()),
+            AuthKind::MacAuth => Some(mac::format(self.mac)),
+            _ => None,
+        }
+    }
+}
+
+/// An identity's sessions and bytes over the sessions that ended, and when
+/// it was last seen.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Totals {
+    pub sessions: u64,
+    pub up_bytes: u64,
+    pub down_bytes: u64,
+    pub seen_ms: u64,
+}
+
+/// An identity's client certificate: when it expires (Unix seconds), as
+/// RADIUS last accepted it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cert {
+    pub expires_s: u64,
+    pub seen_ms: u64,
+}
+
+/// What lately happened to a client that explains how a session of it ends.
+#[derive(Debug, Default)]
+struct Recent {
+    /// The AP whose EAP with it started last, and when.
+    eap_start: Option<(String, u64)>,
+    /// EAP's last failure or timeout, and when.
+    failure: Option<(End, u64)>,
+    /// The last operator's action that worked on it, by whom, and when.
+    action: Option<(&'static str, Option<String>, u64)>,
+}
+
+impl Recent {
+    fn newest(&self) -> u64 {
+        let times = [
+            self.eap_start.as_ref().map(|e| e.1),
+            self.failure.as_ref().map(|f| f.1),
+            self.action.as_ref().map(|a| a.2),
+        ];
+        times.into_iter().flatten().max().unwrap_or(0)
+    }
+}
+
+/// What the file holds.
+#[derive(Serialize, Deserialize)]
+struct Saved {
+    next_id: u64,
+    open: Vec<Session>,
+    closed: Vec<Session>,
+    timeline: Vec<([u8; 6], Vec<Entry>)>,
+    totals: Vec<(String, Totals)>,
+    certs: Vec<(String, Cert)>,
+}
+
+/// The sessions, the timeline and the identities' totals.
+#[derive(Debug, Default)]
+pub struct Sessions {
+    open: HashMap<[u8; 6], Session>,
+    /// Ended sessions, the newest last.
+    closed: VecDeque<Session>,
+    pub timeline: Timeline,
+    totals: BTreeMap<String, Totals>,
+    certs: BTreeMap<String, Cert>,
+    recent: HashMap<[u8; 6], Recent>,
+    /// The leases at the last read, by client and address: their expiry.
+    /// `None` until the first read, which only sets the baseline.
+    leases: Option<HashMap<([u8; 6], IpAddr), u64>>,
+    next_id: u64,
+    dirty: bool,
+}
+
+/// Milliseconds since the epoch.
+pub fn unix_ms(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// Where a station of BSS `bss` of the AP is, as its `naming` says.
+fn place(ap: &str, naming: &Naming, bss: u16, vlan: Option<u16>) -> Option<Place> {
+    let b = naming.bsss.get(usize::from(bss))?;
+    let band = naming
+        .bands
+        .iter()
+        .find(|(p, _)| *p == b.phy)
+        .map(|(_, b)| *b);
+    Some(Place {
+        ap: ap.to_owned(),
+        bss: b.ifname.clone(),
+        ssid: b.ssid.clone(),
+        band,
+        vlan: vlan.unwrap_or(b.vlan),
+    })
+}
+
+impl Sessions {
+    /// Whether anything changed since this was last asked.
+    pub fn take_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.dirty)
+    }
+
+    fn push(&mut self, mac: [u8; 6], at_ms: u64, what: What) {
+        self.timeline.push(mac, Entry { at_ms, what });
+        self.dirty = true;
+    }
+
+    fn recent(&mut self, mac: [u8; 6]) -> &mut Recent {
+        if self.recent.len() >= RECENT_MAX && !self.recent.contains_key(&mac) {
+            let oldest = self.recent.iter().min_by_key(|(_, r)| r.newest());
+            if let Some(m) = oldest.map(|(m, _)| *m) {
+                self.recent.remove(&m);
+            }
+        }
+        self.recent.entry(mac).or_default()
+    }
+
+    /// The cause `kind` of the client's recent past, if it came within
+    /// [`CAUSE_WINDOW_MS`] before `at`.
+    fn cause(&self, mac: &[u8; 6], at: u64, session: &Session) -> End {
+        let fresh = |t: u64| t <= at && at - t <= CAUSE_WINDOW_MS;
+        let r = self.recent.get(mac);
+        match r.and_then(|r| r.action.clone()).filter(|a| fresh(a.2)) {
+            Some(("kick", by, _)) => return End::Kicked { by },
+            Some(("block", by, _)) => return End::Blocked { by },
+            _ => {}
+        }
+        if let Some((end, _)) = r.and_then(|r| r.failure.clone()).filter(|f| fresh(f.1)) {
+            return end;
+        }
+        if session.inactive_ms >= INACTIVE_MS {
+            return End::Inactive;
+        }
+        End::Left
+    }
+
+    /// Takes an event of `ap` heard at `now_ms`.
+    pub fn event(&mut self, ap: &str, naming: &Naming, ev: &Event, now_ms: u64) {
+        let at = if ev.at_ms.abs_diff(now_ms) > SKEW_MS {
+            now_ms
+        } else {
+            ev.at_ms
+        };
+        let eap = |step| What::Eap {
+            ap: ap.to_owned(),
+            step,
+        };
+        match &ev.kind {
+            EventKind::Assoc { mac, bss } => {
+                if let Some(p) = place(ap, naming, *bss, None) {
+                    self.join(*mac, p, at, at);
+                }
+            }
+            EventKind::Disassoc { mac, bss } => {
+                let here = |s: &Session| {
+                    s.place.ap == ap
+                        && naming.bsss.get(usize::from(*bss)).map(|b| &b.ifname)
+                            == Some(&s.place.bss)
+                };
+                if let Some(s) = self.open.get(mac).filter(|s| here(s)) {
+                    let why = self.cause(mac, at, s);
+                    self.close(*mac, at, why);
+                }
+            }
+            EventKind::EapStart { mac, .. } => {
+                self.recent(*mac).eap_start = Some((ap.to_owned(), at));
+                self.push(*mac, at, eap(EapStep::Started));
+            }
+            EventKind::EapOk { mac, .. } => {
+                let started = self.recent.get(mac).and_then(|r| r.eap_start.clone());
+                let ms = started
+                    .filter(|(a, t)| a == ap && *t <= at)
+                    .map(|(_, t)| at - t);
+                self.push(*mac, at, eap(EapStep::Succeeded { ms }));
+            }
+            EventKind::EapFail { mac, .. } => {
+                self.recent(*mac).failure = Some((End::EapFailed, at));
+                self.push(*mac, at, eap(EapStep::Failed));
+            }
+            EventKind::EapTimeout { mac, server, .. } => {
+                self.recent(*mac).failure = Some((End::EapTimedOut, at));
+                let step = EapStep::TimedOut { server: *server };
+                self.push(*mac, at, eap(step));
+            }
+            EventKind::PskMismatch { mac, .. } => {
+                let what = What::PskMismatch { ap: ap.to_owned() };
+                self.push(*mac, at, what);
+            }
+            EventKind::GuardViolation(v) => {
+                let what = What::Guard {
+                    ap: ap.to_owned(),
+                    guard: v.guard,
+                    detail: v.detail.clone(),
+                    dropped: v.dropped,
+                    repeats: v.repeats,
+                };
+                self.push(v.mac, at, what);
+            }
+            _ => {}
+        }
+    }
+
+    /// The client `mac` associated at `place`, beginning at `began` (heard
+    /// of at `at`): a new session, unless its open one is this very
+    /// association. A roam ends the session it leaves without an `Ended`
+    /// entry: the new `Joined` says where it came from.
+    fn join(&mut self, mac: [u8; 6], place: Place, began: u64, at: u64) {
+        let steered = self.recent.get(&mac).and_then(|r| r.action.clone());
+        let steered_by = steered
+            .filter(|a| a.0 == "steer" && a.2 <= at && at - a.2 <= CAUSE_WINDOW_MS)
+            .and_then(|a| a.1);
+        let mut from = None;
+        if let Some(open) = self.open.get(&mac) {
+            let same = open.place.ap == place.ap && open.place.bss == place.bss;
+            if same && began <= open.start_ms + REASSOCIATED_MS {
+                return;
+            }
+            if same {
+                self.close(mac, began, End::Left);
+            } else {
+                from = Some(Roam {
+                    ap: open.place.ap.clone(),
+                    band: open.place.band,
+                    gap_ms: None,
+                    steered_by: steered_by.clone(),
+                });
+                self.close_roamed(mac, began, &place.ap);
+            }
+        } else if let Some((id, ap, band, end)) = self.just_left(&mac, &place, began) {
+            from = Some(Roam {
+                ap,
+                band,
+                gap_ms: Some(began - end),
+                steered_by,
+            });
+            if let Some(s) = self.closed.iter_mut().rev().find(|s| s.id == id) {
+                s.end = Some(End::Roamed {
+                    to: place.ap.clone(),
+                });
+            }
+            let ended = |w: &What| matches!(w, What::Ended { session, .. } if *session == id);
+            self.timeline.edit(&mac, ended, |_| false);
+        }
+        self.next_id += 1;
+        let session = Session {
+            id: self.next_id,
+            mac,
+            place: place.clone(),
+            start_ms: began,
+            end_ms: None,
+            last_ms: at,
+            auth: None,
+            up_bytes: 0,
+            down_bytes: 0,
+            end: None,
+            from: from.as_ref().map(|r| r.ap.clone()),
+            traffic: false,
+            inactive_ms: 0,
+        };
+        self.open.insert(mac, session);
+        let what = What::Joined {
+            session: self.next_id,
+            place,
+            from,
+            auth: None,
+        };
+        self.push(mac, began, what);
+    }
+
+    /// The session of `mac` that ended elsewhere than `place` within
+    /// [`ROAM_WINDOW_MS`] before `began`, by the client leaving or going
+    /// quiet: its id, AP, band and end.
+    fn just_left(
+        &self,
+        mac: &[u8; 6],
+        place: &Place,
+        began: u64,
+    ) -> Option<(u64, String, Option<Band>, u64)> {
+        let recent = self
+            .closed
+            .iter()
+            .rev()
+            .take_while(|s| s.end_ms.is_some_and(|e| e + ROAM_WINDOW_MS >= began))
+            .find(|s| s.mac == *mac)?;
+        let end = recent.end_ms?;
+        let elsewhere = recent.place.ap != place.ap || recent.place.bss != place.bss;
+        let left = matches!(recent.end, Some(End::Left | End::Inactive));
+        let roam = (recent.id, recent.place.ap.clone(), recent.place.band, end);
+        (elsewhere && left && end <= began).then_some(roam)
+    }
+
+    /// Ends the open session of `mac` at `at` for `why`, with its
+    /// `Ended` entry.
+    fn close(&mut self, mac: [u8; 6], at: u64, why: End) {
+        let Some(s) = self.end(mac, at, why.clone()) else {
+            return;
+        };
+        let what = What::Ended {
+            session: s.id,
+            ap: s.place.ap.clone(),
+            why,
+            secs: s.end_ms.unwrap_or(at).saturating_sub(s.start_ms) / 1000,
+        };
+        self.push(mac, at, what);
+    }
+
+    /// Ends the open session of `mac` at `at` by a roam to `to`.
+    fn close_roamed(&mut self, mac: [u8; 6], at: u64, to: &str) {
+        let to = to.to_owned();
+        self.end(mac, at, End::Roamed { to });
+    }
+
+    /// Moves the open session of `mac` to the ended ones, counted in its
+    /// identity's totals; the session.
+    fn end(&mut self, mac: [u8; 6], at: u64, why: End) -> Option<&Session> {
+        let mut s = self.open.remove(&mac)?;
+        s.end_ms = Some(at.max(s.start_ms));
+        s.end = Some(why);
+        if let Some(id) = s.identity() {
+            let t = self.totals.entry(id).or_default();
+            t.sessions += 1;
+            t.up_bytes += s.up_bytes;
+            t.down_bytes += s.down_bytes;
+            t.seen_ms = t.seen_ms.max(at);
+            self.cap_identities();
+        }
+        self.closed.push_back(s);
+        if self.closed.len() > SESSIONS_MAX {
+            self.closed.pop_front();
+        }
+        self.dirty = true;
+        self.closed.back()
+    }
+
+    /// Takes a snapshot of `ap` received at `at_ms`; `fresh` when it is the
+    /// first of a session of the AP's link, after which a client missing
+    /// went unobserved.
+    pub fn snapshot(
+        &mut self,
+        ap: &str,
+        snap: &Snapshot,
+        naming: &Naming,
+        at_ms: u64,
+        fresh: bool,
+    ) {
+        let mut present = HashSet::new();
+        for st in &snap.stations {
+            let Some(p) = place(ap, naming, st.bss, Some(st.vlan)) else {
+                continue;
+            };
+            let began = at_ms.saturating_sub(u64::from(st.connected_s) * 1000);
+            let heard = at_ms.saturating_sub(u64::from(st.inactive_ms));
+            // An AP that still lists an association older than the one the
+            // client roamed to has not dropped it yet.
+            if self
+                .open
+                .get(&st.mac)
+                .is_some_and(|s| s.place.ap != ap && began < s.start_ms)
+            {
+                continue;
+            }
+            present.insert(st.mac);
+            // Associated again while the AP's link was away: the old
+            // session ended unseen.
+            if fresh
+                && let Some(s) = self.open.get(&st.mac)
+                && s.place.ap == ap
+                && began > s.start_ms + REASSOCIATED_MS
+            {
+                let at = s.last_ms;
+                self.close(st.mac, at, End::Unobserved);
+            }
+            self.join(st.mac, p, began, heard);
+            let auth = snap
+                .auth
+                .binary_search_by_key(&st.mac, |(m, _)| *m)
+                .ok()
+                .map(|i| &snap.auth[i].1);
+            let Some(s) = self.open.get_mut(&st.mac) else {
+                continue;
+            };
+            s.last_ms = s.last_ms.max(heard);
+            s.up_bytes = st.rx_bytes;
+            s.down_bytes = st.tx_bytes;
+            s.inactive_ms = st.inactive_ms;
+            let vlan_moved = s.place.vlan != st.vlan;
+            s.place.vlan = st.vlan;
+            let learnt = auth.filter(|a| s.auth.as_ref() != Some(a)).cloned();
+            if learnt.is_none() && !vlan_moved {
+                continue;
+            }
+            if let Some(a) = &learnt {
+                s.auth = Some(a.clone());
+            }
+            let (id, vlan) = (s.id, st.vlan);
+            let joined = |w: &What| matches!(w, What::Joined { session, .. } if *session == id);
+            self.timeline.edit(&st.mac, joined, |w| {
+                if let What::Joined { place, auth, .. } = w {
+                    place.vlan = vlan;
+                    if learnt.is_some() {
+                        *auth = learnt;
+                    }
+                }
+                true
+            });
+            self.dirty = true;
+        }
+        let gone: Vec<[u8; 6]> = self
+            .open
+            .values()
+            .filter(|s| s.place.ap == ap && !present.contains(&s.mac))
+            .map(|s| s.mac)
+            .collect();
+        for mac in gone {
+            let s = &self.open[&mac];
+            let at = s.last_ms;
+            let why = if fresh {
+                End::Unobserved
+            } else {
+                self.cause(&mac, at, s)
+            };
+            self.close(mac, at, why);
+        }
+    }
+
+    /// Takes flows of `ap` received at `at_ms`: the first connections of a
+    /// session.
+    pub fn flows(&mut self, ap: &str, flows: &Flows, at_ms: u64) {
+        for c in flows.clients.iter().filter(|c| c.conns > 0) {
+            let Some(s) = self.open.get_mut(&c.mac) else {
+                continue;
+            };
+            if s.place.ap != ap || s.traffic {
+                continue;
+            }
+            s.traffic = true;
+            let what = What::FirstTraffic {
+                ap: ap.to_owned(),
+                conns: c.conns,
+            };
+            self.push(c.mac, at_ms, what);
+        }
+    }
+
+    /// Takes an operator's action.
+    pub fn action(&mut self, a: &Action) {
+        let Some(mac) = a.mac else { return };
+        let at = unix_ms(a.at);
+        if a.ok {
+            self.recent(mac).action = Some((a.action, a.user.clone(), at));
+        }
+        let what = What::Action {
+            action: a.action.to_owned(),
+            user: a.user.clone(),
+            ap: a.ap.clone(),
+            ok: a.ok,
+            detail: a.detail.clone(),
+        };
+        self.push(mac, at, what);
+    }
+
+    /// Takes a read of the leases at `now_ms`: a lease new since the last
+    /// read, or with a later expiry, is granted or renewed then, for the
+    /// clients the Wi-Fi knows. The first read only sets what is known.
+    pub fn leases(&mut self, leases: &Leases, now_ms: u64) {
+        let now = UNIX_EPOCH + Duration::from_millis(now_ms);
+        let current: HashMap<([u8; 6], IpAddr), u64> = leases
+            .all(now)
+            .flat_map(|(m, l)| l.addresses.into_iter().map(move |(ip, e)| ((m, ip), e)))
+            .collect();
+        let Some(before) = self.leases.replace(current.clone()) else {
+            return;
+        };
+        let mut news: Vec<_> = current
+            .iter()
+            .filter_map(|(&(m, ip), &expires)| match before.get(&(m, ip)) {
+                None => Some((m, ip, expires, false)),
+                Some(&was) if expires > was => Some((m, ip, expires, true)),
+                Some(_) => None,
+            })
+            .filter(|(m, ..)| self.open.contains_key(m) || self.timeline.knows(m))
+            .collect();
+        news.sort();
+        for (m, ip, expires, renewed) in news {
+            let what = What::Lease {
+                ip,
+                expires,
+                renewed,
+            };
+            self.push(m, now_ms, what);
+        }
+    }
+
+    /// Takes RADIUS's verdicts: each into its client's timeline, and an
+    /// accepted certificate's expiry for its identity.
+    pub fn radius(&mut self, lines: &[Line]) {
+        for l in lines {
+            if l.accept
+                && let Some(expires_s) = l.cert_expires
+            {
+                let c = self.certs.entry(l.user.clone()).or_insert(Cert {
+                    expires_s,
+                    seen_ms: 0,
+                });
+                if l.at_ms >= c.seen_ms {
+                    *c = Cert {
+                        expires_s,
+                        seen_ms: l.at_ms,
+                    };
+                }
+                self.cap_identities();
+            }
+            let what = What::Radius {
+                accept: l.accept,
+                user: l.user.clone(),
+                node: l.node.clone(),
+                nas: l.nas.clone(),
+                detail: l.detail.clone(),
+                cert_expires: l.cert_expires,
+            };
+            self.push(l.mac, l.at_ms, what);
+        }
+    }
+
+    /// Keeps the identities seen last, [`IDENTITIES_MAX`] of each kind.
+    fn cap_identities(&mut self) {
+        while self.totals.len() > IDENTITIES_MAX {
+            let oldest = self.totals.iter().min_by_key(|(_, t)| t.seen_ms);
+            let Some(id) = oldest.map(|(i, _)| i.clone()) else {
+                break;
+            };
+            self.totals.remove(&id);
+        }
+        while self.certs.len() > IDENTITIES_MAX {
+            let oldest = self.certs.iter().min_by_key(|(_, c)| c.seen_ms);
+            let Some(id) = oldest.map(|(i, _)| i.clone()) else {
+                break;
+            };
+            self.certs.remove(&id);
+        }
+    }
+
+    /// Drops what is past its keeping at `now_ms`, and ends the open
+    /// sessions of APs not heard for an hour (`up` says which APs are).
+    pub fn tick(&mut self, now_ms: u64, up: impl Fn(&str) -> bool) {
+        let unheard: Vec<[u8; 6]> = self
+            .open
+            .values()
+            .filter(|s| !up(&s.place.ap) && s.last_ms + UNHEARD_MS < now_ms)
+            .map(|s| s.mac)
+            .collect();
+        for mac in unheard {
+            let at = self.open[&mac].last_ms;
+            self.close(mac, at, End::Unobserved);
+        }
+        let before = (self.closed.len(), self.timeline.total());
+        let cutoff = now_ms.saturating_sub(SESSIONS_KEEP_MS);
+        while self
+            .closed
+            .front()
+            .is_some_and(|s| s.end_ms.unwrap_or(0) < cutoff)
+        {
+            self.closed.pop_front();
+        }
+        self.timeline.prune(now_ms);
+        let cutoff = now_ms.saturating_sub(IDENTITY_KEEP_MS);
+        let open: HashSet<String> = self.open.values().filter_map(Session::identity).collect();
+        self.totals
+            .retain(|id, t| t.seen_ms >= cutoff || open.contains(id));
+        self.certs.retain(|_, c| c.seen_ms >= cutoff);
+        self.recent
+            .retain(|_, r| r.newest() + CAUSE_WINDOW_MS.max(ROAM_WINDOW_MS) >= now_ms);
+        self.dirty |= before != (self.closed.len(), self.timeline.total());
+    }
+
+    /// The open session of `mac`.
+    pub fn open_of(&self, mac: &[u8; 6]) -> Option<&Session> {
+        self.open.get(mac)
+    }
+
+    /// The sessions of `mac`, the newest first, the open one first of all.
+    pub fn of(&self, mac: &[u8; 6]) -> impl Iterator<Item = &Session> {
+        let closed = self.closed.iter().rev().filter(move |s| s.mac == *mac);
+        self.open.get(mac).into_iter().chain(closed)
+    }
+
+    /// Every open session.
+    pub fn all_open(&self) -> impl Iterator<Item = &Session> {
+        self.open.values()
+    }
+
+    /// The certificate RADIUS last accepted for `identity`.
+    pub fn cert(&self, identity: &str) -> Option<Cert> {
+        self.certs.get(identity).copied()
+    }
+
+    /// Every identity's certificate, by identity.
+    pub fn certs(&self) -> &BTreeMap<String, Cert> {
+        &self.certs
+    }
+
+    /// Every identity's totals with its open sessions counted in, and how
+    /// many clients it has on now.
+    pub fn identities(&self) -> BTreeMap<String, (Totals, usize)> {
+        let mut out: BTreeMap<String, (Totals, usize)> = self
+            .totals
+            .iter()
+            .map(|(i, t)| (i.clone(), (*t, 0)))
+            .collect();
+        for s in self.open.values() {
+            let Some(id) = s.identity() else { continue };
+            if !out.contains_key(&id) && out.len() >= IDENTITIES_MAX {
+                continue;
+            }
+            let (t, on) = out.entry(id).or_default();
+            t.up_bytes += s.up_bytes;
+            t.down_bytes += s.down_bytes;
+            *on += 1;
+        }
+        out
+    }
+
+    /// The file's bytes.
+    pub fn encode(&self) -> io::Result<Vec<u8>> {
+        let saved = Saved {
+            next_id: self.next_id,
+            open: self.open.values().cloned().collect(),
+            closed: self.closed.iter().cloned().collect(),
+            timeline: self.timeline.saved(),
+            totals: self.totals.iter().map(|(i, t)| (i.clone(), *t)).collect(),
+            certs: self.certs.iter().map(|(i, c)| (i.clone(), *c)).collect(),
+        };
+        let mut bytes = MARK.to_vec();
+        bytes.extend_from_slice(&FORMAT.to_le_bytes());
+        postcard::to_extend(&saved, bytes).map_err(io::Error::other)
+    }
+
+    /// What `path` holds; empty without the file. A file of another format,
+    /// or that does not decode, is set aside (the name it was set aside
+    /// under comes with the empty history); one that cannot be read at all
+    /// is an error.
+    pub fn load(path: &Path) -> io::Result<(Sessions, Option<String>)> {
+        let mut bytes = Vec::new();
+        match fs::File::open(path) {
+            Ok(f) => {
+                io::Read::read_to_end(&mut io::Read::take(f, FILE_MAX), &mut bytes)?;
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok((Sessions::default(), None)),
+            Err(e) => return Err(e),
+        }
+        let saved = match bytes.split_first_chunk::<6>() {
+            Some((head, body)) if &head[..4] == MARK && head[4..] == FORMAT.to_le_bytes() => {
+                postcard::from_bytes::<Saved>(body).ok()
+            }
+            _ => None,
+        };
+        let Some(saved) = saved else {
+            let aside = set_aside(path)?;
+            return Ok((Sessions::default(), Some(aside)));
+        };
+        let s = Sessions {
+            open: saved.open.into_iter().map(|s| (s.mac, s)).collect(),
+            closed: saved.closed.into(),
+            timeline: Timeline::from_saved(saved.timeline),
+            totals: saved.totals.into_iter().collect(),
+            certs: saved.certs.into_iter().collect(),
+            next_id: saved.next_id,
+            ..Sessions::default()
+        };
+        Ok((s, None))
+    }
+}
+
+/// Moves `path` aside as `<name>.corrupt-<ms>`; that name.
+fn set_aside(path: &Path) -> io::Result<String> {
+    let mut aside = path.as_os_str().to_owned();
+    aside.push(format!(".corrupt-{}", unix_ms(SystemTime::now())));
+    let aside = PathBuf::from(aside);
+    fs::rename(path, &aside)?;
+    Ok(aside.display().to_string())
+}
+
+/// Saves the history at `path` if it changed, after dropping what is past
+/// its keeping; a save that fails is tried again at the next.
+pub async fn save(state: &Shared, path: &Path) {
+    let bytes = {
+        let mut s = state.write();
+        s.sessions_tick(SystemTime::now());
+        if !s.sessions.take_dirty() {
+            return;
+        }
+        s.sessions.encode()
+    };
+    let path = path.to_owned();
+    let written = match bytes {
+        Ok(bytes) => tokio::task::spawn_blocking(move || {
+            store::replace(&path, &bytes, 0o600).map_err(|e| format!("{}: {e}", path.display()))
+        })
+        .await
+        .unwrap_or_else(|e| Err(e.to_string())),
+        Err(e) => Err(e.to_string()),
+    };
+    if let Err(e) = written {
+        eprintln!("u6e-controller: the client history could not be saved: {e}");
+        state.write().sessions.dirty = true;
+    }
+}
+
+/// Saves the history every [`SAVE_EVERY`], for the life of the process.
+pub async fn keep(state: Shared, path: PathBuf) {
+    let mut every = interval(SAVE_EVERY);
+    loop {
+        every.tick().await;
+        save(&state, &path).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testdir::TestDir;
+    use u6e_proto::msg::{Bss, ClientFlows, Guard, RateMode, Station, Violation};
+
+    const MAC: [u8; 6] = [2, 0, 0, 0, 0, 1];
+    const T0: u64 = 1_800_000_000_000;
+
+    /// An AP of one 5 GHz BSS (`wlan5`) and one 6 GHz BSS (`wlan6`).
+    fn naming() -> Naming {
+        let bss = |ifname: &str, phy: &str| Bss {
+            ifname: ifname.into(),
+            bssid: [2, 0, 0, 0, 0x10, 1],
+            ssid: "ssid-a".into(),
+            phy: phy.into(),
+            vlan: 10,
+        };
+        Naming {
+            bsss: vec![bss("wlan5", "phy1"), bss("wlan6", "phy2")],
+            bands: vec![("phy1".into(), Band::B5), ("phy2".into(), Band::B6)],
+        }
+    }
+
+    fn ev(at_ms: u64, kind: EventKind) -> Event {
+        Event { at_ms, kind }
+    }
+
+    fn assoc(s: &mut Sessions, ap: &str, bss: u16, at: u64) {
+        let e = ev(at, EventKind::Assoc { mac: MAC, bss });
+        s.event(ap, &naming(), &e, at);
+    }
+
+    fn disassoc(s: &mut Sessions, ap: &str, bss: u16, at: u64) {
+        let e = ev(at, EventKind::Disassoc { mac: MAC, bss });
+        s.event(ap, &naming(), &e, at);
+    }
+
+    fn eap(identity: &str, auth_alg: u16) -> StationAuth {
+        StationAuth {
+            akm: 0x000f_ac03,
+            auth_alg,
+            authorized: true,
+            identity: identity.into(),
+            eap_method: 13,
+            reauth_s: 0,
+        }
+    }
+
+    fn station(bss: u16, connected_s: u32, inactive_ms: u32) -> Station {
+        Station {
+            mac: MAC,
+            bss,
+            signal: -50,
+            signal_avg: -50,
+            rx_bytes: 1000,
+            tx_bytes: 9000,
+            rx_packets: 10,
+            tx_packets: 20,
+            tx_retries: 0,
+            tx_failed: 0,
+            tx_rate_kbps: 0,
+            rx_rate_kbps: 0,
+            tx_mcs: 0,
+            rx_mcs: 0,
+            tx_mode: RateMode::He,
+            rx_mode: RateMode::He,
+            tx_nss: 2,
+            rx_nss: 2,
+            tx_airtime_us: 0,
+            rx_airtime_us: 0,
+            inactive_ms,
+            connected_s,
+            vlan: 42,
+        }
+    }
+
+    fn snap(stations: Vec<Station>, auth: Option<StationAuth>) -> Snapshot {
+        let auth = auth.into_iter().map(|a| (MAC, a)).collect();
+        Snapshot {
+            seq: 1,
+            uptime_s: 0,
+            load_milli: 0,
+            mem_avail_kb: 0,
+            nss_load_pct: 0,
+            temps: Vec::new(),
+            radios: Vec::new(),
+            bsss: naming().bsss,
+            stations,
+            config_sha256: None,
+            clock_synced: true,
+            power_limits: Vec::new(),
+            auth,
+        }
+    }
+
+    /// The kinds of the client's entries, in order.
+    fn kinds(s: &Sessions) -> Vec<&'static str> {
+        let kind = |w: &What| match w {
+            What::Joined { from: None, .. } => "joined",
+            What::Joined { from: Some(_), .. } => "roamed",
+            What::Ended { .. } => "ended",
+            What::Eap { .. } => "eap",
+            What::PskMismatch { .. } => "psk",
+            What::Radius { .. } => "radius",
+            What::Lease { .. } => "lease",
+            What::FirstTraffic { .. } => "traffic",
+            What::Action { .. } => "action",
+            What::Guard { .. } => "guard",
+        };
+        s.timeline.of(&MAC).map(|e| kind(&e.what)).collect()
+    }
+
+    fn ends(s: &Sessions) -> Vec<Option<End>> {
+        s.of(&MAC).map(|x| x.end.clone()).collect()
+    }
+
+    /// A client joins, roams by FT to the other AP (which hears it before
+    /// the first lets it go) and leaves: two sessions, the first ended by
+    /// the roam, and one timeline that tells it once.
+    #[test]
+    fn a_join_an_ft_roam_and_a_leave() {
+        let mut s = Sessions::default();
+        assoc(&mut s, "ap1", 0, T0);
+        let st = station(0, 4, 100);
+        s.snapshot(
+            "ap1",
+            &snap(vec![st], Some(eap("host/pc1", 0))),
+            &naming(),
+            T0 + 5000,
+            false,
+        );
+        assoc(&mut s, "ap2", 1, T0 + 60_000);
+        let st = station(1, 1, 100);
+        s.snapshot(
+            "ap2",
+            &snap(vec![st], Some(eap("host/pc1", 2))),
+            &naming(),
+            T0 + 61_000,
+            false,
+        );
+        disassoc(&mut s, "ap1", 0, T0 + 61_500);
+        disassoc(&mut s, "ap2", 1, T0 + 120_000);
+        assert_eq!(kinds(&s), ["joined", "roamed", "ended"]);
+        assert_eq!(
+            ends(&s),
+            [Some(End::Left), Some(End::Roamed { to: "ap2".into() })]
+        );
+        let roam = s.timeline.of(&MAC).nth(1).unwrap();
+        let What::Joined {
+            place, from, auth, ..
+        } = &roam.what
+        else {
+            panic!("{roam:?}")
+        };
+        assert_eq!(
+            (place.ap.as_str(), place.band, place.vlan),
+            ("ap2", Some(Band::B6), 42)
+        );
+        let from = from.as_ref().unwrap();
+        assert_eq!(
+            (from.ap.as_str(), from.band, from.gap_ms),
+            ("ap1", Some(Band::B5), None)
+        );
+        assert!(auth.as_ref().unwrap().fast_transition());
+        let ended = s.timeline.of(&MAC).last().unwrap();
+        assert!(
+            matches!(
+                &ended.what,
+                What::Ended {
+                    secs: 60,
+                    why: End::Left,
+                    ..
+                }
+            ),
+            "{ended:?}"
+        );
+        let ids = s.identities();
+        let (t, on) = ids["host/pc1"];
+        assert_eq!(
+            (t.sessions, t.up_bytes, t.down_bytes, on),
+            (2, 2000, 18_000, 0)
+        );
+    }
+
+    /// A client that leaves one AP and joins the other within the window
+    /// roamed; its gap is the time between.
+    #[test]
+    fn leaving_then_joining_elsewhere_soon_after_is_a_roam() {
+        let mut s = Sessions::default();
+        assoc(&mut s, "ap1", 0, T0);
+        disassoc(&mut s, "ap1", 0, T0 + 30_000);
+        assoc(&mut s, "ap2", 0, T0 + 33_000);
+        assert_eq!(kinds(&s), ["joined", "roamed"]);
+        assert_eq!(ends(&s)[1], Some(End::Roamed { to: "ap2".into() }));
+        let What::Joined { from, .. } = &s.timeline.of(&MAC).last().unwrap().what else {
+            panic!()
+        };
+        assert_eq!(from.as_ref().unwrap().gap_ms, Some(3000));
+        // Too late, or on the same BSS, it is a new connection.
+        disassoc(&mut s, "ap2", 0, T0 + 40_000);
+        assoc(&mut s, "ap1", 0, T0 + 51_000);
+        disassoc(&mut s, "ap1", 0, T0 + 52_000);
+        assoc(&mut s, "ap1", 0, T0 + 53_000);
+        assert_eq!(
+            kinds(&s),
+            ["joined", "roamed", "ended", "joined", "ended", "joined"]
+        );
+    }
+
+    fn act(s: &mut Sessions, action: &'static str, at_ms: u64) {
+        s.action(&Action {
+            at: UNIX_EPOCH + Duration::from_millis(at_ms),
+            user: Some("admin".into()),
+            action,
+            mac: Some(MAC),
+            ap: Some("ap1".into()),
+            ok: true,
+            detail: String::new(),
+        });
+    }
+
+    /// What came just before a disassociation is its cause: an operator's
+    /// kick or block, EAP failing, or silence; a steer followed makes the
+    /// roam its.
+    #[test]
+    fn a_disassociation_is_put_down_to_what_came_before() {
+        let mut s = Sessions::default();
+        let mut t = T0;
+        let mut cycle = |s: &mut Sessions, before: &dyn Fn(&mut Sessions, u64)| {
+            assoc(s, "ap1", 0, t);
+            before(s, t + 1000);
+            disassoc(s, "ap1", 0, t + 2000);
+            t += 100_000;
+            s.of(&MAC).next().unwrap().end.clone()
+        };
+        assert_eq!(
+            cycle(&mut s, &|s, at| act(s, "kick", at)),
+            Some(End::Kicked {
+                by: Some("admin".into())
+            })
+        );
+        assert_eq!(
+            cycle(&mut s, &|s, at| act(s, "block", at)),
+            Some(End::Blocked {
+                by: Some("admin".into())
+            })
+        );
+        let fail = |s: &mut Sessions, at| {
+            s.event(
+                "ap1",
+                &naming(),
+                &ev(at, EventKind::EapFail { mac: MAC, bss: 0 }),
+                at,
+            )
+        };
+        assert_eq!(cycle(&mut s, &fail), Some(End::EapFailed));
+        let quiet = |s: &mut Sessions, at| {
+            s.snapshot(
+                "ap1",
+                &snap(vec![station(0, 1, 70_000)], None),
+                &naming(),
+                at,
+                false,
+            )
+        };
+        assert_eq!(cycle(&mut s, &quiet), Some(End::Inactive));
+        assert_eq!(cycle(&mut s, &|_, _| {}), Some(End::Left));
+        // A kick long before is no cause.
+        act(&mut s, "kick", t);
+        assoc(&mut s, "ap1", 0, t + CAUSE_WINDOW_MS + 10_000);
+        disassoc(&mut s, "ap1", 0, t + CAUSE_WINDOW_MS + 11_000);
+        assert_eq!(ends(&s)[0], Some(End::Left));
+        let t = t + 200_000;
+        assoc(&mut s, "ap1", 0, t);
+        act(&mut s, "steer", t + 1000);
+        assoc(&mut s, "ap2", 1, t + 3000);
+        let What::Joined { from, .. } = &s.timeline.of(&MAC).last().unwrap().what else {
+            panic!()
+        };
+        assert_eq!(from.as_ref().unwrap().steered_by.as_deref(), Some("admin"));
+    }
+
+    /// EAP's steps go into the timeline, its success timed from its start;
+    /// an AP whose clock is off is timed by the controller's.
+    #[test]
+    fn eap_steps_and_their_times() {
+        let mut s = Sessions::default();
+        let n = naming();
+        s.event(
+            "ap1",
+            &n,
+            &ev(T0, EventKind::EapStart { mac: MAC, bss: 0 }),
+            T0,
+        );
+        s.event(
+            "ap1",
+            &n,
+            &ev(T0 + 1500, EventKind::EapOk { mac: MAC, bss: 0 }),
+            T0 + 1500,
+        );
+        let timeout = EventKind::EapTimeout {
+            mac: MAC,
+            bss: 0,
+            server: true,
+        };
+        s.event("ap1", &n, &ev(1_000, timeout), T0 + 9000);
+        let steps: Vec<(u64, EapStep)> = s
+            .timeline
+            .of(&MAC)
+            .filter_map(|e| match &e.what {
+                What::Eap { step, .. } => Some((e.at_ms, *step)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            steps,
+            [
+                (T0, EapStep::Started),
+                (T0 + 1500, EapStep::Succeeded { ms: Some(1500) }),
+                (T0 + 9000, EapStep::TimedOut { server: true })
+            ]
+        );
+    }
+
+    /// The first snapshot of a link's session reconciles: a client gone in
+    /// the meantime ended unobserved, one that associated again began a
+    /// new session, one still there goes on.
+    #[test]
+    fn an_ap_heard_again_reconciles_its_sessions() {
+        let mut s = Sessions::default();
+        assoc(&mut s, "ap1", 0, T0);
+        s.snapshot(
+            "ap1",
+            &snap(vec![station(0, 10, 0)], None),
+            &naming(),
+            T0 + 10_000,
+            false,
+        );
+        // Still there an hour later, the same association.
+        let later = T0 + 3_600_000;
+        s.snapshot(
+            "ap1",
+            &snap(vec![station(0, 3610, 0)], None),
+            &naming(),
+            later,
+            true,
+        );
+        assert_eq!(s.of(&MAC).count(), 1);
+        // Associated anew while the link was away.
+        let again = later + 3_600_000;
+        s.snapshot(
+            "ap1",
+            &snap(vec![station(0, 30, 0)], None),
+            &naming(),
+            again,
+            true,
+        );
+        assert_eq!(ends(&s), [None, Some(End::Unobserved)]);
+        // Gone while it was away.
+        s.snapshot(
+            "ap1",
+            &snap(Vec::new(), None),
+            &naming(),
+            again + 600_000,
+            true,
+        );
+        assert_eq!(ends(&s)[0], Some(End::Unobserved));
+        let first = s.of(&MAC).next().unwrap();
+        assert_eq!(first.end_ms, Some(again));
+    }
+
+    /// An AP not heard for an hour ends its sessions unobserved; what is
+    /// past its keeping goes.
+    #[test]
+    fn the_tick_ends_what_no_ap_reports_and_drops_the_old() {
+        let mut s = Sessions::default();
+        assoc(&mut s, "ap1", 0, T0);
+        s.tick(T0 + 1000, |_| false);
+        assert!(s.open_of(&MAC).is_some());
+        s.tick(T0 + UNHEARD_MS + 1, |_| true);
+        assert!(s.open_of(&MAC).is_some(), "its AP is up");
+        s.tick(T0 + UNHEARD_MS + 1, |_| false);
+        assert_eq!(ends(&s), [Some(End::Unobserved)]);
+        s.tick(T0 + SESSIONS_KEEP_MS + 1, |_| true);
+        assert_eq!(s.of(&MAC).count(), 0);
+        assert_eq!(s.timeline.total(), 0);
+    }
+
+    fn leases_of(entries: &[([u8; 6], &str, u64)]) -> Leases {
+        let mut l = Leases::new(&["dhcp1:9100".into()]);
+        let list = entries
+            .iter()
+            .map(|(mac, ip, expires)| crate::leases::Lease {
+                mac: *mac,
+                ip: ip.parse().unwrap(),
+                hostname: None,
+                device: None,
+                expires: *expires,
+            })
+            .collect();
+        l.take("dhcp1:9100", Ok(list), UNIX_EPOCH);
+        l
+    }
+
+    /// The first read of the leases only sets what is known; a lease new
+    /// since, or renewed, goes into the timeline of a client the Wi-Fi
+    /// knows, and of no other.
+    #[test]
+    fn leases_granted_and_renewed() {
+        let mut s = Sessions::default();
+        let other = [2, 0, 0, 0, 0, 9];
+        let now = T0 / 1000;
+        s.leases(&leases_of(&[(MAC, "192.0.2.10", now + 600)]), T0);
+        assert_eq!(s.timeline.total(), 0);
+        assoc(&mut s, "ap1", 0, T0 + 1000);
+        let read = [
+            (MAC, "192.0.2.10", now + 1800),
+            (MAC, "192.0.2.11", now + 1800),
+            (other, "192.0.2.12", now + 1800),
+        ];
+        s.leases(&leases_of(&read), T0 + 60_000);
+        s.leases(&leases_of(&read), T0 + 120_000);
+        let leases: Vec<(String, bool)> = s
+            .timeline
+            .of(&MAC)
+            .filter_map(|e| match &e.what {
+                What::Lease { ip, renewed, .. } => Some((ip.to_string(), *renewed)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            leases,
+            [("192.0.2.10".into(), true), ("192.0.2.11".into(), false)]
+        );
+        assert!(!s.timeline.knows(&other));
+    }
+
+    fn line(at_ms: u64, accept: bool, cert_expires: Option<u64>) -> Line {
+        Line {
+            at_ms,
+            mac: MAC,
+            accept,
+            user: "host/pc1".into(),
+            node: "radius1".into(),
+            nas: "ap1".into(),
+            detail: if accept { "eap" } else { "no" }.into(),
+            cert_expires,
+        }
+    }
+
+    /// RADIUS's verdicts go into the timeline in time order; an accepted
+    /// certificate's expiry is its identity's, the newest accept's winning.
+    #[test]
+    fn radius_verdicts_and_certificates() {
+        let mut s = Sessions::default();
+        assoc(&mut s, "ap1", 0, T0 + 5000);
+        s.radius(&[
+            line(T0 + 4000, true, Some(1_900_000_000)),
+            line(T0 + 1000, false, None),
+        ]);
+        assert_eq!(kinds(&s), ["radius", "radius", "joined"]);
+        assert_eq!(s.cert("host/pc1").unwrap().expires_s, 1_900_000_000);
+        // An older line read late does not replace the newer certificate.
+        s.radius(&[line(T0 + 2000, true, Some(1_800_000_000))]);
+        assert_eq!(s.cert("host/pc1").unwrap().expires_s, 1_900_000_000);
+        s.radius(&[line(T0 + 9000, true, Some(1_950_000_000))]);
+        assert_eq!(s.cert("host/pc1").unwrap().expires_s, 1_950_000_000);
+    }
+
+    /// First traffic and the guards' reports, once each.
+    #[test]
+    fn first_traffic_and_guard_reports() {
+        let mut s = Sessions::default();
+        assoc(&mut s, "ap1", 0, T0);
+        let flows = |conns| Flows {
+            seq: 1,
+            complete: true,
+            clients: vec![ClientFlows {
+                mac: MAC,
+                conns,
+                offloaded: 0,
+                tx_bytes: 0,
+                rx_bytes: 0,
+                tx_packets: 0,
+                rx_packets: 0,
+                top: Vec::new(),
+            }],
+        };
+        s.flows("ap1", &flows(0), T0 + 10_000);
+        s.flows("ap2", &flows(3), T0 + 20_000);
+        s.flows("ap1", &flows(3), T0 + 30_000);
+        s.flows("ap1", &flows(5), T0 + 40_000);
+        let v = Violation {
+            guard: Guard::Arp,
+            mac: MAC,
+            ifname: "wlan5".into(),
+            vlan: 10,
+            ip: None,
+            detail: "x".into(),
+            dropped: false,
+            repeats: 2,
+        };
+        let e = ev(T0 + 50_000, EventKind::GuardViolation(v));
+        s.event("ap1", &naming(), &e, T0 + 50_000);
+        assert_eq!(kinds(&s), ["joined", "traffic", "guard"]);
+    }
+
+    /// Saved and loaded alike; a file that is no history is set aside.
+    #[test]
+    fn the_history_is_saved_and_a_bad_file_set_aside() {
+        let t = TestDir::new();
+        let path = t.path().join("history");
+        let (s, aside) = Sessions::load(&path).unwrap();
+        assert_eq!((s.timeline.total(), aside), (0, None));
+        let mut s = Sessions::default();
+        assoc(&mut s, "ap1", 0, T0);
+        disassoc(&mut s, "ap1", 0, T0 + 60_000);
+        assoc(&mut s, "ap1", 1, T0 + 120_000);
+        s.radius(&[line(T0, true, Some(1_900_000_000))]);
+        store::replace(&path, &s.encode().unwrap(), 0o600).unwrap();
+        let (back, aside) = Sessions::load(&path).unwrap();
+        assert_eq!(aside, None);
+        assert_eq!(back.encode().unwrap(), s.encode().unwrap());
+        assert_eq!(back.of(&MAC).count(), 2);
+        fs::write(&path, b"U6CH\x09\x00garbage").unwrap();
+        let (empty, aside) = Sessions::load(&path).unwrap();
+        assert_eq!(empty.timeline.total(), 0);
+        let aside = aside.unwrap();
+        assert!(aside.contains("history.corrupt-"), "{aside}");
+        assert!(!path.exists());
+    }
+
+    /// 200 000 events over 5 000 clients across two APs and their
+    /// snapshots keep every bound, in little time.
+    #[test]
+    fn stress_keeps_every_bound() {
+        let started = std::time::Instant::now();
+        let mut s = Sessions::default();
+        let n = naming();
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |m: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % m
+        };
+        for i in 0..200_000u64 {
+            let c = next(5000) as u16;
+            let mac = [2, 0, 0, 1, (c >> 8) as u8, c as u8];
+            let ap = if next(2) == 0 { "ap1" } else { "ap2" };
+            let bss = next(2) as u16;
+            let at = T0 + i * 1000;
+            let kind = match next(6) {
+                0 | 1 => EventKind::Assoc { mac, bss },
+                2 => EventKind::Disassoc { mac, bss },
+                3 => EventKind::EapStart { mac, bss },
+                4 => EventKind::EapFail { mac, bss },
+                _ => EventKind::PskMismatch { mac, bss },
+            };
+            s.event(ap, &n, &ev(at, kind), at);
+            if i % 5000 == 0 {
+                s.radius(&[Line {
+                    mac,
+                    user: format!("user{c}"),
+                    ..line(at, true, Some(1_900_000_000))
+                }]);
+                s.tick(at, |_| true);
+            }
+        }
+        let end = T0 + 200_000 * 1000;
+        s.tick(end, |_| true);
+        assert!(s.timeline.total() <= crate::timeline::TOTAL);
+        assert!(s.closed.len() <= SESSIONS_MAX);
+        assert!(s.totals.len() <= IDENTITIES_MAX && s.certs.len() <= IDENTITIES_MAX);
+        assert!(s.recent.len() <= RECENT_MAX);
+        assert!(s.open.len() <= 5000);
+        let bytes = s.encode().unwrap().len();
+        assert!(bytes < 32 << 20, "{bytes} B");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+}

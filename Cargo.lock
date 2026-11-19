@@ -1039,6 +1039,7 @@ dependencies = [
  "aws-lc-rs",
  "axum",
  "libc",
+ "postcard",
  "serde",
  "serde_json",
  "tokio",

@@ -6,7 +6,8 @@
 //!   u6e-controller hold <ap> <reason> [--config <path>]
 //!   u6e-controller release <ap> [--config <path>]
 //!
-//! Without a command it is the controller, until stopped. `apply` reads the
+//! Without a command it is the controller, until stopped (SIGTERM, after
+//! which it saves the clients' history and exits). `apply` reads the
 //! script `boot/wifi-up.sh --print` renders for the AP, has the controller
 //! sign its radios' configuration and send it, and exits 0 only when the AP
 //! applied exactly that configuration, printing how each radio took it.
@@ -20,16 +21,16 @@
 //! /etc/wifi-controller/config.toml.
 
 use std::fs;
-use std::future;
 use std::io::{self, Read};
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use tokio::signal::unix::{SignalKind, signal};
 use u6e_controller::agents::Timing;
 use u6e_controller::config::Config;
 use u6e_controller::names::System;
-use u6e_controller::{local, script};
+use u6e_controller::{local, script, sessions};
 use u6e_proto::frame::zeroize;
 use u6e_proto::tls::Identity;
 
@@ -127,7 +128,10 @@ fn run(config: &Config) -> Result<(), String> {
             },
             u6e_proto::PROTOCOL
         );
-        future::pending::<Result<(), String>>().await
+        let mut stop = signal(SignalKind::terminate()).map_err(|e| format!("signals: {e}"))?;
+        stop.recv().await;
+        sessions::save(&c.state, &config.history_path).await;
+        Ok(())
     })
 }
 

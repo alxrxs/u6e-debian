@@ -13,12 +13,15 @@
 //! proposes the radios' channels, widths and powers from their history, and
 //! commits a proposal an admin applies to the site file. Clients are named
 //! from the DHCP servers' leases, the reverse DNS of their addresses and
-//! their MACs' vendors (`identity`, `leases`, `names`, `oui`).
+//! their MACs' vendors (`identity`, `leases`, `names`, `oui`). Each
+//! client's sessions and timeline (`sessions`, `timeline`) come from all of
+//! that and from RADIUS's verdicts, read from its log (`radius`).
 
 pub mod actions;
 pub mod agents;
 pub mod config;
 pub mod configs;
+mod fetch;
 mod frames;
 pub mod http;
 pub mod identity;
@@ -29,15 +32,18 @@ pub mod metrics;
 pub mod names;
 pub mod oui;
 pub mod policy;
+pub mod radius;
 pub mod rf;
 pub mod rollout;
 pub mod script;
+pub mod sessions;
 pub mod spectrum;
 pub mod stage;
 pub mod state;
 mod store;
 #[cfg(test)]
 mod testdir;
+pub mod timeline;
 pub mod view;
 
 use std::collections::HashMap;
@@ -64,6 +70,7 @@ use crate::local::Local;
 use crate::names::{Lookups, Resolve};
 use crate::policy::Store;
 use crate::rollout::Engine;
+use crate::sessions::Sessions;
 use crate::stage::{Ssh, Stage, Target, Waits};
 use crate::state::{Shared, State};
 
@@ -131,8 +138,18 @@ pub async fn start(
             "u6e-controller: [guards] enforce needs [leases]: the APs' client guards only report"
         );
     }
+    let history = &config.history_path;
+    let (sessions, aside) = Sessions::load(history)
+        .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", history.display())))?;
+    if let Some(aside) = aside {
+        eprintln!(
+            "u6e-controller: {}: not a history this controller reads, set aside as {aside}",
+            history.display()
+        );
+    }
     let mut state = State::new(config.hostnames.clone())
         .with_policy(saved)
+        .with_sessions(sessions)
         .with_spectrum(timing.spectrum)
         .with_history(window)
         .with_leases(&config.leases)
@@ -151,6 +168,9 @@ pub async fn start(
         None => None,
     };
     state.set_aside(set_aside);
+    if config.radius.is_some() {
+        state = state.with_radius();
+    }
     let state = Shared::new(state);
     let keys: HashMap<_, _> = config.aps.iter().map(|(n, k)| (*k, n.clone())).collect();
     let allowed: AllowedKeys = Arc::new(RwLock::new(keys));
@@ -217,6 +237,10 @@ pub async fn start(
     if !config.leases.is_empty() {
         tokio::spawn(leases::supervise(state.clone(), config.leases.clone()));
     }
+    if let Some(settings) = &config.radius {
+        tokio::spawn(radius::supervise(state.clone(), settings.clone()));
+    }
+    tokio::spawn(sessions::keep(state.clone(), history.clone()));
     let mut access = Access::new(config, timing.command, store);
     if let Some(e) = &engine {
         e.resume();

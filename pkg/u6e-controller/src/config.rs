@@ -9,7 +9,10 @@
 //! rollouts (`rollout`), each off without its section; in `[rf]`, the RF
 //! planner's (`rf::config`), without which it is off; in `[leases]`, the
 //! DHCP nodes' node exporters the clients' leases are read from (`leases`),
-//! none without it; and, in `[guards]`, the VLANs the APs' client guards
+//! none without it; in `[radius]`, the Loki the RADIUS servers' log is read
+//! from (`radius`), RADIUS's side of the clients' timelines missing without
+//! it; where the clients' sessions and timelines are kept (`history_path`,
+//! `sessions`); and, in `[guards]`, the VLANs the APs' client guards
 //! enforce on (only with `[leases]`: without the seed of the leases a client
 //! that roamed in is unknown to its new AP), the clients with a static
 //! address, and the site's DHCP servers and relays, whose acknowledgements
@@ -23,6 +26,7 @@
 //! public_origin = "https://wifi.example.org"
 //! admin_group = "wifi-admins"
 //! policy_path = "/var/lib/wifi-controller/policy.json"
+//! history_path = "/var/lib/wifi-controller/history"
 //! socket = "/run/wifi-controller/sock"
 //!
 //! [aps.ap1]
@@ -41,6 +45,10 @@
 //! [leases]
 //! exporters = ["dhcp1.example.org:9100", "[2001:db8::53]:9100"]
 //!
+//! [radius]
+//! loki = "logs.example.org:3100"
+//! selector = '{job="radius-auth"}'
+//!
 //! [guards]
 //! enforce = [42]
 //! static = [{ mac = "02:00:00:00:00:01", ip = "192.0.2.5" }]
@@ -57,7 +65,7 @@ use serde::Deserialize;
 use u6e_proto::mac;
 use u6e_proto::msg::{Binding, GuardConfig};
 
-use crate::{configs, rf, rollout};
+use crate::{configs, radius, rf, rollout};
 
 /// The parsed, checked configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +91,8 @@ pub struct Config {
     pub admin_group: String,
     /// The operator's decisions (the blocked clients), kept across restarts.
     pub policy_path: PathBuf,
+    /// The clients' sessions and timelines.
+    pub history_path: PathBuf,
     /// Where root's local commands reach the controller.
     pub socket: PathBuf,
     /// The signing of live configurations, if it is on.
@@ -93,6 +103,8 @@ pub struct Config {
     pub rf: Option<rf::config::Settings>,
     /// The node exporters (`host:port`) that publish the DHCP leases.
     pub leases: Vec<String>,
+    /// Where RADIUS's log is read, if it is.
+    pub radius: Option<radius::Settings>,
     /// How the APs' client guards run.
     pub guards: GuardConfig,
 }
@@ -115,13 +127,23 @@ struct File {
     admin_group: String,
     #[serde(default = "default_policy")]
     policy_path: PathBuf,
+    #[serde(default = "default_history")]
+    history_path: PathBuf,
     #[serde(default = "default_socket")]
     socket: PathBuf,
     configs: Option<configs::File>,
     rollouts: Option<rollout::File>,
     rf: Option<rf::config::File>,
     leases: Option<LeasesFile>,
+    radius: Option<RadiusFile>,
     guards: Option<GuardsFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RadiusFile {
+    loki: String,
+    selector: String,
 }
 
 #[derive(Deserialize)]
@@ -182,6 +204,10 @@ fn default_policy() -> PathBuf {
     "/var/lib/wifi-controller/policy.json".into()
 }
 
+fn default_history() -> PathBuf {
+    "/var/lib/wifi-controller/history".into()
+}
+
 fn default_socket() -> PathBuf {
     "/run/wifi-controller/sock".into()
 }
@@ -213,6 +239,9 @@ pub enum ConfigError {
     Rf(String),
     /// A `[leases]` exporter is not `host:port`.
     BadExporter(String),
+    /// `[radius]`'s Loki is not `host:port`, or its selector no LogQL
+    /// stream selector: which.
+    Radius(String),
     /// `[guards]` names no VLAN, or no client's MAC: which.
     Guards(String),
 }
@@ -233,6 +262,7 @@ impl fmt::Display for ConfigError {
             Self::NoAdminGroup => f.write_str("admin_group is empty"),
             Self::Section(e) | Self::Rf(e) => f.write_str(e),
             Self::BadExporter(e) => write!(f, "leases.exporters: {e:?} is not host:port"),
+            Self::Radius(e) => write!(f, "radius: {e}"),
             Self::Guards(e) => write!(f, "guards: {e}"),
         }
     }
@@ -285,9 +315,10 @@ impl Config {
             .transpose()
             .map_err(ConfigError::Rf)?;
         let leases = file.leases.map_or_else(Vec::new, |l| l.exporters);
-        if let Some(bad) = leases.iter().find(|e| !is_exporter(e)) {
+        if let Some(bad) = leases.iter().find(|e| !is_host_port(e)) {
             return Err(ConfigError::BadExporter(bad.clone()));
         }
+        let radius = file.radius.map(radius_settings).transpose()?;
         let guards = file
             .guards
             .map_or_else(|| Ok(GuardConfig::default()), guards)?;
@@ -302,14 +333,35 @@ impl Config {
             public_origin: file.public_origin,
             admin_group: file.admin_group,
             policy_path: file.policy_path,
+            history_path: file.history_path,
             socket: file.socket,
             configs: configs.map_err(ConfigError::Section)?,
             rollouts: rollouts.map_err(ConfigError::Section)?,
             rf,
             leases,
+            radius,
             guards,
         })
     }
+}
+
+/// The RADIUS log's section, checked: a `host:port`, and a stream selector
+/// (in braces, on one line: it goes into the query as it is).
+fn radius_settings(file: RadiusFile) -> Result<radius::Settings, ConfigError> {
+    if !is_host_port(&file.loki) {
+        let e = format!("loki: {:?} is not host:port", file.loki);
+        return Err(ConfigError::Radius(e));
+    }
+    let s = &file.selector;
+    if !(s.starts_with('{') && s.ends_with('}') && !s.chars().any(char::is_control)) {
+        return Err(ConfigError::Radius(format!(
+            "selector: {s:?} is no stream selector"
+        )));
+    }
+    Ok(radius::Settings {
+        loki: file.loki,
+        selector: file.selector,
+    })
 }
 
 /// The guards' section, checked: real VLANs, each once, and unicast MACs.
@@ -341,7 +393,7 @@ fn guards(file: GuardsFile) -> Result<GuardConfig, ConfigError> {
 
 /// Whether `s` is `host:port`: a name or IPv4 address, or an IPv6 one in
 /// brackets, and a port.
-fn is_exporter(s: &str) -> bool {
+fn is_host_port(s: &str) -> bool {
     let Some((host, port)) = s.rsplit_once(':') else {
         return false;
     };
@@ -584,6 +636,39 @@ mod tests {
                 leases(&format!("\"{bad}\"")),
                 Err(ConfigError::BadExporter(bad.into())),
                 "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_radius_log_is_read_from_a_loki_by_its_selector() {
+        let c = Config::parse(ORIGIN).unwrap();
+        assert_eq!(c.radius, None);
+        assert_eq!(
+            c.history_path,
+            PathBuf::from("/var/lib/wifi-controller/history")
+        );
+        let radius = |loki: &str, selector: &str| {
+            let section = format!("[radius]\nloki = \"{loki}\"\nselector = '{selector}'\n");
+            Config::parse(&format!("{ORIGIN}history_path = \"/h\"\n{section}"))
+        };
+        let c = radius("logs.example.org:3100", r#"{job="radius-auth"}"#).unwrap();
+        assert_eq!(
+            c.radius,
+            Some(radius::Settings {
+                loki: "logs.example.org:3100".into(),
+                selector: r#"{job="radius-auth"}"#.into(),
+            })
+        );
+        assert_eq!(c.history_path, PathBuf::from("/h"));
+        for (loki, selector) in [
+            ("logs.example.org", r#"{job="x"}"#),
+            ("logs.example.org:3100", r#"job="x""#),
+            ("logs.example.org:3100", "{job=\"x\"}\t|= \"y\""),
+        ] {
+            assert!(
+                matches!(radius(loki, selector), Err(ConfigError::Radius(_))),
+                "{loki} {selector}"
             );
         }
     }
