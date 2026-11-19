@@ -346,7 +346,7 @@ impl Sessions {
             from = Some(Roam {
                 ap,
                 band,
-                gap_ms: Some(began - end),
+                gap_ms: (began > end).then(|| began - end),
                 steered_by,
             });
             if let Some(s) = self.closed.iter_mut().rev().find(|s| s.id == id) {
@@ -384,8 +384,10 @@ impl Sessions {
     }
 
     /// The session of `mac` that ended elsewhere than `place` within
-    /// [`ROAM_WINDOW_MS`] before `began`, by the client leaving or going
-    /// quiet: its id, AP, band and end.
+    /// [`ROAM_WINDOW_MS`] of `began`, by the client leaving or going quiet:
+    /// its id, AP, band and end. It may end after `began`: the new AP heard
+    /// the client first (a fast transition), and its old AP's word of the
+    /// end reached the controller first.
     fn just_left(
         &self,
         mac: &[u8; 6],
@@ -402,7 +404,7 @@ impl Sessions {
         let elsewhere = recent.place.ap != place.ap || recent.place.bss != place.bss;
         let left = matches!(recent.end, Some(End::Left | End::Inactive));
         let roam = (recent.id, recent.place.ap.clone(), recent.place.band, end);
-        (elsewhere && left && end <= began).then_some(roam)
+        (elsewhere && left && end <= began + ROAM_WINDOW_MS).then_some(roam)
     }
 
     /// Ends the open session of `mac` at `at` for `why`, with its
@@ -1030,14 +1032,25 @@ mod tests {
             panic!()
         };
         assert_eq!(from.as_ref().unwrap().gap_ms, Some(3000));
+        // The old AP's word of a fast transition can come first, timed after
+        // the new association: a roam without a gap.
+        disassoc(&mut s, "ap2", 0, T0 + 36_000);
+        assoc(&mut s, "ap1", 1, T0 + 35_500);
+        let What::Joined { from, .. } = &s.timeline.of(&MAC).last().unwrap().what else {
+            panic!()
+        };
+        assert_eq!(from.as_ref().unwrap().gap_ms, None);
+        assert_eq!(kinds(&s), ["joined", "roamed", "roamed"]);
+        disassoc(&mut s, "ap1", 1, T0 + 37_000);
         // Too late, or on the same BSS, it is a new connection.
-        disassoc(&mut s, "ap2", 0, T0 + 40_000);
         assoc(&mut s, "ap1", 0, T0 + 51_000);
         disassoc(&mut s, "ap1", 0, T0 + 52_000);
         assoc(&mut s, "ap1", 0, T0 + 53_000);
         assert_eq!(
             kinds(&s),
-            ["joined", "roamed", "ended", "joined", "ended", "joined"]
+            [
+                "joined", "roamed", "roamed", "ended", "joined", "ended", "joined"
+            ]
         );
     }
 

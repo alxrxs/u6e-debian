@@ -655,7 +655,7 @@ impl Drop for Proc {
 
 /// The controller binary, its log lines, and the addresses it reported.
 struct Binary {
-    _proc: Proc,
+    proc: Proc,
     log: Receiver<String>,
     agents: SocketAddr,
     http: SocketAddr,
@@ -693,7 +693,7 @@ fn spawn_binary(dir: &TempDir) -> Binary {
         rest.split(',').next().unwrap().parse().unwrap()
     };
     Binary {
-        _proc: proc,
+        proc,
         log,
         agents: addr("agents on "),
         http: addr("http on "),
@@ -711,6 +711,32 @@ fn wait_line(log: &Receiver<String>, matches: impl Fn(&str) -> bool) -> String {
             return line;
         }
     }
+}
+
+/// Stopped (SIGTERM), the controller saves the clients' history before it
+/// exits, and started again it goes on from it.
+#[test]
+fn the_history_is_saved_when_the_controller_stops() {
+    let dir = TempDir::new("history-stop");
+    let mut b = spawn_binary(&dir);
+    let mut a = Agent::hello(b.agents, KEY_AP1, "ap1");
+    let s = snapshot(1, vec![bss("wlan5", "Corp")], vec![station(MAC, 0, -54)]);
+    a.send(&AgentMsg::Key(s)).unwrap();
+    let path = "/api/clients/02:00:00:00:00:01/history";
+    let sessions = |http| {
+        json_get(http, path)["sessions"]
+            .as_array()
+            .map_or(0, Vec::len)
+    };
+    wait_for("the client's session", || sessions(b.http) == 1);
+    let pid = libc::pid_t::try_from(b.proc.0.id()).unwrap();
+    // SAFETY: a signal to the child this test started and still holds.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    assert!(b.proc.0.wait().unwrap().success());
+    let saved = fs::metadata(dir.0.join("history")).unwrap();
+    assert_eq!(saved.permissions().mode() & 0o777, 0o600);
+    let again = spawn_binary(&dir);
+    assert_eq!(sessions(again.http), 1);
 }
 
 #[test]
