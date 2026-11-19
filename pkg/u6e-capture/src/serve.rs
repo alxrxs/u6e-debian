@@ -175,12 +175,13 @@ pub fn run(cfg: &Config, mut conn: UnixStream, stop: RawFd) -> io::Result<()> {
     }
     c.marked = devs;
     eprintln!(
-        "u6e-capture: {} for {} s, at most {} B, {} B a packet, filter {}: {}",
+        "u6e-capture: {} for {} s, at most {} B, {} B a packet, filter {}, {} KiB of socket: {}",
         mac::format(req.mac),
         req.secs,
         req.max_bytes,
         req.snaplen,
         describe(&req.filter),
+        c.ports.rcvbuf() >> 10,
         how_said(how)
     );
     let reason = c.serve(stop);

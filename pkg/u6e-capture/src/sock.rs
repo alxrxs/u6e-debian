@@ -11,8 +11,12 @@ const ETH_P_ALL: u16 = 0x0003;
 const SOL_PACKET: libc::c_int = 263;
 const PACKET_AUXDATA: libc::c_int = 8;
 const PACKET_STATISTICS: libc::c_int = 6;
-/// What the socket may hold for the helper: a burst while it writes.
-const RCVBUF: libc::c_int = 2 << 20;
+/// What the socket is to hold for the helper, its kernel overhead in: a
+/// burst while it writes. A plain SO_RCVBUF is capped at twice
+/// net.core.rmem_max (about 416 KiB), less than an AP image's default of
+/// 1 MiB, so the helper forces it with CAP_NET_ADMIN where the socket holds
+/// less, and reads back what it got ([`PacketSocket::rcvbuf`]).
+const RCVBUF: usize = 2 << 20;
 
 /// A packet read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +33,7 @@ pub struct Received {
 
 pub struct PacketSocket {
     fd: OwnedFd,
+    rcvbuf: usize,
 }
 
 impl PacketSocket {
@@ -47,12 +52,19 @@ impl PacketSocket {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: a fresh descriptor this process owns.
-        let s = PacketSocket {
+        let mut s = PacketSocket {
             fd: unsafe { OwnedFd::from_raw_fd(fd) },
+            rcvbuf: 0,
         };
         s.option(libc::SOL_SOCKET, libc::SO_TIMESTAMPNS, &1i32)?;
         s.option(SOL_PACKET, PACKET_AUXDATA, &1i32)?;
-        s.option(libc::SOL_SOCKET, libc::SO_RCVBUF, &RCVBUF)?;
+        if s.read_option(libc::SOL_SOCKET, libc::SO_RCVBUF)? < RCVBUF {
+            // The kernel doubles what it is asked. Without CAP_NET_ADMIN the
+            // socket keeps the default rather than shrink to the cap.
+            let half = (RCVBUF / 2) as libc::c_int;
+            let _ = s.option(libc::SOL_SOCKET, libc::SO_RCVBUFFORCE, &half);
+        }
+        s.rcvbuf = s.read_option(libc::SOL_SOCKET, libc::SO_RCVBUF)?;
         s.filter(&[libc::sock_filter {
             code: u6e_proto::bpf::RET,
             jt: 0,
@@ -98,6 +110,30 @@ impl PacketSocket {
             return Err(io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    fn read_option(&self, level: libc::c_int, name: libc::c_int) -> io::Result<usize> {
+        let mut v: libc::c_int = 0;
+        let mut len = mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: `v` is a valid int of the length passed.
+        let r = unsafe {
+            libc::getsockopt(
+                self.fd.as_raw_fd(),
+                level,
+                name,
+                (&raw mut v).cast(),
+                &raw mut len,
+            )
+        };
+        if r != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(usize::try_from(v).unwrap_or(0))
+    }
+
+    /// The bytes the kernel holds for the socket, its own overhead in.
+    pub fn rcvbuf(&self) -> usize {
+        self.rcvbuf
     }
 
     /// Keeps what `prog` passes from now on.
@@ -188,5 +224,28 @@ impl PacketSocket {
 
     pub fn fd(&self) -> RawFd {
         self.fd.as_raw_fd()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// With the helper's capabilities the socket holds what it is to, more
+    /// than the rmem_max cap; without them it says so and passes.
+    #[test]
+    fn the_socket_holds_what_the_kernel_granted() {
+        let s = match PacketSocket::open(None) {
+            Ok(s) => s,
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                return eprintln!("skipped: no packet socket ({e})");
+            }
+            Err(e) => panic!("{e}"),
+        };
+        assert_eq!(
+            s.rcvbuf(),
+            s.read_option(libc::SOL_SOCKET, libc::SO_RCVBUF).unwrap()
+        );
+        assert!(s.rcvbuf() >= RCVBUF, "{} B", s.rcvbuf());
     }
 }

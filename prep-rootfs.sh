@@ -711,8 +711,8 @@ UNIT
 # /run/u6e-capture/restore, its own deadline ends it, the runtime limit
 # below backs that up, and its last step puts back what a capture left,
 # whatever ended it (u6e-agent reports a held offload). It runs as root with
-# CAP_NET_RAW (its packet sockets) and CAP_NET_ADMIN (nft) alone, writes
-# only its run directory, ECM's deceleration file and u6e-pcc's files (a
+# CAP_NET_RAW (its packet sockets) and CAP_NET_ADMIN (nft, and its sockets'
+# 2 MiB past net.core.rmem_max) alone, writes only its run directory, ECM's deceleration file and u6e-pcc's files (a
 # debugfs that holds those and nothing else); every other sandbox setting
 # is at its most restrictive but where a comment says what it needs
 # instead.
