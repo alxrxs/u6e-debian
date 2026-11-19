@@ -14,7 +14,9 @@
 //!
 //! With the three controller options it also streams telemetry to the
 //! controller, carries out its commands and forwards the spectrum scans it
-//! asks for, which u6e-spectral runs; with the public half of the
+//! asks for, which u6e-spectral runs, puts its rate limits on the NSS
+//! through u6e-shaper and forwards the client captures it asks for, which
+//! u6e-capture runs (see `limits` and `capture`); with the public half of the
 //! controller's configuration key too, it applies the Wi-Fi configurations
 //! the controller signs with it (see `link`, `command`, `spectrum` and
 //! `apply`).
@@ -26,6 +28,7 @@
 //! helper does after each install, for u6e-wifi to run at boot.
 
 mod apply;
+mod capture;
 mod clientsock;
 mod collect;
 mod command;
@@ -34,6 +37,7 @@ mod events;
 mod guards;
 mod helper;
 mod kmsg;
+mod limits;
 mod link;
 mod neighbors;
 mod netcheck;

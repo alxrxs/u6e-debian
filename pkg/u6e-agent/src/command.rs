@@ -467,7 +467,7 @@ fn both(a: Outcome, b: Outcome) -> Outcome {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::net::UnixDatagram;
@@ -683,7 +683,7 @@ mod tests {
         }
     }
 
-    fn station(mac: [u8; 6], bss: u16) -> Station {
+    pub fn station(mac: [u8; 6], bss: u16) -> Station {
         Station {
             mac,
             bss,

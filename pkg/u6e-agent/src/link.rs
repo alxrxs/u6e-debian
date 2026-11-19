@@ -10,10 +10,13 @@
 //! hand and answered in turn, starts and stops radios' spectrum scans, whose
 //! frames leave as they come (see `spectrum`), and sends configurations,
 //! applied away from the link and answered once applied, in this session or
-//! the next (see `apply`), and the client guards' mode and the leases they
-//! are seeded with, whose bindings and violations leave each tick (see
-//! `guards`); a silent or broken connection
-//! is dropped, its scans with it, and dialed again. The wait before a redial
+//! the next (see `apply`), the client guards' mode and the leases they are
+//! seeded with, whose bindings and violations leave each tick (see
+//! `guards`), the rate limits, kept across sessions and synced with the AP
+//! each tick (see `limits`), and a client's capture, whose chunks leave as
+//! the controller acknowledges them (see `capture`); a silent or broken
+//! connection is dropped, its scans and its capture with it, and dialed
+//! again. The wait before a redial
 //! doubles from 1 s to 30 s until a session is useful (the controller said
 //! something in it), so a controller that takes each session and drops it is
 //! not redialed at once.
@@ -43,13 +46,15 @@ use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection};
 use u6e_proto::frame::{decode_frame, frame_body, write_frame, zeroize};
 use u6e_proto::msg::{
-    AgentMsg, Command, CommandResult, ConfigApplied, CtlMsg, Event, Flows, Hello, SignedConfig,
-    Snapshot,
+    AgentMsg, Command, CommandKind, CommandResult, ConfigApplied, CtlMsg, Event, Flows, Hello,
+    SignedConfig, Snapshot,
 };
 use u6e_proto::tls::{self, Identity};
 use u6e_proto::{PROTOCOL, delta, version};
 
+use crate::capture::Captures;
 use crate::guards::Guards;
+use crate::limits::{self, Limits};
 use crate::spectrum::{self, Spectrum};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -96,6 +101,11 @@ pub struct Config {
     pub guards: PathBuf,
     /// Where the place reached in their violations is kept.
     pub guards_cursor: PathBuf,
+    /// The rate-limit helper's socket, and where the AP's netdevs are listed.
+    pub shaper: PathBuf,
+    pub net: PathBuf,
+    /// The capture helper's socket.
+    pub capture: PathBuf,
 }
 
 impl Config {
@@ -116,8 +126,18 @@ impl Config {
             spectrum_limit: spectrum::LIMIT,
             guards: u6e_proto::guard::SOCKET.into(),
             guards_cursor: crate::guards::CURSOR.into(),
+            shaper: u6e_proto::shaper::SOCKET.into(),
+            net: "/sys/class/net".into(),
+            capture: u6e_proto::capture::SOCKET.into(),
         }
     }
+}
+
+/// What the agent holds across sessions: the client guards' place and the
+/// rate limits the controller gave.
+pub struct Held {
+    pub guards: Guards,
+    pub limits: Limits,
 }
 
 /// What reads the flows: called with the seq of the message, the stations
@@ -174,7 +194,10 @@ fn run_with(
     mut relay: impl FnMut() -> io::Result<Arc<Ring>>,
 ) -> ! {
     let client = tls::client_config(&cfg.identity, cfg.controller_key);
-    let mut guards = Guards::new(cfg.guards.clone(), cfg.guards_cursor.clone());
+    let mut held = Held {
+        guards: Guards::new(cfg.guards.clone(), cfg.guards_cursor.clone()),
+        limits: Limits::new(cfg.shaper.clone(), cfg.net.clone()),
+    };
     let mut ring = None;
     let mut backoff = *cfg.backoff.start();
     // A failure that repeats is logged once, not at every attempt.
@@ -200,7 +223,7 @@ fn run_with(
                     &mut flows,
                     &mut command,
                     &mut applier,
-                    &mut guards,
+                    &mut held,
                 );
                 if s.heard {
                     eprintln!("u6e-agent: link to {} down: {e}", cfg.controller);
@@ -311,7 +334,7 @@ fn connect(cfg: &Config, client: &Arc<ClientConfig>) -> io::Result<Session> {
         conn.complete_io(&mut sock)?;
     }
     let spectrum = Spectrum::new(&cfg.spectrum, cfg.spectrum_limit);
-    let mut s = Session::new(conn, sock, spectrum);
+    let mut s = Session::new(conn, sock, spectrum, Captures::new(&cfg.capture));
     s.agree()?;
     Ok(s)
 }
@@ -372,10 +395,20 @@ struct Session {
     spectrum: Spectrum,
     /// What the scans sent, waiting for the next record.
     spectrum_out: Vec<u8>,
+    /// The client capture the controller asked for; it ends with the
+    /// session.
+    captures: Captures,
+    /// What it sent, waiting for the next record.
+    capture_out: Vec<u8>,
 }
 
 impl Session {
-    fn new(conn: ClientConnection, sock: TcpStream, spectrum: Spectrum) -> Self {
+    fn new(
+        conn: ClientConnection,
+        sock: TcpStream,
+        spectrum: Spectrum,
+        captures: Captures,
+    ) -> Self {
         let now = Instant::now();
         Session {
             conn,
@@ -398,6 +431,8 @@ impl Session {
             heard: false,
             spectrum,
             spectrum_out: Vec::new(),
+            captures,
+            capture_out: Vec::new(),
         }
     }
 
@@ -443,11 +478,12 @@ impl Session {
         flows: &mut impl FlowSource,
         command: &mut impl CommandRunner,
         applier: &mut impl ConfigApplier,
-        guards: &mut Guards,
+        held: &mut Held,
     ) -> io::Result<Infallible> {
         let mut out = Vec::new();
         write_frame(&mut out, &AgentMsg::Hello(cfg.hello.clone()))?;
-        guards.session();
+        held.guards.session();
+        held.limits.session();
         let mut up = false;
         loop {
             if let Some(r) = ring {
@@ -457,7 +493,13 @@ impl Session {
             let ticked = now >= self.due;
             if ticked {
                 self.snapshot_into(&mut out, now, snapshot)?;
-                guards.read_into(&mut out)?;
+                held.guards.read_into(&mut out)?;
+                if let Some(last) = &self.prev {
+                    held.limits.tick(last);
+                }
+            }
+            if let Some(m) = held.limits.update() {
+                write_frame(&mut out, &m)?;
             }
             if now >= self.flows_due {
                 self.flows_into(&mut out, now, flows)?;
@@ -466,21 +508,25 @@ impl Session {
                 write_frame(&mut out, &AgentMsg::ConfigApplied(a))?;
             }
             self.spectrum.read(&mut self.spectrum_out);
+            self.captures.read(&mut self.capture_out);
             if ticked || self.due - now > COALESCE {
                 for ev in ring.map(Ring::take).unwrap_or_default() {
                     write_frame(&mut out, &AgentMsg::Event(ev))?;
                 }
                 out.append(&mut self.spectrum_out);
+                out.append(&mut self.capture_out);
             }
             if !out.is_empty() {
                 self.send(&out)?;
+                held.limits.wrote();
                 out.clear();
             }
             // On the first pass, what came with the version frame.
-            self.process(command, applier, guards)?;
-            if self.wait(ring, applier.fd(), cfg.silence) {
-                self.receive(command, applier, guards)?;
+            self.process(command, applier, held)?;
+            if self.wait(ring, applier.fd(), cfg.silence, &held.limits) {
+                self.receive(command, applier, held)?;
             }
+            held.limits.confirm(limits::unacked(self.sock.as_raw_fd()));
             if self.heard && !up {
                 up = true;
                 eprintln!("u6e-agent: link to {} up", cfg.controller);
@@ -544,11 +590,23 @@ impl Session {
         Ok(())
     }
 
-    /// Waits for the socket (true), an event, a spectrum scan's frame, the
-    /// end of an apply (`applied`) or the next deadline (false).
-    fn wait(&self, ring: Option<&Ring>, applied: RawFd, silence: Duration) -> bool {
+    /// Waits for the socket (true), an event, a spectrum scan's frame, a
+    /// capture's, the end of an apply (`applied`) or the next deadline,
+    /// among them a rate-limit sync's confirmation (false).
+    fn wait(
+        &self,
+        ring: Option<&Ring>,
+        applied: RawFd,
+        silence: Duration,
+        limits: &Limits,
+    ) -> bool {
         let mut deadline = self.due.min(self.flows_due).min(self.last_rx + silence);
-        if let Some(d) = self.spectrum.deadline() {
+        let others = [
+            self.spectrum.deadline(),
+            self.captures.deadline(),
+            limits.deadline(),
+        ];
+        for d in others.into_iter().flatten() {
             deadline = deadline.min(d);
         }
         let left = deadline.saturating_duration_since(Instant::now());
@@ -558,6 +616,7 @@ impl Session {
         let mut fds: Vec<libc::pollfd> = [self.sock.as_raw_fd(), wake, applied]
             .into_iter()
             .chain(self.spectrum.fds())
+            .chain(self.captures.fd())
             .map(|fd| libc::pollfd {
                 fd,
                 events: libc::POLLIN,
@@ -600,11 +659,11 @@ impl Session {
         &mut self,
         command: &mut impl CommandRunner,
         applier: &mut impl ConfigApplier,
-        guards: &mut Guards,
+        held: &mut Held,
     ) -> io::Result<()> {
         self.read_records()?;
         let closed = self.take_plaintext()?;
-        self.process(command, applier, guards)?;
+        self.process(command, applier, held)?;
         if closed {
             return Err(ErrorKind::UnexpectedEof.into());
         }
@@ -636,14 +695,14 @@ impl Session {
         &mut self,
         command: &mut impl CommandRunner,
         applier: &mut impl ConfigApplier,
-        guards: &mut Guards,
+        held: &mut Held,
     ) -> io::Result<()> {
         let mut used = 0;
         while let Some((msg, n)) = decode_frame::<CtlMsg>(&self.inbuf[used..])? {
             used += n;
             self.last_rx = Instant::now();
             self.heard = true;
-            self.handle(msg, command, applier, guards)?;
+            self.handle(msg, command, applier, held)?;
         }
         consume(&mut self.inbuf, used);
         Ok(())
@@ -654,7 +713,7 @@ impl Session {
         msg: CtlMsg,
         command: &mut impl CommandRunner,
         applier: &mut impl ConfigApplier,
-        guards: &mut Guards,
+        held: &mut Held,
     ) -> io::Result<()> {
         match msg {
             CtlMsg::SetTick { secs } => {
@@ -666,6 +725,17 @@ impl Session {
                 self.due = Instant::now();
             }
             CtlMsg::Ping(n) => self.send_msg(&AgentMsg::Pong(n))?,
+            CtlMsg::Command(Command {
+                id,
+                kind: CommandKind::SyncLimits { limits },
+            }) => {
+                let result = held.limits.command(id, limits, self.prev.as_ref());
+                self.send_msg(&AgentMsg::Result(result))?;
+                if let Some(m) = held.limits.update() {
+                    self.send_msg(&m)?;
+                }
+                held.limits.wrote();
+            }
             CtlMsg::Command(c) => {
                 let result = command(&c, self.prev.as_ref());
                 self.send_msg(&AgentMsg::Result(result))?;
@@ -692,8 +762,15 @@ impl Session {
                     self.send_msg(&AgentMsg::ConfigApplied(answer))?;
                 }
             }
-            CtlMsg::Guards(config) => guards.configure(config),
-            CtlMsg::SeedBindings(leases) => guards.seed(leases),
+            CtlMsg::Guards(config) => held.guards.configure(config),
+            CtlMsg::SeedBindings(leases) => held.guards.seed(leases),
+            CtlMsg::CaptureStart(req) => {
+                if let Some(answer) = self.captures.start(req) {
+                    self.send_msg(&answer)?;
+                }
+            }
+            CtlMsg::CaptureStop { id } => self.captures.stop(id),
+            CtlMsg::CaptureAck { id, seq } => self.captures.ack(id, seq),
             // A newer controller's messages mean nothing to this agent.
             _ => {}
         }
@@ -1344,6 +1421,102 @@ mod tests {
         assert_eq!(p.recv(), AgentMsg::Pong(7));
         let asked = guards.asked.lock().unwrap().clone();
         assert!(asked.contains(&Request::Mode(mode)) && asked.contains(&Request::Seed(vec![])));
+    }
+
+    /// A limit set is synced with the shaper, answered, its states sent;
+    /// a sync that built a tree is confirmed once the controller has
+    /// acknowledged what came after it.
+    #[test]
+    fn rate_limits_are_synced_their_states_sent_and_a_tree_confirmed() {
+        use std::os::unix::net::UnixListener;
+        use u6e_proto::msg::{Limit, LimitStatus, LimitTarget, Rate};
+        use u6e_proto::shaper::{Reply, Request};
+        let dir = TestDir::new();
+        let path = dir.path().join("shaper.sock");
+        let l = UnixListener::bind(&path).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            for c in l.incoming() {
+                let mut c = c.unwrap();
+                let req: Request = u6e_proto::frame::read_frame(&mut c).unwrap();
+                tx.send(req).unwrap();
+                let synced = Reply::Synced {
+                    outcomes: Vec::new(),
+                    confirm: true,
+                };
+                write_frame(&mut c, &synced).unwrap();
+                if let Ok(r) = u6e_proto::frame::read_frame::<_, Request>(&mut c) {
+                    tx.send(r).unwrap();
+                    write_frame(&mut c, &Reply::Done).unwrap();
+                }
+            }
+        });
+        let fake = Fake::new();
+        let net = dir.path().join("net");
+        let tweak = move |c: &mut Config| {
+            c.shaper = path;
+            c.net = net;
+        };
+        let _agent = Agent::spawn_with(&fake, 0, tweak, blank);
+        let mut p = fake.accept();
+        p.start();
+        let limit = Limit {
+            target: LimitTarget::Client([2, 0, 0, 0, 0, 1]),
+            rate: Rate {
+                down_kbit: Some(1_000),
+                up_kbit: None,
+            },
+        };
+        p.send(CtlMsg::Command(Command {
+            id: 4,
+            kind: CommandKind::SyncLimits {
+                limits: vec![limit],
+            },
+        }));
+        let AgentMsg::Result(r) = p.recv() else {
+            panic!()
+        };
+        assert_eq!(
+            (r.id, r.ok, r.detail.as_str()),
+            (4, true, "0 enforced, 1 waiting, 0 refused")
+        );
+        let AgentMsg::Limits(s) = p.recv() else {
+            panic!()
+        };
+        assert_eq!(s[0].status, LimitStatus::Waiting);
+        assert!(matches!(rx.recv().unwrap(), Request::Sync(_)));
+        let confirmed = rx.recv_timeout(Duration::from_secs(5));
+        assert_eq!(confirmed, Ok(Request::Confirm));
+    }
+
+    /// A capture's chunks leave under the controller's credit, and a stop
+    /// brings its tail and its end.
+    #[test]
+    fn a_capture_streams_under_credit() {
+        use crate::capture::tests::{chunk, helper, request, started};
+        let dir = TestDir::new();
+        let mut first = vec![started(1, true)];
+        first.extend((0..6).map(|s| chunk(1, s, 100)));
+        let (sock, _rx) = helper(&dir, first, vec![chunk(1, 6, 10), started(1, false)]);
+        let fake = Fake::new();
+        let tweak = move |c: &mut Config| c.capture = sock;
+        let _agent = Agent::spawn_with(&fake, 0, tweak, blank);
+        let mut p = fake.accept();
+        p.start();
+        p.send(CtlMsg::CaptureStart(request(1)));
+        assert_eq!(p.recv(), started(1, true));
+        for s in 0..4 {
+            assert_eq!(p.recv(), chunk(1, s, 100));
+        }
+        // No credit: the ping's answer comes before any chunk.
+        p.send(CtlMsg::Ping(5));
+        assert_eq!(p.recv(), AgentMsg::Pong(5));
+        p.send(CtlMsg::CaptureAck { id: 1, seq: 3 });
+        assert_eq!(p.recv(), chunk(1, 4, 100));
+        assert_eq!(p.recv(), chunk(1, 5, 100));
+        p.send(CtlMsg::CaptureStop { id: 1 });
+        assert_eq!(p.recv(), chunk(1, 6, 10));
+        assert_eq!(p.recv(), started(1, false));
     }
 
     /// A command is carried out against the snapshot sent last and answered
