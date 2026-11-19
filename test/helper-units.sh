@@ -44,9 +44,7 @@ ecm=/proc/sys/net/ecm
 if [ -d $ecm ]; then
 	stand_in=(-e "s#^##")
 else
-	stand_in=(-e "s#$ecm/front_end_ipv4_stop#/proc/sys/net/ipv4/conf/lo/forwarding#"
-		-e "s#$ecm/front_end_ipv6_stop#/proc/sys/net/ipv6/conf/lo/forwarding#"
-		-e "s#$ecm/defunct_by_mac#/proc/sys/net/ipv4/conf/lo/rp_filter#"
+	stand_in=(-e "s#$ecm/defunct_by_mac#/proc/sys/net/ipv4/conf/lo/rp_filter#"
 		-e "s#$ecm/defunct_by_iface#/proc/sys/net/ipv4/conf/lo/log_martians#")
 fi
 

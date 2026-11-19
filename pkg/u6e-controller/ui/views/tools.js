@@ -274,7 +274,7 @@ function textField(label, attrs) {
 /** How a capture took the flows, in words. */
 export function mechanismText(m) {
   if (m === 'mirror') return 'Its connections stay offloaded; the NSS copies their packets.';
-  if (m === 'off offload') return 'Taken off the offload for the capture: its traffic, and every new connection of its access point, go through the access point’s CPU until it ends.';
+  if (m === 'off offload') return 'Taken off the offload for the capture: its traffic, and no other client’s, goes through the access point’s CPU until it ends.';
   return '';
 }
 

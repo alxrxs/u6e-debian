@@ -624,7 +624,8 @@ ln -sf /etc/systemd/system/u6e-guard.service $W/u6e-guard.service
 # per connection, on a socket only the agent's group may open: nsshtb trees
 # on the BSSs' netdevs and the uplink, their classes, and the nftables
 # netdev table that tags the limited clients' packets (nf_tables is loaded at
-# boot, as the sandbox loads no module). A sync that built a tree waits for
+# boot, as neither its sandbox nor u6e-capture's, whose marks need it too,
+# loads a module). A sync that built a tree waits for
 # the agent's confirmation and is undone without it; its last step undoes a
 # sync it died in. It runs as root with CAP_NET_ADMIN alone and writes only
 # its run directory and ECM's two deceleration files; every other sandbox
@@ -702,15 +703,18 @@ UNIT
 # open no packet socket and take no client's flows from the NSS offload.
 # Socket-activated, one helper per connection, one capture at a time, on a
 # socket only the agent's group may open. It takes the client's flows where
-# the image loads u6e-pcc by its mirror, else by stopping ECM and
-# decelerating the client, and always gives them back: what it changes is
-# written first to /run/u6e-capture/restore, its own deadline ends it, the
-# runtime limit below backs that up, and its last step puts back what a
-# capture left, whatever ended it (u6e-agent reports a held offload). It runs
-# as root with CAP_NET_RAW alone, writes only its run directory, ECM's stop
-# switches and deceleration file and u6e-pcc's files (a debugfs that holds
-# those and nothing else); every other sandbox setting is at its most
-# restrictive but where a comment says what it needs instead.
+# the image loads u6e-pcc by its mirror, else off the offload: a nftables
+# netdev table marks the client's frames, which ECM (patch 904) keeps on the
+# CPU, and the client is decelerated; no other client's flows are touched.
+# It always gives them back: what it changes is written first to
+# /run/u6e-capture/restore, its own deadline ends it, the runtime limit
+# below backs that up, and its last step puts back what a capture left,
+# whatever ended it (u6e-agent reports a held offload). It runs as root with
+# CAP_NET_RAW (its packet sockets) and CAP_NET_ADMIN (nft) alone, writes
+# only its run directory, ECM's deceleration file and u6e-pcc's files (a
+# debugfs that holds those and nothing else); every other sandbox setting
+# is at its most restrictive but where a comment says what it needs
+# instead.
 install -m0755 target/aarch64-unknown-linux-musl/release/u6e-capture $RF/usr/local/sbin/
 printf 'd /run/u6e-capture 0750 root u6e-agent -\n' > $RF/usr/lib/tmpfiles.d/u6e-capture.conf
 cat > $RF/etc/systemd/system/u6e-capture.socket <<'UNIT'
@@ -741,22 +745,23 @@ StandardOutput=journal
 StandardError=journal
 # A capture's longest (10 minutes) and its end.
 RuntimeMaxSec=11min
-CapabilityBoundingSet=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
 AmbientCapabilities=
 NoNewPrivileges=yes
 UMask=0077
 KeyringMode=private
 ProtectSystem=strict
-ReadWritePaths=/run/u6e-capture /proc/sys/net/ecm/front_end_ipv4_stop /proc/sys/net/ecm/front_end_ipv6_stop /proc/sys/net/ecm/defunct_by_mac
+ReadWritePaths=/run/u6e-capture /proc/sys/net/ecm/defunct_by_mac
 ProtectHome=yes
 PrivateTmp=yes
 ProtectProc=invisible
-# ECM's switches live in /proc/sys, which ProcSubset=pid hides: the
-# ReadWritePaths above could not be mounted (226/NAMESPACE).
+# ECM's deceleration file lives in /proc/sys, which ProcSubset=pid hides:
+# the ReadWritePaths above could not be mounted (226/NAMESPACE).
 ProcSubset=all
 PrivateDevices=yes
 DevicePolicy=closed
-# The packet sockets read the AP's own interfaces; nothing is sent anywhere.
+# The packet sockets read the AP's own interfaces and nft marks frames on
+# them; nothing is sent anywhere.
 IPAddressDeny=any
 PrivateIPC=yes
 ProtectClock=yes
@@ -774,7 +779,7 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 # The agent's connection (UNIX), the packets (PACKET), the interfaces'
-# names and indices (NETLINK).
+# names and indices and nft (NETLINK).
 RestrictAddressFamilies=AF_UNIX AF_PACKET AF_NETLINK
 SystemCallArchitectures=native
 SystemCallErrorNumber=EPERM

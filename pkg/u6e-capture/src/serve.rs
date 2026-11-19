@@ -7,7 +7,8 @@
 //! reading them as the controller acknowledges them: at most two chunks
 //! wait here, and packets past them are dropped and counted rather than
 //! held. The Wi-Fi ports are looked at again every two seconds, so a
-//! client's new per-VLAN netdev is read within that.
+//! client's new per-VLAN netdev is read within that, and, off the offload,
+//! its frames marked there too.
 //!
 //! It ends at its deadline, at its size limit (no block is written past
 //! it), when the agent shuts its side down (the last chunks and the state
@@ -31,7 +32,7 @@ use u6e_proto::msg::{
 use u6e_proto::netdev::wifi_port;
 
 use crate::filter;
-use crate::offload::{self, MIRROR, Paths};
+use crate::offload::{self, Devs, MIRROR, Paths};
 use crate::pcapng::{self, Direction, ETHERNET, RAW};
 use crate::sock::PacketSocket;
 
@@ -168,9 +169,11 @@ pub fn run(cfg: &Config, mut conn: UnixStream, stop: RawFd) -> io::Result<()> {
         Ok(c) => c,
         Err(e) => return refuse(&mut conn, format!("no packet socket: {e}")),
     };
-    if let Err(why) = offload::take(&cfg.paths, how, req.mac, req.snaplen) {
+    let devs = Devs::of(devs.iter().map(|(n, _)| n.as_str()));
+    if let Err(why) = offload::take(&cfg.paths, how, req.mac, req.snaplen, &devs) {
         return refuse(&mut conn, why);
     }
+    c.marked = devs;
     eprintln!(
         "u6e-capture: {} for {} s, at most {} B, {} B a packet, filter {}: {}",
         mac::format(req.mac),
@@ -203,13 +206,18 @@ pub fn run(cfg: &Config, mut conn: UnixStream, stop: RawFd) -> io::Result<()> {
 fn how_said(how: CaptureMechanism) -> &'static str {
     match how {
         CaptureMechanism::Mirror => "its flows stay offloaded and the NSS mirrors them",
-        CaptureMechanism::OffOffload => "its flows are taken off the offload",
+        CaptureMechanism::OffOffload => {
+            "its flows, and no other client's, are taken off the offload"
+        }
     }
 }
 
 struct Capture {
     req: CaptureRequest,
     how: CaptureMechanism,
+    paths: Paths,
+    /// Off the offload, the netdevs the client's frames are marked on.
+    marked: Devs,
     conn: UnixStream,
     ports: PacketSocket,
     mirror: Option<PacketSocket>,
@@ -252,6 +260,8 @@ impl Capture {
         let mut c = Capture {
             req: req.clone(),
             how,
+            paths: cfg.paths.clone(),
+            marked: Devs::default(),
             conn,
             ports,
             mirror,
@@ -280,9 +290,19 @@ impl Capture {
         Ok(c)
     }
 
-    /// Looks at the Wi-Fi ports again; a change gets the program again.
+    /// Looks at the netdevs again: a change of the Wi-Fi ports gets the
+    /// program again and, off the offload, of the ports or the VLANs' the
+    /// client's marks.
     fn rescan(&mut self) -> io::Result<()> {
-        let now: BTreeMap<u32, String> = (self.netdevs)()
+        let all = (self.netdevs)();
+        if self.how == CaptureMechanism::OffOffload && !self.marked.ports.is_empty() {
+            let devs = Devs::of(all.iter().map(|(n, _)| n.as_str()));
+            if devs != self.marked && !devs.ports.is_empty() {
+                offload::follow(&self.paths, self.req.mac, &devs).map_err(io::Error::other)?;
+                self.marked = devs;
+            }
+        }
+        let now: BTreeMap<u32, String> = all
             .into_iter()
             .filter(|(n, _)| wifi_port(n))
             .map(|(n, i)| (i, n))
@@ -317,7 +337,7 @@ impl Capture {
             if now >= scanned + RESCAN_EVERY {
                 scanned = now;
                 if let Err(e) = self.rescan() {
-                    return format!("the ports could not be read again: {e}");
+                    return format!("the ports could not be followed: {e}");
                 }
             }
             if now >= flushed + FLUSH_EVERY {

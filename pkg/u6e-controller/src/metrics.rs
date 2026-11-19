@@ -322,7 +322,7 @@ pub fn render(state: &State) -> String {
     m.family(
         "wifi_offload_held",
         GAUGE,
-        "1 while a capture holds the AP's NSS offload back (ECM stopped, or its restore not done).",
+        "1 while a capture holds a client's flows off the AP's NSS offload (its restore not done).",
     );
     for &(ap, s) in &snaps {
         m.sample(&[("ap", ap)], f64::from(u8::from(s.offload_held)));

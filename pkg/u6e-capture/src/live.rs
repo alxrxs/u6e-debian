@@ -1,10 +1,12 @@
-//! A capture against a real kernel, in a network namespace of the test's
-//! own: veth pairs stand for two Wi-Fi ports, a BSS's (`wlan5`) and a
-//! per-VLAN one (`wlan6.42`), their peers for the clients; the ECM files are
-//! a scratch tree's. The client's frames both ways are captured once each
-//! and another client's not; the flows are taken and given back however
-//! the capture ends: stopped, its time up, the agent gone. It needs
-//! CAP_SYS_ADMIN and CAP_NET_ADMIN; without them it says so and passes.
+//! A capture against a real kernel and nftables, in a network namespace of
+//! the test's own: veth pairs stand for two Wi-Fi ports, a BSS's (`wlan5`)
+//! and a per-VLAN one (`wlan6.42`), their peers for the clients, and a
+//! client VLAN's netdev (`vlan42`); the ECM files are a scratch tree's. The
+//! client's frames both ways are captured once each and another client's
+//! not, and only the client's are marked off the offload; the flows are
+//! taken and given back however the capture ends: stopped, its time up, the
+//! agent gone. It needs CAP_SYS_ADMIN and CAP_NET_ADMIN, and nft; without
+//! them it says so and passes.
 
 use std::io::{self, Read};
 use std::net::Shutdown;
@@ -14,14 +16,13 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use u6e_proto::ecm::STOP;
+use u6e_proto::ecm::{DEFUNCT_BY_MAC, NO_ACCEL_MARK};
 use u6e_proto::frame::{decode_frame, write_frame};
 use u6e_proto::msg::{AgentMsg, CaptureFilter, CaptureMechanism, CaptureRequest};
 
 use crate::filter::tests::{CLIENT, OTHER, eth, ipv4, ports_l4};
-use crate::offload::Paths;
-use crate::offload::tests::pending;
-use crate::offload::tests::{ap, read};
+use crate::offload::tests::{STOP, ap, pending, read};
+use crate::offload::{Paths, TABLE};
 use crate::pcapng::tests::blocks;
 use crate::serve::{self, Config};
 use crate::testdir::TestDir;
@@ -92,7 +93,8 @@ fn in_netns(test: impl FnOnce() + Send + 'static) -> bool {
         }
         ip("link add wlan5 type veth peer name c5");
         ip("link add wlan6.42 type veth peer name c6");
-        for d in ["wlan5", "c5", "wlan6.42", "c6"] {
+        ip("link add vlan42 type veth peer name u42");
+        for d in ["wlan5", "c5", "wlan6.42", "c6", "vlan42", "u42"] {
             ip(&format!("link set {d} up"));
         }
         test();
@@ -112,15 +114,52 @@ fn request(secs: u16) -> CaptureRequest {
     }
 }
 
-/// Starts a capture of `req` on `t`'s scratch AP; the agent's end of it.
-fn start(t: &TestDir, req: &CaptureRequest) -> (UnixStream, thread::JoinHandle<io::Result<()>>) {
+/// `t`'s scratch AP, its marks made by the host's nft.
+fn scratch_ap(t: &TestDir) -> Paths {
+    Paths {
+        nft: "/usr/sbin/nft".into(),
+        ..ap(t, false)
+    }
+}
+
+fn nft(script: &str) -> Result<(), String> {
+    u6e_proto::nft::run(std::path::Path::new("/usr/sbin/nft"), script)
+}
+
+/// How many frames carrying the no-offload mark came in by `wlan5` and by
+/// `vlan42`, as the counters `count_marks` adds count them.
+fn marked() -> (u64, u64) {
+    let out = Command::new("nft")
+        .args(["list", "table", "netdev", "count"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let n: Vec<u64> = text
+        .split("packets ")
+        .skip(1)
+        .map(|s| s.split(' ').next().unwrap().parse().unwrap())
+        .collect();
+    (n[0], n[1])
+}
+
+fn count_marks() {
+    let rule = format!("meta mark {NO_ACCEL_MARK:#x} counter");
+    nft(&format!(
+        "table netdev count {{
+         	chain w {{ type filter hook ingress device \"wlan5\" priority 10; {rule}; }}
+         	chain v {{ type filter hook ingress device \"vlan42\" priority 10; {rule}; }}
+}}
+"
+    ))
+    .unwrap();
+}
+
+/// Starts a capture of `req` on the scratch AP `paths`; the agent's end of it.
+fn start(paths: &Paths, req: &CaptureRequest) -> (UnixStream, thread::JoinHandle<io::Result<()>>) {
     let (mut agent, helper) = UnixStream::pair().unwrap();
     write_frame(&mut agent, req).unwrap();
-    let paths = Paths {
-        root: t.path().into(),
-    };
     let cfg = Config {
-        paths,
+        paths: paths.clone(),
         host: "ap1".into(),
         netdevs: serve::netdevs,
     };
@@ -174,11 +213,12 @@ fn file(msgs: &[AgentMsg]) -> (Vec<u8>, &u6e_proto::msg::CaptureState) {
 }
 
 #[test]
-fn a_clients_frames_both_ways_are_captured_once_and_the_flows_come_back() {
+fn a_clients_frames_both_ways_are_captured_once_and_only_its_flows_leave_the_offload() {
     let ran = in_netns(|| {
         let t = TestDir::new();
-        let p = ap(&t, false);
-        let (mut agent, h) = start(&t, &request(60));
+        let p = scratch_ap(&t);
+        count_marks();
+        let (mut agent, h) = start(&p, &request(60));
         let AgentMsg::Capture(s) = first(&mut agent) else {
             panic!()
         };
@@ -186,7 +226,16 @@ fn a_clients_frames_both_ways_are_captured_once_and_the_flows_come_back() {
             s.running && s.mechanism == Some(CaptureMechanism::OffOffload),
             "{s:?}"
         );
-        assert_eq!(read(&p, STOP[0]), "1\n");
+        // ECM goes on accelerating every other client's connections; the
+        // client's are decelerated.
+        assert_eq!(
+            (read(&p, STOP[0]), read(&p, STOP[1])),
+            ("0\n".into(), "0\n".into())
+        );
+        assert_eq!(
+            read(&p, DEFUNCT_BY_MAC),
+            format!("{}\n", u6e_proto::mac::format(CLIENT))
+        );
         let up = eth(
             OTHER,
             CLIENT,
@@ -209,7 +258,12 @@ fn a_clients_frames_both_ways_are_captured_once_and_the_flows_come_back() {
         send("c5", &stranger);
         send("wlan5", &down);
         send("c6", &up);
+        // The client's frames are marked on their way in, from it on its
+        // port and to it on its VLAN's netdev; the stranger's are not.
+        send("u42", &down);
+        send("u42", &stranger);
         thread::sleep(Duration::from_millis(300));
+        assert_eq!(marked(), (1, 1));
         agent.shutdown(Shutdown::Write).unwrap();
         let msgs = read_all(&mut agent);
         h.join().unwrap().unwrap();
@@ -220,10 +274,11 @@ fn a_clients_frames_both_ways_are_captured_once_and_the_flows_come_back() {
         // The header, wlan5's description and its two packets, then
         // wlan6.42's description and its packet.
         assert_eq!(kinds, [0x0A0D_0D0A, 1, 6, 6, 1, 6]);
-        assert_eq!(
-            (read(&p, STOP[0]), read(&p, STOP[1])),
-            ("0\n".into(), "0\n".into())
-        );
+        // The marks are gone and nothing more is marked.
+        assert!(nft(&format!("list table {TABLE}")).is_err());
+        send("c5", &up);
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(marked(), (1, 1));
         assert!(!pending(&p));
         // tcpdump reads it as written, when the host has it.
         let pcap = t.path().join("c.pcapng");
@@ -246,24 +301,22 @@ fn a_clients_frames_both_ways_are_captured_once_and_the_flows_come_back() {
 fn a_capture_ends_at_its_time_or_when_the_agent_goes_and_gives_the_flows_back() {
     let ran = in_netns(|| {
         let t = TestDir::new();
-        let p = ap(&t, false);
+        let p = scratch_ap(&t);
         let at = Instant::now();
-        let (mut agent, h) = start(&t, &request(1));
+        let (mut agent, h) = start(&p, &request(1));
         let msgs = read_all(&mut agent);
         h.join().unwrap().unwrap();
         let (_, end) = file(&msgs);
         assert_eq!(end.reason, "its time is up");
         assert!(at.elapsed() < Duration::from_secs(3));
-        assert_eq!(read(&p, STOP[0]), "0\n");
+        assert!(nft(&format!("list table {TABLE}")).is_err());
 
-        let (mut agent, h) = start(&t, &request(60));
+        let (mut agent, h) = start(&p, &request(60));
         let _ = first(&mut agent);
+        assert!(nft(&format!("list table {TABLE}")).is_ok());
         drop(agent);
         assert!(h.join().unwrap().is_err(), "nobody took the last frames");
-        assert_eq!(
-            (read(&p, STOP[0]), read(&p, STOP[1])),
-            ("0\n".into(), "0\n".into())
-        );
+        assert!(nft(&format!("list table {TABLE}")).is_err());
         assert!(!pending(&p));
     });
     if !ran {
@@ -275,10 +328,10 @@ fn a_capture_ends_at_its_time_or_when_the_agent_goes_and_gives_the_flows_back() 
 fn no_block_is_written_past_the_size_limit() {
     let ran = in_netns(|| {
         let t = TestDir::new();
-        let p = ap(&t, false);
+        let p = scratch_ap(&t);
         let mut req = request(60);
         req.snaplen = 1500;
-        let (mut agent, h) = start(&t, &req);
+        let (mut agent, h) = start(&p, &req);
         let _ = first(&mut agent);
         // The agent takes what comes as it comes.
         let reader = thread::spawn(move || read_all(&mut agent));
@@ -315,7 +368,7 @@ fn no_block_is_written_past_the_size_limit() {
             _ => true,
         }));
         assert_eq!(blocks(&f).len() as u64, end.packets + 2);
-        assert_eq!(read(&p, STOP[0]), "0\n");
+        assert!(!pending(&p));
     });
     if !ran {
         eprintln!("skipped: no network namespace of its own");
@@ -326,10 +379,10 @@ fn no_block_is_written_past_the_size_limit() {
 fn one_capture_at_a_time_and_a_bad_request_takes_nothing() {
     let ran = in_netns(|| {
         let t = TestDir::new();
-        let p = ap(&t, false);
-        let (mut a, ha) = start(&t, &request(60));
+        let p = scratch_ap(&t);
+        let (mut a, ha) = start(&p, &request(60));
         let _ = first(&mut a);
-        let (mut b, hb) = start(&t, &request(60));
+        let (mut b, hb) = start(&p, &request(60));
         let msgs = read_all(&mut b);
         hb.join().unwrap().unwrap();
         let [AgentMsg::Capture(s)] = &msgs[..] else {
@@ -342,11 +395,11 @@ fn one_capture_at_a_time_and_a_bad_request_takes_nothing() {
 
         let mut bad = request(60);
         bad.snaplen = 10;
-        let (mut c, hc) = start(&t, &bad);
+        let (mut c, hc) = start(&p, &bad);
         let msgs = read_all(&mut c);
         hc.join().unwrap().unwrap();
         assert!(matches!(&msgs[..], [AgentMsg::Capture(s)] if s.reason.starts_with("refused")));
-        assert_eq!(read(&p, STOP[0]), "0\n");
+        assert!(nft(&format!("list table {TABLE}")).is_err() && !pending(&p));
     });
     if !ran {
         eprintln!("skipped: no network namespace of its own");

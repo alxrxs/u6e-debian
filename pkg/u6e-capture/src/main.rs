@@ -39,7 +39,10 @@ const AGENT_GROUP: &str = "u6e-agent";
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
-    let paths = Paths { root: "/".into() };
+    let paths = Paths {
+        root: "/".into(),
+        nft: "/usr/sbin/nft".into(),
+    };
     let result = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["serve"] => serve(paths),
         ["restore"] => restore(&paths),

@@ -1,0 +1,57 @@
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Subject: [PATCH] ecm_classifier_dscp: keep a connection whose packets carry a mark off the NSS
+
+A capture of one client's traffic on an access point needs that client's
+connections on the CPU, where a packet socket sees them, and no other
+client's. ECM's only per-connection veto without a PCC registrant is a
+classifier's response, and the DSCP classifier is the one every
+connection is offered, with conntrack or without (903).
+
+A packet whose skb mark is ECM_CLASSIFIER_DSCP_NO_ACCEL_MARK (0x75360000,
+set by a nftables rule on the client's frames in both directions) now
+makes the classifier relevant and deny acceleration, before conntrack is
+looked at. Nothing else about the connection is recorded: once its
+packets no longer carry the mark, it is classified as before (the
+no-conntrack path, the conntrack path, or not relevant and unassigned).
+Its existing accelerated connections are decelerated by the capture
+(defunct_by_mac); an accelerated packet never reaches the classifier.
+Every packet without the mark takes exactly the path it took before.
+---
+--- a/ecm_classifier_dscp.c
++++ b/ecm_classifier_dscp.c
+@@ -72,6 +72,13 @@
+ #define ECM_CLASSIFIER_DSCP_PATH "net/ecm/ecm_classifier_dscp"
+ 
+ /*
++ * The skb mark that keeps a connection off the NSS: a nftables rule sets
++ * it on the packets of one client whose traffic must reach the host (a
++ * capture). Its low byte is clear of ECM_INTERFACE_WIFI_QOS_TAG_MASK's tags.
++ */
++#define ECM_CLASSIFIER_DSCP_NO_ACCEL_MARK 0x75360000
++
++/*
+  * struct ecm_classifier_dscp_instance
+  * 	State to allow tracking of dynamic qos for a connection
+  */
+@@ -425,6 +432,21 @@
+ 	if (ECM_FRONT_END_ACCELERATION_NOT_POSSIBLE(accel_mode)) {
+ 		spin_lock_bh(&ecm_classifier_dscp_lock);
+ 		cdscpi->process_response.relevance = ECM_CLASSIFIER_RELEVANCE_NO;
++		goto dscp_classifier_out;
++	}
++
++	/*
++	 * A packet carrying the no-acceleration mark keeps its connection on
++	 * the CPU, with conntrack or without, for as long as its packets carry
++	 * it. Nothing else is recorded, so once they no longer do the
++	 * connection is classified as any other.
++	 */
++	if (skb->mark == ECM_CLASSIFIER_DSCP_NO_ACCEL_MARK) {
++		spin_lock_bh(&ecm_classifier_dscp_lock);
++		cdscpi->process_response.relevance = ECM_CLASSIFIER_RELEVANCE_YES;
++		cdscpi->process_response.became_relevant = ecm_db_time_get();
++		cdscpi->process_response.process_actions |= ECM_CLASSIFIER_PROCESS_ACTION_ACCEL_MODE;
++		cdscpi->process_response.accel_mode = ECM_CLASSIFIER_ACCELERATION_MODE_NO;
+ 		goto dscp_classifier_out;
+ 	}
+ 

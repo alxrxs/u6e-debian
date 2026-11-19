@@ -185,9 +185,9 @@ pub struct Snapshot {
     /// How the stations authenticated, by MAC, sorted, each one a station's:
     /// a station hostapd could not be asked about yet has none.
     pub auth: Vec<([u8; 6], StationAuth)>,
-    /// Whether the NSS offload is held back for a capture: ECM stopped, or
-    /// a capture's restore not done. A capture holds it at most 10 minutes;
-    /// longer is a restore that failed.
+    /// Whether a capture holds a client's flows off the NSS offload: its
+    /// restore not done. A capture holds them at most 10 minutes; longer is
+    /// a restore that failed.
     pub offload_held: bool,
 }
 
@@ -889,9 +889,9 @@ pub enum CaptureMechanism {
     /// They stay offloaded, and the NSS copies each of their packets to the
     /// host.
     Mirror,
-    /// They are taken off the offload for the capture: the client's go back
-    /// to the AP's CPU at its start, and every new connection of the AP stays
-    /// there until it ends.
+    /// They are taken off the offload for the capture: the client's, and no
+    /// other client's, go back to the AP's CPU at its start and stay there
+    /// until it ends.
     OffOffload,
 }
 
