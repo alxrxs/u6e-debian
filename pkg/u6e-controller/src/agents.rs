@@ -68,6 +68,9 @@ pub struct Timing {
     /// Past the agent's longest redial (30 s) and a boot's tail.
     pub resume: Duration,
     pub reconcile: Duration,
+    /// The longest a UI WebSocket is served: the page then connects again,
+    /// and its user's groups are judged again.
+    pub ui_session: Duration,
 }
 
 impl Default for Timing {
@@ -80,6 +83,7 @@ impl Default for Timing {
             spectrum: Limits::default(),
             resume: Duration::from_secs(120),
             reconcile: Duration::from_secs(30),
+            ui_session: Duration::from_secs(3600),
         }
     }
 }

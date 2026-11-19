@@ -43,7 +43,7 @@ use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use axum::Router;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
 use axum::extract::{Path, Query, State as Ext};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -386,13 +386,14 @@ async fn ws(Ext(web): Ext<Web>, req: HeaderMap, upgrade: WebSocketUpgrade) -> Re
     }
     let user = actions::user(&req);
     let admin = actions::is_admin(&req, &web.access.admin_group);
+    let session = web.access.ui_session;
     let scans = Gate {
         req,
         access: web.access,
     };
     upgrade
         .max_message_size(MAX_MESSAGE)
-        .on_upgrade(move |socket| live(socket, web.state, user, admin, scans))
+        .on_upgrade(move |socket| live(socket, web.state, user, admin, session, scans))
 }
 
 /// Whether a socket may start scans: the headers of its handshake, judged as
@@ -487,9 +488,18 @@ fn scan_state(state: &Shared, key: &str, refused: Option<&str>) -> Value {
     json!({ "spectrum": v })
 }
 
-/// Serves one WebSocket until either end closes it; the captures only to
-/// an `admin`, as its handshake named them.
-async fn live(mut ws: WebSocket, state: Shared, user: Option<String>, admin: bool, scans: Gate) {
+/// Serves one WebSocket until either end closes it, or for `session` at
+/// most: the page then connects again, so its user's groups (`admin`, as
+/// its handshake named them, which alone are sent the captures) are judged
+/// again.
+async fn live(
+    mut ws: WebSocket,
+    state: Shared,
+    user: Option<String>,
+    admin: bool,
+    session: Duration,
+    scans: Gate,
+) {
     let Some((names, mut flows)) = subscription(&mut ws, &state).await else {
         return;
     };
@@ -515,8 +525,18 @@ async fn live(mut ws: WebSocket, state: Shared, user: Option<String>, admin: boo
     {
         return;
     }
+    let ends = tokio::time::sleep(session);
+    tokio::pin!(ends);
     loop {
         let change = tokio::select! {
+            () = &mut ends => {
+                let bye = CloseFrame {
+                    code: close_code::AWAY,
+                    reason: "its session is up; connect again".into(),
+                };
+                let _ = ws.send(Message::Close(Some(bye))).await;
+                return;
+            }
             c = changes.recv() => c,
             m = ws.recv() => {
                 let text = match m {

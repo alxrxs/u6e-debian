@@ -315,7 +315,8 @@ function connect() {
       if (store.historyLoaded && store.live === 'down') loadHistory(true);
       store.live = 'live';
       backoff = 1;
-      if (!store.me) loadMe();
+      // Each socket's groups are judged anew (it lasts an hour at most).
+      loadMe();
     }
     if (m.patch) merge(store.state, m.patch);
     if (m.key || (m.patch && 'flows' in m.patch)) {

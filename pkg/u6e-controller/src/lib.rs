@@ -251,7 +251,7 @@ pub async fn start(
         tokio::spawn(radius::supervise(state.clone(), settings.clone()));
     }
     tokio::spawn(sessions::keep(state.clone(), history.clone()));
-    let mut access = Access::new(config, timing.command, store);
+    let mut access = Access::new(config, &timing, store);
     if let Some(e) = &engine {
         e.resume();
         access.rollouts = Some(e.clone());

@@ -40,6 +40,7 @@ use tokio::task::JoinSet;
 use u6e_proto::mac;
 use u6e_proto::msg::CommandKind;
 
+use crate::agents::Timing;
 use crate::config::Config;
 use crate::http::{error, json_response};
 use crate::images::image_name;
@@ -63,6 +64,8 @@ pub struct Access {
     policy: Store,
     /// How long an AP has to answer a command.
     pub timeout: Duration,
+    /// How long a UI WebSocket is served, its groups judged at its start.
+    pub ui_session: Duration,
     /// The RF planner, when the configuration has one.
     pub rf: Option<Arc<Planner>>,
     /// The rollouts, when the configuration has them.
@@ -70,12 +73,13 @@ pub struct Access {
 }
 
 impl Access {
-    pub fn new(config: &Config, timeout: Duration, policy: Store) -> Self {
+    pub fn new(config: &Config, timing: &Timing, policy: Store) -> Self {
         Access {
             public_origin: config.public_origin.clone(),
             admin_group: config.admin_group.clone(),
             policy,
-            timeout,
+            timeout: timing.command,
+            ui_session: timing.ui_session,
             rf: rf::from(config.rf.as_ref()),
             rollouts: None,
         }

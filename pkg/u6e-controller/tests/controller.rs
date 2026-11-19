@@ -1385,6 +1385,32 @@ fn ws_sends_only_what_changed() {
 }
 
 #[test]
+fn a_ui_socket_is_served_for_its_session_then_closed_to_connect_again() {
+    let session = Duration::from_millis(500);
+    let r = controller(Timing {
+        ui_session: session,
+        ..Timing::default()
+    });
+    let at = Instant::now();
+    let mut ui = Ui::open(r.c.http, &ADMIN_PAGE).unwrap();
+    ui.send(&json!({"subscribe": "*"}));
+    assert!(ui.recv()["key"].is_object());
+    let close = loop {
+        match ui.0.read() {
+            Ok(Message::Close(f)) => break f,
+            Ok(_) => continue,
+            Err(e) => panic!("no close: {e}"),
+        }
+    };
+    assert_eq!(close.map(|f| u16::from(f.code)), Some(1001), "going away");
+    assert!(at.elapsed() >= session);
+    // The page connects again, its groups judged again.
+    let mut again = Ui::open(r.c.http, &ADMIN_PAGE[..2]).unwrap();
+    again.send(&json!({"subscribe": "*"}));
+    assert!(again.recv()["key"].get("captures").is_none());
+}
+
+#[test]
 fn ws_refuses_another_sites_page() {
     let r = controller(Timing::default());
     let refused = Ui::open(r.c.http, &[("origin", "https://elsewhere.example")]);
