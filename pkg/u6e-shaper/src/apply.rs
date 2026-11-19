@@ -15,12 +15,13 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use u6e_proto::ecm::{DEFUNCT_BY_IFACE, DEFUNCT_BY_MAC};
 use u6e_proto::mac;
 use u6e_proto::msg::LimitTarget;
 use u6e_proto::shaper::{Netdev, Outcome, Spec};
 
 use crate::check::{self, vap};
-use crate::host::{DEFUNCT_BY_IFACE, DEFUNCT_BY_MAC, Host};
+use crate::host::Host;
 use crate::plan::{
     self, Class, DEFAULT, DOWN, LINE_KBIT, Slots, TOP, Tags, TargetPlan, Tree, UP, UPLINK,
 };

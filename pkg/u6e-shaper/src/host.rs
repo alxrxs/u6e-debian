@@ -1,6 +1,6 @@
 //! What the shaper does to the AP, behind one trait the tests fake: `tc` and
-//! `nft` run by argument vector (never a shell), ECM's per-client and
-//! per-interface deceleration, and the AP's netdevs as sysfs lists them.
+//! `nft` run by argument vector (never a shell), sysctl writes (ECM's
+//! deceleration, `u6e_proto::ecm`), and the AP's netdevs as sysfs lists them.
 
 use std::fs;
 use std::io::Write;
@@ -20,11 +20,6 @@ pub trait Host {
     /// The AP's netdevs now.
     fn netdevs(&mut self) -> Vec<Netdev>;
 }
-
-/// ECM decelerates a client's connections, and an interface's, on a write
-/// of its MAC or name; its handler drops the write's last byte, a newline.
-pub const DEFUNCT_BY_MAC: &str = "/proc/sys/net/ecm/defunct_by_mac";
-pub const DEFUNCT_BY_IFACE: &str = "/proc/sys/net/ecm/defunct_by_iface";
 
 /// The AP.
 pub struct System {

@@ -6,8 +6,8 @@
 //! and (feature `tls`, which includes `digest`) the post-quantum, key-pinned
 //! TLS configuration of the link. `guard`, `shaper` and `capture` are the
 //! AP's own sockets between the agent and its client guards, its rate-limit
-//! helper and its capture helper, `local` and `bpf` what the AP's root
-//! helpers share; `text` cleans
+//! helper and its capture helper, `local`, `bpf` and `ecm` what the AP's
+//! root helpers share; `text` cleans
 //! what a person reads of it. Each end opens with the frozen version frame
 //! of `version`, so ends of different protocols tell so before either
 //! decodes a message.
@@ -17,6 +17,7 @@ pub mod capture;
 #[cfg(feature = "digest")]
 pub mod config;
 pub mod delta;
+pub mod ecm;
 pub mod frame;
 #[cfg(test)]
 mod golden;

@@ -514,7 +514,7 @@ fn radio_up(status: io::Result<String>, last: Option<bool>) -> bool {
 /// address family, or a capture's restore not done.
 fn offload_held(root: &Path) -> bool {
     let stopped = |p: &str| fs::read_to_string(root.join(&p[1..])).is_ok_and(|v| v.trim() != "0");
-    capture::ECM_STOP.iter().any(|p| stopped(p)) || root.join(&capture::RESTORE[1..]).exists()
+    u6e_proto::ecm::STOP.iter().any(|p| stopped(p)) || root.join(&capture::RESTORE[1..]).exists()
 }
 
 fn first_field(path: &Path) -> Option<f64> {
@@ -1504,7 +1504,7 @@ mod tests {
 
         // The offload, held while ECM is stopped or a restore is pending.
         assert!(!c.snapshot(15).offload_held);
-        let [v4, v6] = capture::ECM_STOP.map(|p| paths.root.join(&p[1..]));
+        let [v4, v6] = u6e_proto::ecm::STOP.map(|p| paths.root.join(&p[1..]));
         fs::create_dir_all(v4.parent().unwrap()).unwrap();
         fs::write(&v4, "0\n").unwrap();
         fs::write(&v6, "1\n").unwrap();

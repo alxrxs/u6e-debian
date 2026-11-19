@@ -13,9 +13,3 @@ pub const SOCKET: &str = "/run/u6e-capture/sock";
 /// What a capture changed, written before it changes anything and removed
 /// once it is put back: while it exists the NSS offload is held back.
 pub const RESTORE: &str = "/run/u6e-capture/restore";
-
-/// ECM's switches that stop it accelerating new IPv4 and IPv6 connections.
-pub const ECM_STOP: [&str; 2] = [
-    "/proc/sys/net/ecm/front_end_ipv4_stop",
-    "/proc/sys/net/ecm/front_end_ipv6_stop",
-];
