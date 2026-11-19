@@ -1,8 +1,9 @@
 //! The agent's side of the client guards (`u6e-guard`, a helper on a socket
 //! of the agent's group): each tick it reads their bindings and drop counts,
 //! each sent to the controller when it changed and at the start of each
-//! session, and the violations recorded since the last read, sent as
-//! events; it hands them the seed of the leases and the mode the controller
+//! session, the violations recorded since the last read, sent as events,
+//! and what they read of mDNS, whole at the start of each session (and
+//! from guards that restarted) and then what changed; it hands them the seed of the leases and the mode the controller
 //! sends, and hands them both again (the seed first, so no enforcing mode
 //! meets an empty table) to guards that restarted, which forget them. The
 //! violations are read across sessions, so those of an outage leave once
@@ -19,7 +20,7 @@ use std::time::Duration;
 
 use u6e_proto::frame::{read_frame, write_frame};
 use u6e_proto::guard::{Reply, Request};
-use u6e_proto::msg::{AgentMsg, Binding, Guard, GuardConfig};
+use u6e_proto::msg::{AgentMsg, Binding, Guard, GuardConfig, Services};
 
 /// The longest a request may take: the guards answer from memory.
 const WAIT: Duration = Duration::from_secs(2);
@@ -38,6 +39,9 @@ pub struct Guards {
     /// The bindings and the drop counts this session was sent last.
     sent: Option<(u64, u64)>,
     sent_drops: Option<Vec<(Guard, u64)>>,
+    /// The guards' start and the generation of their mDNS table this
+    /// session was sent last.
+    services: Option<(u64, u64)>,
     config: Option<GuardConfig>,
     seed: Option<Vec<Binding>>,
     failed: String,
@@ -60,6 +64,7 @@ impl Guards {
             after: kept.map_or(0, |(_, a)| a),
             sent: None,
             sent_drops: None,
+            services: None,
             config: None,
             seed: None,
             failed: String::new(),
@@ -121,15 +126,17 @@ impl Guards {
         self.tell(Request::Seed(leases));
     }
 
-    /// A new session: it is sent the bindings and drop counts at the next
-    /// read.
+    /// A new session: it is sent the bindings, the drop counts and the
+    /// whole mDNS table at the next read.
     pub fn session(&mut self) {
         self.sent = None;
         self.sent_drops = None;
+        self.services = None;
     }
 
     /// Appends to `out` the bindings and drop counts, if this session has
-    /// not had them as they are, and the violations since the last read.
+    /// not had them as they are, the violations since the last read and
+    /// what changed of the mDNS table.
     pub fn read_into(&mut self, out: &mut Vec<u8>) -> io::Result<()> {
         let (started, generation, bindings, dropped) = match self.ask(&Request::Bindings) {
             Ok(Reply::Bindings {
@@ -179,8 +186,25 @@ impl Guards {
             }
             self.keep();
         }
+        let since = self.services;
+        if let Ok(Reply::Services {
+            started_ms,
+            generation,
+            services,
+        }) = self.ask(&Request::Services { since })
+        {
+            if services.full || !unchanged(&services) {
+                write_frame(out, &AgentMsg::Services(services))?;
+            }
+            self.services = Some((started_ms, generation));
+        }
         Ok(())
     }
+}
+
+/// Whether a read of the mDNS table holds no change.
+fn unchanged(s: &Services) -> bool {
+    s.devices.is_empty() && s.offers.is_empty() && s.queries.is_empty() && s.gone.is_empty()
 }
 
 #[cfg(test)]
@@ -203,6 +227,10 @@ pub mod tests {
         pub bindings: Vec<Binding>,
         pub dropped: Vec<(Guard, u64)>,
         pub violations: Vec<(u64, Event)>,
+        /// The mDNS table's generation and what it answers with: whole to
+        /// a read without a place, else as it is.
+        pub services_generation: u64,
+        pub services: Services,
     }
 
     /// Stand-in guards on `dir/guard.sock`: they record what they are asked
@@ -224,6 +252,8 @@ pub mod tests {
                 bindings: Vec::new(),
                 dropped: Vec::new(),
                 violations: Vec::new(),
+                services_generation: 0,
+                services: Services::default(),
             }));
             let (a, s) = (Arc::clone(&asked), Arc::clone(&state));
             thread::spawn(move || {
@@ -245,6 +275,14 @@ pub mod tests {
                                 .into_iter()
                                 .filter(|(n, _)| n > after)
                                 .collect(),
+                        },
+                        Request::Services { since } => Reply::Services {
+                            started_ms: st.started_ms,
+                            generation: st.services_generation,
+                            services: Services {
+                                full: since.is_none_or(|(s, _)| s != st.started_ms),
+                                ..st.services
+                            },
                         },
                         _ => Reply::Done,
                     };
@@ -281,7 +319,7 @@ pub mod tests {
         )
     }
 
-    fn sent(out: &[u8]) -> Vec<AgentMsg> {
+    pub fn sent(out: &[u8]) -> Vec<AgentMsg> {
         let mut msgs = Vec::new();
         let mut at = 0;
         while let Some((m, n)) = decode_frame::<AgentMsg>(&out[at..]).unwrap() {
@@ -293,6 +331,13 @@ pub mod tests {
 
     fn guards(fake: &Fake, dir: &TestDir) -> Guards {
         Guards::new(fake.socket.clone(), dir.path().join("cursor"))
+    }
+
+    /// The messages of `out` but the mDNS table's.
+    fn but_services(out: &[u8]) -> Vec<AgentMsg> {
+        let all = sent(out).into_iter();
+        all.filter(|m| !matches!(m, AgentMsg::Services(_)))
+            .collect()
     }
 
     #[test]
@@ -310,7 +355,7 @@ pub mod tests {
         let mut out = Vec::new();
         g.read_into(&mut out).unwrap();
         assert_eq!(
-            sent(&out),
+            but_services(&out),
             [
                 AgentMsg::Bindings(vec![b]),
                 AgentMsg::GuardDrops(vec![]),
@@ -328,7 +373,7 @@ pub mod tests {
         fake.state.lock().unwrap().dropped = vec![(Guard::Arp, 3)];
         g.read_into(&mut out).unwrap();
         assert_eq!(
-            sent(&out),
+            but_services(&out),
             [
                 AgentMsg::Bindings(vec![b]),
                 AgentMsg::GuardDrops(vec![]),
@@ -388,6 +433,67 @@ pub mod tests {
             .filter(|m| matches!(m, AgentMsg::Event(_)))
             .count();
         assert_eq!(events, 2);
+    }
+
+    #[test]
+    fn the_mdns_table_goes_whole_then_its_changes() {
+        use u6e_proto::msg::MdnsKey;
+        let dir = TestDir::new();
+        let fake = Fake::start(&dir);
+        let mut g = guards(&fake, &dir);
+        let services = |out: &[u8]| -> Vec<Services> {
+            let all = sent(out).into_iter();
+            all.filter_map(|m| match m {
+                AgentMsg::Services(s) => Some(s),
+                _ => None,
+            })
+            .collect()
+        };
+        let asked = |fake: &Fake| -> Vec<Option<(u64, u64)>> {
+            let all = fake.asked.lock().unwrap().clone().into_iter();
+            all.filter_map(|r| match r {
+                Request::Services { since } => Some(since),
+                _ => None,
+            })
+            .collect()
+        };
+        // The first read of a session asks with no place: the whole table,
+        // empty or not.
+        let mut out = Vec::new();
+        g.read_into(&mut out).unwrap();
+        assert_eq!(services(&out).len(), 1);
+        assert!(services(&out)[0].full);
+        // Then with the place reached; nothing changed sends nothing.
+        fake.state.lock().unwrap().services_generation = 7;
+        out.clear();
+        g.read_into(&mut out).unwrap();
+        g.read_into(&mut out).unwrap();
+        assert_eq!(services(&out), []);
+        // A change is sent.
+        let gone = vec![MdnsKey::Device([2, 0, 0, 0, 0, 9])];
+        fake.state.lock().unwrap().services.gone.clone_from(&gone);
+        g.read_into(&mut out).unwrap();
+        assert_eq!(services(&out)[0].gone, gone);
+        assert!(!services(&out)[0].full);
+        // A new session asks with no place again, and restarted guards
+        // answer whole.
+        g.session();
+        g.read_into(&mut out).unwrap();
+        fake.state.lock().unwrap().started_ms = 2;
+        g.read_into(&mut out).unwrap();
+        let fulls: Vec<bool> = services(&out).iter().map(|s| s.full).collect();
+        assert_eq!(fulls, [false, true, true]);
+        assert_eq!(
+            asked(&fake),
+            [
+                None,
+                Some((1, 0)),
+                Some((1, 7)),
+                Some((1, 7)),
+                None,
+                Some((1, 7))
+            ]
+        );
     }
 
     #[test]

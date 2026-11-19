@@ -11,8 +11,8 @@
 //! frames leave as they come (see `spectrum`), and sends configurations,
 //! applied away from the link and answered once applied, in this session or
 //! the next (see `apply`), the client guards' mode and the leases they are
-//! seeded with, whose bindings and violations leave each tick (see
-//! `guards`), the rate limits, kept across sessions and synced with the AP
+//! seeded with, whose bindings, violations and mDNS table leave each tick
+//! (see `guards`), the rate limits, kept across sessions and synced with the AP
 //! each tick (see `limits`), and a client's capture, whose chunks leave as
 //! the controller acknowledges them (see `capture`); a silent or broken
 //! connection is dropped, its scans and its capture with it, and dialed
@@ -1410,8 +1410,8 @@ mod tests {
         assert!(sent.elapsed() < Duration::from_secs(3));
     }
 
-    /// The client guards' bindings and violations leave with the first
-    /// tick; the mode and seed the controller sends reach them.
+    /// The client guards' bindings, violations and mDNS table leave with the
+    /// first tick; the mode and seed the controller sends reach them.
     #[test]
     fn the_client_guards_are_heard_and_told() {
         use crate::guards::tests::{Fake as FakeGuards, violation};
@@ -1431,6 +1431,11 @@ mod tests {
         assert_eq!(p.recv(), AgentMsg::Bindings(vec![]));
         assert_eq!(p.recv(), AgentMsg::GuardDrops(vec![]));
         assert_eq!(p.recv(), AgentMsg::Event(violation(1).1));
+        let whole = u6e_proto::msg::Services {
+            full: true,
+            ..u6e_proto::msg::Services::default()
+        };
+        assert_eq!(p.recv(), AgentMsg::Services(whole));
         let mode = u6e_proto::msg::GuardConfig {
             enforce: vec![42],
             ..u6e_proto::msg::GuardConfig::default()
