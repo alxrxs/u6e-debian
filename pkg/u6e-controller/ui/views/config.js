@@ -1,10 +1,12 @@
-// Config: per AP, the Wi-Fi configuration it runs against the latest one
+// Config: the SSIDs' rate limits (`tools`), and per AP, the Wi-Fi
+// configuration it runs against the latest one
 // signed for it and the one sent last (by hash: the controller never holds
 // their text for the UI), how the last one went, and its image: what it
 // runs, the images kept for it, the Upgrade to its newest, and the rollout
 // under way or the last one, step by step until it is done or rolled back.
 
 import { h, ago, ask, bandName, hm, icon } from '../util.js';
+import { ssidLimitsPanel } from './tools.js';
 
 const ADMIN_GROUP = 'wifi-admins';
 const UP = 'M12 19V5M5 12l7-7 7 7';
@@ -137,15 +139,18 @@ function apPanel(store, name, ap) {
 export default {
   mount(root, store) {
     const sub = h('p');
+    const limits = ssidLimitsPanel(store);
     const list = h('div');
-    root.append(h('div', { class: 'head' }, h('h1', {}, 'Config'), sub), list);
+    root.append(h('div', { class: 'head' }, h('h1', {}, 'Config'), sub), limits.el, list);
     return {
       update() {
+        limits.el.hidden = !store.keyed;
         if (!store.keyed) {
           const [title, text] = store.waiting();
           list.replaceChildren(h('div', { class: 'panel empty' }, h('strong', {}, title), h('p', {}, text)));
           return;
         }
+        limits.update();
         const manage = store.state.manage || {};
         sub.textContent = [manage.configs ? 'live configurations signed here' : 'live configurations off',
           manage.images ? 'images rolled out here' : 'rollouts off'].join(', ');

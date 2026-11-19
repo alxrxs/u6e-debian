@@ -1,7 +1,8 @@
 // One client: who it is (its MAC's vendor, the DHCP server's device for it,
 // its lease's host name, its DNS name, its addresses and lease, how it
 // signed in and as whom, its certificate's expiry), where it is, its
-// readings now, the actions an admin can take on it, its largest
+// readings now, the actions an admin can take on it, its rate limit and its
+// captures (`tools`), its largest
 // connections, its signal, rates and traffic over the session as this page
 // has seen it, and, as the controller keeps them, its sessions and its
 // timeline, asked for again when an event of it comes and every 15 s.
@@ -10,6 +11,7 @@ import { h, icon, ask, bandName, bits, bytes, dayOf, DID, duration, hm, mbps, pa
 import { lineChart } from '../charts.js';
 import { clientFlows, flowTable, offload, redraw, sampled, tick, topRows } from './flows.js';
 import { certificate, sessionsTable, timelineItems } from './history.js';
+import { capturePanel, limitPanel } from './tools.js';
 
 const ADMIN_GROUP = 'wifi-admins';
 const REFRESH_MS = 15000;
@@ -206,6 +208,9 @@ export default {
         h('div', { class: 'ident' }, title, sub), where,
         h('div', { class: 'act' }, actions, lock)),
       identity, result, readings, absent);
+    const limit = limitPanel(store, mac);
+    const capture = capturePanel(store, mac);
+    const tools = h('div', { class: 'tools-row' }, limit.el, capture.el);
     const charts = [chartPanel('Signal'), chartPanel('Rates'), chartPanel('Throughput')];
     const chartsEl = h('div', { class: 'charts' }, charts.map((c) => c.el));
     const flowSub = h('p');
@@ -224,7 +229,7 @@ export default {
     const noHistory = h('div', { class: 'panel empty' });
     root.append(
       h('a', { class: 'crumb', href: '#/clients' }, icon('M15 18l-6-6 6-6'), 'Clients'),
-      head, chartsEl, flowsEl,
+      head, tools, chartsEl, flowsEl,
       h('h2', { class: 'section-title' }, 'Sessions'), sessions, allSessions,
       h('h2', { class: 'section-title' }, 'Timeline'), timeline, timelineNote, noHistory);
     /** The history the controller keeps, when it came, and its events seen
@@ -417,6 +422,8 @@ export default {
         const c = store.state.clients[mac];
         const p = palette();
         updateHead(c);
+        limit.update();
+        capture.update();
         updateFlows(c);
         chartsEl.hidden = !c;
 

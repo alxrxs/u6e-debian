@@ -29,6 +29,8 @@
 //! A radio asked to scan sends eight spectra a second until it is told to stop
 //! or goes down (`spectrum`: Wi-Fi bursts, a narrowband sender on 5 GHz, a
 //! microwave oven and Bluetooth on 2.4 GHz, a quiet 6 GHz channel).
+//! The rate limits the controller gives stand on the AP of their client or
+//! SSID, and a capture streams a made-up pcapng file (`tools`).
 //! The RF planner commits to a site repository of its own in the temporary
 //! directory, made afresh at each start, and the radios' history starts a
 //! day full (`rf`). The controller signs configurations (`u6e-controller
@@ -48,6 +50,7 @@ mod manage;
 mod radius;
 mod rf;
 mod spectrum;
+mod tools;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -72,9 +75,9 @@ use u6e_controller::names::Resolve;
 use u6e_controller::stage::Stage;
 use u6e_proto::frame::{decode_frame, frame_body, write_frame};
 use u6e_proto::msg::{
-    AgentMsg, Band, Bss, CommandKind, CommandResult, ConfigApplied, CtlMsg, Event, EventKind,
-    Flows, Guard, Hello, Mechanism, PowerLimit, Radio, RadioApplied, RateMode, Snapshot,
-    SpectrumFrame, Station, Temp, Violation,
+    AgentMsg, Band, Bss, CaptureState, CommandKind, CommandResult, ConfigApplied, CtlMsg, Event,
+    EventKind, Flows, Guard, Hello, Limit, Mechanism, PowerLimit, Radio, RadioApplied, RateMode,
+    Snapshot, SpectrumFrame, Station, Temp, Violation,
 };
 use u6e_proto::tls::{self, Identity};
 use u6e_proto::{PROTOCOL, delta, mac, version};
@@ -1104,6 +1107,16 @@ async fn agent(addr: SocketAddr, ap: usize, pem: &str, world: Arc<Mutex<World>>)
     frames.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let (mut seq, mut last, mut want_key) = (0, None::<Snapshot>, true);
     let mut flows_seq = 0;
+    // The limits the controller gave and their states as last sent, and the
+    // capture being made up, a chunk a second.
+    let (mut limits, mut sent_states) = (None::<Vec<Limit>>, None);
+    let mut capture = None::<tools::Capture>;
+    let mut chunks = interval(Duration::from_secs(1));
+    let unix_s = || {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+    };
     let flows = |seq: &mut u64, full| {
         *seq += 1;
         let mut w = world.lock().unwrap_or_else(|e| e.into_inner());
@@ -1126,6 +1139,10 @@ async fn agent(addr: SocketAddr, ap: usize, pem: &str, world: Arc<Mutex<World>>)
                 }
                 CtlMsg::WantFlows { full } => send(&mut wr, &flows(&mut flows_seq, full)).await?,
                 CtlMsg::Command(cmd) => {
+                    if let CommandKind::SyncLimits { limits: given } = &cmd.kind {
+                        limits = Some(given.clone());
+                        sent_states = None;
+                    }
                     let done = world
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -1167,6 +1184,33 @@ async fn agent(addr: SocketAddr, ap: usize, pem: &str, world: Arc<Mutex<World>>)
                 }
                 // The guards bind what they are seeded with.
                 CtlMsg::SeedBindings(b) => send(&mut wr, &AgentMsg::Bindings(b)).await?,
+                CtlMsg::CaptureStart(req) if capture.is_some() => {
+                    let busy = AgentMsg::Capture(CaptureState {
+                        id: req.id,
+                        running: false,
+                        mechanism: None,
+                        bytes: 0,
+                        packets: 0,
+                        dropped: 0,
+                        reason: "refused: a capture runs on this AP".into(),
+                    });
+                    send(&mut wr, &busy).await?;
+                }
+                CtlMsg::CaptureStart(req) => {
+                    let (c, state) = tools::Capture::start(ap, req, unix_s());
+                    send(&mut wr, &state).await?;
+                    capture = Some(c);
+                }
+                CtlMsg::CaptureStop { id } => {
+                    if let Some(c) = capture.take_if(|c| c.request.id == id) {
+                        send(&mut wr, &c.state(false, "stopped")).await?;
+                    }
+                }
+                CtlMsg::CaptureAck { id, seq } => {
+                    if let Some(c) = capture.as_mut().filter(|c| c.request.id == id) {
+                        c.ack(seq);
+                    }
+                }
                 // Taken as is, in place: the AP reports it installed.
                 CtlMsg::ApplyConfig(c) => {
                     let radios = c.radios.iter().map(|r| RadioApplied {
@@ -1198,6 +1242,13 @@ async fn agent(addr: SocketAddr, ap: usize, pem: &str, world: Arc<Mutex<World>>)
                     _ => None,
                 };
                 send(&mut wr, &msg.unwrap_or_else(|| AgentMsg::Key(snap.clone()))).await?;
+                if let Some(l) = &limits {
+                    let now = tools::states(l, &snap);
+                    if sent_states.as_ref() != Some(&now) {
+                        send(&mut wr, &AgentMsg::Limits(now.clone())).await?;
+                        sent_states = Some(now);
+                    }
+                }
                 (last, want_key) = (Some(snap), false);
                 next += tick;
             }
@@ -1238,6 +1289,16 @@ async fn agent(addr: SocketAddr, ap: usize, pem: &str, world: Arc<Mutex<World>>)
                         reason: why.into(),
                     };
                     send(&mut wr, &state).await?;
+                }
+            }
+            _ = chunks.tick(), if capture.is_some() => {
+                let (data, end) = capture.as_mut().map_or((None, None), |c| c.next(unix_s()));
+                if let Some(m) = data {
+                    send(&mut wr, &m).await?;
+                }
+                if let Some(m) = end {
+                    send(&mut wr, &m).await?;
+                    capture = None;
                 }
             }
             n = read(&mut rd, &mut chunk) => buf.extend_from_slice(&chunk[..n?]),

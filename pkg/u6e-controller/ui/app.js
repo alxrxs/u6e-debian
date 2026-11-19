@@ -62,6 +62,10 @@ const store = {
   /** Fetches the events held before this page opened, once. */
   loadHistory,
   act,
+  limit,
+  ssidLimit,
+  capture,
+  stopCapture,
   fullFlows,
   getJson,
   rfPlan,
@@ -159,6 +163,26 @@ async function adminPost(path, body) {
 /** Takes `action` (kick, block, unblock, steer) on client `mac`. */
 function act(mac, action, body = {}) {
   return adminPost(`/api/clients/${encodeURIComponent(mac)}/${action}`, body);
+}
+
+/** Limits client `mac` to `{ down_kbit, up_kbit }`; both null removes it. */
+function limit(mac, rates) {
+  return adminPost(`/api/clients/${encodeURIComponent(mac)}/limit`, rates);
+}
+
+/** Limits SSID `ssid` as `limit` does a client; both null gives it back
+ * the site file's limit. */
+function ssidLimit(ssid, rates) {
+  return adminPost('/api/ssids/limit', { ssid, ...rates });
+}
+
+/** Starts a capture of client `mac`: `{ secs, max_mb, snaplen, filter }`. */
+function capture(mac, request) {
+  return adminPost(`/api/clients/${encodeURIComponent(mac)}/capture`, request);
+}
+
+function stopCapture(id) {
+  return adminPost(`/api/captures/${encodeURIComponent(id)}/stop`, {});
 }
 
 /** The JSON `path` answers, with its `status`; status 0 when the
