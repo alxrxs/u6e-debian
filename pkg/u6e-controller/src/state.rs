@@ -1956,6 +1956,7 @@ mod tests {
             config_sha256: None,
             clock_synced: true,
             power_limits: Vec::new(),
+            auth: Vec::new(),
         }
     }
 
@@ -1969,6 +1970,7 @@ mod tests {
             removed: Vec::new(),
             added: Vec::new(),
             bsss: None,
+            auth: Vec::new(),
         }
     }
 

@@ -528,6 +528,7 @@ fn snapshot(seq: u64, bsss: Vec<Bss>, stations: Vec<Station>) -> Snapshot {
         config_sha256: None,
         clock_synced: true,
         power_limits: Vec::new(),
+        auth: Vec::new(),
     }
 }
 
@@ -541,6 +542,7 @@ fn delta(seq: u64, base: u64) -> SnapshotDelta {
         removed: Vec::new(),
         added: Vec::new(),
         bsss: None,
+        auth: Vec::new(),
     }
 }
 

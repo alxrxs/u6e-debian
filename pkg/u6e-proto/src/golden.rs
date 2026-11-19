@@ -27,7 +27,7 @@ use crate::msg::{
     AgentMsg, Band, Binding, Bss, ClientFlows, Command, CommandKind, CommandResult, ConfigApplied,
     CtlMsg, Event, EventKind, FieldDelta, Flow, Flows, Guard, GuardConfig, Hello, Mechanism,
     PowerLimit, Radio, RadioApplied, RadioConfig, RateMode, RecDelta, SignedConfig, Snapshot,
-    SnapshotDelta, SpectrumFrame, Station, Temp, Violation,
+    SnapshotDelta, SpectrumFrame, Station, StationAuth, Temp, Violation,
 };
 
 const HOW: &str = "bump u6e_proto::PROTOCOL (pkg/u6e-proto/src/version.rs) and write the \
@@ -78,6 +78,19 @@ fn station(last: u8, mode: RateMode) -> Station {
         inactive_ms: 70_003,
         connected_s: 70_004,
         vlan: 4094,
+    }
+}
+
+/// An 802.1X client's authentication, its identity past 127 bytes so that
+/// its length takes two bytes of varint.
+fn station_auth() -> StationAuth {
+    StationAuth {
+        akm: 0x000f_ac05,
+        auth_alg: 300,
+        authorized: true,
+        identity: format!("host/{}", "a".repeat(130)),
+        eap_method: 200,
+        reauth_s: 70_011,
     }
 }
 
@@ -225,6 +238,7 @@ fn samples() -> Samples {
             last: 301,
             dbm: -100,
         }],
+        auth: vec![([0x02, 0, 0, 0, 0, 1], station_auth())],
     };
     let rec = |idx| RecDelta {
         idx,
@@ -243,14 +257,25 @@ fn samples() -> Samples {
         removed: vec![[0x02, 0, 0, 0, 0, 9]],
         added: vec![station(10, RateMode::He)],
         bsss: Some(vec![bss("wlan2", "phy2")]),
+        auth: vec![([0x02, 0, 0, 0, 0, 10], station_auth())],
     };
     let mac = [0x02, 0, 0, 0, 0, 1];
     let phy = || "phy1".to_owned();
     let events = [
         ("Assoc", EventKind::Assoc { mac, bss: 300 }),
         ("Disassoc", EventKind::Disassoc { mac, bss: 300 }),
+        ("EapStart", EventKind::EapStart { mac, bss: 300 }),
         ("EapOk", EventKind::EapOk { mac, bss: 300 }),
         ("EapFail", EventKind::EapFail { mac, bss: 300 }),
+        (
+            "EapTimeout",
+            EventKind::EapTimeout {
+                mac,
+                bss: 300,
+                server: true,
+            },
+        ),
+        ("PskMismatch", EventKind::PskMismatch { mac, bss: 300 }),
         ("RadioUp", EventKind::RadioUp { phy: phy() }),
         ("RadioDown", EventKind::RadioDown { phy: phy() }),
         ("FwCrash", EventKind::FwCrash { phy: phy() }),

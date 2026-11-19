@@ -803,6 +803,7 @@ mod tests {
             config_sha256: None,
             clock_synced: true,
             power_limits: Vec::new(),
+            auth: Vec::new(),
         }
     }
 

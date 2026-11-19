@@ -160,6 +160,79 @@ pub struct Snapshot {
     /// enabled channels of one limit. They change so rarely that a key frame
     /// carries a change.
     pub power_limits: Vec<PowerLimit>,
+    /// How the stations authenticated, by MAC, sorted, each one a station's:
+    /// a station hostapd could not be asked about yet has none.
+    pub auth: Vec<([u8; 6], StationAuth)>,
+}
+
+/// The longest identity carried: RADIUS's User-Name is at most 253 bytes.
+pub const IDENTITY_MAX: usize = 253;
+
+/// How a client authenticated, as hostapd holds it for its association:
+/// what it associated with, and, over 802.1X, the identity it gave and the
+/// EAP method it used. The VLAN RADIUS gave it is its [`Station::vlan`].
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StationAuth {
+    /// The AKM suite it associated with, as its selector (OUI and type:
+    /// 00-0f-ac:1 is 0x000f_ac01); 0 for none.
+    pub akm: u32,
+    /// The 802.11 authentication algorithm of the association: 0 open
+    /// system, 2 fast BSS transition (802.11r), 3 SAE.
+    pub auth_alg: u16,
+    /// Whether hostapd authorized it: its keys are in place and its traffic
+    /// passes.
+    pub authorized: bool,
+    /// The identity it gave EAP, which hostapd relays to RADIUS as its
+    /// User-Name, at most [`IDENTITY_MAX`] bytes; empty without 802.1X.
+    pub identity: String,
+    /// The EAP method it last used, by its IANA type (13 TLS, 21 TTLS, 25
+    /// PEAP, 26 MSCHAPv2); 0 without one.
+    pub eap_method: u8,
+    /// The reauthentication period RADIUS set (Session-Timeout with
+    /// Termination-Action RADIUS-Request), in seconds; 0 without one.
+    pub reauth_s: u32,
+}
+
+/// How a client authenticates, by its AKM suite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthKind {
+    /// 802.1X: EAP, checked by RADIUS.
+    Eap,
+    /// A passphrase (WPA-PSK), which u6e-wifi always pairs with RADIUS MAC
+    /// authentication (its `psk-mab` networks): RADIUS admitted the MAC.
+    MacAuth,
+    /// WPA3-Personal.
+    Sae,
+    /// Anything else: an open network, OWE, FILS.
+    Other,
+}
+
+/// The OUI of the IEEE 802.11 AKM suites.
+const IEEE80211: u32 = 0x000f_ac00;
+
+impl StationAuth {
+    pub fn kind(&self) -> AuthKind {
+        if self.akm & !0xff != IEEE80211 {
+            return AuthKind::Other;
+        }
+        match self.akm & 0xff {
+            // 802.1X, FT over 802.1X, their SHA-256 and Suite B forms.
+            1 | 3 | 5 | 11 | 12 | 13 => AuthKind::Eap,
+            // PSK, FT-PSK, PSK-SHA256.
+            2 | 4 | 6 => AuthKind::MacAuth,
+            // SAE, FT-SAE, and their extended-key forms.
+            8 | 9 | 24 | 25 => AuthKind::Sae,
+            _ => AuthKind::Other,
+        }
+    }
+
+    /// Whether the association was a fast BSS transition (802.11r): a roam
+    /// that carried its keys over, with no new authentication.
+    pub fn fast_transition(&self) -> bool {
+        self.auth_alg == 2
+    }
 }
 
 /// The most a radio transmits with `first..=last` of `band` as its primary
@@ -286,6 +359,9 @@ pub struct SnapshotDelta {
     pub added: Vec<Station>,
     /// The complete list when it changed.
     pub bsss: Option<Vec<Bss>>,
+    /// The stations' authentications that are new or changed, by MAC; a
+    /// station's leaves with it.
+    pub auth: Vec<([u8; 6], StationAuth)>,
 }
 
 /// Changed fields of a record that has no index.
@@ -328,11 +404,29 @@ pub enum EventKind {
         mac: [u8; 6],
         bss: u16,
     },
+    /// hostapd started EAP with a client that associated.
+    EapStart {
+        mac: [u8; 6],
+        bss: u16,
+    },
     EapOk {
         mac: [u8; 6],
         bss: u16,
     },
+    /// RADIUS (or hostapd's own EAP server) rejected the client.
     EapFail {
+        mac: [u8; 6],
+        bss: u16,
+    },
+    /// EAP gave up: the client stopped answering, or, with `server`, the
+    /// RADIUS server did.
+    EapTimeout {
+        mac: [u8; 6],
+        bss: u16,
+        server: bool,
+    },
+    /// A client's 4-way handshake failed as a wrong passphrase makes it fail.
+    PskMismatch {
         mac: [u8; 6],
         bss: u16,
     },
@@ -689,6 +783,36 @@ mod tests {
             kernel: String::new(),
             hostapd: String::new(),
             agent: String::new(),
+        }
+    }
+
+    /// The AKM suites u6e-wifi configures (ent: WPA-EAP-SHA256 and FT-EAP;
+    /// psk-mab: WPA-PSK; sae: SAE and FT-SAE) and a few it does not.
+    #[test]
+    fn the_akm_suite_says_how_a_client_authenticates() {
+        let kind = |akm| {
+            let a = StationAuth {
+                akm,
+                auth_alg: 0,
+                authorized: true,
+                identity: String::new(),
+                eap_method: 0,
+                reauth_s: 0,
+            };
+            a.kind()
+        };
+        for (akm, want) in [
+            (0x000f_ac05, AuthKind::Eap),
+            (0x000f_ac03, AuthKind::Eap),
+            (0x000f_ac01, AuthKind::Eap),
+            (0x000f_ac02, AuthKind::MacAuth),
+            (0x000f_ac08, AuthKind::Sae),
+            (0x000f_ac09, AuthKind::Sae),
+            (0x000f_ac12, AuthKind::Other),
+            (0x0050_f201, AuthKind::Other),
+            (0, AuthKind::Other),
+        ] {
+            assert_eq!(kind(akm), want, "{akm:08x}");
         }
     }
 

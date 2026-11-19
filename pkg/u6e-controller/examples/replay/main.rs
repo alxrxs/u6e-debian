@@ -857,6 +857,7 @@ impl World {
             config_sha256: self.aps[ap].installed,
             clock_synced: true,
             power_limits: power_limits(),
+            auth: Vec::new(),
         }
     }
 }

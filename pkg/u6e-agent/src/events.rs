@@ -1,5 +1,6 @@
 //! What happens between two snapshots: stations associating and leaving, EAP
-//! results, a radio going up or down (hostapd's event stream, one attached
+//! starting, succeeding, failing or timing out, a passphrase that does not
+//! match, a radio going up or down (hostapd's event stream, one attached
 //! control socket per BSS) and a Wi-Fi firmware crash (the kernel log). One
 //! thread owns all the sockets; it re-attaches to a hostapd that restarted
 //! and picks up BSSs that appear, so nothing has to restart it.
@@ -228,16 +229,30 @@ fn parse(msg: &str, bss: u16, phy: impl FnOnce() -> String) -> Option<EventKind>
             mac: station(&mut f)?,
             bss,
         },
+        "CTRL-EVENT-EAP-STARTED" => EventKind::EapStart {
+            mac: station(&mut f)?,
+            bss,
+        },
         // The 2 forms are hostapd relaying to a RADIUS server, the plain
         // ones its own EAP server.
         "CTRL-EVENT-EAP-SUCCESS" | "CTRL-EVENT-EAP-SUCCESS2" => EventKind::EapOk {
             mac: station(&mut f)?,
             bss,
         },
-        "CTRL-EVENT-EAP-FAILURE"
-        | "CTRL-EVENT-EAP-FAILURE2"
-        | "CTRL-EVENT-EAP-TIMEOUT-FAILURE"
-        | "CTRL-EVENT-EAP-TIMEOUT-FAILURE2" => EventKind::EapFail {
+        "CTRL-EVENT-EAP-FAILURE" | "CTRL-EVENT-EAP-FAILURE2" => EventKind::EapFail {
+            mac: station(&mut f)?,
+            bss,
+        },
+        // Without the 2 the client stopped answering hostapd; with it, the
+        // RADIUS server stopped answering hostapd's relay.
+        "CTRL-EVENT-EAP-TIMEOUT-FAILURE" | "CTRL-EVENT-EAP-TIMEOUT-FAILURE2" => {
+            EventKind::EapTimeout {
+                mac: station(&mut f)?,
+                bss,
+                server: name.ends_with('2'),
+            }
+        }
+        "AP-STA-POSSIBLE-PSK-MISMATCH" => EventKind::PskMismatch {
             mac: station(&mut f)?,
             bss,
         },
@@ -294,21 +309,37 @@ mod tests {
     }
 
     /// With an external RADIUS server hostapd only relays EAP, and reports
-    /// its results with a 2 suffix.
+    /// its results with a 2 suffix; a timeout without it is the client's.
     #[test]
-    fn reports_the_eap_results_of_a_radius_server() {
+    fn reports_the_eap_steps_and_who_timed_out() {
         let a = "02:00:00:00:00:08";
-        for (name, ok) in [
-            ("CTRL-EVENT-EAP-SUCCESS2", true),
-            ("CTRL-EVENT-EAP-FAILURE2", false),
-            ("CTRL-EVENT-EAP-TIMEOUT-FAILURE", false),
-            ("CTRL-EVENT-EAP-TIMEOUT-FAILURE2", false),
+        let (mac, bss) = (STA, 1);
+        for (name, want) in [
+            ("CTRL-EVENT-EAP-STARTED", EventKind::EapStart { mac, bss }),
+            ("CTRL-EVENT-EAP-SUCCESS2", EventKind::EapOk { mac, bss }),
+            ("CTRL-EVENT-EAP-FAILURE2", EventKind::EapFail { mac, bss }),
+            ("CTRL-EVENT-EAP-FAILURE", EventKind::EapFail { mac, bss }),
+            (
+                "CTRL-EVENT-EAP-TIMEOUT-FAILURE",
+                EventKind::EapTimeout {
+                    mac,
+                    bss,
+                    server: false,
+                },
+            ),
+            (
+                "CTRL-EVENT-EAP-TIMEOUT-FAILURE2",
+                EventKind::EapTimeout {
+                    mac,
+                    bss,
+                    server: true,
+                },
+            ),
+            (
+                "AP-STA-POSSIBLE-PSK-MISMATCH",
+                EventKind::PskMismatch { mac, bss },
+            ),
         ] {
-            let want = if ok {
-                EventKind::EapOk { mac: STA, bss: 1 }
-            } else {
-                EventKind::EapFail { mac: STA, bss: 1 }
-            };
             assert_eq!(parse(&format!("<3>{name} {a}"), 1, phy1), Some(want));
         }
     }
@@ -358,11 +389,20 @@ mod tests {
         assert_eq!(count(|k| matches!(k, EventKind::Disassoc { .. })), 10);
         assert_eq!(count(|k| matches!(k, EventKind::RadioUp { .. })), 3);
         let sta = |n| [2, 0, 0, 0, 0, n];
+        assert_eq!(count(|k| matches!(k, EventKind::EapStart { .. })), 5);
         let eap: Vec<_> = got
             .iter()
-            .filter(|k| matches!(k, EventKind::EapOk { .. } | EventKind::EapFail { .. }))
+            .filter(|k| {
+                matches!(
+                    k,
+                    EventKind::EapOk { .. }
+                        | EventKind::EapFail { .. }
+                        | EventKind::EapTimeout { .. }
+                )
+            })
             .cloned()
             .collect();
+        // 02:..:02 stopped answering, then RADIUS did, then it got on.
         assert_eq!(
             eap,
             [
@@ -370,13 +410,15 @@ mod tests {
                     mac: sta(6),
                     bss: 1
                 },
-                EventKind::EapFail {
+                EventKind::EapTimeout {
                     mac: sta(2),
-                    bss: 1
+                    bss: 1,
+                    server: false
                 },
-                EventKind::EapFail {
+                EventKind::EapTimeout {
                     mac: sta(2),
-                    bss: 1
+                    bss: 1,
+                    server: true
                 },
                 EventKind::EapOk {
                     mac: sta(2),
@@ -384,7 +426,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(got.len(), 15 + 10 + 3 + 4);
+        assert_eq!(got.len(), 15 + 10 + 3 + 5 + 4);
     }
 
     #[test]

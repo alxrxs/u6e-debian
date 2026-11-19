@@ -42,6 +42,7 @@ mod passed;
 mod rates;
 mod regdomain;
 mod spectrum;
+mod stainfo;
 mod stats;
 #[cfg(test)]
 mod testdir;

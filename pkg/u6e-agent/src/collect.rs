@@ -10,7 +10,9 @@
 //! publishes (the configuration itself is root's alone), read again only
 //! when the helper replaced it; so is the power asked of each radio, which
 //! with the radio's own regulatory rules (its wiphy's `GET_REG`, read again
-//! every [`REGS_FOR`]) says the most it sends.
+//! every [`REGS_FOR`]) says the most it sends. How each station
+//! authenticated is hostapd's answer to `STA` (`stainfo`), asked once per
+//! association, and again each tick until hostapd has authorized it.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
@@ -19,14 +21,19 @@ use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-use u6e_proto::msg::{Bss, Flows, Radio, Snapshot, Station, Temp};
+use u6e_proto::mac;
+use u6e_proto::msg::{Bss, Flows, Radio, Snapshot, Station, StationAuth, Temp};
 
 use crate::ecm;
 use crate::kmsg::{self, Kmsg};
 use crate::neighbors::{self, Hostapd};
 use crate::nl80211::{self, Iface, Nl80211, Survey, Watch};
 use crate::rates::RateHold;
-use crate::{regdomain, wificonf};
+use crate::{regdomain, stainfo, wificonf};
+
+/// The most stations hostapd is asked about in one tick: a burst of clients
+/// joining at once is spread over a few ticks.
+const ASK_MAX: usize = 16;
 
 /// Where the collectors and the events thread look, so tests can point them
 /// at a scratch tree.
@@ -223,6 +230,18 @@ pub struct Collector {
     config: ConfigHash,
     /// Each radio's channels and regulatory rules, by wiphy, and when read.
     regs: HashMap<u32, (Instant, regdomain::BandCaps, Vec<regdomain::RegRule>)>,
+    /// How each station authenticated, by MAC.
+    auth: HashMap<[u8; 6], Known>,
+}
+
+/// A station's authentication as hostapd answered for its association: the
+/// BSS it was on and its connected time at the last tick, which going back
+/// says it associated again.
+#[derive(Debug, Clone, PartialEq)]
+struct Known {
+    bss: u16,
+    connected_s: u32,
+    auth: StationAuth,
 }
 
 impl Collector {
@@ -253,6 +272,7 @@ impl Collector {
             rates: RateHold::default(),
             config: ConfigHash::default(),
             regs: HashMap::new(),
+            auth: HashMap::new(),
         }
     }
 
@@ -338,6 +358,12 @@ impl Collector {
             },
         );
         self.up.retain(|bss, _| order.contains(bss));
+        let auth = authentications(&mut self.auth, &stations, |bss, mac| {
+            let h = hostapd.as_mut()?;
+            let ifname = order.get(usize::from(bss))?;
+            h.try_request(ifname, &format!("STA {}", mac::format(mac)))
+                .ok()
+        });
         let mut radios = radios;
         let asked = wificonf::read_asked(&self.paths.wifi);
         let mut power_limits = Vec::new();
@@ -388,6 +414,7 @@ impl Collector {
             config_sha256: self.config.get(&self.paths.wifi),
             clock_synced: root.join(&wificonf::SYNCHRONIZED[1..]).exists(),
             power_limits,
+            auth,
         }
     }
 
@@ -406,6 +433,52 @@ impl Collector {
             }
         }
     }
+}
+
+/// The authentications of `stations` (sorted by MAC, each once), in their
+/// order: what `known` holds of each association, after asking hostapd
+/// (`ask`: a BSS's index and a MAC, its answer to `STA`) about the stations
+/// it holds nothing of, has not authorized yet, or that associated again, at
+/// most [`ASK_MAX`] of them. `known` keeps only the stations present.
+fn authentications(
+    known: &mut HashMap<[u8; 6], Known>,
+    stations: &[Station],
+    mut ask: impl FnMut(u16, [u8; 6]) -> Option<String>,
+) -> Vec<([u8; 6], StationAuth)> {
+    known.retain(|mac, _| stations.binary_search_by_key(mac, |t| t.mac).is_ok());
+    let mut asked = 0;
+    for st in stations {
+        let current = known
+            .get_mut(&st.mac)
+            .filter(|k| k.bss == st.bss && k.connected_s <= st.connected_s);
+        match current {
+            Some(k) => {
+                k.connected_s = st.connected_s;
+                if k.auth.authorized {
+                    continue;
+                }
+            }
+            None => {
+                known.remove(&st.mac);
+            }
+        }
+        if asked == ASK_MAX {
+            continue;
+        }
+        asked += 1;
+        if let Some(auth) = ask(st.bss, st.mac).as_deref().and_then(stainfo::parse) {
+            let k = Known {
+                bss: st.bss,
+                connected_s: st.connected_s,
+                auth,
+            };
+            known.insert(st.mac, k);
+        }
+    }
+    let held = stations
+        .iter()
+        .filter_map(|st| Some((st.mac, known.get(&st.mac)?.auth.clone())));
+    held.collect()
 }
 
 /// Whether a radio serves, from its hostapd's answer to STATUS. A hostapd
@@ -826,6 +899,102 @@ mod tests {
         let all = stations(&sys, &order(), vec![("wlan24", old), ("wlan6", new)]);
         assert_eq!(all.len(), 1);
         assert_eq!((all[0].bss, all[0].connected_s), (5, 2));
+    }
+
+    /// A station on BSS `bss` connected for `connected_s`.
+    fn on(last: u8, bss: u16, connected_s: u32) -> Station {
+        Station {
+            mac: [2, 0, 0, 0, 0, last],
+            bss,
+            connected_s,
+            ..nl80211::parse_stations(STATIONS)[0].clone()
+        }
+    }
+
+    /// hostapd's answers, by MAC: authorized or not; every question is
+    /// counted.
+    struct Answers {
+        authorized: HashMap<[u8; 6], bool>,
+        asked: Vec<(u16, [u8; 6])>,
+    }
+
+    impl Answers {
+        fn ask(&mut self, bss: u16, mac: [u8; 6]) -> Option<String> {
+            self.asked.push((bss, mac));
+            let authorized = *self.authorized.get(&mac)?;
+            let text = include_str!("../tests/fixtures/sta-eap.txt");
+            let text = text.replacen("02:00:00:00:00:22", &mac::format(mac), 1);
+            Some(if authorized {
+                text
+            } else {
+                text.replace("[AUTHORIZED]", "")
+            })
+        }
+
+        /// The authentications of `stations` after one tick, as (last byte
+        /// of the MAC, authorized).
+        fn tick(
+            &mut self,
+            known: &mut HashMap<[u8; 6], Known>,
+            stations: &[Station],
+        ) -> Vec<(u8, bool)> {
+            self.asked.clear();
+            let auth = authentications(known, stations, |bss, mac| self.ask(bss, mac));
+            auth.iter().map(|(m, a)| (m[5], a.authorized)).collect()
+        }
+    }
+
+    /// hostapd is asked once per association, again each tick until it
+    /// authorizes the station, and again when it associates anew (another
+    /// BSS, or a connected time that went back); a station that left is
+    /// forgotten, and one hostapd does not know has no authentication.
+    #[test]
+    fn each_association_is_asked_about_until_it_is_authorized() {
+        let mut known = HashMap::new();
+        let sta = |n| [2, 0, 0, 0, 0, n];
+        let mut hostapd = Answers {
+            authorized: HashMap::from([(sta(1), true), (sta(2), false)]),
+            asked: Vec::new(),
+        };
+        let stations = [on(1, 0, 10), on(2, 0, 10), on(3, 1, 10)];
+        let got = hostapd.tick(&mut known, &stations);
+        assert_eq!(got, [(1, true), (2, false)]);
+        assert_eq!(hostapd.asked.len(), 3);
+        // Only the one not authorized yet, and the one hostapd did not know.
+        let stations = [on(1, 0, 25), on(2, 0, 25), on(3, 1, 25)];
+        hostapd.tick(&mut known, &stations);
+        assert_eq!(hostapd.asked, [(0, sta(2)), (1, sta(3))]);
+        hostapd.authorized.insert(sta(2), true);
+        let got = hostapd.tick(&mut known, &stations);
+        assert_eq!(got, [(1, true), (2, true)]);
+        hostapd.tick(&mut known, &stations);
+        assert_eq!(hostapd.asked, [(1, sta(3))]);
+        // 1 roams to another BSS, 2 associates again on its own; 3 leaves.
+        let stations = [on(1, 1, 2), on(2, 0, 3)];
+        hostapd.tick(&mut known, &stations);
+        assert_eq!(hostapd.asked, [(1, sta(1)), (0, sta(2))]);
+        assert_eq!(known.len(), 2);
+    }
+
+    /// A crowd joining at once is asked about over several ticks; a
+    /// reassociation not asked about yet holds no stale authentication.
+    #[test]
+    fn at_most_sixteen_stations_are_asked_about_a_tick() {
+        let mut known = HashMap::new();
+        let mut hostapd = Answers {
+            authorized: (1..=40).map(|i| ([2, 0, 0, 0, 0, i], true)).collect(),
+            asked: Vec::new(),
+        };
+        let stations: Vec<Station> = (1..=40).map(|i| on(i, 0, 5)).collect();
+        let held: Vec<usize> = (0..3)
+            .map(|_| hostapd.tick(&mut known, &stations).len())
+            .collect();
+        assert_eq!(held, [16, 32, 40]);
+        let mut again = stations.clone();
+        for st in &mut again {
+            st.connected_s = 1;
+        }
+        assert!(authentications(&mut known, &again, |_, _| None).is_empty());
     }
 
     #[test]

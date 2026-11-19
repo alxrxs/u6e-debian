@@ -51,6 +51,7 @@ mod tests {
             config_sha256: None,
             clock_synced: true,
             power_limits: Vec::new(),
+            auth: Vec::new(),
         };
         let stations = [("wlan5".to_string(), 3), ("wlan24".to_string(), 0)];
         assert_eq!(

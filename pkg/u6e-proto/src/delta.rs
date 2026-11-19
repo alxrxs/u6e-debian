@@ -4,14 +4,19 @@
 //! A delta addresses stations by their index in the base, so both ends must
 //! hold the same list in the same order. [`valid`] states what that takes;
 //! [`diff`] declines and [`apply`] refuses whatever is not valid, so a broken
-//! snapshot costs a key frame instead of misattributed counters.
+//! snapshot costs a key frame instead of misattributed counters. The
+//! stations' authentications travel whole, only those new or changed, and
+//! leave with their stations.
 //!
 //! Which bit stands for which field is wire format too: a change to it bumps
 //! [`crate::PROTOCOL`].
 
 use std::collections::{HashMap, HashSet};
 
-use crate::msg::{Band, FieldDelta, Radio, RateMode, RecDelta, Snapshot, SnapshotDelta, Station};
+use crate::msg::{
+    Band, FieldDelta, IDENTITY_MAX, Radio, RateMode, RecDelta, Snapshot, SnapshotDelta, Station,
+    StationAuth,
+};
 
 /// The base of a delta is not the snapshot it is applied to, or the delta is
 /// inconsistent with it: the receiver asks for a key frame.
@@ -30,9 +35,11 @@ const MAX_STATIONS: usize = 1024;
 const MAX_LIMITS: usize = 256;
 
 /// Whether the delta coding can work on `s`: stations sorted by MAC with each
-/// MAC once, each on a BSS of the list, every list within its cap, and each
+/// MAC once, each on a BSS of the list, every list within its cap, each
 /// radio, BSS and temperature zone named once (the names key the
-/// controller's metrics, where a duplicate would fail the whole scrape).
+/// controller's metrics, where a duplicate would fail the whole scrape), and
+/// the authentications sorted by MAC, each a station's, each identity within
+/// [`IDENTITY_MAX`].
 pub fn valid(s: &Snapshot) -> bool {
     s.temps.len() <= MAX_TEMPS
         && s.radios.len() <= MAX_RADIOS
@@ -44,6 +51,11 @@ pub fn valid(s: &Snapshot) -> bool {
         && unique(s.radios.iter().map(|r| &r.phy))
         && unique(s.bsss.iter().map(|b| &b.ifname))
         && unique(s.temps.iter().map(|t| &t.zone))
+        && s.auth.windows(2).all(|w| w[0].0 < w[1].0)
+        && s.auth.iter().all(|(mac, a)| {
+            a.identity.len() <= IDENTITY_MAX
+                && s.stations.binary_search_by_key(mac, |t| t.mac).is_ok()
+        })
 }
 
 fn unique<'a>(mut names: impl Iterator<Item = &'a String>) -> bool {
@@ -74,12 +86,14 @@ fn same_shape(prev: &Snapshot, next: &Snapshot) -> bool {
 }
 
 /// The difference from `prev` to `next`, stations matched by MAC; `None` when
-/// a delta cannot carry it (either is not [`valid`], or the shape changed) and
-/// the sender sends `next` as a key frame.
+/// a delta cannot carry it (either is not [`valid`], the shape changed, or a
+/// station that stays lost its authentication) and the sender sends `next`
+/// as a key frame.
 pub fn diff(prev: &Snapshot, next: &Snapshot) -> Option<SnapshotDelta> {
     if !(valid(prev) && valid(next) && same_shape(prev, next)) {
         return None;
     }
+    let auth = auth_diff(prev, next)?;
     let (mask, vals) = diff_fields(&scalar_fields(prev), &scalar_fields(next));
     let radios = prev
         .radios
@@ -125,7 +139,32 @@ pub fn diff(prev: &Snapshot, next: &Snapshot) -> Option<SnapshotDelta> {
         removed,
         added,
         bsss: (prev.bsss != next.bsss).then(|| next.bsss.clone()),
+        auth,
     })
+}
+
+/// The authentications of `next` that `prev` lacks or holds otherwise;
+/// `None` when one of `prev` is gone while its station stays, which only a
+/// key frame says.
+fn auth_diff(prev: &Snapshot, next: &Snapshot) -> Option<Vec<([u8; 6], StationAuth)>> {
+    let held = |mac: &[u8; 6]| {
+        let i = next.auth.binary_search_by_key(mac, |(m, _)| *m).ok()?;
+        Some(&next.auth[i].1)
+    };
+    let staying = |mac: &[u8; 6]| next.stations.binary_search_by_key(mac, |t| t.mac).is_ok();
+    if prev
+        .auth
+        .iter()
+        .any(|(mac, _)| staying(mac) && held(mac).is_none())
+    {
+        return None;
+    }
+    let was = |mac: &[u8; 6]| {
+        let i = prev.auth.binary_search_by_key(mac, |(m, _)| *m).ok()?;
+        Some(&prev.auth[i].1)
+    };
+    let changed = next.auth.iter().filter(|(mac, a)| was(mac) != Some(a));
+    Some(changed.cloned().collect())
 }
 
 /// Rebuilds the snapshot `d` was made from, given the one it was made against;
@@ -171,6 +210,13 @@ pub fn apply(base: &Snapshot, d: &SnapshotDelta) -> Result<Snapshot, Gap> {
     }
     next.stations.extend(d.added.iter().cloned());
     next.stations.sort_by_key(|s| s.mac);
+    next.auth.retain(|(mac, _)| !removed.contains(mac));
+    for (mac, a) in &d.auth {
+        match next.auth.binary_search_by_key(mac, |(m, _)| *m) {
+            Ok(i) => next.auth[i].1 = a.clone(),
+            Err(i) => next.auth.insert(i, (*mac, a.clone())),
+        }
+    }
     if !valid(&next) {
         return Err(Gap);
     }
@@ -439,7 +485,7 @@ mod tests {
             zone: z.into(),
             milli_c: 55_000 + r(5_000) as i32,
         });
-        let first = Snapshot {
+        let mut first = Snapshot {
             seq: 100,
             uptime_s: 86_400,
             load_milli: 120,
@@ -452,7 +498,15 @@ mod tests {
             config_sha256: Some([0xab; 32]),
             clock_synced: true,
             power_limits: Vec::new(),
+            auth: Vec::new(),
         };
+        // Every third station authenticated over 802.1X.
+        first.auth = first
+            .stations
+            .iter()
+            .step_by(3)
+            .map(|t| (t.mac, auth(&format!("host/pc{}", t.mac[5]))))
+            .collect();
         let mut second = first.clone();
         second.seq += 1;
         second.uptime_s += 2;
@@ -470,12 +524,30 @@ mod tests {
         (first, second)
     }
 
+    fn auth(identity: &str) -> StationAuth {
+        StationAuth {
+            akm: 0x000f_ac05,
+            auth_alg: 0,
+            authorized: true,
+            identity: identity.into(),
+            eap_method: 13,
+            reauth_s: 0,
+        }
+    }
+
     fn roundtrips(prev: &Snapshot, next: &Snapshot) {
         let d = diff(prev, next).unwrap();
         assert_eq!(&apply(prev, &d).unwrap(), next);
         let wire = postcard::to_stdvec(&d).unwrap();
         let d2: SnapshotDelta = postcard::from_bytes(&wire).unwrap();
         assert_eq!(&apply(prev, &d2).unwrap(), next);
+    }
+
+    /// Drops the authentications of stations no longer there, as a
+    /// collector does.
+    fn settle(s: &mut Snapshot) {
+        let stations: HashSet<_> = s.stations.iter().map(|t| t.mac).collect();
+        s.auth.retain(|(m, _)| stations.contains(m));
     }
 
     fn successor(prev: &Snapshot) -> Snapshot {
@@ -524,6 +596,7 @@ mod tests {
         let mut n = successor(&a);
         n.stations.remove(4);
         n.stations.remove(0);
+        settle(&mut n);
         roundtrips(&a, &n);
     }
 
@@ -575,6 +648,7 @@ mod tests {
         let mut n = successor(&a);
         n.bsss.pop();
         n.stations.retain(|s| usize::from(s.bss) < n.bsss.len());
+        settle(&mut n);
         n.bsss[0].ssid = "other".into();
         roundtrips(&a, &n);
     }
@@ -661,6 +735,7 @@ mod tests {
         s.radios.truncate(1);
         s.bsss.truncate(2);
         s.stations = stations;
+        settle(&mut s);
         s
     }
 
@@ -696,6 +771,7 @@ mod tests {
             removed: Vec::new(),
             added: Vec::new(),
             bsss: None,
+            auth: Vec::new(),
         };
         assert_eq!(apply(&b, &d), Err(Gap));
     }
@@ -742,6 +818,7 @@ mod tests {
             removed: Vec::new(),
             added: Vec::new(),
             bsss: None,
+            auth: Vec::new(),
         };
         assert_eq!(apply(&a, &d), Err(Gap));
         assert_eq!(diff(&a, &successor(&a)), None);
@@ -830,6 +907,65 @@ mod tests {
         roundtrips(&a, &b);
     }
 
+    /// A station that associates is added with its authentication; one
+    /// that hostapd authorizes since, or that roams in by FT, has its entry
+    /// upserted; one that leaves takes its entry along.
+    #[test]
+    fn authentications_round_trip() {
+        let (a, _) = fixture();
+        let mut n = successor(&a);
+        let (unauthorized, roamed, gone) = (a.auth[0].0, a.auth[1].0, a.auth[2].0);
+        let mut s = n.stations[3].clone();
+        s.mac = [0x02, 0, 0, 0, 0, 0x99];
+        n.stations.push(s);
+        n.stations.sort_by_key(|s| s.mac);
+        n.auth
+            .push(([0x02, 0, 0, 0, 0, 0x99], auth("anonymous@example.org")));
+        n.auth.sort_by_key(|(m, _)| *m);
+        for (mac, a) in &mut n.auth {
+            a.authorized &= *mac != unauthorized;
+            if *mac == roamed {
+                a.auth_alg = 2;
+            }
+        }
+        n.stations.retain(|t| t.mac != gone);
+        settle(&mut n);
+        let d = diff(&a, &n).unwrap();
+        assert_eq!(d.auth.len(), 3, "the new and the two changed only");
+        roundtrips(&a, &n);
+        // Unchanged, nothing travels.
+        assert!(diff(&n, &successor(&n)).unwrap().auth.is_empty());
+    }
+
+    /// An authentication dropped while its station stays is no change a
+    /// delta can carry.
+    #[test]
+    fn an_authentication_lost_by_a_staying_station_is_a_key_frame() {
+        let (a, _) = fixture();
+        let mut n = successor(&a);
+        n.auth.remove(0);
+        assert_eq!(diff(&a, &n), None);
+    }
+
+    #[test]
+    fn invalid_authentications_are_refused() {
+        let (a, _) = fixture();
+        assert!(valid(&a));
+        let mut s = a.clone();
+        s.auth.reverse();
+        assert!(!valid(&s));
+        let mut s = a.clone();
+        s.auth.push(([0xff; 6], auth("x")));
+        assert!(!valid(&s), "not a station's");
+        let mut s = a.clone();
+        s.auth[0].1.identity = "x".repeat(IDENTITY_MAX + 1);
+        assert!(!valid(&s));
+        // A delta that names a client that is no station is a gap.
+        let mut d = diff(&a, &successor(&a)).unwrap();
+        d.auth.push(([0xff; 6], auth("x")));
+        assert_eq!(apply(&a, &d), Err(Gap));
+    }
+
     fn wire_len(v: &impl serde::Serialize) -> usize {
         postcard::to_stdvec(v).unwrap().len()
     }
@@ -838,7 +974,8 @@ mod tests {
     /// full, 426 B delta); the BSS list, radios, temperatures and each
     /// station's VLAN and rate modes come on top, and the whole frames stay
     /// within what this fixture measures. The modes cost a key frame 4 B per
-    /// station and a delta nothing while they hold.
+    /// station and a delta nothing while they hold; so do the
+    /// authentications, about 24 B each in a key frame.
     #[test]
     fn delta_is_small() {
         let (a, b) = fixture();
@@ -865,7 +1002,7 @@ mod tests {
             wire_len(&a.stations)
         );
         assert!(wire_len(&d) <= 500, "delta {} B", wire_len(&d));
-        assert!(wire_len(&a) <= 1500, "full {} B", wire_len(&a));
+        assert!(wire_len(&a) <= 1700, "full {} B", wire_len(&a));
     }
 
     #[test]

@@ -1109,6 +1109,7 @@ mod tests {
                 config_sha256: None,
                 clock_synced: true,
                 power_limits: limits(),
+                auth: Vec::new(),
             }
         };
         (snap(0), snap(1))

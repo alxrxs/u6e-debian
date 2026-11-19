@@ -459,6 +459,7 @@ fn snapshot(seq: u64, channels: [(u16, u16); 3], secs: u64, client: bool) -> Sna
         config_sha256: None,
         clock_synced: true,
         power_limits: Vec::new(),
+        auth: Vec::new(),
     }
 }
 
