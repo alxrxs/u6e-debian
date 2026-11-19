@@ -22,9 +22,14 @@ function apSide(s) {
   return [what, h('small', {}, [s.ap ? `on ${s.ap}` : '', never].filter(Boolean).join(' · '))];
 }
 
-/** What RADIUS said, in words; `log` is whether its log is read. */
-function radiusSide(r, log) {
-  if (r) return [r.detail, h('small', {}, [r.user, r.node].filter(Boolean).join(' · '))];
+/** What RADIUS said, in words, and the User-Name the client claimed (a
+ * MAC-authenticated client's is its MAC, `mac`); `log` is whether its log
+ * is read. */
+function radiusSide(r, log, mac) {
+  if (r) {
+    const claimed = r.claimed && r.claimed.replaceAll('-', ':').toLowerCase() !== mac ? `claimed ${r.claimed}` : null;
+    return [r.detail, h('small', {}, [claimed, r.node].filter(Boolean).join(' · '))];
+  }
   if (log === 'up') return h('span', { class: 'muted' }, 'no rejection');
   return h('span', { class: 'muted' }, 'unknown: its log is not read');
 }
@@ -81,15 +86,14 @@ export default {
           return;
         }
         body.replaceChildren(...rows.map((c) => {
-          // A MAC-authenticated client's User-Name is its MAC.
-          const user = c.user && c.user.replaceAll('-', ':').toLowerCase() !== c.mac ? c.user : null;
-          const who = c.name || user || c.mac;
+          // Who a client is never comes from the User-Name it claimed.
+          const who = c.name || c.mac;
           const under = [who === c.mac ? null : c.mac, c.vendor].filter(Boolean).join(' · ');
           return h('tr', { onclick: (e) => e.target.closest('a') || (location.hash = `#/client/${c.mac}`) },
             h('td', { class: 'c-who' }, h('a', { class: who === c.mac ? 'mono' : null, href: `#/client/${c.mac}` }, who), under ? h('small', {}, under) : null),
             h('td', { class: 'c-when' }, ago(c.last), h('small', {}, when(c.last))),
             h('td', { class: 'wrap c-ap', 'data-label': head[2] }, apSide(c.ap_side)),
-            h('td', { class: 'wrap c-radius', 'data-label': head[3] }, radiusSide(c.radius, data.radius)),
+            h('td', { class: 'wrap c-radius', 'data-label': head[3] }, radiusSide(c.radius, data.radius, c.mac)),
             h('td', { class: 'num c-tries' }, `${c.attempts}×`),
             h('td', { class: 'c-now' }, status(c)));
         }));

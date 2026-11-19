@@ -26,10 +26,12 @@ export function when(ms) {
   return dayOf(ms) === 'Today' ? hm(ms) : `${dayOf(ms)}, ${hm(ms)}`;
 }
 
-/** How a sign-in went: its method and, over EAP, as whom. */
+/** How a sign-in went: its method and, over EAP, as whom, or whom it only
+ * claims to be until its AP authorizes it. */
 function signIn(e) {
   if (!e.method) return '';
-  return e.identity ? `${e.method} as ${e.identity}` : e.method;
+  if (!e.identity) return e.method;
+  return e.authorized === false ? `${e.method}, claiming ${e.identity}` : `${e.method} as ${e.identity}`;
 }
 
 /** What an EAP timeout means. */
@@ -73,7 +75,7 @@ function words(e) {
       return { tone: 'bad', text: ['Gave a passphrase that does not match'] };
     case 'radius': {
       const node = e.node ? ` (${e.node})` : '';
-      if (!e.accept) return { tone: 'bad', text: [`RADIUS${node} rejected ${e.user}: ${e.detail}`] };
+      if (!e.accept) return { tone: 'bad', text: [`RADIUS${node} rejected a sign-in claiming ${e.user}: ${e.detail}`] };
       const cert = e.cert_expires ? certificate(e.cert_expires) : null;
       const its = cert ? `, certificate ${e.cert_cn} ${cert.text}` : '';
       return { tone: 'ok', text: [`RADIUS${node} accepted ${e.user}`, h('span', { class: 'muted' }, ` · ${e.detail}${its}`)] };

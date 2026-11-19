@@ -629,7 +629,10 @@ fn client_view(state: &State, c: &ClientView) -> Value {
         let session = state.sessions.open_of(&st.mac);
         let authenticated = a.authorized || session.is_some_and(|s| s.authenticated);
         let cert = session.and_then(|s| state.sessions.session_cert(&st.mac, s));
-        o["auth"] = auth_view(a, authenticated, cert);
+        let identity = session
+            .and_then(Session::eap_identity)
+            .or_else(|| claimed(a));
+        o["auth"] = auth_view(a, identity, authenticated, cert);
     }
     if let Value::Object(o) = &mut o {
         o.extend(state.identity(&st.mac).fields());
@@ -691,20 +694,31 @@ pub fn method(a: &StationAuth) -> String {
     }
 }
 
-/// A client's authentication: its `method`, its EAP `identity`, whether its
-/// AP has authorized it in the session (`authenticated`; until then the
+/// The EAP identity an AP names for a client, authenticated or claimed.
+fn claimed(a: &StationAuth) -> Option<String> {
+    (a.kind() == AuthKind::Eap && !a.identity.is_empty()).then(|| a.identity.clone())
+}
+
+/// A client's authentication: its `method`, its EAP `identity` (a fast
+/// transition's carried over from the session it roamed in from), whether
+/// its AP has authorized it in the session (`authenticated`; until then the
 /// identity is only what the client claims), the certificate it signed in
 /// with (`cert_cn`, `cert_expires` in milliseconds), whether its association
 /// was a fast transition (`ft`), and the reauthentication period RADIUS set
 /// (`reauth`, seconds).
-fn auth_view(a: &StationAuth, authenticated: bool, cert: Option<(String, u64)>) -> Value {
+fn auth_view(
+    a: &StationAuth,
+    identity: Option<String>,
+    authenticated: bool,
+    cert: Option<(String, u64)>,
+) -> Value {
     let mut o = json!({
         "method": method(a),
         "ft": a.fast_transition(),
         "authenticated": authenticated,
     });
-    if a.kind() == AuthKind::Eap && !a.identity.is_empty() {
-        o["identity"] = a.identity.clone().into();
+    if let Some(i) = identity {
+        o["identity"] = i.into();
     }
     if let Some((cn, expires_s)) = cert.filter(|_| authenticated) {
         o["cert_cn"] = cn.into();
@@ -754,7 +768,7 @@ pub fn history(state: &State, mac: &[u8; 6]) -> Value {
     let latest = sessions.iter().find_map(|s| Some((s, s.auth.as_ref()?)));
     if let Some((s, a)) = latest {
         let cert = state.sessions.session_cert(mac, s);
-        let mut id = auth_view(a, s.authenticated, cert);
+        let mut id = auth_view(a, s.eap_identity(), s.authenticated, cert);
         id["vlan"] = s.place.vlan.into();
         id["connected"] = s.end_ms.is_none().into();
         o["identity"] = id;
@@ -810,7 +824,8 @@ fn session(state: &State, s: &Session) -> Value {
     }
     if let Some(a) = &s.auth {
         let cert = state.sessions.session_cert(&s.mac, s);
-        o.insert("auth".into(), auth_view(a, s.authenticated, cert));
+        let auth = auth_view(a, s.eap_identity(), s.authenticated, cert);
+        o.insert("auth".into(), auth);
     }
     o.insert("rx_bytes".into(), s.up_bytes.into());
     o.insert("tx_bytes".into(), s.down_bytes.into());
@@ -823,7 +838,9 @@ fn session(state: &State, s: &Session) -> Value {
     Value::Object(o)
 }
 
-/// One timeline entry: its time (`at`), its `kind` and what it says.
+/// One timeline entry: its time (`at`), its `kind` and what it says (a
+/// join's `authorized`: whether its AP authorized it in that session, until
+/// when its `identity` is only claimed).
 fn entry(e: &Entry) -> Value {
     let mut o = Map::new();
     o.insert("at".into(), e.at_ms.into());
@@ -844,6 +861,7 @@ fn entry(e: &Entry) -> Value {
             if let Some(a) = auth {
                 put("method", method(a).into());
                 put("ft", a.fast_transition().into());
+                put("authorized", a.authorized.into());
                 if !a.identity.is_empty() {
                     put("identity", a.identity.clone().into());
                 }
@@ -1030,8 +1048,9 @@ fn ap_side(e: &Entry, recent: &[&Entry]) -> Option<Value> {
 /// (`/api/auth-problems`): for each, its last failure on the APs' side
 /// (`ap_side`: EAP rejected or timed out, by the client or by RADIUS, and
 /// whether a client that timed out reached RADIUS at all; a passphrase
-/// mismatch), RADIUS's last rejection and its reason (`radius`), how many
-/// failures there were, and whether it got on since (`connected_since`,
+/// mismatch), RADIUS's last rejection, its reason and the User-Name the
+/// client claimed in it (`radius`: `claimed`, never who the client is), how
+/// many failures there were, and whether it got on since (`connected_since`,
 /// `connected`); the ones still failing first, the latest first.
 pub fn auth_problems(state: &State, now_ms: u64) -> Value {
     let since = now_ms.saturating_sub(PROBLEMS_WINDOW_MS);
@@ -1060,11 +1079,10 @@ pub fn auth_problems(state: &State, now_ms: u64) -> Value {
         let rejected = failures.iter().rev().find_map(|e| match &e.what {
             What::Radius {
                 user, node, detail, ..
-            } => Some(json!({ "at": e.at_ms, "user": user, "node": node, "detail": detail })),
+            } => Some(json!({ "at": e.at_ms, "claimed": user, "node": node, "detail": detail })),
             _ => None,
         });
         if let Some(r) = rejected {
-            o["user"] = r["user"].clone();
             o["radius"] = r;
         }
         // On only once authorized: a client mid-EAP has not got on.

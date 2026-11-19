@@ -107,19 +107,55 @@ pub struct Session {
     pub end: Option<End>,
     /// The AP it roamed in from.
     pub from: Option<String>,
+    /// The sign-in of the session it roamed in from, which a fast
+    /// transition carries over.
+    prior: Option<Prior>,
     /// Whether its first traffic was seen.
     traffic: bool,
     /// How long its client had been silent when last heard of.
     inactive_ms: u32,
 }
 
+/// The sign-in a session roamed in from ran: when its EAP ran, and the
+/// identity it authenticated as.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Prior {
+    signed_in_ms: u64,
+    identity: Option<String>,
+}
+
 impl Session {
+    /// Whether it began by a fast transition, carrying over the sign-in of
+    /// the session it roamed in from.
+    fn carried_over(&self) -> Option<&Prior> {
+        let ft = self.auth.as_ref().is_some_and(StationAuth::fast_transition);
+        self.prior.as_ref().filter(|_| ft)
+    }
+
+    /// When its sign-in ran: when it began, or, for a fast transition, when
+    /// the session it roamed in from signed in.
+    pub fn signed_in_ms(&self) -> u64 {
+        self.carried_over()
+            .map_or(self.start_ms, |p| p.signed_in_ms)
+    }
+
+    /// Its EAP identity, authenticated or only claimed: its AP's word, or,
+    /// for a fast transition its AP names none for, the identity of the
+    /// session it roamed in from.
+    pub fn eap_identity(&self) -> Option<String> {
+        let a = self.auth.as_ref().filter(|a| a.kind() == AuthKind::Eap)?;
+        let carried = || self.carried_over()?.identity.clone();
+        Some(a.identity.clone())
+            .filter(|i| !i.is_empty())
+            .or_else(carried)
+    }
+
     /// Who it authenticated as, once its AP authorized it: its EAP
     /// identity, or its MAC when RADIUS admitted the MAC.
     pub fn identity(&self) -> Option<String> {
         let a = self.auth.as_ref().filter(|_| self.authenticated)?;
         match a.kind() {
-            AuthKind::Eap if !a.identity.is_empty() => Some(a.identity.clone()),
+            AuthKind::Eap => self.eap_identity(),
             AuthKind::MacAuth => Some(mac::format(self.mac)),
             _ => None,
         }
@@ -336,6 +372,11 @@ impl Sessions {
             .filter(|a| a.0 == "steer" && a.2 <= at && at - a.2 <= CAUSE_WINDOW_MS)
             .and_then(|a| a.1);
         let mut from = None;
+        let mut prior = None;
+        let carry = |s: &Session| Prior {
+            signed_in_ms: s.signed_in_ms(),
+            identity: s.identity(),
+        };
         if let Some(open) = self.open.get(&mac) {
             let same = open.place.ap == place.ap && open.place.bss == place.bss;
             if same && began <= open.start_ms + REASSOCIATED_MS {
@@ -344,6 +385,7 @@ impl Sessions {
             if same {
                 self.close(mac, began, End::Left);
             } else {
+                prior = Some(carry(open));
                 from = Some(Roam {
                     ap: open.place.ap.clone(),
                     band: open.place.band,
@@ -360,6 +402,7 @@ impl Sessions {
                 steered_by,
             });
             if let Some(s) = self.closed.iter_mut().rev().find(|s| s.id == id) {
+                prior = Some(carry(s));
                 s.end = Some(End::Roamed {
                     to: place.ap.clone(),
                 });
@@ -381,6 +424,7 @@ impl Sessions {
             down_bytes: 0,
             end: None,
             from: from.as_ref().map(|r| r.ap.clone()),
+            prior,
             traffic: false,
             inactive_ms: 0,
         };
@@ -522,6 +566,16 @@ impl Sessions {
                 s.authenticated |= a.authorized;
                 s.auth = Some(a.clone());
             }
+            // The timeline says who the session is: authorized once its AP
+            // authorized it in the session, the identity a fast transition
+            // carried over.
+            let learnt = learnt.map(|mut a| {
+                a.authorized = s.authenticated;
+                if a.kind() == AuthKind::Eap {
+                    a.identity = s.eap_identity().unwrap_or_default();
+                }
+                a
+            });
             let (id, vlan) = (s.id, st.vlan);
             let joined = |w: &What| matches!(w, What::Joined { session, .. } if *session == id);
             self.timeline.edit(&st.mac, joined, |w| {
@@ -741,13 +795,14 @@ impl Sessions {
 
     /// The certificate `session` of `mac` signed in with, once its AP
     /// authorized it: the newest EAP-TLS accept of the client from shortly
-    /// before the session began (EAP comes first) to its end; its common name
-    /// and expiry (Unix seconds).
+    /// before its sign-in ran (EAP comes first; a fast transition's ran in
+    /// the session it roamed in from) to its end; its common name and expiry
+    /// (Unix seconds).
     pub fn session_cert(&self, mac: &[u8; 6], session: &Session) -> Option<(String, u64)> {
         if !session.authenticated {
             return None;
         }
-        let from = session.start_ms.saturating_sub(CERT_BEFORE_MS);
+        let from = session.signed_in_ms().saturating_sub(CERT_BEFORE_MS);
         let to = session.end_ms.unwrap_or(u64::MAX);
         let accepts = self.timeline.of(mac).rev();
         accepts
@@ -1395,6 +1450,94 @@ mod tests {
         };
         s.radius(&[anonymous]);
         assert_eq!(s.certs().len(), 2);
+    }
+
+    /// A session begun by a fast transition ran no EAP of its own: 10
+    /// minutes after the client signed in, it shows the certificate of the
+    /// session that ran EAP, through a second roam too, and the identity
+    /// that session authenticated as when its AP names none.
+    #[test]
+    fn a_fast_transition_carries_the_sign_in_over() {
+        let mut s = Sessions::default();
+        assoc(&mut s, "ap1", 0, T0);
+        let signed_in = snap(vec![station(0, 4, 100)], Some(eap("host/pc1", 0)));
+        s.snapshot("ap1", &signed_in, &naming(), T0 + 5000, false);
+        s.radius(&[line(T0 - 1000, true, Some(1_900_000_000))]);
+        let cert = Some(("host/pc1".to_owned(), 1_900_000_000));
+        assert_eq!(s.session_cert(&MAC, s.open_of(&MAC).unwrap()), cert);
+        let later = T0 + 600_000;
+        assoc(&mut s, "ap2", 1, later);
+        let ft = snap(vec![station(1, 1, 100)], Some(eap("", 2)));
+        s.snapshot("ap2", &ft, &naming(), later + 1000, false);
+        disassoc(&mut s, "ap1", 0, later + 1500);
+        let open = s.open_of(&MAC).unwrap();
+        assert_eq!(open.signed_in_ms(), T0);
+        assert_eq!(open.identity().as_deref(), Some("host/pc1"));
+        assert_eq!(s.session_cert(&MAC, open), cert);
+        let joined = s.timeline.of(&MAC).rev().find_map(|e| match &e.what {
+            What::Joined { auth: Some(a), .. } => Some(a.clone()),
+            _ => None,
+        });
+        assert_eq!(joined.unwrap().identity, "host/pc1");
+        // Roamed on, out of the first AP's window altogether.
+        let again = later + 600_000;
+        assoc(&mut s, "ap1", 0, again);
+        let ft = snap(vec![station(0, 1, 100)], Some(eap("", 2)));
+        s.snapshot("ap1", &ft, &naming(), again + 1000, false);
+        let open = s.open_of(&MAC).unwrap();
+        assert_eq!(s.session_cert(&MAC, open), cert);
+        assert_eq!(s.identities()["host/pc1"].1, 1);
+        // A session that ran EAP again does not carry the old sign-in.
+        disassoc(&mut s, "ap1", 0, again + 2000);
+        assoc(&mut s, "ap2", 1, again + 3000);
+        let full = snap(vec![station(1, 1, 100)], Some(eap("host/pc1", 0)));
+        s.snapshot("ap2", &full, &naming(), again + 4000, false);
+        let open = s.open_of(&MAC).unwrap();
+        assert_eq!(open.signed_in_ms(), open.start_ms);
+        assert_eq!(s.session_cert(&MAC, open), None);
+    }
+
+    /// The timeline's join says whether its AP authorized the session, and
+    /// keeps saying so while a reauthentication runs.
+    #[test]
+    fn a_join_says_whether_it_was_authorized() {
+        let mut s = Sessions::default();
+        assoc(&mut s, "ap1", 0, T0);
+        let authorized = |s: &Sessions| {
+            s.timeline.of(&MAC).find_map(|e| match &e.what {
+                What::Joined { auth: Some(a), .. } => Some(a.authorized),
+                _ => None,
+            })
+        };
+        let claiming = StationAuth {
+            authorized: false,
+            ..eap("host/claimed", 0)
+        };
+        let st = vec![station(0, 1, 0)];
+        s.snapshot(
+            "ap1",
+            &snap(st.clone(), Some(claiming.clone())),
+            &naming(),
+            T0 + 1000,
+            false,
+        );
+        assert_eq!(authorized(&s), Some(false));
+        s.snapshot(
+            "ap1",
+            &snap(st.clone(), Some(eap("host/claimed", 0))),
+            &naming(),
+            T0 + 2000,
+            false,
+        );
+        assert_eq!(authorized(&s), Some(true));
+        s.snapshot(
+            "ap1",
+            &snap(st, Some(claiming)),
+            &naming(),
+            T0 + 3000,
+            false,
+        );
+        assert_eq!(authorized(&s), Some(true));
     }
 
     /// A client its AP has not authorized only claims its identity: it

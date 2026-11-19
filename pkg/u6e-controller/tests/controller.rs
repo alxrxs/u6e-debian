@@ -4262,6 +4262,11 @@ fn identity_sessions_timeline_and_auth_problems() {
         .collect();
     // It associated a minute ago (its connected time), RADIUS answered since.
     assert_eq!(kinds, ["radius", "joined"], "newest first");
+    let joined = &h["timeline"][1];
+    assert_eq!(
+        (&joined["identity"], &joined["authorized"]),
+        (&json!("host/pc1"), &json!(true))
+    );
     let c = json_get(r.c.http, "/api/clients");
     let auth = &c["02:00:00:00:00:01"]["auth"];
     assert_eq!(
@@ -4275,7 +4280,9 @@ fn identity_sessions_timeline_and_auth_problems() {
     let row = &rows[0];
     assert_eq!(row["mac"], "02:00:00:00:00:02");
     assert_eq!(row["attempts"], 2);
-    assert_eq!(row["user"], "bob@example.org");
+    // The User-Name RADIUS rejected is only what the client claimed.
+    assert_eq!(row["radius"]["claimed"], "bob@example.org");
+    assert_eq!(row.get("user"), None);
     assert_eq!(row["radius"]["detail"], "Not authorized for Wi-Fi");
     assert_eq!(
         (&row["ap_side"]["kind"], &row["ap_side"]["reached_radius"]),
@@ -4301,6 +4308,19 @@ fn identity_sessions_timeline_and_auth_problems() {
     assert_eq!(
         (&row["connected"], row.get("connected_since")),
         (&json!(false), None)
+    );
+    // Its timeline's join says the identity is only claimed.
+    let path = "/api/clients/02:00:00:00:00:02/history";
+    let joined = json_get(r.c.http, path)["timeline"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "joined" && e.get("identity").is_some())
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        (&joined["identity"], &joined["authorized"]),
+        (&json!("bob@example.org"), &json!(false))
     );
 
     // The client leaves: its session ends, and counts for its identity.
