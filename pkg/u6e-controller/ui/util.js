@@ -185,8 +185,11 @@ export function describe(ev) {
   switch (ev.kind) {
     case 'assoc': return { text: `joined${on}${band}`, tone: 'ok', group: 'conn' };
     case 'disassoc': return { text: `left${on}`, tone: '', group: 'conn' };
+    case 'eap-start': return { text: `started signing in to${on}`, tone: '', group: 'auth' };
     case 'eap-ok': return { text: `signed in to${on}`, tone: 'ok', group: 'auth' };
-    case 'eap-fail': return { text: `failed to sign in to${on}`, tone: 'bad', group: 'auth' };
+    case 'eap-fail': return { text: `was refused by RADIUS on${on}`, tone: 'bad', group: 'auth' };
+    case 'eap-timeout': return { text: `timed out signing in to${on}: ${ev.server ? 'RADIUS did not answer' : 'the client stopped answering'}`, tone: 'bad', group: 'auth' };
+    case 'psk-mismatch': return { text: `gave a passphrase for${on} that does not match`, tone: 'bad', group: 'auth' };
     case 'radio-up': return { text: `${ev.phy} came up`, tone: 'ok', group: 'radio' };
     case 'radio-down': return { text: `${ev.phy} went down`, tone: 'bad', group: 'radio' };
     case 'fw-crash': return { text: `${ev.phy} firmware crashed`, tone: 'bad', group: 'radio' };

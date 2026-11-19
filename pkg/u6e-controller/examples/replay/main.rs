@@ -2,17 +2,23 @@
 //! hardware: the controller runs in this process, and `ap1` and `ap2` dial it
 //! over the real link with the tests' throwaway keys. Each AP has three
 //! radios; ten clients move about in a two-minute script that repeats (joins
-//! and leaves, roams between the APs, an EAP failure, a 6 GHz radio going
-//! down and up, one AP's link dropping for a while), their signals, rates,
-//! traffic and connections drifting all the while.
+//! and leaves, roams between the APs and between bands, by fast transition
+//! on the EAP SSID, a 6 GHz radio going down and up, one AP's link dropping
+//! for a while), their signals, rates, traffic and connections drifting all
+//! the while. Each signs in as its SSID has it (`radius`): EAP-TLS or PEAP
+//! with an identity, MAC authentication, SAE; and some do not get on: one
+//! RADIUS rejects before it is let on, one that stops answering EAP, one
+//! with a wrong passphrase, one RADIUS does not know at all. RADIUS's log of
+//! it all, a week of it from the start, is served by a Loki of the replay's
+//! own, and the client history is kept in the temporary directory.
 //! The agents keep to the tick and flow cadence the controller sets, as real
 //! ones do, and carry out its commands: a kicked client rejoins a few seconds
 //! later, a blocked one stays away until it is unblocked, a steered one moves
 //! to its target, a radio switches channel or power at once, a configuration
 //! is taken in place, and the thermostat (`02:00:00:00:00:06`) never answers
 //! a kick, for the timeout. Each client but one has a DHCP lease with its
-//! host name, three a device name too, which a node exporter of the replay's
-//! own publishes as the DHCP nodes' do; their addresses have DNS names, as do
+//! host name, three a device name too, renewed every ten minutes, which a
+//! node exporter of the replay's own publishes as the DHCP nodes' do; their addresses have DNS names, as do
 //! most far ends of their connections. Clients with an odd last byte have a
 //! universally administered MAC (RFC 7042's documentation block, whose vendor
 //! is IANA), the others a made-up private one. Each AP's client guards bind
@@ -39,6 +45,7 @@ mod flows;
 #[path = "../../tests/common/keys.rs"]
 mod keys;
 mod manage;
+mod radius;
 mod rf;
 mod spectrum;
 
@@ -158,7 +165,8 @@ impl Resolve for Names {
 
 /// The DHCP leases, as a DHCP node's exporter publishes them: each client
 /// with a name has its address leased under its host name (and its device,
-/// for those that have one), expiring some hours from now.
+/// for those that have one) for twenty minutes, renewed every ten, each
+/// client at a moment of its own.
 fn leases() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -172,7 +180,9 @@ fn leases() -> String {
             .iter()
             .find(|(l, _)| *l == last)
             .map_or("", |(_, d)| d);
-        let expires = now + 3600 * (2 + u64::from(last));
+        let offset = u64::from(last) * 37;
+        let renewed = (now - offset) - (now - offset) % 600 + offset;
+        let expires = renewed + 1200;
         out.push_str(&format!(
             "kea_lease_expiry_timestamp_seconds{{device=\"{device}\",family=\"ipv4\",hostname=\"{host}\",\
              ip=\"192.0.2.{}\",mac=\"{}\",subnet_id=\"1\"}} {expires}\n",
@@ -232,6 +242,8 @@ struct Client {
     tx_airtime_us: f64,
     rx_airtime_us: f64,
     idle_s: f64,
+    /// Its association was a fast transition.
+    ft: bool,
 }
 
 /// What the script does at a moment of its cycle.
@@ -240,6 +252,13 @@ enum Act {
     Join(u8, usize, usize, f64),
     Leave(u8),
     EapFail(u8, usize, usize),
+    /// A client stops answering EAP on an AP, never reaching RADIUS.
+    EapTimeout(u8, usize, usize),
+    /// A client gives a passphrase that does not match.
+    PskMismatch(u8, usize, usize),
+    /// The device RADIUS does not know tries MAC authentication on an AP,
+    /// which hears nothing of it.
+    Unknown(usize),
     RadioDown(usize, usize),
     RadioUp(usize, usize),
     /// The AP's link drops for so many seconds.
@@ -251,13 +270,16 @@ enum Act {
 /// The script, by second of the cycle and in that order; clients by the last
 /// byte of their MAC, APs and BSSs by index. A join of a client already
 /// somewhere is a roam.
-const SCRIPT: [(f64, Act); 15] = [
+const SCRIPT: [(f64, Act); 18] = [
     (20.0, Act::Join(3, 1, 1, -58.0)),
+    (30.0, Act::EapTimeout(11, 0, 1)),
     (35.0, Act::Leave(7)),
+    (40.0, Act::PskMismatch(12, 1, 0)),
     (45.0, Act::Violation(9, 0, Guard::Arp)),
     (50.0, Act::EapFail(10, 1, 1)),
     (53.0, Act::Join(10, 1, 1, -67.0)),
     (60.0, Act::RadioDown(1, 2)),
+    (65.0, Act::Unknown(1)),
     (61.0, Act::Join(8, 1, 1, -61.0)),
     (70.0, Act::Violation(2, 0, Guard::Ra)),
     (75.0, Act::Join(7, 1, 0, -74.0)),
@@ -285,6 +307,8 @@ struct World {
     /// Joins the commands have set off, at seconds since the start.
     later: Vec<(f64, Act)>,
     rng: u64,
+    /// RADIUS's log of the clients' sign-ins.
+    pub radius: radius::Log,
 }
 
 fn client(
@@ -311,6 +335,7 @@ fn client(
         tx_airtime_us: 0.0,
         rx_airtime_us: 0.0,
         idle_s: 0.0,
+        ft: false,
     }
 }
 
@@ -403,6 +428,7 @@ impl World {
             homes: BTreeMap::new(),
             later: Vec::new(),
             rng: 0x9e37_79b9_7f4a_7c15,
+            radius: radius::Log::new(now_ms()),
         };
         for i in 0..w.clients.len() {
             if let Some((ap, bss)) = w.clients[i].at {
@@ -420,9 +446,10 @@ impl World {
     }
 
     fn event(&mut self, ap: usize, kind: EventKind) {
-        let at_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis() as u64);
+        self.event_at(ap, now_ms(), kind);
+    }
+
+    fn event_at(&mut self, ap: usize, at_ms: u64, kind: EventKind) {
         self.aps[ap].events.push(Event { at_ms, kind });
     }
 
@@ -434,13 +461,24 @@ impl World {
         }
     }
 
+    /// The client `i` associates with BSS `bss` of AP `ap`: over EAP it
+    /// signs in first, RADIUS's log saying so (as it does of a MAC
+    /// authentication), unless it comes by fast transition.
     fn announce_join(&mut self, i: usize, ap: usize, bss: usize) {
-        let mac = World::mac(self.clients[i].last);
+        let last = self.clients[i].last;
+        let mac = World::mac(last);
         let b = bss as u16;
-        self.event(ap, EventKind::Assoc { mac, bss: b });
-        if BSSS[bss].1 == EAP_SSID {
-            self.event(ap, EventKind::EapOk { mac, bss: b });
+        let ssid = BSSS[bss].1;
+        if !self.clients[i].ft {
+            // EAP takes about a second, which it was given before the join.
+            if ssid == EAP_SSID {
+                let started = now_ms() - 600 - u64::from(last) * 70;
+                self.event_at(ap, started, EventKind::EapStart { mac, bss: b });
+                self.event(ap, EventKind::EapOk { mac, bss: b });
+            }
+            self.radius.accept(now_ms(), last, ap, ssid);
         }
+        self.event(ap, EventKind::Assoc { mac, bss: b });
     }
 
     fn leave(&mut self, i: usize) {
@@ -459,12 +497,25 @@ impl World {
                 if self.blocked.contains(&World::mac(last)) {
                     return;
                 }
-                self.leave(i);
+                // On the EAP SSID a roam is a fast transition: the new AP
+                // has it before the old one lets it go.
+                let from = self.clients[i].at;
+                let ft =
+                    from.is_some_and(|(_, b)| BSSS[b].1 == EAP_SSID) && BSSS[bss].1 == EAP_SSID;
+                if !ft {
+                    self.leave(i);
+                }
                 let c = &mut self.clients[i];
                 // A new association: the station's counters start over.
                 *c = client(c.last, c.phy, c.nss, c.traffic, Some((ap, bss, signal)));
                 c.since = self.t;
+                c.ft = ft;
                 self.announce_join(i, ap, bss);
+                if let Some((old_ap, old_bss)) = from.filter(|_| ft) {
+                    let mac = World::mac(last);
+                    let bss = old_bss as u16;
+                    self.event(old_ap, EventKind::Disassoc { mac, bss });
+                }
             }
             Act::Leave(last) => {
                 if let Some(i) = find(self, last) {
@@ -472,15 +523,23 @@ impl World {
                 }
             }
             Act::EapFail(last, ap, bss) => {
-                let mac = World::mac(last);
-                self.event(
-                    ap,
-                    EventKind::EapFail {
-                        mac,
-                        bss: bss as u16,
-                    },
-                );
+                let (mac, bss) = (World::mac(last), bss as u16);
+                self.event(ap, EventKind::EapStart { mac, bss });
+                let why = "Not authorized for Wi-Fi: group membership required";
+                self.radius.reject(now_ms(), last, ap, why);
+                self.event(ap, EventKind::EapFail { mac, bss });
             }
+            Act::EapTimeout(last, ap, bss) => {
+                let (mac, bss) = (World::mac(last), bss as u16);
+                self.event(ap, EventKind::EapStart { mac, bss });
+                let server = false;
+                self.event(ap, EventKind::EapTimeout { mac, bss, server });
+            }
+            Act::PskMismatch(last, ap, bss) => {
+                let (mac, bss) = (World::mac(last), bss as u16);
+                self.event(ap, EventKind::PskMismatch { mac, bss });
+            }
+            Act::Unknown(ap) => self.radius.unknown(now_ms(), ap),
             Act::RadioDown(ap, radio) => {
                 self.aps[ap].radios[radio].up = false;
                 let phy = RADIOS[radio].into();
@@ -828,6 +887,15 @@ impl World {
             })
             .collect();
         stations.sort_by_key(|s| s.mac);
+        let mut auth: Vec<_> = self
+            .clients
+            .iter()
+            .filter_map(|c| {
+                let (x, bss) = c.at?;
+                (x == ap).then(|| (World::mac(c.last), radius::auth(c.last, bss, c.ft)))
+            })
+            .collect();
+        auth.sort_by_key(|(m, _)| *m);
         Snapshot {
             seq,
             uptime_s: a.booted_s + t as u32,
@@ -857,9 +925,16 @@ impl World {
             config_sha256: self.aps[ap].installed,
             clock_synced: true,
             power_limits: power_limits(),
-            auth: Vec::new(),
+            auth,
         }
     }
+}
+
+/// Milliseconds since the epoch.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 fn bssid(ap: usize, bss: usize) -> [u8; 6] {
@@ -1151,8 +1226,10 @@ async fn main() -> io::Result<()> {
         .find(|a| !a.starts_with("--"))
         .map_or("127.0.0.1:8080", String::as_str);
     let public = |pem| Identity::from_pem(pem).map(|i| mac::hex(&i.public_key()));
-    // The actions' decisions, kept for the next replay like a controller's.
+    // The actions' decisions and the clients' history, kept for the next
+    // replay like a controller's.
     let policy = std::env::temp_dir().join("u6e-replay-policy.json");
+    let history = std::env::temp_dir().join("u6e-replay-history");
     let (remote, clone) = rf::repository()?;
     // Its signing key and kept images, the staging of one made up.
     let managed = std::env::temp_dir().join("u6e-replay-manage");
@@ -1163,7 +1240,8 @@ async fn main() -> io::Result<()> {
     // is a made-up country's.
     let config = format!(
         "listen_agents = \"127.0.0.1:0\"\nlisten_http = \"127.0.0.1:0\"\nlisten_metrics = \"127.0.0.1:0\"\n\
-         public_origin = \"http://{web}\"\npolicy_path = \"{}\"\nsocket = \"{}\"\n\
+         public_origin = \"http://{web}\"\npolicy_path = \"{}\"\nhistory_path = \"{}\"\n\
+         socket = \"{}\"\n\
          [aps.ap1]\npublic_key = \"{}\"\naddress = \"192.0.2.16\"\n\
          [aps.ap2]\npublic_key = \"{}\"\naddress = \"192.0.2.17\"\n{}\
          [rf]\nremote = \"{}\"\nrepo = \"{}\"\nfile = \"{}\"\n\
@@ -1171,8 +1249,10 @@ async fn main() -> io::Result<()> {
          \"5\" = [{{ channels = \"36-48\" }}, {{ channels = \"52-64\", dfs = true }}, \
          {{ channels = \"149-177\" }}]\n\
          \"6\" = [{{ channels = \"1-93\" }}]\n\
-         [leases]\nexporters = [\"{}\"]\n",
+         [leases]\nexporters = [\"{}\"]\n\
+         [radius]\nloki = \"{}\"\nselector = '{{job=\"radius-auth\"}}'\n",
         policy.display(),
+        history.display(),
         managed.join("sock").display(),
         public(KEY_AP1).map_err(io::Error::other)?,
         public(KEY_AP2).map_err(io::Error::other)?,
@@ -1181,6 +1261,7 @@ async fn main() -> io::Result<()> {
         clone.display(),
         rf::FILE,
         exporter()?,
+        radius::serve(Arc::clone(&world))?,
     );
     let config = Config::parse(&config).map_err(io::Error::other)?;
     let identity = Identity::from_pem(KEY_CONTROLLER).map_err(io::Error::other)?;

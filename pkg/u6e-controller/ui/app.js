@@ -8,12 +8,14 @@
 // watches the one radio whose spectrum is shown, if any: its scan's state
 // comes as JSON, its frames as binary messages straight to the view. The RF
 // plan shown beside it is fetched, and applied with a POST like an action,
-// as is an AP's upgrade, which the Config view follows from the state.
+// as is an AP's upgrade, which the Config view follows from the state. A
+// client's history and the auth problems are fetched by their views.
 
 import { icon } from './util.js';
 import devices from './views/devices.js';
 import clients from './views/clients.js';
 import client from './views/client.js';
+import auth from './views/auth.js';
 import config from './views/config.js';
 import events from './views/events.js';
 import flows from './views/flows.js';
@@ -61,13 +63,14 @@ const store = {
   loadHistory,
   act,
   fullFlows,
+  getJson,
   rfPlan,
   rfApply,
   upgrade,
   watchSpectrum,
 };
 
-const views = { devices, clients, client, flows, events, spectrum, config };
+const views = { devices, clients, client, auth, flows, events, spectrum, config };
 let current = null;
 let currentName = '';
 
@@ -158,11 +161,11 @@ function act(mac, action, body = {}) {
   return adminPost(`/api/clients/${encodeURIComponent(mac)}/${action}`, body);
 }
 
-/** The RF plan: `{ status, … }` as `/api/rf/plan` gives it; status 0 when
- * the controller could not be reached. */
-async function rfPlan() {
+/** The JSON `path` answers, with its `status`; status 0 when the
+ * controller could not be reached. */
+async function getJson(path) {
   try {
-    const r = await fetch('/api/rf/plan', { cache: 'no-store' });
+    const r = await fetch(path, { cache: 'no-store' });
     let data = {};
     try {
       data = await r.json();
@@ -171,6 +174,11 @@ async function rfPlan() {
   } catch {
     return { status: 0 };
   }
+}
+
+/** The RF plan, as `/api/rf/plan` gives it. */
+function rfPlan() {
+  return getJson('/api/rf/plan');
 }
 
 /** Rolls `ap` onto its newest kept image, `image`, as the admin saw it. */
@@ -395,7 +403,7 @@ function render() {
       ? `Live updates stopped: the controller cannot be reached. Trying again in ${s} s; the figures shown are the last received.`
       : `The controller cannot be reached. Trying again in ${s} s.`;
   }
-  const title = { devices: 'Devices', clients: 'Clients', client: 'Client', flows: 'Flows', spectrum: 'Spectrum', config: 'Config', events: 'Events' }[currentName];
+  const title = { devices: 'Devices', clients: 'Clients', client: 'Client', auth: 'Auth problems', flows: 'Flows', spectrum: 'Spectrum', config: 'Config', events: 'Events' }[currentName];
   document.title = `${title} – Wi-Fi`;
   current?.update();
 }

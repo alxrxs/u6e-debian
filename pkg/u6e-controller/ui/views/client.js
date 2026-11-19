@@ -1,15 +1,20 @@
 // One client: who it is (its MAC's vendor, the DHCP server's device for it,
-// its lease's host name, its DNS name, its addresses and lease), where it is,
-// its readings now, the actions an admin can take on it, its largest
+// its lease's host name, its DNS name, its addresses and lease, how it
+// signed in and as whom, its certificate's expiry), where it is, its
+// readings now, the actions an admin can take on it, its largest
 // connections, its signal, rates and traffic over the session as this page
-// has seen it, and its event history.
+// has seen it, and, as the controller keeps them, its sessions and its
+// timeline, asked for again when an event of it comes and every 15 s.
 
 import { h, icon, ask, bandName, bits, bytes, dayOf, DID, duration, hm, mbps, palette, pct, phy, quality, time } from '../util.js';
 import { lineChart } from '../charts.js';
-import { feed } from './events.js';
 import { clientFlows, flowTable, offload, redraw, sampled, tick, topRows } from './flows.js';
+import { certificate, sessionsTable, timelineItems } from './history.js';
 
 const ADMIN_GROUP = 'wifi-admins';
+const REFRESH_MS = 15000;
+/** The sessions shown until all are asked for. */
+const SESSIONS_SHOWN = 10;
 
 const ICONS = {
   kick: 'M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9',
@@ -28,6 +33,20 @@ function fill(el, ...kids) {
 
 function reading(label, value, detail, cls) {
   return h('div', {}, h('dt', {}, label), h('dd', { class: cls }, value, detail ? h('small', {}, detail) : null));
+}
+
+/** How it signed in (`id`: the live client's `auth`, or its last
+ * session's): the method and identity, and the client certificate RADIUS
+ * last accepted for it. */
+function signInFacts(id) {
+  if (!id) return [];
+  const fact = (label, value, detail) => h('div', {}, h('dt', {}, label), h('dd', {}, value, detail ? h('small', {}, ` ${detail}`) : null));
+  const how = [id.ft ? 'came by fast transition' : null, id.authorized === false ? 'not authorized yet' : null].filter(Boolean).join(', ');
+  const cert = id.cert_expires ? certificate(id.cert_expires) : null;
+  return [
+    fact('Signed in', id.identity ? `${id.method} as ${id.identity}` : id.method, how),
+    cert ? fact('Certificate', cert.tone ? h('span', { class: `chip ${cert.tone}` }, cert.text) : cert.text, `on ${new Date(id.cert_expires).toLocaleDateString()}`) : null,
+  ];
 }
 
 /** What names the client, each source of it that it has. */
@@ -160,7 +179,6 @@ function outcome(action, res, who, target) {
 export default {
   flows: true,
   mount(root, store, mac) {
-    store.loadHistory();
     const title = h('h1');
     const sub = h('div', { class: 'id-sub' });
     const where = h('div', { class: 'where' });
@@ -186,13 +204,39 @@ export default {
     const flowBox = h('div');
     const flowsEl = h('section', { class: 'client-flows' },
       h('div', { class: 'head section-title' }, h('h2', {}, 'Flows'), flowSub), flowBox);
-    const events = h('ol', { class: 'feed panel', reversed: true });
-    const noEvents = h('div', { class: 'panel empty' });
+    const sessions = h('div', { class: 'panel table-wrap' });
+    const allSessions = h('button', { class: 'more', type: 'button' });
+    allSessions.addEventListener('click', () => {
+      sessionsShown = Infinity;
+      historyDrawn = '';
+      view.update();
+    });
+    const timeline = h('ol', { class: 'feed panel', reversed: true });
+    const timelineNote = h('p', { class: 'muted foot' });
+    const noHistory = h('div', { class: 'panel empty' });
     root.append(
       h('a', { class: 'crumb', href: '#/clients' }, icon('M15 18l-6-6 6-6'), 'Clients'),
       head, chartsEl, flowsEl,
-      h('h2', { class: 'section-title' }, 'Events'), events, noEvents);
-    let drawn = '';
+      h('h2', { class: 'section-title' }, 'Sessions'), sessions, allSessions,
+      h('h2', { class: 'section-title' }, 'Timeline'), timeline, timelineNote, noHistory);
+    /** The history the controller keeps, when it came, and its events seen
+     * then. */
+    let hist = null;
+    let fetched = 0;
+    let loading = false;
+    let eventsSeen = '';
+    let historyDrawn = '';
+    let sessionsShown = SESSIONS_SHOWN;
+
+    async function loadHistory() {
+      loading = true;
+      const r = await store.getJson(`/api/clients/${encodeURIComponent(mac)}/history`);
+      loading = false;
+      fetched = Date.now();
+      if (r.status === 200) hist = r;
+      else if (!hist) hist = { error: r.status };
+      view.update();
+    }
     let flowsDrawn = '';
     /** The action on its way, if any. */
     let busy = '';
@@ -264,7 +308,7 @@ export default {
       fill(sub, name ? h('span', { class: 'mono' }, mac) : null,
         c?.vendor ? h('span', {}, c.vendor) : null,
         blocked ? h('span', { class: 'chip bad' }, 'Blocked') : null);
-      fill(identity, ...(c ? identityFacts(c) : []));
+      fill(identity, ...signInFacts(c?.auth || hist?.identity), ...(c ? identityFacts(c) : []));
       identity.hidden = !identity.childNodes.length;
       sub.hidden = !sub.childNodes.length;
       buttons.block.hidden = blocked;
@@ -298,8 +342,8 @@ export default {
       } else {
         where.replaceChildren();
         absent.textContent = !store.keyed ? store.waiting()[0]
-          : blocked ? 'Blocked: no access point lets it join. Its past events are below.'
-            : 'This client is not associated with any AP right now. Its past events are below.';
+          : blocked ? 'Blocked: no access point lets it join. Its sessions and timeline are below.'
+            : 'This client is not associated with any AP right now. Its sessions and timeline are below.';
       }
       readings.hidden = !c;
       absent.hidden = !!c;
@@ -333,6 +377,31 @@ export default {
         h('p', { class: 'muted foot' }, cf.top.length < cf.conns
           ? [`The largest ${cf.top.length} of its ${cf.conns} connections. `, h('a', { href: '#/flows' }, `Every connection of ${x.ap}`), ' is on the Flows page.']
           : cf.conns ? `All its ${cf.conns} connections.` : 'No connection is open.'))]);
+    }
+
+    function updateHistory() {
+      const stamp = JSON.stringify([fetched, sessionsShown, dayOf(Date.now())]);
+      if (stamp === historyDrawn) return;
+      historyDrawn = stamp;
+      const list = hist?.sessions || [];
+      const entries = hist?.timeline || [];
+      sessions.hidden = !list.length;
+      allSessions.hidden = list.length <= sessionsShown;
+      allSessions.textContent = `Show all ${list.length} sessions`;
+      if (list.length) sessions.replaceChildren(sessionsTable(list.slice(0, sessionsShown)));
+      timeline.hidden = !entries.length;
+      if (entries.length) timeline.replaceChildren(...timelineItems(entries));
+      const notes = [
+        hist?.more ? `The newest ${entries.length} entries; ${hist.more} older ones are kept.` : '',
+        hist?.radius === 'off' ? 'RADIUS’s log is not read, so its verdicts are not here.' : '',
+        hist?.radius === 'down' ? 'RADIUS’s log cannot be read right now; its verdicts come when it can.' : '',
+      ].filter(Boolean);
+      timelineNote.hidden = !notes.length || !entries.length;
+      timelineNote.textContent = notes.join(' ');
+      noHistory.hidden = !!entries.length;
+      noHistory.replaceChildren(h('p', {}, !hist ? 'Loading its history.'
+        : hist.error !== undefined ? 'The controller cannot be reached; this page tries again.'
+          : 'The controller holds nothing of this client from the last 7 days.'));
     }
 
     const view = {
@@ -381,14 +450,12 @@ export default {
         }
 
         const mine = store.events.filter((e) => e.mac === mac);
-        const stamp = `${mine.length}|${mine.at(-1)?.at}`;
-        if (stamp !== drawn) {
-          drawn = stamp;
-          events.replaceChildren(...feed(mine.slice(-200).reverse(), { showMac: false }));
+        const seen = `${mine.length}|${mine.at(-1)?.at}`;
+        if (!loading && (seen !== eventsSeen || Date.now() - fetched > REFRESH_MS)) {
+          eventsSeen = seen;
+          loadHistory();
         }
-        events.hidden = !mine.length;
-        noEvents.hidden = !!mine.length;
-        noEvents.replaceChildren(h('p', {}, store.historyLoaded ? 'The controller holds no events of this client.' : 'Loading the event history.'));
+        updateHistory();
       },
     };
     return view;
