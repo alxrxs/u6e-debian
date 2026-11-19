@@ -13,7 +13,12 @@
 //! exist only when the leases are read. The client guards' violations are
 //! counted per AP, guard and VLAN from the first of each, repeats included,
 //! and the frames their filters dropped per AP and guard as the AP counts
-//! them.
+//! them. Per identity (an EAP identity, or the MAC of a MAC-authenticated
+//! client), the only label of its series, so their number is bounded by
+//! the identities the sessions keep (`sessions::IDENTITIES_MAX`): its ended
+//! sessions and its bytes (those of its open sessions counted in), its
+//! clients on now, and the expiry of the client certificate RADIUS last
+//! accepted for it; the RADIUS log's reads exist only when it is read.
 
 use std::collections::BTreeSet;
 use std::fmt::Write;
@@ -28,6 +33,7 @@ use u6e_proto::PROTOCOL;
 use u6e_proto::mac;
 use u6e_proto::msg::{Radio, Snapshot, Station};
 
+use crate::sessions::Totals;
 use crate::spectrum::{RADIOS, Scan};
 use crate::state::{Ap, OUTCOMES, Shared, State, is_failure};
 use crate::view::{band, guard_name};
@@ -422,6 +428,8 @@ pub fn render(state: &State) -> String {
     not_as_planned(&mut m, state);
     leases(&mut m, state);
     guards(&mut m, &aps);
+    identities(&mut m, state);
+    radius_log(&mut m, state);
     m.family(
         "wifi_blocked_clients",
         GAUGE,
@@ -519,6 +527,73 @@ fn guards(m: &mut Text, aps: &[(&str, &Ap)]) {
             ];
             m.sample(&labels, *n as f64);
         }
+    }
+}
+
+/// Each identity's sessions, bytes, clients and client certificate.
+fn identities(m: &mut Text, state: &State) {
+    let ids = state.sessions.identities();
+    type Value = fn(&Totals, usize) -> f64;
+    let families: [(&str, &str, &str, Value); 4] = [
+        (
+            "wifi_identity_sessions_total",
+            COUNTER,
+            "Sessions of the identity's clients that ended (a roam begins a new one).",
+            |t, _| t.sessions as f64,
+        ),
+        (
+            "wifi_identity_rx_bytes_total",
+            COUNTER,
+            "Bytes the APs received from the identity's clients.",
+            |t, _| t.up_bytes as f64,
+        ),
+        (
+            "wifi_identity_tx_bytes_total",
+            COUNTER,
+            "Bytes the APs sent to the identity's clients.",
+            |t, _| t.down_bytes as f64,
+        ),
+        (
+            "wifi_identity_clients",
+            GAUGE,
+            "The identity's clients associated now.",
+            |_, on| on as f64,
+        ),
+    ];
+    for (name, kind, help, value) in families {
+        m.family(name, kind, help);
+        for (id, (t, on)) in &ids {
+            m.sample(&[("identity", id)], value(t, *on));
+        }
+    }
+    m.family(
+        "wifi_client_cert_expiry_timestamp_seconds",
+        GAUGE,
+        "When the client certificate RADIUS last accepted for the identity (EAP-TLS) expires.",
+    );
+    for (id, c) in state.sessions.certs() {
+        m.sample(&[("identity", id)], c.expires_s as f64);
+    }
+}
+
+/// The reads of RADIUS's log, when it is read.
+fn radius_log(m: &mut Text, state: &State) {
+    let Some(h) = &state.radius else {
+        return;
+    };
+    m.family(
+        "wifi_radius_log_up",
+        GAUGE,
+        "Whether the controller's last read of RADIUS's log worked.",
+    );
+    m.sample(&[], f64::from(u8::from(h.up == Some(true))));
+    m.family(
+        "wifi_radius_log_last_success_timestamp_seconds",
+        GAUGE,
+        "When the controller last read RADIUS's log.",
+    );
+    if let Some(t) = h.last_ok {
+        m.sample(&[], unix_seconds(t));
     }
 }
 

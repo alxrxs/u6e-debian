@@ -29,7 +29,9 @@
 //! those it runs, `GET /api/rollouts` the image rollouts with their whole
 //! logs (the WebSocket's view carries both, the rollouts with their last
 //! lines). `GET /api/rf/plan` and `POST /api/rf/apply` are the RF
-//! planner's (`rf`).
+//! planner's (`rf`). `GET /api/clients/{mac}/history` is a client's
+//! sessions and timeline, `GET /api/auth-problems` the clients that failed
+//! to get on in the last day; both read only what the controller holds.
 //!
 //! The listener is reached only through the reverse proxy that signs users
 //! in, which names the user in `X-Forwarded-Preferred-Username` and their
@@ -53,10 +55,10 @@ use tokio::time::{interval, timeout};
 use u6e_proto::mac;
 
 use crate::actions::{self, Access, Via, Web};
-use crate::rf;
 use crate::spectrum::{self, Watching};
 use crate::state::{Change, Full, ROLLOUT_LOG_CAP, Shared, WatchGuard};
 use crate::view;
+use crate::{rf, sessions};
 
 /// How long a new WebSocket may take to say what it watches.
 const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -155,6 +157,8 @@ pub fn router(state: Shared, access: Access) -> Router {
         .route("/api/flows", get(api_flows))
         .route("/api/flows/full", get(api_flows_full))
         .route("/api/me", get(actions::me))
+        .route("/api/clients/{mac}/history", get(api_history))
+        .route("/api/auth-problems", get(api_auth_problems))
         .route("/api/clients/{mac}/kick", post(actions::kick))
         .route("/api/clients/{mac}/block", post(actions::block))
         .route("/api/clients/{mac}/unblock", post(actions::unblock))
@@ -253,6 +257,18 @@ async fn api_manage(Ext(state): Ext<Shared>) -> Response {
 
 async fn api_rollouts(Ext(state): Ext<Shared>) -> Response {
     json_response(&view::rollouts(&state.read(), ROLLOUT_LOG_CAP))
+}
+
+async fn api_history(Ext(state): Ext<Shared>, Path(m): Path<String>) -> Response {
+    match mac::parse(&m) {
+        Some(m) => json_response(&view::history(&state.read(), &m)),
+        None => error(StatusCode::BAD_REQUEST, "not a MAC"),
+    }
+}
+
+async fn api_auth_problems(Ext(state): Ext<Shared>) -> Response {
+    let now = sessions::unix_ms(std::time::SystemTime::now());
+    json_response(&view::auth_problems(&state.read(), now))
 }
 
 #[derive(Deserialize)]

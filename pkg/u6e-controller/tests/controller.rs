@@ -98,11 +98,12 @@ fn config_text(key: &str, ap2: bool, dir: &Path, gate_secs: u64) -> String {
     let mut text = format!(
         "listen_agents = \"127.0.0.1:0\"\nlisten_http = \"127.0.0.1:0\"\n\
          listen_metrics = \"127.0.0.1:0\"\nkey = \"{key}\"\n\
-         public_origin = \"{ORIGIN}\"\npolicy_path = \"{}\"\nsocket = \"{}\"\n\
-         [configs]\nsigning_key = \"{signing}\"\nstate = \"{}\"\n\
+         public_origin = \"{ORIGIN}\"\npolicy_path = \"{}\"\nhistory_path = \"{}\"\n\
+         socket = \"{}\"\n[configs]\nsigning_key = \"{signing}\"\nstate = \"{}\"\n\
          [rollouts]\nimages = \"{}\"\ngate_secs = {gate_secs}\nroot_key = \"{root}\"\n\
          stock_password = \"{password}\"\nknown_hosts = \"{hosts}\"\n{}",
         dir.join("policy.json").display(),
+        dir.join("history").display(),
         dir.join("sock").display(),
         dir.join("configs").display(),
         dir.join("images").display(),
@@ -4108,4 +4109,223 @@ fn violations_are_events_and_counted() {
         ["wifi_guard_bindings{ap=\"ap1\"} 1"]
     );
     assert!(promtool_accepts(&http_get(r.c.metrics, "/metrics")));
+}
+
+/// A stand-in for the Loki RADIUS's log is shipped to: every request gets
+/// the lines `answer` holds now, which are counted.
+fn fake_loki(answer: Arc<Mutex<String>>, asked: Arc<Mutex<u32>>) -> String {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    thread::spawn(move || {
+        for s in l.incoming() {
+            let Ok(mut s) = s else { continue };
+            let mut buf = [0; 8192];
+            let _ = s.read(&mut buf);
+            *asked.lock().unwrap() += 1;
+            let body = answer.lock().unwrap().clone();
+            let head = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n";
+            let _ = s.write_all(format!("{head}{body}").as_bytes());
+        }
+    });
+    addr
+}
+
+/// Loki's answer of `lines`, each (milliseconds, text), from one node.
+fn loki_lines(lines: &[(u64, String)]) -> String {
+    let values: Vec<Value> = lines
+        .iter()
+        .map(|(ms, l)| json!([(ms * 1_000_000).to_string(), l]))
+        .collect();
+    let stream = json!({"stream": {"host": "radius1.example.org"}, "values": values});
+    json!({"status": "success", "data": {"result": [stream]}}).to_string()
+}
+
+fn eap_tls(identity: &str) -> u6e_proto::msg::StationAuth {
+    u6e_proto::msg::StationAuth {
+        akm: 0x000f_ac05,
+        auth_alg: 0,
+        authorized: true,
+        identity: identity.into(),
+        eap_method: 13,
+        reauth_s: 0,
+    }
+}
+
+/// Who a client is and how it got on, joined from its AP and RADIUS's log:
+/// its identity, method and certificate on the client and in its history,
+/// its sessions and timeline, the client that failed with both sides'
+/// reasons, and the identity's series.
+#[test]
+fn identity_sessions_timeline_and_auth_problems() {
+    let dir = TempDir::new("history");
+    let now = now_ms();
+    let failing = [0x02, 0, 0, 0, 0, 0x02];
+    let lines = vec![
+        (
+            now - 5000,
+            "t|ACCEPT|host/pc1|02-00-00-00-00-01|ap1|192.0.2.16|eap|271231235959Z".to_owned(),
+        ),
+        (
+            now - 3000,
+            "t|REJECT|bob@example.org|02-00-00-00-00-02|ap1|192.0.2.16|Not authorized for Wi-Fi|"
+                .to_owned(),
+        ),
+    ];
+    let answer = Arc::new(Mutex::new(loki_lines(&lines)));
+    let asked = Arc::new(Mutex::new(0));
+    let loki = fake_loki(Arc::clone(&answer), Arc::clone(&asked));
+    let extra = format!("[radius]\nloki = \"{loki}\"\nselector = '{{job=\"radius-auth\"}}'\n");
+    let r = configured(
+        Timing::default(),
+        &dir.0,
+        420,
+        Arc::new(FakeStage::default()),
+        &extra,
+    );
+    let mut a = Agent::hello(r.c.agents, KEY_AP1, "ap1");
+    let bsss = vec![bss("wlan5", "Corp")];
+    let mut s = snapshot(1, bsss.clone(), vec![station(MAC, 0, -54)]);
+    s.auth = vec![(MAC, eap_tls("host/pc1"))];
+    a.send(&AgentMsg::Key(s)).unwrap();
+    for (at_ms, kind) in [
+        (
+            now - 2000,
+            EventKind::EapStart {
+                mac: failing,
+                bss: 0,
+            },
+        ),
+        (
+            now - 1000,
+            EventKind::EapTimeout {
+                mac: failing,
+                bss: 0,
+                server: false,
+            },
+        ),
+    ] {
+        a.send(&AgentMsg::Event(Event { at_ms, kind })).unwrap();
+    }
+    let history = || json_get(r.c.http, "/api/clients/02:00:00:00:00:01/history");
+    wait_for("RADIUS's verdicts and the client's session", || {
+        let h = history();
+        h["timeline"].as_array().is_some_and(|t| t.len() == 2) && h["radius"] == "up"
+    });
+    let h = history();
+    let id = &h["identity"];
+    assert_eq!(
+        (
+            &id["method"],
+            &id["identity"],
+            &id["vlan"],
+            &id["connected"]
+        ),
+        (
+            &json!("EAP-TLS"),
+            &json!("host/pc1"),
+            &json!(42),
+            &json!(true)
+        )
+    );
+    assert_eq!(id["cert_expires"], json!(1_830_297_599_000u64));
+    let kinds: Vec<&str> = h["timeline"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
+    // It associated a minute ago (its connected time), RADIUS answered since.
+    assert_eq!(kinds, ["radius", "joined"], "newest first");
+    let c = json_get(r.c.http, "/api/clients");
+    let auth = &c["02:00:00:00:00:01"]["auth"];
+    assert_eq!(
+        (&auth["method"], &auth["ft"]),
+        (&json!("EAP-TLS"), &json!(false))
+    );
+
+    let problems = json_get(r.c.http, "/api/auth-problems");
+    let rows = problems["clients"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{problems}");
+    let row = &rows[0];
+    assert_eq!(row["mac"], "02:00:00:00:00:02");
+    assert_eq!(row["attempts"], 2);
+    assert_eq!(row["user"], "bob@example.org");
+    assert_eq!(row["radius"]["detail"], "Not authorized for Wi-Fi");
+    assert_eq!(
+        (&row["ap_side"]["kind"], &row["ap_side"]["reached_radius"]),
+        (&json!("eap-timeout"), &json!(true))
+    );
+    assert_eq!(row["connected"], false);
+
+    // The client leaves: its session ends, and counts for its identity.
+    let e = Event {
+        at_ms: now_ms(),
+        kind: EventKind::Disassoc { mac: MAC, bss: 0 },
+    };
+    a.send(&AgentMsg::Event(e)).unwrap();
+    wait_for("the session's end", || {
+        history()["sessions"][0]["why"] == "left"
+    });
+    assert_eq!(
+        metrics_of(&r, "wifi_identity_sessions_total{"),
+        ["wifi_identity_sessions_total{identity=\"host/pc1\"} 1"]
+    );
+    assert_eq!(
+        metrics_of(&r, "wifi_client_cert_expiry_timestamp_seconds{"),
+        ["wifi_client_cert_expiry_timestamp_seconds{identity=\"host/pc1\"} 1830297599"]
+    );
+    assert_eq!(
+        metrics_of(&r, "wifi_radius_log_up "),
+        ["wifi_radius_log_up 1"]
+    );
+    assert!(promtool_accepts(&http_get(r.c.metrics, "/metrics")));
+    // A MAC that is none is refused; one never seen has no history.
+    let (head, _) = http_request(r.c.http, "/api/clients/nonsense/history", "");
+    assert!(head.starts_with("http/1.1 400"), "{head}");
+    let none = json_get(r.c.http, "/api/clients/02:00:00:00:00:09/history");
+    assert_eq!(
+        (&none["sessions"], &none["timeline"]),
+        (&json!([]), &json!([]))
+    );
+    assert!(*asked.lock().unwrap() >= 1);
+}
+
+/// A Loki that answers nothing usable leaves RADIUS's side out and says
+/// so; the APs' side is all there.
+#[test]
+fn without_loki_the_radius_side_is_left_out() {
+    let dir = TempDir::new("no-loki");
+    let answer = Arc::new(Mutex::new("<html>".to_owned()));
+    let loki = fake_loki(answer, Arc::new(Mutex::new(0)));
+    let extra = format!("[radius]\nloki = \"{loki}\"\nselector = '{{job=\"x\"}}'\n");
+    let r = configured(
+        Timing::default(),
+        &dir.0,
+        420,
+        Arc::new(FakeStage::default()),
+        &extra,
+    );
+    let mut a = Agent::hello(r.c.agents, KEY_AP1, "ap1");
+    a.send(&AgentMsg::Key(snapshot(
+        1,
+        vec![bss("wlan5", "Corp")],
+        Vec::new(),
+    )))
+    .unwrap();
+    let e = Event {
+        at_ms: now_ms(),
+        kind: EventKind::EapFail { mac: MAC, bss: 0 },
+    };
+    a.send(&AgentMsg::Event(e)).unwrap();
+    wait_for("the failure listed", || {
+        let p = json_get(r.c.http, "/api/auth-problems");
+        p["clients"].as_array().is_some_and(|c| c.len() == 1) && p["radius"] == "down"
+    });
+    let p = json_get(r.c.http, "/api/auth-problems");
+    assert_eq!(p["clients"][0]["ap_side"]["kind"], "eap-failed");
+    assert!(p["clients"][0].get("radius").is_none());
+    assert_eq!(
+        metrics_of(&r, "wifi_radius_log_up "),
+        ["wifi_radius_log_up 0"]
+    );
 }

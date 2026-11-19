@@ -10,7 +10,11 @@
 //! (`remote_name`) once one was looked up, and the addresses its AP's client
 //! guards bind to it (`bound`); a guard's violation is an event of kind
 //! `guard` (its `guard`, `detail`, whether its frame was `dropped`, and the
-//! `repeats` since the last one reported). The clients the policy blocks are
+//! `repeats` since the last one reported). An associated client carries how
+//! it authenticated (`auth`: the method, its EAP identity and the expiry of
+//! the client certificate RADIUS last accepted for it, whether it came by a
+//! fast transition); its sessions and timeline are `history`, the clients
+//! that fail to get on `auth_problems`. The clients the policy blocks are
 //! listed whole (`blocked`), associated or not, so that one kept off every AP
 //! can still be found and unblocked; an associated client says it too.
 //!
@@ -30,12 +34,15 @@ use serde_json::{Map, Value, json};
 use u6e_proto::PROTOCOL;
 use u6e_proto::mac;
 use u6e_proto::msg::{
-    Band, Event, EventKind, Flow, Flows, Guard, Radio, RateMode, Snapshot, Station, Violation,
+    AuthKind, Band, Event, EventKind, Flow, Flows, Guard, Radio, RateMode, Snapshot, Station,
+    StationAuth, Violation,
 };
 
 use crate::names;
 use crate::policy::{ConfigId, Phase};
+use crate::sessions::Session;
 use crate::state::{Action, Ap, ClientView, Rollout, State, mechanism_name, outcome_name};
+use crate::timeline::{EapStep, End, Entry, Place, What};
 
 /// The APs and clients of the APs `wanted` says yes to, and the clients
 /// blocked, as one object, with their flows when `flows`.
@@ -314,8 +321,14 @@ pub fn event(ap_name: &str, ap: &Ap, ev: &Event) -> Option<Value> {
     let (kind, who) = match &ev.kind {
         EventKind::Assoc { mac, bss } => ("assoc", Ok((mac, *bss))),
         EventKind::Disassoc { mac, bss } => ("disassoc", Ok((mac, *bss))),
+        EventKind::EapStart { mac, bss } => ("eap-start", Ok((mac, *bss))),
         EventKind::EapOk { mac, bss } => ("eap-ok", Ok((mac, *bss))),
         EventKind::EapFail { mac, bss } => ("eap-fail", Ok((mac, *bss))),
+        EventKind::EapTimeout { mac, bss, server } => {
+            o.insert("server".into(), (*server).into());
+            ("eap-timeout", Ok((mac, *bss)))
+        }
+        EventKind::PskMismatch { mac, bss } => ("psk-mismatch", Ok((mac, *bss))),
         EventKind::RadioUp { phy } => ("radio-up", Err(phy)),
         EventKind::RadioDown { phy } => ("radio-down", Err(phy)),
         EventKind::FwCrash { phy } => ("fw-crash", Err(phy)),
@@ -608,6 +621,13 @@ fn client_view(state: &State, c: &ClientView) -> Value {
     if let Some(b) = band {
         o["band"] = b.into();
     }
+    let auth = snap.and_then(|s| {
+        let i = s.auth.binary_search_by_key(&st.mac, |(m, _)| *m).ok()?;
+        Some(&s.auth[i].1)
+    });
+    if let Some(a) = auth {
+        o["auth"] = auth_view(state, a);
+    }
     if let Value::Object(o) = &mut o {
         o.extend(state.identity(&st.mac).fields());
     }
@@ -637,6 +657,422 @@ fn client_view(state: &State, c: &ClientView) -> Value {
         o.extend(rates);
     }
     o
+}
+
+/// The name of an EAP method, by its IANA type.
+fn eap_name(t: u8) -> String {
+    let known = match t {
+        0 => "EAP",
+        13 => "EAP-TLS",
+        18 => "EAP-SIM",
+        21 => "EAP-TTLS",
+        23 => "EAP-AKA",
+        25 => "PEAP",
+        26 => "EAP-MSCHAPv2",
+        43 => "EAP-FAST",
+        50 => "EAP-AKA'",
+        52 => "EAP-pwd",
+        55 => "TEAP",
+        _ => return format!("EAP (type {t})"),
+    };
+    known.into()
+}
+
+/// How a client authenticated, in words.
+pub fn method(a: &StationAuth) -> String {
+    match a.kind() {
+        AuthKind::Eap => eap_name(a.eap_method),
+        AuthKind::MacAuth => "MAC authentication".into(),
+        AuthKind::Sae => "WPA3-Personal".into(),
+        AuthKind::Other => "Open or other".into(),
+    }
+}
+
+/// A client's authentication: its `method`, its EAP `identity` (and the
+/// expiry of the certificate RADIUS last accepted for it, `cert_expires`, in
+/// milliseconds), whether its association was a fast transition (`ft`),
+/// whether hostapd has authorized it yet, and the reauthentication period
+/// RADIUS set (`reauth`, seconds).
+fn auth_view(state: &State, a: &StationAuth) -> Value {
+    let mut o = json!({
+        "method": method(a),
+        "ft": a.fast_transition(),
+        "authorized": a.authorized,
+    });
+    if a.kind() == AuthKind::Eap && !a.identity.is_empty() {
+        o["identity"] = a.identity.clone().into();
+        if let Some(c) = state.sessions.cert(&a.identity) {
+            o["cert_expires"] = (c.expires_s * 1000).into();
+        }
+    }
+    if a.reauth_s > 0 {
+        o["reauth"] = a.reauth_s.into();
+    }
+    o
+}
+
+/// The most sessions of one client a history gives, the newest.
+const HISTORY_SESSIONS: usize = 100;
+/// The most timeline entries a history gives, the newest.
+const HISTORY_ENTRIES: usize = 500;
+
+/// Whether RADIUS's log is read: `off`, `up`, or `down` (its last read
+/// failed, or none worked yet).
+fn radius_log(state: &State) -> &'static str {
+    match &state.radius {
+        None => "off",
+        Some(h) if h.up == Some(true) => "up",
+        Some(_) => "down",
+    }
+}
+
+/// A client's history (`/api/clients/{mac}/history`): how it authenticated
+/// last (`identity`, with its VLAN and whether it is on now), its sessions
+/// and its timeline, the newest first (`more`: the older entries left out),
+/// and whether RADIUS's verdicts are read (`radius`).
+pub fn history(state: &State, mac: &[u8; 6]) -> Value {
+    let sessions: Vec<&Session> = state.sessions.of(mac).take(HISTORY_SESSIONS).collect();
+    let timeline = &state.sessions.timeline;
+    let entries: Vec<Value> = timeline
+        .of(mac)
+        .rev()
+        .take(HISTORY_ENTRIES)
+        .map(entry)
+        .collect();
+    let kept = timeline.of(mac).count();
+    let mut o = json!({
+        "sessions": sessions.iter().map(|s| session(state, s)).collect::<Vec<_>>(),
+        "timeline": entries,
+        "more": kept.saturating_sub(HISTORY_ENTRIES),
+        "radius": radius_log(state),
+    });
+    let latest = sessions.iter().find_map(|s| Some((s, s.auth.as_ref()?)));
+    if let Some((s, a)) = latest {
+        let mut id = auth_view(state, a);
+        id["vlan"] = s.place.vlan.into();
+        id["connected"] = s.end_ms.is_none().into();
+        o["identity"] = id;
+    }
+    o
+}
+
+fn place(p: &Place) -> Map<String, Value> {
+    let mut o = Map::new();
+    o.insert("ap".into(), p.ap.clone().into());
+    o.insert("bss".into(), p.bss.clone().into());
+    o.insert("ssid".into(), p.ssid.clone().into());
+    o.insert("vlan".into(), p.vlan.into());
+    if let Some(b) = p.band {
+        o.insert("band".into(), band(b).into());
+    }
+    o
+}
+
+/// Why a session ended: `why`, and who (`by`) or where to (`to`).
+fn end(e: &End) -> Map<String, Value> {
+    let (why, by, to) = match e {
+        End::Left => ("left", None, None),
+        End::Roamed { to } => ("roamed", None, Some(to)),
+        End::Kicked { by } => ("kicked", by.as_ref(), None),
+        End::Blocked { by } => ("blocked", by.as_ref(), None),
+        End::EapFailed => ("eap-failed", None, None),
+        End::EapTimedOut => ("eap-timeout", None, None),
+        End::Inactive => ("inactive", None, None),
+        End::Unobserved => ("unobserved", None, None),
+    };
+    let mut o = Map::new();
+    o.insert("why".into(), why.into());
+    if let Some(by) = by {
+        o.insert("by".into(), by.clone().into());
+    }
+    if let Some(to) = to {
+        o.insert("to".into(), to.clone().into());
+    }
+    o
+}
+
+/// One session: where, from when to when (`end` absent while it is open),
+/// how and as whom it authenticated, its bytes each way as its AP counted
+/// them (`rx_bytes` from the client), why it ended, and the AP it roamed in
+/// from.
+fn session(state: &State, s: &Session) -> Value {
+    let mut o = place(&s.place);
+    o.insert("id".into(), s.id.into());
+    o.insert("start".into(), s.start_ms.into());
+    if let Some(e) = s.end_ms {
+        o.insert("end".into(), e.into());
+    }
+    if let Some(a) = &s.auth {
+        o.insert("auth".into(), auth_view(state, a));
+    }
+    o.insert("rx_bytes".into(), s.up_bytes.into());
+    o.insert("tx_bytes".into(), s.down_bytes.into());
+    if let Some(e) = &s.end {
+        o.extend(end(e));
+    }
+    if let Some(from) = &s.from {
+        o.insert("from".into(), from.clone().into());
+    }
+    Value::Object(o)
+}
+
+/// One timeline entry: its time (`at`), its `kind` and what it says.
+fn entry(e: &Entry) -> Value {
+    let mut o = Map::new();
+    o.insert("at".into(), e.at_ms.into());
+    let mut put = |k: &str, v: Value| {
+        o.insert(k.into(), v);
+    };
+    let kind = match &e.what {
+        What::Joined {
+            session,
+            place: p,
+            from,
+            auth,
+        } => {
+            for (k, v) in place(p) {
+                put(&k, v);
+            }
+            put("session", (*session).into());
+            if let Some(a) = auth {
+                put("method", method(a).into());
+                put("ft", a.fast_transition().into());
+                if !a.identity.is_empty() {
+                    put("identity", a.identity.clone().into());
+                }
+            }
+            match from {
+                None => "joined",
+                Some(r) => {
+                    put("from", r.ap.clone().into());
+                    if let Some(b) = r.band {
+                        put("from_band", band(b).into());
+                    }
+                    if let Some(gap) = r.gap_ms {
+                        put("gap", gap.into());
+                    }
+                    if let Some(by) = &r.steered_by {
+                        put("steered_by", by.clone().into());
+                    }
+                    "roamed"
+                }
+            }
+        }
+        What::Ended {
+            session,
+            ap,
+            why,
+            secs,
+        } => {
+            put("session", (*session).into());
+            put("ap", ap.clone().into());
+            put("secs", (*secs).into());
+            for (k, v) in end(why) {
+                put(&k, v);
+            }
+            "ended"
+        }
+        What::Eap { ap, step } => {
+            put("ap", ap.clone().into());
+            let step = match step {
+                EapStep::Started => "started",
+                EapStep::Succeeded { ms } => {
+                    if let Some(ms) = ms {
+                        put("ms", (*ms).into());
+                    }
+                    "succeeded"
+                }
+                EapStep::Failed => "failed",
+                EapStep::TimedOut { server } => {
+                    put("server", (*server).into());
+                    "timeout"
+                }
+            };
+            put("step", step.into());
+            "eap"
+        }
+        What::PskMismatch { ap } => {
+            put("ap", ap.clone().into());
+            "psk-mismatch"
+        }
+        What::Radius {
+            accept,
+            user,
+            node,
+            nas,
+            detail,
+            cert_expires,
+        } => {
+            put("accept", (*accept).into());
+            put("user", user.clone().into());
+            put("node", node.clone().into());
+            put("nas", nas.clone().into());
+            put("detail", detail.clone().into());
+            if let Some(s) = cert_expires {
+                put("cert_expires", (s * 1000).into());
+            }
+            "radius"
+        }
+        What::Lease {
+            ip,
+            expires,
+            renewed,
+        } => {
+            put("ip", ip.to_string().into());
+            put("expires", (expires * 1000).into());
+            put("renewed", (*renewed).into());
+            "lease"
+        }
+        What::FirstTraffic { ap, conns } => {
+            put("ap", ap.clone().into());
+            put("conns", (*conns).into());
+            "first-traffic"
+        }
+        What::Action {
+            action,
+            user,
+            ap,
+            ok,
+            detail,
+        } => {
+            put("action", action.clone().into());
+            if let Some(u) = user {
+                put("user", u.clone().into());
+            }
+            if let Some(ap) = ap {
+                put("ap", ap.clone().into());
+            }
+            put("ok", (*ok).into());
+            put("detail", detail.clone().into());
+            "action"
+        }
+        What::Guard {
+            ap,
+            guard,
+            detail,
+            dropped,
+            repeats,
+        } => {
+            put("ap", ap.clone().into());
+            put("guard", guard_name(*guard).into());
+            put("detail", detail.clone().into());
+            put("dropped", (*dropped).into());
+            put("repeats", (*repeats).into());
+            "guard"
+        }
+    };
+    o.insert("kind".into(), kind.into());
+    Value::Object(o)
+}
+
+/// How far back the auth problems look.
+pub const PROBLEMS_WINDOW_MS: u64 = 24 * 3600 * 1000;
+/// The most clients the auth problems list.
+const PROBLEMS_MAX: usize = 200;
+/// A client's EAP timeout with no RADIUS verdict this close before it never
+/// reached RADIUS.
+const REACHED_MS: u64 = 60_000;
+
+/// Whether `e` is a failure to get on: EAP rejected or timed out, a
+/// passphrase mismatch, a RADIUS rejection.
+fn failed(e: &Entry) -> bool {
+    match &e.what {
+        What::Eap { step, .. } => matches!(step, EapStep::Failed | EapStep::TimedOut { .. }),
+        What::PskMismatch { .. } => true,
+        What::Radius { accept, .. } => !accept,
+        _ => false,
+    }
+}
+
+/// The APs' side of a failure `e`, given the client's entries `recent`.
+fn ap_side(e: &Entry, recent: &[&Entry]) -> Option<Value> {
+    let mut side = json!({ "at": e.at_ms });
+    match &e.what {
+        What::Eap {
+            ap,
+            step: EapStep::TimedOut { server },
+        } => {
+            side["ap"] = ap.clone().into();
+            side["kind"] = "eap-timeout".into();
+            side["server"] = (*server).into();
+            let verdict = |r: &&&Entry| {
+                matches!(r.what, What::Radius { .. })
+                    && r.at_ms <= e.at_ms
+                    && e.at_ms - r.at_ms <= REACHED_MS
+            };
+            side["reached_radius"] = (*server || recent.iter().any(|r| verdict(&r))).into();
+        }
+        What::Eap { ap, .. } => {
+            side["ap"] = ap.clone().into();
+            side["kind"] = "eap-failed".into();
+        }
+        What::PskMismatch { ap } => {
+            side["ap"] = ap.clone().into();
+            side["kind"] = "psk-mismatch".into();
+        }
+        _ => return None,
+    }
+    Some(side)
+}
+
+/// The clients that failed to get on in the day before `now_ms`
+/// (`/api/auth-problems`): for each, its last failure on the APs' side
+/// (`ap_side`: EAP rejected or timed out, by the client or by RADIUS, and
+/// whether a client that timed out reached RADIUS at all; a passphrase
+/// mismatch), RADIUS's last rejection and its reason (`radius`), how many
+/// failures there were, and whether it got on since (`connected_since`,
+/// `connected`); the ones still failing first, the latest first.
+pub fn auth_problems(state: &State, now_ms: u64) -> Value {
+    let since = now_ms.saturating_sub(PROBLEMS_WINDOW_MS);
+    let mut rows: Vec<(bool, u64, Value)> = Vec::new();
+    for (mac, entries) in state.sessions.timeline.clients() {
+        let recent: Vec<&Entry> = entries.iter().filter(|e| e.at_ms >= since).collect();
+        let failures: Vec<&Entry> = recent.iter().copied().filter(|e| failed(e)).collect();
+        let Some(last) = failures.last() else {
+            continue;
+        };
+        let mut o = json!({
+            "mac": mac::format(*mac),
+            "attempts": failures.len(),
+            "last": last.at_ms,
+        });
+        let who = state.identity(mac).fields();
+        for k in ["name", "vendor"] {
+            if let Some(v) = who.get(k) {
+                o[k] = v.clone();
+            }
+        }
+        let side = failures.iter().rev().find_map(|e| ap_side(e, &recent));
+        if let Some(side) = side {
+            o["ap_side"] = side;
+        }
+        let rejected = failures.iter().rev().find_map(|e| match &e.what {
+            What::Radius {
+                user, node, detail, ..
+            } => Some(json!({ "at": e.at_ms, "user": user, "node": node, "detail": detail })),
+            _ => None,
+        });
+        if let Some(r) = rejected {
+            o["user"] = r["user"].clone();
+            o["radius"] = r;
+        }
+        let joined = recent
+            .iter()
+            .find(|e| e.at_ms > last.at_ms && matches!(e.what, What::Joined { .. }));
+        if let Some(j) = joined {
+            o["connected_since"] = j.at_ms.into();
+        }
+        let connected = state.sessions.open_of(mac).is_some();
+        o["connected"] = connected.into();
+        rows.push((joined.is_none() && !connected, last.at_ms, o));
+    }
+    rows.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    rows.truncate(PROBLEMS_MAX);
+    json!({
+        "radius": radius_log(state),
+        "since": since,
+        "clients": rows.into_iter().map(|(_, _, o)| o).collect::<Vec<_>>(),
+    })
 }
 
 /// What the counters say of the `secs` between two snapshots of a station:
