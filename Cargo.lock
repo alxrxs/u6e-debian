@@ -1077,6 +1077,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "u6e-shaper"
+version = "1.0.0"
+dependencies = [
+ "libc",
+ "postcard",
+ "serde",
+ "u6e-proto",
+]
+
+[[package]]
 name = "u6e-spectral"
 version = "1.0.0"
 dependencies = [
