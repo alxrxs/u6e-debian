@@ -255,13 +255,29 @@ pub fn config_of(ap: &Ap) -> Map<String, Value> {
 }
 
 /// An action as the events show it.
-pub fn action(a: &Action) -> Value {
+/// What an action's detail reads as to a viewer who is not an admin, when
+/// it is the admins' alone.
+pub const DETAIL_HIDDEN: &str = "its details are the admins'";
+
+/// An action's detail as a viewer reads it: a capture's (its filter, size
+/// and outcome) is the admins' alone; who took which action, on whom, where
+/// and when is every viewer's.
+fn detail_for(action: &str, detail: &str, admin: bool) -> String {
+    if admin || action != "capture" {
+        detail.to_owned()
+    } else {
+        DETAIL_HIDDEN.to_owned()
+    }
+}
+
+/// One action as an `admin`, or any other viewer, reads it.
+pub fn action(a: &Action, admin: bool) -> Value {
     let mut o = json!({
         "at": unix_ms(a.at),
         "kind": "action",
         "action": a.action,
         "ok": a.ok,
-        "detail": a.detail,
+        "detail": detail_for(a.action, &a.detail, admin),
     });
     if let Some(m) = a.mac {
         o["mac"] = mac::format(m).into();
@@ -297,8 +313,9 @@ pub fn clients(state: &State, wanted: impl Fn(&str) -> bool) -> Value {
 }
 
 /// The events of `ap`, or of every AP, oldest first; the operator's actions
-/// among them (one carried out on no AP only in every AP's).
-pub fn events(state: &State, ap: Option<&str>) -> Vec<Value> {
+/// among them (one carried out on no AP only in every AP's), as an `admin`
+/// or any other viewer reads them.
+pub fn events(state: &State, ap: Option<&str>, admin: bool) -> Vec<Value> {
     let mut out: Vec<(u64, Value)> = Vec::new();
     for (name, a) in state.aps().filter(|(n, _)| ap.is_none_or(|ap| ap == *n)) {
         let at = a
@@ -311,7 +328,7 @@ pub fn events(state: &State, ap: Option<&str>) -> Vec<Value> {
         .actions
         .iter()
         .filter(|a| ap.is_none_or(|ap| a.ap.as_deref() == Some(ap)));
-    out.extend(actions.map(|a| (unix_ms(a.at), action(a))));
+    out.extend(actions.map(|a| (unix_ms(a.at), action(a, admin))));
     // Stable: one AP's events keep the order they came in.
     out.sort_by_key(|(at, _)| *at);
     out.into_iter().map(|(_, v)| v).collect()
@@ -754,15 +771,16 @@ fn radius_log(state: &State) -> &'static str {
 /// A client's history (`/api/clients/{mac}/history`): how it authenticated
 /// last (`identity`, with its VLAN and whether it is on now), its sessions
 /// and its timeline, the newest first (`more`: the older entries left out),
-/// and whether RADIUS's verdicts are read (`radius`).
-pub fn history(state: &State, mac: &[u8; 6]) -> Value {
+/// and whether RADIUS's verdicts are read (`radius`); a capture's detail
+/// only for an `admin`.
+pub fn history(state: &State, mac: &[u8; 6], admin: bool) -> Value {
     let sessions: Vec<&Session> = state.sessions.of(mac).take(HISTORY_SESSIONS).collect();
     let timeline = &state.sessions.timeline;
     let entries: Vec<Value> = timeline
         .of(mac)
         .rev()
         .take(HISTORY_ENTRIES)
-        .map(entry)
+        .map(|e| entry(e, admin))
         .collect();
     let kept = timeline.of(mac).count();
     let mut o = json!({
@@ -846,8 +864,9 @@ fn session(state: &State, s: &Session) -> Value {
 
 /// One timeline entry: its time (`at`), its `kind` and what it says (a
 /// join's `authorized`: whether its AP authorized it in that session, until
-/// when its `identity` is only claimed).
-fn entry(e: &Entry) -> Value {
+/// when its `identity` is only claimed), as an `admin` or any other viewer
+/// reads it.
+fn entry(e: &Entry, admin: bool) -> Value {
     let mut o = Map::new();
     o.insert("at".into(), e.at_ms.into());
     let mut put = |k: &str, v: Value| {
@@ -978,7 +997,7 @@ fn entry(e: &Entry) -> Value {
                 put("ap", ap.clone().into());
             }
             put("ok", (*ok).into());
-            put("detail", detail.clone().into());
+            put("detail", detail_for(action, detail, admin).into());
             "action"
         }
         What::Guard {

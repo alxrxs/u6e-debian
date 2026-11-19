@@ -1971,6 +1971,78 @@ fn the_captures_are_shown_to_admins_only() {
 }
 
 #[test]
+fn a_captures_record_is_everyones_and_its_detail_the_admins() {
+    let r = controller(Timing::default());
+    let mut a = ap_with_client(&r, KEY_AP1, "ap1", &[]);
+    let open = |headers: &[(&'static str, &str)]| {
+        let mut ui = Ui::open(r.c.http, headers).unwrap();
+        ui.send(&json!({"subscribe": "*"}));
+        assert!(ui.recv()["key"].is_object());
+        ui
+    };
+    let mut admins = open(&ADMIN_PAGE);
+    let mut viewers = open(&ADMIN_PAGE[..2]);
+    let body = r#"{"secs": 60, "max_mb": 1, "snaplen": 64, "filter": {"proto": "tcp", "port": 443, "host": null}}"#;
+    let (status, _) = post(
+        r.c.http,
+        &format!("{CLIENT}/capture"),
+        &format!("{SAME_SITE}{ADMIN}"),
+        body,
+    );
+    assert_eq!(status, 202);
+    while !matches!(a.expect(), CtlMsg::CaptureStart(_)) {}
+    let capture = |events: &Value| -> Value {
+        let all = events.as_array().unwrap();
+        all.iter()
+            .find(|e| e["action"] == "capture")
+            .cloned()
+            .unwrap()
+    };
+    let live = |ui: &mut Ui| loop {
+        let m = ui.recv();
+        if let Some(ev) = m.get("events") {
+            return capture(ev);
+        }
+    };
+    let shown = |e: &Value| {
+        e["detail"]
+            .as_str()
+            .unwrap()
+            .contains("filter tcp port 443")
+    };
+    let hidden = |e: &Value| {
+        // Who captured which client, on which AP and when stays plain.
+        e["user"] == "alice"
+            && e["mac"] == "02:00:00:00:00:01"
+            && e["ap"] == "ap1"
+            && e["at"].is_u64()
+            && e["detail"] == "its details are the admins'"
+    };
+    let e = live(&mut admins);
+    assert!(shown(&e), "{e}");
+    let e = live(&mut viewers);
+    assert!(hidden(&e), "{e}");
+    let get = |path: &str, headers: &str| {
+        let (head, body) = http_get_full(r.c.http, path, headers);
+        assert!(head.starts_with("HTTP/1.0 200"), "{head}");
+        serde_json::from_slice::<Value>(&body).unwrap()
+    };
+    let bob = "X-Forwarded-Preferred-Username: bob\r\n";
+    let e = capture(&get("/api/events", ADMIN));
+    assert!(shown(&e), "{e}");
+    let e = capture(&get("/api/events", bob));
+    assert!(hidden(&e), "{e}");
+    let history = format!("{CLIENT}/history");
+    let e = capture(&get(&history, ADMIN)["timeline"]);
+    assert!(shown(&e), "{e}");
+    let e = capture(&get(&history, bob)["timeline"]);
+    assert!(
+        e["user"] == "alice" && e["detail"] == "its details are the admins'",
+        "{e}"
+    );
+}
+
+#[test]
 fn a_capture_chunk_out_of_place_stops_it_and_a_gone_link_ends_it() {
     use u6e_proto::msg::CaptureChunk;
     let r = controller(Timing::default());

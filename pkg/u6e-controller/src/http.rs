@@ -272,9 +272,15 @@ async fn api_rollouts(Ext(state): Ext<Shared>) -> Response {
     json_response(&view::rollouts(&state.read(), ROLLOUT_LOG_CAP))
 }
 
-async fn api_history(Ext(state): Ext<Shared>, Path(m): Path<String>) -> Response {
+async fn api_history(
+    Ext(state): Ext<Shared>,
+    Ext(access): Ext<Access>,
+    Path(m): Path<String>,
+    req: HeaderMap,
+) -> Response {
+    let admin = actions::is_admin(&req, &access.admin_group);
     match mac::parse(&m) {
-        Some(m) => json_response(&view::history(&state.read(), &m)),
+        Some(m) => json_response(&view::history(&state.read(), &m, admin)),
         None => error(StatusCode::BAD_REQUEST, "not a MAC"),
     }
 }
@@ -289,8 +295,14 @@ struct EventsQuery {
     ap: Option<String>,
 }
 
-async fn api_events(Ext(state): Ext<Shared>, Query(q): Query<EventsQuery>) -> Response {
-    let events = view::events(&state.read(), q.ap.as_deref());
+async fn api_events(
+    Ext(state): Ext<Shared>,
+    Ext(access): Ext<Access>,
+    Query(q): Query<EventsQuery>,
+    req: HeaderMap,
+) -> Response {
+    let admin = actions::is_admin(&req, &access.admin_group);
+    let events = view::events(&state.read(), q.ap.as_deref(), admin);
     json_response(&Value::Array(events))
 }
 
@@ -600,7 +612,7 @@ async fn live(mut ws: WebSocket, state: Shared, user: Option<String>, admin: boo
             Ok(Change::Captures) => (admin, None),
             // A block or an unblock changes the list of clients blocked.
             Ok(Change::Action(a)) if a.ap.as_deref().is_none_or(wanted) => {
-                (true, Some(json!({ "events": [view::action(&a)] })))
+                (true, Some(json!({ "events": [view::action(&a, admin)] })))
             }
             Ok(Change::Spectrum(ap, radio))
                 if scan
