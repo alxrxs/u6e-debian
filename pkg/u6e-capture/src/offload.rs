@@ -92,26 +92,25 @@ impl Devs {
 }
 
 /// The script that marks the client `mac`'s frames on `devs`.
+/// On the Wi-Fi ports both its frames and those to it from another client
+/// of the AP (another BSS's or VLAN's port, bridged by the host) are
+/// marked; on the VLANs' netdevs those to it from the uplink.
 pub fn marks(mac: [u8; 6], devs: &Devs) -> String {
     let m = mac::format(mac);
-    let chain = |name: &str, devs: &[String], rule: String| {
+    let mark = format!("meta mark set {NO_ACCEL_MARK:#x}");
+    let chain = |name: &str, devs: &[String], rules: &[String]| {
         if devs.is_empty() {
             return String::new();
         }
+        let rules: String = rules.iter().map(|r| format!("\t\t{r}\n")).collect();
         format!(
-            "\tchain {name} {{\n\t\ttype filter hook ingress devices = {{ {} }} priority 0; policy accept;\n\t\t{rule}\n\t}}\n",
+            "\tchain {name} {{\n\t\ttype filter hook ingress devices = {{ {} }} priority 0; policy accept;\n{rules}\t}}\n",
             nft::devices(devs)
         )
     };
-    let body = chain(
-        "up",
-        &devs.ports,
-        format!("ether saddr {m} meta mark set {NO_ACCEL_MARK:#x}"),
-    ) + &chain(
-        "down",
-        &devs.vlans,
-        format!("ether daddr {m} meta mark set {NO_ACCEL_MARK:#x}"),
-    );
+    let from = format!("ether saddr {m} {mark}");
+    let to = format!("ether daddr {m} {mark}");
+    let body = chain("up", &devs.ports, &[from, to.clone()]) + &chain("down", &devs.vlans, &[to]);
     nft::replace(TABLE, &body)
 }
 
@@ -310,7 +309,8 @@ pub mod tests {
             marks(MAC, &devs()),
             "table netdev u6e-capture\ndelete table netdev u6e-capture\ntable netdev u6e-capture {\n\
              \tchain up {\n\t\ttype filter hook ingress devices = { \"wlan5\", \"wlan6.42\" } priority 0; policy accept;\n\
-             \t\tether saddr 02:00:00:00:00:01 meta mark set 0x75360000\n\t}\n\
+             \t\tether saddr 02:00:00:00:00:01 meta mark set 0x75360000\n\
+             \t\tether daddr 02:00:00:00:00:01 meta mark set 0x75360000\n\t}\n\
              \tchain down {\n\t\ttype filter hook ingress devices = { \"vlan42\" } priority 0; policy accept;\n\
              \t\tether daddr 02:00:00:00:00:01 meta mark set 0x75360000\n\t}\n}\n"
         );

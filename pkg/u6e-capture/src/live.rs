@@ -126,9 +126,9 @@ fn nft(script: &str) -> Result<(), String> {
     u6e_proto::nft::run(std::path::Path::new("/usr/sbin/nft"), script)
 }
 
-/// How many frames carrying the no-offload mark came in by `wlan5` and by
-/// `vlan42`, as the counters `count_marks` adds count them.
-fn marked() -> (u64, u64) {
+/// How many frames carrying the no-offload mark came in by `wlan5`, by
+/// `wlan6.42` and by `vlan42`, as the counters `count_marks` adds count them.
+fn marked() -> (u64, u64, u64) {
     let out = Command::new("nft")
         .args(["list", "table", "netdev", "count"])
         .output()
@@ -139,19 +139,18 @@ fn marked() -> (u64, u64) {
         .skip(1)
         .map(|s| s.split(' ').next().unwrap().parse().unwrap())
         .collect();
-    (n[0], n[1])
+    (n[0], n[1], n[2])
 }
 
 fn count_marks() {
     let rule = format!("meta mark {NO_ACCEL_MARK:#x} counter");
-    nft(&format!(
-        "table netdev count {{
-         	chain w {{ type filter hook ingress device \"wlan5\" priority 10; {rule}; }}
-         	chain v {{ type filter hook ingress device \"vlan42\" priority 10; {rule}; }}
-}}
-"
-    ))
-    .unwrap();
+    let chain = |name: &str, dev: &str| {
+        format!(
+            "\tchain {name} {{ type filter hook ingress device \"{dev}\" priority 10; {rule}; }}\n"
+        )
+    };
+    let body = chain("w", "wlan5") + &chain("x", "wlan6.42") + &chain("v", "vlan42");
+    nft(&u6e_proto::nft::replace("netdev count", &body)).unwrap();
 }
 
 /// Starts a capture of `req` on the scratch AP `paths`; the agent's end of it.
@@ -259,11 +258,13 @@ fn a_clients_frames_both_ways_are_captured_once_and_only_its_flows_leave_the_off
         send("wlan5", &down);
         send("c6", &up);
         // The client's frames are marked on their way in, from it on its
-        // port and to it on its VLAN's netdev; the stranger's are not.
+        // ports, to it from another client's port and on its VLAN's netdev;
+        // the stranger's are not.
+        send("c6", &down);
         send("u42", &down);
         send("u42", &stranger);
         thread::sleep(Duration::from_millis(300));
-        assert_eq!(marked(), (1, 1));
+        assert_eq!(marked(), (1, 2, 1));
         agent.shutdown(Shutdown::Write).unwrap();
         let msgs = read_all(&mut agent);
         h.join().unwrap().unwrap();
@@ -278,7 +279,7 @@ fn a_clients_frames_both_ways_are_captured_once_and_only_its_flows_leave_the_off
         assert!(nft(&format!("list table {TABLE}")).is_err());
         send("c5", &up);
         thread::sleep(Duration::from_millis(100));
-        assert_eq!(marked(), (1, 1));
+        assert_eq!(marked(), (1, 2, 1));
         assert!(!pending(&p));
         // tcpdump reads it as written, when the host has it.
         let pcap = t.path().join("c.pcapng");
