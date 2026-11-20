@@ -1,10 +1,11 @@
 // A client's history as the controller keeps it: its timeline (associations
 // and roams, EAP's steps and RADIUS's verdicts, its leases, its first
-// traffic, the operators' actions, the client guards' reports, disconnects)
+// traffic, the operators' actions, the client guards' reports, the changes
+// of the services it offers over mDNS, disconnects)
 // in the feed's shape, and its sessions as a table. The client page and the
 // Auth problems page share the words.
 
-import { h, bandName, bytes, dayOf, DID, duration, GUARDS, hm, time } from '../util.js';
+import { h, bandName, bytes, dayOf, DID, duration, GUARDS, hm, serviceWords, time } from '../util.js';
 
 /** Why a session ended, in words. */
 export function ended(e) {
@@ -91,6 +92,10 @@ function words(e) {
     case 'guard': {
       const more = e.repeats ? `, ${e.repeats} more times since the last report` : '';
       return { tone: 'bad', text: [`Broke the ${GUARDS[e.guard] || e.guard}: ${e.detail}${more}.${e.dropped ? ' Dropped.' : ''}`] };
+    }
+    case 'service': {
+      const w = serviceWords(e);
+      return { tone: w.tone, text: [`${w.text[0].toUpperCase()}${w.text.slice(1)}`] };
     }
     default:
       return { tone: '', text: [e.kind] };

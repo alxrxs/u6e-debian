@@ -1,8 +1,9 @@
-// Canvas charts: table sparklines, the radio utilization stack and the line
-// charts of a client's session. Each draws at the device's pixel ratio from
-// the colour tokens of the current theme.
+// Canvas charts: table sparklines, the radio utilization stack, the line
+// charts of a client's session and the bars of its traffic by hour. Each
+// draws at the device's pixel ratio from the colour tokens of the current
+// theme.
 
-import { hm, palette, time } from './util.js';
+import { dayOf, hm, palette, time } from './util.js';
 
 /** The canvas sized to its box at the pixel ratio, cleared; null if hidden. */
 function setup(canvas) {
@@ -235,6 +236,117 @@ function drawLine(canvas) {
   ctx.textAlign = 'left';
   lines.forEach((l, k) => {
     ctx.fillStyle = k ? p.ink : p.ink3;
+    ctx.fillText(l, tx + 8, box.t + 9 + k * 17);
+  });
+}
+
+/**
+ * Stacked bars, one per period of `step` ms starting at `start`, `count` of
+ * them: `{ start, step, count, series: [{ label, color, values }], format }`,
+ * `values` sparse by period index (a missing one is none). The first series
+ * sits at the bottom. Days are marked under the bars when they span more
+ * than one; pointing at a bar reads it out.
+ */
+export function barChart(canvas, opts) {
+  canvas.chart = opts;
+  if (!canvas.pointing) {
+    canvas.pointing = true;
+    const at = (e) => {
+      canvas.hoverX = e.offsetX;
+      drawBars(canvas);
+    };
+    canvas.addEventListener('pointermove', at);
+    canvas.addEventListener('pointerdown', at);
+    canvas.addEventListener('pointerleave', () => {
+      canvas.hoverX = null;
+      drawBars(canvas);
+    });
+  }
+  drawBars(canvas);
+}
+
+function drawBars(canvas) {
+  const opts = canvas.chart;
+  const c = setup(canvas);
+  if (!c || !opts) return;
+  const { ctx, w, h } = c;
+  const p = palette();
+  const { start, step, count, series, format } = opts;
+  const totals = Array.from({ length: count }, (_, i) => series.reduce((sum, s) => sum + (s.values[i] || 0), 0));
+  const ys = ticks(0, Math.max(1, ...totals));
+  const hi = ys[ys.length - 1];
+  ctx.font = '11px system-ui, -apple-system, "Segoe UI", sans-serif';
+  const left = Math.max(...ys.map((v) => ctx.measureText(format(v)).width)) + 10;
+  const box = { l: left, r: w - 4, t: 6, b: h - 20 };
+  const slot = (box.r - box.l) / count;
+  const y = (v) => box.b - (v / hi) * (box.b - box.t);
+
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'right';
+  ctx.lineWidth = 1;
+  for (const v of ys) {
+    const yy = Math.round(y(v)) + 0.5;
+    ctx.strokeStyle = p.rule2;
+    ctx.beginPath();
+    ctx.moveTo(box.l, yy);
+    ctx.lineTo(box.r, yy);
+    ctx.stroke();
+    ctx.fillStyle = p.ink3;
+    ctx.fillText(format(v), box.l - 8, yy);
+  }
+
+  const gap = slot > 4 ? 1 : 0;
+  for (let i = 0; i < count; i++) {
+    let base = 0;
+    for (const s of series) {
+      const v = s.values[i] || 0;
+      if (v <= 0) continue;
+      ctx.fillStyle = s.color;
+      ctx.fillRect(box.l + i * slot + gap / 2, y(base + v), Math.max(1, slot - gap), y(base) - y(base + v));
+      base += v;
+    }
+  }
+
+  // The x axis: each day's start, or each few hours' within one day.
+  ctx.textBaseline = 'top';
+  ctx.fillStyle = p.ink3;
+  const span = step * count;
+  const days = span > 86400e3;
+  const every = days ? 86400e3 : 6 * 3600e3;
+  for (let t = Math.ceil(start / every) * every; t < start + span; t += every) {
+    const xx = box.l + ((t - start) / step) * slot;
+    ctx.strokeStyle = p.rule;
+    ctx.beginPath();
+    ctx.moveTo(Math.round(xx) + 0.5, box.b);
+    ctx.lineTo(Math.round(xx) + 0.5, box.b + 4);
+    ctx.stroke();
+    ctx.textAlign = xx > box.r - 40 ? 'right' : 'left';
+    ctx.fillText(days ? dayOf(t) : hm(t), xx + 3, box.b + 6);
+  }
+
+  if (canvas.hoverX === null || canvas.hoverX === undefined) return;
+  const i = Math.floor((canvas.hoverX - box.l) / slot);
+  if (i < 0 || i >= count) return;
+  ctx.fillStyle = p.ink;
+  ctx.globalAlpha = 0.07;
+  ctx.fillRect(box.l + i * slot, box.t, slot, box.b - box.t);
+  ctx.globalAlpha = 1;
+  const t = start + i * step;
+  const lines = [`${dayOf(t)}, ${hm(t)}`, ...series.map((s) => `${s.label} ${format(s.values[i] || 0)}`)];
+  ctx.font = '12px system-ui, -apple-system, "Segoe UI", sans-serif';
+  const tw = Math.max(...lines.map((l) => ctx.measureText(l).width)) + 16;
+  const th = lines.length * 17 + 8;
+  const xx = box.l + (i + 0.5) * slot;
+  const tx = xx + 10 + tw > box.r ? xx - 10 - tw : xx + 10;
+  ctx.fillStyle = p.surface;
+  ctx.strokeStyle = p.rule;
+  ctx.beginPath();
+  ctx.roundRect(tx, box.t + 4, tw, th, 6);
+  ctx.fill();
+  ctx.stroke();
+  ctx.textAlign = 'left';
+  lines.forEach((l, k) => {
+    ctx.fillStyle = k ? series[k - 1].color : p.ink3;
     ctx.fillText(l, tx + 8, box.t + 9 + k * 17);
   });
 }

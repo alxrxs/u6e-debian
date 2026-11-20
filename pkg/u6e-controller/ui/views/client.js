@@ -4,14 +4,18 @@
 // readings now, the actions an admin can take on it, its rate limit and its
 // captures (`tools`), its largest
 // connections, its signal, rates and traffic over the session as this page
-// has seen it, and, as the controller keeps them, its sessions and its
-// timeline, asked for again when an event of it comes and every 15 s.
+// has seen it, and, as the controller keeps them, its traffic over the week
+// (`traffic`), the services it offers and asks for over mDNS (`services`),
+// its sessions and its timeline, asked for again when an event of it comes
+// and every 15 s.
 
 import { h, icon, ask, bandName, bits, bytes, dayOf, DID, duration, hm, mbps, palette, pct, phy, quality, time } from '../util.js';
 import { lineChart } from '../charts.js';
 import { clientFlows, flowTable, offload, redraw, sampled, tick, topRows } from './flows.js';
 import { certificate, sessionsTable, timelineItems } from './history.js';
 import { capturePanel, limitPanel } from './tools.js';
+import { byMac, deviceCard } from './services.js';
+import { trafficPanel } from './traffic.js';
 
 const ADMIN_GROUP = 'wifi-admins';
 const REFRESH_MS = 15000;
@@ -217,6 +221,9 @@ export default {
     const flowBox = h('div');
     const flowsEl = h('section', { class: 'client-flows' },
       h('div', { class: 'head section-title' }, h('h2', {}, 'Flows'), flowSub), flowBox);
+    const traffic = trafficPanel(store, mac);
+    const svcBox = h('div');
+    const svcEl = h('section', { class: 'client-services' }, h('h2', { class: 'section-title' }, 'Services'), svcBox);
     const sessions = h('div', { class: 'panel table-wrap' });
     const allSessions = h('button', { class: 'more', type: 'button' });
     allSessions.addEventListener('click', () => {
@@ -229,7 +236,7 @@ export default {
     const noHistory = h('div', { class: 'panel empty' });
     root.append(
       h('a', { class: 'crumb', href: '#/clients' }, icon('M15 18l-6-6 6-6'), 'Clients'),
-      head, tools, chartsEl, flowsEl,
+      head, tools, chartsEl, flowsEl, traffic.el, svcEl,
       h('h2', { class: 'section-title' }, 'Sessions'), sessions, allSessions,
       h('h2', { class: 'section-title' }, 'Timeline'), timeline, timelineNote, noHistory);
     /** The history the controller keeps, when it came, and its events seen
@@ -250,6 +257,34 @@ export default {
       else if (!hist) hist = { error: r.status };
       view.update();
     }
+    /** What it offers and asks over mDNS, and when that came. */
+    let svc = null;
+    let svcFetched = 0;
+    let svcLoading = false;
+    let svcDrawn = '';
+
+    async function loadServices() {
+      svcLoading = true;
+      const r = await store.getJson(`/api/services?device=${encodeURIComponent(mac)}`);
+      svcLoading = false;
+      svcFetched = Date.now();
+      svc = r.status === 200 ? r : svc || { error: r.status };
+      view.update();
+    }
+
+    function updateServices() {
+      if (!svcLoading && Date.now() - svcFetched > REFRESH_MS) loadServices();
+      const stamp = `${svcFetched}|${dayOf(Date.now())}`;
+      if (stamp === svcDrawn) return;
+      svcDrawn = stamp;
+      const macs = byMac(svc);
+      const d = macs.get(mac);
+      svcBox.replaceChildren(d ? deviceCard(d, macs, { link: false }) : h('div', { class: 'panel empty' }, h('p', {},
+        !svc ? 'Loading what it offers over mDNS.'
+          : svc.error !== undefined ? 'The controller cannot be reached; this page tries again.'
+            : 'No access point has heard it speak mDNS (Bonjour, AirPlay, HomeKit) lately.')));
+    }
+
     let flowsDrawn = '';
     /** The action on its way, if any. */
     let busy = '';
@@ -425,6 +460,8 @@ export default {
         limit.update();
         capture.update();
         updateFlows(c);
+        traffic.update();
+        updateServices();
         chartsEl.hidden = !c;
 
         const s = store.samples.get(mac);

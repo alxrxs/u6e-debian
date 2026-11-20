@@ -30,7 +30,11 @@
 //! or goes down (`spectrum`: Wi-Fi bursts, a narrowband sender on 5 GHz, a
 //! microwave oven and Bluetooth on 2.4 GHz, a quiet 6 GHz channel).
 //! The rate limits the controller gives stand on the AP of their client or
-//! SSID, and a capture streams a made-up pcapng file (`tools`).
+//! SSID, and a capture streams a made-up pcapng file (`tools`). Both APs
+//! read the mDNS of a HomePod stereo pair (`0e`, `0f`, with leases of their
+//! own) whose right speaker stops answering the iPhone's browses for part of
+//! each cycle, of a TV, a printer and a wired HomeKit bridge (`services`);
+//! each client's traffic builds up from its flows and counters.
 //! The RF planner commits to a site repository of its own in the temporary
 //! directory, made afresh at each start, and the radios' history starts a
 //! day full (`rf`). The controller signs configurations (`u6e-controller
@@ -49,6 +53,7 @@ mod keys;
 mod manage;
 mod radius;
 mod rf;
+mod services;
 mod spectrum;
 mod tools;
 
@@ -139,6 +144,12 @@ const DEVICES: [(u8, &str); 3] = [
     (6, "Bedroom thermostat"),
     (7, "Office printer"),
 ];
+/// The HomePod pair (`services`), by the last byte of their MAC: their
+/// leases' host names and devices.
+const SPEAKERS: [(u8, &str, &str); 2] = [
+    (services::LEFT, "homepod-left", "Living room speaker L"),
+    (services::RIGHT, "homepod-right", "Living room speaker R"),
+];
 
 /// The reverse DNS (`flows`): of the clients' addresses, their profiles'
 /// names; of the far ends, made-up names, but for every seventh address.
@@ -175,14 +186,16 @@ fn leases() -> String {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let mut out = String::from("# TYPE kea_lease_expiry_timestamp_seconds gauge\n");
-    for (i, (name, _)) in PROFILES.iter().enumerate() {
-        let Some(name) = name else { continue };
+    let profiled = PROFILES.iter().enumerate().filter_map(|(i, (name, _))| {
         let last = i as u8 + 1;
-        let host = name.split('.').next().unwrap_or(name);
+        let host = (*name)?.split('.').next()?;
         let device = DEVICES
             .iter()
             .find(|(l, _)| *l == last)
             .map_or("", |(_, d)| d);
+        Some((last, host, device))
+    });
+    for (last, host, device) in profiled.chain(SPEAKERS) {
         let offset = u64::from(last) * 37;
         let renewed = (now - offset) - (now - offset) % 600 + offset;
         let expires = renewed + 1200;
@@ -434,6 +447,8 @@ impl World {
                 client(9, RateMode::Ht, 1, 30e3, Some((0, 0, -66.0))),
                 client(10, RateMode::He, 2, 2e6, None),
                 client(11, RateMode::He, 2, 1e6, None),
+                client(services::LEFT, RateMode::He, 2, 3e5, Some((0, 1, -60.0))),
+                client(services::RIGHT, RateMode::He, 2, 3e5, Some((0, 1, -64.0))),
             ],
             blocked: BTreeSet::new(),
             homes: BTreeMap::new(),
@@ -1112,6 +1127,7 @@ async fn agent(addr: SocketAddr, ap: usize, pem: &str, world: Arc<Mutex<World>>)
     let (mut limits, mut sent_states) = (None::<Vec<Limit>>, None);
     let mut capture = None::<tools::Capture>;
     let mut chunks = interval(Duration::from_secs(1));
+    let mut mdns = services::Sent::default();
     let unix_s = || {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1250,6 +1266,15 @@ async fn agent(addr: SocketAddr, ap: usize, pem: &str, world: Arc<Mutex<World>>)
                     }
                 }
                 (last, want_key) = (Some(snap), false);
+                let read = {
+                    let w = world.lock().unwrap_or_else(|e| e.into_inner());
+                    let boot_ms = u64::from(w.aps[ap].booted_s) * 1000 + (w.t * 1000.0) as u64;
+                    let at = |l: u8| w.clients.iter().find(|c| c.last == l).and_then(|c| c.at);
+                    services::table(w.t, boot_ms, ap, at)
+                };
+                if let Some(m) = mdns.next(read) {
+                    send(&mut wr, &AgentMsg::Services(m)).await?;
+                }
                 next += tick;
             }
             () = sleep_until(next_flows) => {

@@ -1,6 +1,7 @@
 // DOM building and the formats every view shares.
 
-/** An element with attributes, properties (`on*` handlers, `class`) and children. */
+/** An element with attributes, properties (`on*` handlers, `class`) and
+ * children, nested in lists as deep as they come. */
 export function h(tag, attrs, ...kids) {
   const el = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs || {})) {
@@ -9,7 +10,7 @@ export function h(tag, attrs, ...kids) {
     else if (k === 'class') el.className = v;
     else el.setAttribute(k, v === true ? '' : v);
   }
-  el.append(...kids.flat().filter((k) => k !== null && k !== undefined && k !== false));
+  el.append(...kids.flat(Infinity).filter((k) => k !== null && k !== undefined && k !== false));
   return el;
 }
 
@@ -175,6 +176,68 @@ export const DID = {
   'rf-plan': 'applied an RF plan',
 };
 
+/** The DNS-SD service types a person knows by a name. */
+const SERVICES = {
+  _airplay: 'AirPlay',
+  _raop: 'AirPlay audio',
+  '_companion-link': 'Apple companion link',
+  _hap: 'HomeKit',
+  _homekit: 'HomeKit',
+  _googlecast: 'Google Cast',
+  '_spotify-connect': 'Spotify Connect',
+  _ipp: 'Printer (IPP)',
+  _ipps: 'Printer (IPPS)',
+  _printer: 'Printer (LPD)',
+  '_pdl-datastream': 'Printer (raw)',
+  _scanner: 'Scanner',
+  _uscan: 'Scanner (eSCL)',
+  '_sleep-proxy': 'Sleep proxy',
+  _matter: 'Matter',
+  _matterc: 'Matter commissioning',
+  '_device-info': 'Device info',
+  _smb: 'File sharing',
+  _afpovertcp: 'File sharing (AFP)',
+  _adisk: 'Time Machine',
+  _ssh: 'SSH',
+  _rfb: 'Screen sharing',
+  _mediaremotetv: 'Apple TV remote',
+  '_touch-able': 'Apple Remote',
+  _remotepairing: 'Remote pairing',
+  '_apple-mobdev2': 'Apple device sync',
+  _meshcop: 'Thread border router',
+  _trel: 'Thread link',
+  _http: 'Web',
+};
+
+/** The name a service type (`_airplay._tcp.local`) goes by. */
+export function serviceName(type) {
+  const first = (type || '').split('.')[0].toLowerCase();
+  return SERVICES[first] || first.replace(/^_/, '');
+}
+
+/** An offer's label as a person reads it: an AirPlay audio instance
+ * without the hardware address it starts with (`5E2C3A1B9F04@Kitchen`). */
+export function offerLabel(label) {
+  return (label || '').replace(/^[0-9a-f]{12}@/i, '');
+}
+
+/** DNS record types, as mDNS questions ask for them. */
+export const QTYPES = { 1: 'A', 12: 'PTR', 16: 'TXT', 28: 'AAAA', 33: 'SRV', 255: 'ANY' };
+
+/** What a service change says, as the feed and a client's timeline show it
+ * (`who` names the device that asked). */
+export function serviceWords(e, who = (m) => m) {
+  const what = `${offerLabel(e.label)} (${serviceName(e.service)})`;
+  const after = e.silent_for ? ` after ${duration(e.silent_for / 1000)} of silence` : '';
+  switch (e.change) {
+    case 'silent': return { text: `stopped answering for ${what}: missed ${e.misses} queries in a row${e.by ? `, the last from ${who(e.by)}` : ''}`, tone: 'bad' };
+    case 'answering': return { text: `answers for ${what} again${after}`, tone: 'ok' };
+    case 'gone': return { text: `withdrew ${what}${e.goodbye ? ' (said goodbye)' : ': its announcement ran out'}`, tone: '' };
+    case 'back': return { text: `offers ${what} again`, tone: 'ok' };
+    default: return { text: `${e.change} ${what}`, tone: '' };
+  }
+}
+
 /** The client guards, by the name the controller gives them. */
 export const GUARDS = { arp: 'ARP inspection', dhcp: 'Rogue DHCP guard', ra: 'RA guard', source: 'IP source guard', tag: 'VLAN tag guard' };
 
@@ -199,6 +262,7 @@ export function describe(ev) {
       const fate = ev.dropped ? ' Dropped.' : '';
       return { text: `broke the ${GUARDS[ev.guard] || ev.guard}: ${ev.detail}${more}.${fate}`, tone: 'bad', group: 'guard' };
     }
+    case 'service': return { ...serviceWords(ev), group: 'service' };
     default: return { text: ev.kind, tone: '', group: 'other' };
   }
 }

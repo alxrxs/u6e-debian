@@ -1,11 +1,12 @@
 // Events: the live feed of what the APs report (joins, leaves, sign-ins,
-// radios) and of the operators' actions on clients, newest first, by day; a
-// client's own history uses the same list.
+// radios, the services devices offer over mDNS) and of the operators'
+// actions on clients, newest first, by day; a client's own history uses the
+// same list.
 
 import { h, dayOf, describe, time } from '../util.js';
 
 const PAGE = 300;
-const GROUPS = [['', 'All'], ['conn', 'Joins and leaves'], ['auth', 'Sign-ins'], ['radio', 'Radios'], ['guard', 'Guards'], ['action', 'Actions']];
+const GROUPS = [['', 'All'], ['conn', 'Joins and leaves'], ['auth', 'Sign-ins'], ['radio', 'Radios'], ['guard', 'Guards'], ['service', 'Services'], ['action', 'Actions']];
 
 /** The radio an event names, with its band where the controller knows it. */
 function radioName(e) {
@@ -45,7 +46,7 @@ export function feed(list, { seen, since = Infinity, showMac = true } = {}) {
       lastDay = d;
     }
     const what = describe(e.phy ? { ...e, phy: radioName(e) } : e);
-    const key = `${e.ap}|${e.at}|${e.kind}|${e.action || e.guard || ''}|${e.mac || e.phy}`;
+    const key = `${e.ap}|${e.at}|${e.kind}|${e.action || e.guard || e.instance || ''}|${e.mac || e.phy}`;
     const fresh = seen && !seen.has(key) && e.at > since;
     seen?.add(key);
     out.push(h('li', { class: [what.tone, fresh ? 'fresh' : ''].join(' ').trim() || null },

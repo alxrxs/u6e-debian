@@ -837,3 +837,64 @@ main > .tool { margin-bottom: 18px; }
 .kept { display: inline-flex; flex-wrap: wrap; gap: 4px 10px; font-weight: 400; }
 .kept code.newest { font-weight: 650; }
 .rollout .manifest { margin-top: 8px; }
+
+/* Services: each device that speaks mDNS as a card, what it offers and
+   asks; the groups; whether one device sees another. */
+.svc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 14px; align-items: start; }
+.svc-card, .svc-group { padding: 14px 18px 12px; min-width: 0; }
+.svc-card.svc-bad { border-color: color-mix(in srgb, var(--bad) 45%, var(--rule)); }
+.svc-card h3 { margin: 14px 0 4px; font-size: 12px; color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.04em; }
+.svc-head { display: flex; align-items: center; justify-content: space-between; gap: 8px 14px; flex-wrap: wrap; }
+.svc-head .id { min-width: 0; }
+.svc-head .id a, .svc-head .id b { font-weight: 600; font-size: 15px; }
+.svc-head .id small { display: block; max-width: none; color: var(--ink-3); font-size: 12px; white-space: normal; overflow-wrap: anywhere; }
+.svc-where { display: flex; align-items: center; gap: 8px; font-size: 12.5px; }
+.svc-list { list-style: none; margin: 0; padding: 0; }
+.svc-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); gap: 4px 14px; padding: 8px 0; border-top: 1px solid var(--rule-2); font-size: 13px; }
+.svc-row:first-child { border-top: 0; }
+.svc-what { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; min-width: 0; }
+.svc-what > span { color: var(--ink-2); overflow-wrap: anywhere; }
+.svc-what small, .svc-how small { flex-basis: 100%; color: var(--ink-3); font-size: 12px; overflow-wrap: anywhere; }
+.svc-how { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; min-width: 0; }
+.svc-none { margin: 2px 0; font-size: 13px; }
+.svc-card .foot { margin: 10px 0 0; font-size: 12px; }
+.svc-group .svc-head { margin-bottom: 6px; }
+.svc-group .svc-head b { font-size: 15px; }
+.client-services .svc-card { max-width: 980px; }
+
+.see { padding: 16px 20px; margin-bottom: 4px; }
+.see-head { display: flex; align-items: center; justify-content: space-between; gap: 10px 18px; flex-wrap: wrap; }
+.see-head h2 { font-size: 16px; }
+.see-pick { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.see-pick select { max-width: 32ch; }
+.see-out { margin-top: 12px; }
+.see-sum { margin: 0 0 8px; font-weight: 600; }
+.see-sum.bad { color: var(--bad); }
+.see-sum.ok { color: var(--ok); }
+.see-list { list-style: none; margin: 0; padding: 0; }
+.see-list li { display: grid; grid-template-columns: 14px 1fr; gap: 10px; align-items: baseline; padding: 8px 0; border-top: 1px solid var(--rule-2); font-size: 13px; }
+.see-list .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink-3); align-self: center; }
+.see-list li.ok .dot { background: var(--ok); }
+.see-list li.bad .dot { background: var(--bad); }
+.see-list small { color: var(--ink-3); font-size: 12px; }
+
+/* A client's traffic over the week. */
+.traffic .chart-head { padding: 14px 16px 0; }
+.traffic .flow-sum { border-top: 1px solid var(--rule-2); margin-top: 12px; }
+.traffic .chart canvas { height: 170px; }
+.traffic .foot { padding: 0 16px 14px; margin: 10px 0 0; font-size: 12px; }
+.traffic .table-wrap > p { padding: 0 16px; }
+table.dests td.wrap { min-width: 24ch; }
+.share { display: inline-flex; align-items: center; gap: 8px; }
+.share b { display: block; width: 72px; height: 6px; border-radius: 3px; background: var(--rule-2); overflow: hidden; }
+.share i { display: block; height: 100%; background: var(--accent); }
+.share span { width: 3.4em; text-align: right; color: var(--ink-2); }
+
+@media (max-width: 720px) {
+  .svc-grid { grid-template-columns: 1fr; }
+  .svc-card, .svc-group { padding: 12px 14px 10px; }
+  .svc-row { grid-template-columns: 1fr; }
+  .see { padding: 14px 16px; }
+  .see-pick select { max-width: 100%; flex: 1 1 100%; }
+  .traffic .chart canvas { height: 150px; }
+}

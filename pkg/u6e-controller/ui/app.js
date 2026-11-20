@@ -9,7 +9,8 @@
 // comes as JSON, its frames as binary messages straight to the view. The RF
 // plan shown beside it is fetched, and applied with a POST like an action,
 // as is an AP's upgrade, which the Config view follows from the state. A
-// client's history and the auth problems are fetched by their views.
+// client's history and traffic, the auth problems and the mDNS services are
+// fetched by their views.
 
 import { icon } from './util.js';
 import devices from './views/devices.js';
@@ -19,6 +20,7 @@ import auth from './views/auth.js';
 import config from './views/config.js';
 import events from './views/events.js';
 import flows from './views/flows.js';
+import services from './views/services.js';
 import spectrum, { decodeFrame } from './views/spectrum.js';
 
 /** Samples kept per client and radio: an hour at one per tick. */
@@ -74,7 +76,7 @@ const store = {
   watchSpectrum,
 };
 
-const views = { devices, clients, client, auth, flows, events, spectrum, config };
+const views = { devices, clients, client, auth, flows, services, events, spectrum, config };
 let current = null;
 let currentName = '';
 
@@ -88,7 +90,7 @@ function merge(target, patch) {
 }
 
 function eventKey(e) {
-  return `${e.ap}|${e.at}|${e.kind}|${e.action || e.guard || ''}|${e.mac || e.phy || ''}`;
+  return `${e.ap}|${e.at}|${e.kind}|${e.action || e.guard || e.instance || ''}|${e.mac || e.phy || ''}`;
 }
 
 function addEvents(list) {
@@ -428,7 +430,7 @@ function render() {
       ? `Live updates stopped: the controller cannot be reached. Trying again in ${s} s; the figures shown are the last received.`
       : `The controller cannot be reached. Trying again in ${s} s.`;
   }
-  const title = { devices: 'Devices', clients: 'Clients', client: 'Client', auth: 'Auth problems', flows: 'Flows', spectrum: 'Spectrum', config: 'Config', events: 'Events' }[currentName];
+  const title = { devices: 'Devices', clients: 'Clients', client: 'Client', auth: 'Auth problems', flows: 'Flows', services: 'Services', spectrum: 'Spectrum', config: 'Config', events: 'Events' }[currentName];
   document.title = `${title} – Wi-Fi`;
   current?.update();
 }
