@@ -533,7 +533,10 @@ UNIT
 # or makes static), and report each violation to the agent on a socket only
 # its group may open; on the VLANs the controller says to enforce on they drop
 # exactly the frames they report with tc ingress filters, which nothing else
-# on the Wi-Fi ports uses. Started at boot (and by its socket), it runs as its
+# on the Wi-Fi ports uses. The same packet socket brings them the mDNS the
+# bridges carry, which they keep as a bounded table of the services devices
+# offer and whether they answer for them, for the agent to read: no other
+# privilege. Started at boot (and by its socket), it runs as its
 # own user with CAP_NET_RAW and CAP_NET_ADMIN alone, ambient so tc has them
 # too; its first and last steps remove its qdiscs and actions, and fail
 # loudly when they cannot, so a guard that is not running drops nothing.
