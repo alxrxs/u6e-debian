@@ -54,6 +54,7 @@ use crate::rf::history::{self, History};
 use crate::services::{self, Services};
 use crate::sessions::{self, Sessions};
 use crate::spectrum::{self, Limits, Scan, Stopped};
+use crate::traffic::{self, Traffic};
 
 /// Events kept per AP, newest last.
 pub const EVENTS_CAP: usize = 1000;
@@ -619,6 +620,8 @@ pub struct State {
     pub captures: Captures,
     /// What the APs read of mDNS.
     pub services: Services,
+    /// Each client's volumes and destinations.
+    pub traffic: Traffic,
 }
 
 impl State {
@@ -657,6 +660,7 @@ impl State {
             site_limits: BTreeMap::new(),
             captures: Captures::default(),
             services: Services::default(),
+            traffic: Traffic::default(),
         }
     }
 
@@ -688,6 +692,11 @@ impl State {
     /// The state going on from the sessions and timelines `sessions`.
     pub fn with_sessions(self, sessions: Sessions) -> Self {
         State { sessions, ..self }
+    }
+
+    /// The state keeping the clients' traffic as `traffic` holds it.
+    pub fn with_traffic(self, traffic: Traffic) -> Self {
+        State { traffic, ..self }
     }
 
     /// The state reading RADIUS's log, its newest verdict the newest its
@@ -1137,6 +1146,7 @@ impl State {
                 (&a.previous, &a.snapshot, a.snapshot_at)
         {
             self.history.observe(ap, prev, *then, now, at);
+            self.traffic.snapshot(prev, *then, now, at);
         }
         let now_ms = sessions::unix_ms(now);
         if let Some(a) = self.aps.get(ap) {
@@ -1150,6 +1160,9 @@ impl State {
                 Some(Change::Flows(_)) => {
                     if let Some((f, _)) = &a.flows {
                         self.sessions.flows(ap, f, now_ms);
+                        let names = &self.names;
+                        self.traffic
+                            .flows(ap, f, now_ms, |ip| names.get(ip).map(str::to_owned));
                     }
                 }
                 _ => {}
@@ -1902,6 +1915,12 @@ impl State {
         self.names.due(own.chain(remote).collect::<Vec<_>>(), now)
     }
 
+    /// Of `shown`, the far ends a page shows, those to look up now, marked
+    /// as in flight.
+    pub fn shown_due(&mut self, shown: Vec<IpAddr>, now: Instant) -> Vec<IpAddr> {
+        self.names.due(shown, now)
+    }
+
     /// Takes the answer of a lookup of `ip`.
     pub fn named(&mut self, ip: IpAddr, name: Option<String>, now: Instant) {
         if self.names.answer(ip, name, now) {
@@ -2026,6 +2045,25 @@ impl State {
             }
         }
         by_mac.into_values().collect()
+    }
+}
+
+/// A far end is named by its reverse DNS, and a client's own address by
+/// that client.
+impl traffic::Look for State {
+    fn dns_name(&self, ip: &IpAddr) -> Option<String> {
+        self.names.get(ip).map(str::to_owned)
+    }
+
+    fn client_at(&self, ip: &IpAddr) -> Option<([u8; 6], Option<String>)> {
+        let seen = self.addresses.iter().find(|(_, a)| a.ips.contains(ip));
+        let leased = || {
+            let mut all = self.leases.all(SystemTime::now());
+            all.find(|(_, l)| l.addresses.iter().any(|(a, _)| a == ip))
+                .map(|(m, _)| m)
+        };
+        let mac = seen.map(|(m, _)| *m).or_else(leased)?;
+        Some((mac, self.identity(&mac).name().map(str::to_owned)))
     }
 }
 

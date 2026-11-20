@@ -7,7 +7,7 @@
 //!   u6e-controller release <ap> [--config <path>]
 //!
 //! Without a command it is the controller, until stopped (SIGTERM, after
-//! which it saves the clients' history and exits). `apply` reads the
+//! which it saves the clients' history and traffic and exits). `apply` reads the
 //! script `boot/wifi-up.sh --print` renders for the AP, has the controller
 //! sign its radios' configuration and send it, and exits 0 only when the AP
 //! applied exactly that configuration, printing how each radio took it.
@@ -30,7 +30,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use u6e_controller::agents::Timing;
 use u6e_controller::config::Config;
 use u6e_controller::names::System;
-use u6e_controller::{local, script, sessions};
+use u6e_controller::{local, script, sessions, traffic};
 use u6e_proto::frame::zeroize;
 use u6e_proto::tls::Identity;
 
@@ -131,6 +131,7 @@ fn run(config: &Config) -> Result<(), String> {
         let mut stop = signal(SignalKind::terminate()).map_err(|e| format!("signals: {e}"))?;
         stop.recv().await;
         sessions::save(&c.state, &config.history_path).await;
+        traffic::save(&c.state, &config.traffic_path).await;
         Ok(())
     })
 }

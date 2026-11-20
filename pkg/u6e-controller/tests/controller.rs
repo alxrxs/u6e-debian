@@ -99,12 +99,13 @@ fn config_text(key: &str, ap2: bool, dir: &Path, gate_secs: u64) -> String {
         "listen_agents = \"127.0.0.1:0\"\nlisten_http = \"127.0.0.1:0\"\n\
          listen_metrics = \"127.0.0.1:0\"\nkey = \"{key}\"\n\
          public_origin = \"{ORIGIN}\"\npolicy_path = \"{}\"\nhistory_path = \"{}\"\n\
-         captures_path = \"{}\"\n\
+         traffic_path = \"{}\"\ncaptures_path = \"{}\"\n\
          socket = \"{}\"\n[configs]\nsigning_key = \"{signing}\"\nstate = \"{}\"\n\
          [rollouts]\nimages = \"{}\"\ngate_secs = {gate_secs}\nroot_key = \"{root}\"\n\
          stock_password = \"{password}\"\nknown_hosts = \"{hosts}\"\n{}",
         dir.join("policy.json").display(),
         dir.join("history").display(),
+        dir.join("traffic").display(),
         dir.join("captures").display(),
         dir.join("sock").display(),
         dir.join("configs").display(),
@@ -741,10 +742,45 @@ fn wait_line(log: &Receiver<String>, matches: impl Fn(&str) -> bool) -> String {
     }
 }
 
-/// Stopped (SIGTERM), the controller saves the clients' history before it
-/// exits, and started again it goes on from it.
+/// The flows of `MAC`, each connection `(far end's last byte, bytes sent,
+/// bytes received)`, a second old.
+fn flows_of(seq: u64, conns: &[(u8, u64, u64)]) -> Flows {
+    let top: Vec<Flow> = (conns.iter())
+        .map(|&(last, tx, rx)| Flow {
+            proto: 6,
+            src: IpAddr::from([192, 0, 2, 10]),
+            sport: 50_000 + u16::from(last),
+            dst: IpAddr::from([198, 51, 100, last]),
+            dport: 443,
+            tx_bytes: tx,
+            rx_bytes: rx,
+            tx_packets: 1,
+            rx_packets: 1,
+            offloaded: true,
+            age_s: 1,
+            client_is_src: true,
+        })
+        .collect();
+    Flows {
+        seq,
+        complete: true,
+        clients: vec![ClientFlows {
+            mac: MAC,
+            conns: top.len() as u32,
+            offloaded: top.len() as u32,
+            tx_bytes: 0,
+            rx_bytes: 0,
+            tx_packets: 0,
+            rx_packets: 0,
+            top,
+        }],
+    }
+}
+
+/// Stopped (SIGTERM), the controller saves the clients' history and their
+/// traffic before it exits, and started again it goes on from them.
 #[test]
-fn the_history_is_saved_when_the_controller_stops() {
+fn the_history_and_traffic_are_saved_when_the_controller_stops() {
     let dir = TempDir::new("history-stop");
     let mut b = spawn_binary(&dir);
     let mut a = Agent::hello(b.agents, KEY_AP1, "ap1");
@@ -757,14 +793,51 @@ fn the_history_is_saved_when_the_controller_stops() {
             .map_or(0, Vec::len)
     };
     wait_for("the client's session", || sessions(b.http) == 1);
+    // Its traffic: the volume from the station's counters, its far ends
+    // from the flows (the first summary of an AP only where they stand).
+    let mut moved = station(MAC, 0, -54);
+    (moved.rx_bytes, moved.tx_bytes) = (moved.rx_bytes + 3000, moved.tx_bytes + 90_000);
+    a.send(&AgentMsg::Key(snapshot(
+        2,
+        vec![bss("wlan5", "Corp")],
+        vec![moved],
+    )))
+    .unwrap();
+    a.send(&AgentMsg::Flows(flows_of(1, &[(1, 100, 1000)])))
+        .unwrap();
+    a.send(&AgentMsg::Flows(flows_of(
+        2,
+        &[(1, 600, 61_000), (2, 50, 70)],
+    )))
+    .unwrap();
+    let traffic = |http| json_get(http, "/api/clients/02:00:00:00:00:01/traffic");
+    wait_for("its traffic", || {
+        traffic(b.http)["top"]
+            .as_array()
+            .is_some_and(|t| t.len() == 2)
+    });
+    let before = traffic(b.http);
+    let day = &before["days"][0];
+    assert_eq!(
+        (day["up"].as_u64(), day["down"].as_u64()),
+        (Some(3000), Some(90_000))
+    );
+    let top = &before["top"][0];
+    assert_eq!(
+        (top["ip"].as_str(), top["up"].as_u64(), top["down"].as_u64()),
+        (Some("198.51.100.1"), Some(500), Some(60_000))
+    );
     let pid = libc::pid_t::try_from(b.proc.0.id()).unwrap();
     // SAFETY: a signal to the child this test started and still holds.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
     assert!(b.proc.0.wait().unwrap().success());
-    let saved = fs::metadata(dir.0.join("history")).unwrap();
-    assert_eq!(saved.permissions().mode() & 0o777, 0o600);
+    for file in ["history", "traffic"] {
+        let saved = fs::metadata(dir.0.join(file)).unwrap();
+        assert_eq!(saved.permissions().mode() & 0o777, 0o600, "{file}");
+    }
     let again = spawn_binary(&dir);
     assert_eq!(sessions(again.http), 1);
+    assert_eq!(traffic(again.http), before);
 }
 
 #[test]
@@ -4975,4 +5048,34 @@ fn services_reach_the_api_the_metrics_and_the_events() {
         assert!(body.lines().any(|l| l == line), "missing {line}\n{body}");
     }
     assert!(promtool_accepts(&body));
+}
+
+/// A client's far ends are looked up once its traffic page shows them, not
+/// before, and named at the page's next read.
+#[test]
+fn a_clients_destinations_are_named_once_a_page_shows_them() {
+    let r = controller(Timing::default());
+    let mut a = ap_with_client(&r, KEY_AP1, "ap1", &[]);
+    let far: IpAddr = "198.51.100.1".parse().unwrap();
+    r.dns
+        .names
+        .lock()
+        .unwrap()
+        .insert(far, "one.example.org".into());
+    a.send(&AgentMsg::Flows(flows_of(1, &[(1, 100, 1000)])))
+        .unwrap();
+    a.send(&AgentMsg::Flows(flows_of(2, &[(1, 200, 3000)])))
+        .unwrap();
+    wait_for("the client's address looked up", || {
+        !r.dns.asked.lock().unwrap().is_empty()
+    });
+    assert!(!r.dns.asked.lock().unwrap().contains(&far));
+    let traffic = || json_get(r.c.http, "/api/clients/02:00:00:00:00:01/traffic");
+    let first = traffic();
+    assert_eq!(first["top"][0]["ip"], "198.51.100.1");
+    assert!(first["top"][0].get("name").is_none());
+    wait_for("the far end named", || {
+        traffic()["top"][0]["name"] == "one.example.org"
+    });
+    assert!(r.dns.asked.lock().unwrap().contains(&far));
 }

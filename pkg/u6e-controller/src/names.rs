@@ -2,7 +2,8 @@
 //! client's own, as its flows show them, which name it when neither the DHCP
 //! server's device nor the client's own host name does (a static client's
 //! PTR, typically); and the far ends of the flows a UI watches, shown under
-//! each address.
+//! each address, and of the destinations a client's traffic page shows
+//! (`traffic`).
 //!
 //! Each address is looked up at most once at a time, [`LOOKUPS`] at most at
 //! once. A name found is kept for [`FOUND_TTL`], the lack of one for
@@ -20,6 +21,8 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Semaphore;
 use u6e_proto::msg::Flow;
+
+use crate::state::Shared;
 
 pub const FOUND_TTL: Duration = Duration::from_secs(3600);
 pub const MISSING_TTL: Duration = Duration::from_secs(600);
@@ -206,6 +209,17 @@ impl Lookups {
             .await
             .ok()
             .flatten()
+    }
+}
+
+/// Looks each of `due` up in a task of its own, its answer into `state`.
+pub fn look_up(state: &Shared, lookups: &Lookups, due: Vec<IpAddr>) {
+    for ip in due {
+        let (state, lookups) = (state.clone(), lookups.clone());
+        tokio::spawn(async move {
+            let name = lookups.reverse(ip).await;
+            state.write().named(ip, name, Instant::now());
+        });
     }
 }
 

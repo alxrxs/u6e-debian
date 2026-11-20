@@ -19,7 +19,8 @@
 //! client's sessions and timeline (`sessions`, `timeline`) come from all of
 //! that and from RADIUS's verdicts, read from its log (`radius`). What the
 //! APs read of mDNS shows which device offers which service and whether it
-//! answers for it (`services`).
+//! answers for it (`services`); the flows and the station counters each
+//! client's volumes and where they went (`traffic`).
 
 pub mod actions;
 pub mod agents;
@@ -52,6 +53,7 @@ mod store;
 #[cfg(test)]
 mod testdir;
 pub mod timeline;
+pub mod traffic;
 pub mod view;
 
 use std::collections::HashMap;
@@ -82,6 +84,7 @@ use crate::rollout::Engine;
 use crate::sessions::Sessions;
 use crate::stage::{Ssh, Stage, Target, Waits};
 use crate::state::{Shared, State};
+use crate::traffic::Traffic;
 
 /// A running controller: its state, the addresses it listens on, and what
 /// its web listener's actions take (for a listener of another's own).
@@ -156,9 +159,19 @@ pub async fn start(
             history.display()
         );
     }
+    let traffic_path = &config.traffic_path;
+    let (traffic, aside) = Traffic::load(traffic_path)
+        .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", traffic_path.display())))?;
+    if let Some(aside) = aside {
+        eprintln!(
+            "u6e-controller: {}: not traffic this controller reads, set aside as {aside}",
+            traffic_path.display()
+        );
+    }
     let mut state = State::new(config.hostnames.clone())
         .with_policy(saved)
         .with_sessions(sessions)
+        .with_traffic(traffic)
         .with_spectrum(timing.spectrum)
         .with_history(window)
         .with_leases(&config.leases)
@@ -237,12 +250,13 @@ pub async fn start(
         };
         tokio::spawn(local::serve(local, bind_local(config)?));
     }
+    let lookups = Lookups::new(resolver);
     let listener = Listener {
         acceptor: TlsAcceptor::from(tls::server_config(identity, Arc::clone(&allowed))),
         allowed,
         state: state.clone(),
         timing,
-        lookups: Lookups::new(resolver),
+        lookups: lookups.clone(),
         store: store.clone(),
     };
     tokio::spawn(agents::serve(agents, listener));
@@ -254,7 +268,8 @@ pub async fn start(
         tokio::spawn(radius::supervise(state.clone(), settings.clone()));
     }
     tokio::spawn(sessions::keep(state.clone(), history.clone()));
-    let mut access = Access::new(config, &timing, store);
+    tokio::spawn(traffic::keep(state.clone(), traffic_path.clone()));
+    let mut access = Access::new(config, &timing, store, lookups);
     if let Some(e) = &engine {
         e.resume();
         access.rollouts = Some(e.clone());

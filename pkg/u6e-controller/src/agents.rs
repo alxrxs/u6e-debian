@@ -41,7 +41,7 @@ use u6e_proto::msg::{AgentMsg, CtlMsg, Hello};
 use u6e_proto::tls::{self, AllowedKeys};
 use u6e_proto::{PROTOCOL, version};
 
-use crate::names::Lookups;
+use crate::names::{self, Lookups};
 use crate::policy::{self, Store};
 use crate::spectrum::Limits;
 use crate::state::{FLOWS_WATCHED, Registration, Shared, TICK_WATCHED};
@@ -471,13 +471,7 @@ impl Session {
     /// Looks up the names now due, each in a task of its own.
     fn look_up_names(&self) {
         let due = self.state.write().names_due(std::time::Instant::now());
-        for ip in due {
-            let (state, lookups) = (self.state.clone(), self.lookups.clone());
-            tokio::spawn(async move {
-                let name = lookups.reverse(ip).await;
-                state.write().named(ip, name, std::time::Instant::now());
-            });
-        }
+        names::look_up(&self.state, &self.lookups, due);
     }
 
     /// Sends `msg`; a configuration's frame is wiped once sent.

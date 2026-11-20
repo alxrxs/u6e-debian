@@ -24,7 +24,8 @@
 //! exported, and an AP whose offload a capture holds back says so. What an
 //! AP's client guards read of mDNS is counted per AP alone (its devices,
 //! offers, offers not answering, messages read, unreadable and evicted),
-//! never per device or service.
+//! never per device or service, and the clients whose traffic is kept are
+//! counted.
 
 use std::collections::BTreeSet;
 use std::fmt::Write;
@@ -462,6 +463,12 @@ pub fn render(state: &State) -> String {
     leases(&mut m, state);
     guards(&mut m, &aps);
     services(&mut m, state);
+    m.family(
+        "wifi_traffic_clients",
+        GAUGE,
+        "Clients whose volumes and destinations the controller keeps.",
+    );
+    m.sample(&[], state.traffic.clients() as f64);
     identities(&mut m, state);
     radius_log(&mut m, state);
     m.family(

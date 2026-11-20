@@ -44,6 +44,7 @@ use crate::agents::Timing;
 use crate::config::Config;
 use crate::http::{error, json_response};
 use crate::images::image_name;
+use crate::names::Lookups;
 use crate::policy::{self, Policy, Store};
 use crate::rf::{self, Planner};
 use crate::rollout::Engine;
@@ -70,10 +71,12 @@ pub struct Access {
     pub rf: Option<Arc<Planner>>,
     /// The rollouts, when the configuration has them.
     pub rollouts: Option<Engine>,
+    /// The reverse lookups of what a page shows.
+    pub lookups: Lookups,
 }
 
 impl Access {
-    pub fn new(config: &Config, timing: &Timing, policy: Store) -> Self {
+    pub fn new(config: &Config, timing: &Timing, policy: Store, lookups: Lookups) -> Self {
         Access {
             public_origin: config.public_origin.clone(),
             admin_group: config.admin_group.clone(),
@@ -82,6 +85,7 @@ impl Access {
             ui_session: timing.ui_session,
             rf: rf::from(config.rf.as_ref()),
             rollouts: None,
+            lookups,
         }
     }
 }

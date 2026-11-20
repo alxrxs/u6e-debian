@@ -30,8 +30,10 @@
 //! logs (the WebSocket's view carries both, the rollouts with their last
 //! lines). `GET /api/rf/plan` and `POST /api/rf/apply` are the RF
 //! planner's (`rf`). `GET /api/clients/{mac}/history` is a client's
-//! sessions and timeline, `GET /api/auth-problems` the clients that failed
-//! to get on in the last day; both read only what the controller holds.
+//! sessions and timeline, `GET /api/clients/{mac}/traffic` its volumes and
+//! destinations over the last week (`traffic`), `GET /api/auth-problems`
+//! the clients that failed to get on in the last day; all read only what
+//! the controller holds.
 //! `GET /api/services?ap=&device=` is what the APs read of mDNS (the site's
 //! view, one AP's table, or one device and those it relates to), `GET
 //! /api/services/see?from=&to=` whether one device's queries for what
@@ -64,7 +66,7 @@ use crate::services;
 use crate::spectrum::{self, Watching};
 use crate::state::{Change, Full, ROLLOUT_LOG_CAP, Shared, WatchGuard};
 use crate::view;
-use crate::{captures, limits, rf, sessions};
+use crate::{captures, limits, names, rf, sessions, traffic};
 
 /// How long a new WebSocket may take to say what it watches.
 const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -167,6 +169,7 @@ pub fn router(state: Shared, access: Access) -> Router {
         .route("/api/flows/full", get(api_flows_full))
         .route("/api/me", get(actions::me))
         .route("/api/clients/{mac}/history", get(api_history))
+        .route("/api/clients/{mac}/traffic", get(api_traffic))
         .route("/api/auth-problems", get(api_auth_problems))
         .route("/api/services", get(api_services))
         .route("/api/services/see", get(api_services_see))
@@ -291,6 +294,22 @@ async fn api_history(
         Some(m) => json_response(&view::history(&state.read(), &m, admin)),
         None => error(StatusCode::BAD_REQUEST, "not a MAC"),
     }
+}
+
+/// A client's traffic; the far ends it shows that have no name yet are
+/// looked up, for the page's next read.
+async fn api_traffic(Ext(web): Ext<Web>, Path(m): Path<String>) -> Response {
+    let Some(m) = mac::parse(&m) else {
+        return error(StatusCode::BAD_REQUEST, "not a MAC");
+    };
+    let (view, due) = {
+        let mut s = web.state.write();
+        let view = traffic::view(&s.traffic, &m, &*s);
+        let shown = traffic::shown(&s.traffic, &m);
+        (view, s.shown_due(shown, Instant::now()))
+    };
+    names::look_up(&web.state, &web.access.lookups, due);
+    json_response(&view)
 }
 
 async fn api_auth_problems(Ext(state): Ext<Shared>) -> Response {

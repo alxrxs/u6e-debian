@@ -12,7 +12,8 @@
 //! none without it; in `[radius]`, the Loki the RADIUS servers' log is read
 //! from (`radius`), RADIUS's side of the clients' timelines missing without
 //! it; where the clients' sessions and timelines are kept (`history_path`,
-//! `sessions`); where the client captures' files are kept
+//! `sessions`), and their traffic (`traffic_path`, `traffic`); where the
+//! client captures' files are kept
 //! (`captures_path`, `captures`); in `[limits]`, the site's per-SSID rate
 //! limits, which an
 //! admin's limit of the same SSID overrides (`limits`); and, in `[guards]`,
@@ -31,6 +32,7 @@
 //! admin_group = "wifi-admins"
 //! policy_path = "/var/lib/wifi-controller/policy.json"
 //! history_path = "/var/lib/wifi-controller/history"
+//! traffic_path = "/var/lib/wifi-controller/traffic"
 //! captures_path = "/var/lib/wifi-controller/captures"
 //! socket = "/run/wifi-controller/sock"
 //!
@@ -101,6 +103,8 @@ pub struct Config {
     pub policy_path: PathBuf,
     /// The clients' sessions and timelines.
     pub history_path: PathBuf,
+    /// The clients' volumes and destinations.
+    pub traffic_path: PathBuf,
     /// The client captures' files.
     pub captures_path: PathBuf,
     /// The site's rate limits, per SSID.
@@ -141,6 +145,8 @@ struct File {
     policy_path: PathBuf,
     #[serde(default = "default_history")]
     history_path: PathBuf,
+    #[serde(default = "default_traffic")]
+    traffic_path: PathBuf,
     #[serde(default = "default_captures")]
     captures_path: PathBuf,
     #[serde(default = "default_socket")]
@@ -236,6 +242,10 @@ fn default_policy() -> PathBuf {
 
 fn default_history() -> PathBuf {
     "/var/lib/wifi-controller/history".into()
+}
+
+fn default_traffic() -> PathBuf {
+    "/var/lib/wifi-controller/traffic".into()
 }
 
 fn default_captures() -> PathBuf {
@@ -372,6 +382,7 @@ impl Config {
             admin_group: file.admin_group,
             policy_path: file.policy_path,
             history_path: file.history_path,
+            traffic_path: file.traffic_path,
             captures_path: file.captures_path,
             limits,
             socket: file.socket,
@@ -707,6 +718,17 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn the_traffic_is_kept_where_it_says() {
+        let c = Config::parse(ORIGIN).unwrap();
+        assert_eq!(
+            c.traffic_path,
+            PathBuf::from("/var/lib/wifi-controller/traffic")
+        );
+        let c = Config::parse(&format!("{ORIGIN}traffic_path = \"/t\"\n")).unwrap();
+        assert_eq!(c.traffic_path, PathBuf::from("/t"));
     }
 
     #[test]
