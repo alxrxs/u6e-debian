@@ -1,8 +1,9 @@
 //! What the guards read of the mDNS the bridges carry (`mdns`), as one
 //! bounded table: the devices heard (by source MAC: the port and VLAN, the
 //! host name and addresses their address records give), the services they
-//! offer (from their PTR, SRV and TXT records; a TTL of 0 is a goodbye) and
-//! the queries they send. Nothing of a message is kept but those names,
+//! offer (from their PTR, SRV and TXT records, each extending the offer's
+//! life; a PTR, or an SRV naming its target, of TTL 0 is a goodbye) and the
+//! queries they send. Nothing of a message is kept but those names,
 //! types, ports, addresses and TTLs and the few TXT keys `mdns` reads.
 //!
 //! Whether a device answers what it offers: a query (not a probe) opens a
@@ -11,7 +12,9 @@
 //! answers and every response record's name heard within the second are
 //! noted; when it closes, each live offer of that service type or instance
 //! answered, was listed as known by an asker (so its owner rightly kept
-//! quiet, RFC 6762 7.1), or missed. A window whose every question asked for
+//! quiet, RFC 6762 7.1), or missed. An offer past its TTL is unconfirmed,
+//! not gone: a device may stay quiet while nobody asks. A query for it that
+//! goes unanswered withdraws it then, as its goodbye would have. A window whose every question asked for
 //! a unicast answer (QU) counts no miss: that answer may never reach the
 //! host (between two clients of one BSS it never does). Nor does one that
 //! a query sent unicast or from another port than 5353 (a legacy query)
@@ -34,7 +37,7 @@ use std::collections::{HashMap, VecDeque};
 
 use u6e_proto::msg::{
     MDNS_ADDRS, MDNS_DEVICES, MDNS_LISTED, MDNS_OFFERS, MDNS_QUERIES, MdnsDevice, MdnsKey,
-    MdnsOffer, MdnsQuery, Services,
+    MdnsOffer, MdnsQuery, Services, Withdrawn,
 };
 
 use crate::mdns::{self, Data, Kind, Message, Section};
@@ -72,8 +75,10 @@ struct Offer {
 }
 
 impl Offer {
+    /// Not withdrawn, and within the life its records gave it.
     fn live(&self, now: u64) -> bool {
-        !self.wire.goodbye && self.wire.announced_ms + u64::from(self.wire.ttl_s) * 1000 > now
+        self.wire.withdrawn.is_none()
+            && self.wire.announced_ms + u64::from(self.wire.ttl_s) * 1000 > now
     }
 
     /// When it was last heard of.
@@ -308,7 +313,7 @@ impl Table {
                 txt: Vec::new(),
                 ttl_s: 0,
                 announced_ms: now,
-                goodbye: false,
+                withdrawn: None,
                 answered: 0,
                 missed: 0,
                 missed_in_row: 0,
@@ -336,19 +341,29 @@ impl Table {
                 }
                 Data::Srv { port, target } => {
                     if let Some(o) = self.offer(src, &r.name, msg, now) {
-                        announce(&mut o.wire, r.ttl, now);
-                        o.wire.port = *port;
                         let target = target.text(msg);
-                        if o.wire.target != target {
-                            o.wire.target = target;
+                        // A goodbye of another target is of an SRV record
+                        // the offer no longer has.
+                        let same = o.wire.target.is_empty()
+                            || (o.wire.target == target && o.wire.port == *port);
+                        if r.ttl > 0 || same {
+                            announce(&mut o.wire, r.ttl, now);
+                        }
+                        if r.ttl > 0 {
+                            o.wire.port = *port;
+                            if o.wire.target != target {
+                                o.wire.target = target;
+                            }
                         }
                     }
                 }
-                Data::Txt(txt) => {
-                    if let Some(o) = self.offer(src, &r.name, msg, now)
-                        && o.wire.txt != *txt
-                    {
-                        o.wire.txt.clone_from(txt);
+                // A TXT record's goodbye alone withdraws nothing.
+                Data::Txt(txt) if r.ttl > 0 => {
+                    if let Some(o) = self.offer(src, &r.name, msg, now) {
+                        announce(&mut o.wire, r.ttl, now);
+                        if o.wire.txt != *txt {
+                            o.wire.txt.clone_from(txt);
+                        }
                     }
                 }
                 Data::A(a) => self.address(src, &r.name, msg, (*a).into()),
@@ -494,8 +509,9 @@ impl Table {
         }
     }
 
-    /// Counts what each live offer the window asked for did, and tells its
-    /// askers.
+    /// Counts what each offer the window asked for did, and tells its
+    /// askers: a live one answered, was known or missed; an unconfirmed one
+    /// that did not answer is withdrawn.
     fn settle(&mut self, w: &Window, now: u64) {
         let (mut answered, mut missed, mut known) = (Vec::new(), Vec::new(), Vec::new());
         let g = self.bump();
@@ -503,7 +519,7 @@ impl Table {
         let asked = self
             .offers
             .iter_mut()
-            .filter(|(k, o)| (o.service == w.name || k.1 == w.name) && o.live(now));
+            .filter(|(k, o)| (o.service == w.name || k.1 == w.name) && o.wire.withdrawn.is_none());
         for ((mac, instance), o) in asked {
             if w.answered.contains(instance) {
                 o.wire.answered = o.wire.answered.saturating_add(1);
@@ -512,13 +528,15 @@ impl Table {
             } else if w.known.contains(instance) {
                 push_unique(&mut known, *mac, MDNS_LISTED);
                 continue;
-            } else if !w.unicast {
+            } else if w.unicast {
+                continue;
+            } else if !o.live(now) {
+                o.wire.withdrawn = Some(Withdrawn::Unanswered);
+            } else {
                 o.wire.missed = o.wire.missed.saturating_add(1);
                 o.wire.missed_in_row = o.wire.missed_in_row.saturating_add(1);
                 (o.wire.missed_ms, o.wire.missed_by) = (Some(now), asker);
                 push_unique(&mut missed, *mac, MDNS_LISTED);
-            } else {
-                continue;
             }
             o.changed = g;
         }
@@ -622,16 +640,16 @@ impl Table {
 /// or withdrawn by one of TTL 0 (a goodbye).
 fn announce(o: &mut MdnsOffer, ttl: u32, now: u64) {
     if ttl == 0 {
-        (o.announced_ms, o.goodbye) = (now, true);
+        (o.announced_ms, o.withdrawn) = (now, Some(Withdrawn::Goodbye));
         return;
     }
-    let held = match o.goodbye {
-        true => now,
-        false => o.announced_ms + u64::from(o.ttl_s) * 1000,
+    let held = match o.withdrawn {
+        Some(_) => now,
+        None => o.announced_ms + u64::from(o.ttl_s) * 1000,
     };
     let until = held.max(now + u64::from(ttl) * 1000);
     o.ttl_s = u32::try_from((until - now) / 1000).unwrap_or(u32::MAX);
-    (o.announced_ms, o.goodbye) = (now, false);
+    (o.announced_ms, o.withdrawn) = (now, None);
 }
 
 #[cfg(test)]
@@ -705,7 +723,7 @@ pub mod tests {
             left.txt,
             [("gid".into(), "G".into()), ("igl".into(), "1".into())]
         );
-        assert_eq!((left.ttl_s, left.goodbye), (4500, false));
+        assert_eq!((left.ttl_s, left.withdrawn), (4500, None));
         let d = r.devices.iter().find(|d| d.mac == LEFT).unwrap();
         assert_eq!(d.host, "Left.local");
         assert_eq!(d.addrs.len(), 2);
@@ -718,7 +736,7 @@ pub mod tests {
         bye.record(1, AIRPLAY, PTR, 0, Rd::Ptr("Left._airplay._tcp.local"));
         s.take(&wifi(), LEFT, &bye.bytes(), false, 20);
         let (_, r) = s.read(None, 30);
-        assert!(offer(&r, LEFT).goodbye);
+        assert_eq!(offer(&r, LEFT).withdrawn, Some(Withdrawn::Goodbye));
     }
 
     #[test]
@@ -806,6 +824,70 @@ pub mod tests {
             .find(|q| q.name == "_raop._tcp.local")
             .unwrap();
         assert_eq!(raop.unanswered, 1);
+    }
+
+    /// An instance's SRV record (TTL 120) and nothing else, at `t`.
+    fn srv_only(target: &str, port: u16, ttl: u32) -> Vec<u8> {
+        let mut b = Builder::new(true);
+        let instance = format!("Left.{AIRPLAY}");
+        b.record(1, &instance, SRV, ttl, Rd::Srv(port, target));
+        b.bytes()
+    }
+
+    #[test]
+    fn every_record_of_an_instance_extends_its_life() {
+        let mut s = Table::default();
+        s.take(&wifi(), LEFT, &srv_only("Left.local", 7000, 120), false, 0);
+        let mut txt = Builder::new(true);
+        txt.record(
+            1,
+            &format!("Left.{AIRPLAY}"),
+            TXT,
+            4500,
+            Rd::Txt(&["model=M"]),
+        );
+        s.take(&wifi(), LEFT, &txt.bytes(), false, 0);
+        let (_, r) = s.read(None, 200_000);
+        assert_eq!(
+            (offer(&r, LEFT).ttl_s, offer(&r, LEFT).withdrawn),
+            (4500, None)
+        );
+    }
+
+    #[test]
+    fn a_lapse_is_unconfirmed_until_a_query_goes_unanswered() {
+        let mut s = Table::default();
+        s.take(&wifi(), LEFT, &srv_only("Left.local", 7000, 120), false, 0);
+        // Nobody asks: past its TTL it is unconfirmed, not withdrawn.
+        let (_, r) = s.read(None, 121_000);
+        assert_eq!(offer(&r, LEFT).withdrawn, None);
+        // A browse it does not answer withdraws it, and is no miss.
+        s.take(&wifi(), PHONE, &browse(AIRPLAY, false, &[]), false, 130_000);
+        let (_, r) = s.read(None, 131_100);
+        let o = offer(&r, LEFT);
+        assert_eq!((o.withdrawn, o.missed), (Some(Withdrawn::Unanswered), 0));
+        // It announces again: back.
+        s.take(
+            &wifi(),
+            LEFT,
+            &srv_only("Left.local", 7000, 120),
+            false,
+            140_000,
+        );
+        let (_, r) = s.read(None, 141_000);
+        assert_eq!(offer(&r, LEFT).withdrawn, None);
+    }
+
+    #[test]
+    fn a_goodbye_of_another_target_withdraws_nothing() {
+        let mut s = Table::default();
+        s.take(&wifi(), LEFT, &srv_only("Left.local", 7000, 120), false, 0);
+        s.take(&wifi(), LEFT, &srv_only("Old.local", 7001, 0), false, 1000);
+        let (_, r) = s.read(None, 1000);
+        assert_eq!(offer(&r, LEFT).withdrawn, None);
+        s.take(&wifi(), LEFT, &srv_only("Left.local", 7000, 0), false, 2000);
+        let (_, r) = s.read(None, 2000);
+        assert_eq!(offer(&r, LEFT).withdrawn, Some(Withdrawn::Goodbye));
     }
 
     #[test]

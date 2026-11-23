@@ -232,7 +232,7 @@ export function serviceWords(e, who = (m) => m) {
   switch (e.change) {
     case 'silent': return { text: `stopped answering for ${what}: missed ${e.misses} queries in a row${e.by ? `, the last from ${who(e.by)}` : ''}`, tone: 'bad' };
     case 'answering': return { text: `answers for ${what} again${after}`, tone: 'ok' };
-    case 'gone': return { text: `withdrew ${what}${e.goodbye ? ' (said goodbye)' : ': its announcement ran out'}`, tone: '' };
+    case 'gone': return { text: `withdrew ${what}${e.goodbye ? ' (said goodbye)' : ': it did not answer a query after its announcement ran out'}`, tone: '' };
     case 'back': return { text: `offers ${what} again`, tone: 'ok' };
     default: return { text: `${e.change} ${what}`, tone: '' };
   }

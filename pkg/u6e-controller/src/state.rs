@@ -2574,7 +2574,7 @@ mod tests {
             txt: Vec::new(),
             ttl_s: 4500,
             announced_ms: 1000,
-            goodbye: false,
+            withdrawn: None,
             answered: 0,
             missed: u32::from(missed_in_row),
             missed_in_row,

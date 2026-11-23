@@ -29,7 +29,7 @@ use crate::msg::{
     EventKind, FieldDelta, FilterProto, Flow, Flows, Guard, GuardConfig, Hello, Limit, LimitState,
     LimitStatus, LimitTarget, MdnsDevice, MdnsKey, MdnsOffer, MdnsQuery, Mechanism, PowerLimit,
     Radio, RadioApplied, RadioConfig, Rate, RateMode, RecDelta, Services, SignedConfig, Snapshot,
-    SnapshotDelta, SpectrumFrame, Station, StationAuth, Temp, Violation,
+    SnapshotDelta, SpectrumFrame, Station, StationAuth, Temp, Violation, Withdrawn,
 };
 
 const HOW: &str = "bump u6e_proto::PROTOCOL (pkg/u6e-proto/src/version.rs) and write the \
@@ -572,23 +572,26 @@ fn services() -> Services {
             queries: 70_016,
             responses: 70_017,
         }],
-        offers: vec![MdnsOffer {
-            mac,
-            instance: "Device 1._airplay._tcp.local".into(),
-            service: "_airplay._tcp.local".into(),
-            target: "Device-1.local".into(),
-            port: 60_003,
-            txt: vec![("model".into(), "Model1,1".into())],
-            ttl_s: 70_018,
-            announced_ms: (1 << 33) + 2,
-            goodbye: true,
-            answered: 70_019,
-            missed: 70_020,
-            missed_in_row: 300,
-            answered_ms: Some((1 << 33) + 3),
-            missed_ms: None,
-            missed_by: Some(other),
-        }],
+        offers: [Withdrawn::Goodbye, Withdrawn::Unanswered]
+            .into_iter()
+            .map(|w| MdnsOffer {
+                mac,
+                instance: "Device 1._airplay._tcp.local".into(),
+                service: "_airplay._tcp.local".into(),
+                target: "Device-1.local".into(),
+                port: 60_003,
+                txt: vec![("model".into(), "Model1,1".into())],
+                ttl_s: 70_018,
+                announced_ms: (1 << 33) + 2,
+                withdrawn: Some(w),
+                answered: 70_019,
+                missed: 70_020,
+                missed_in_row: 300,
+                answered_ms: Some((1 << 33) + 3),
+                missed_ms: None,
+                missed_by: Some(other),
+            })
+            .collect(),
         queries: vec![MdnsQuery {
             mac: other,
             name: "_airplay._tcp.local".into(),
@@ -649,10 +652,13 @@ fn every_variant_has_an_instance() {
     let mut mechanisms = Vec::new();
     let mut guards = Vec::new();
     let (mut targets, mut statuses, mut captures) = (Vec::new(), Vec::new(), Vec::new());
-    let mut keys = Vec::new();
+    let (mut keys, mut withdrawals) = (Vec::new(), Vec::new());
     for m in &agent {
         match m {
-            AgentMsg::Services(s) => keys.extend(s.gone.iter().cloned()),
+            AgentMsg::Services(s) => {
+                keys.extend(s.gone.iter().cloned());
+                withdrawals.extend(s.offers.iter().filter_map(|o| o.withdrawn));
+            }
             AgentMsg::Limits(l) => {
                 targets.extend(l.iter().map(|s| s.target.clone()));
                 statuses.extend(l.iter().map(|s| s.status));
@@ -704,6 +710,7 @@ fn every_variant_has_an_instance() {
     assert_every_variant("CaptureMechanism", &captures);
     assert_every_variant("FilterProto", &protos);
     assert_every_variant("MdnsKey", &keys);
+    assert_every_variant("Withdrawn", &withdrawals);
 }
 
 #[test]

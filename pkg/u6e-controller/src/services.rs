@@ -6,7 +6,8 @@
 //! a client is on first hand.
 //!
 //! The site view's offers are watched for what the UI and the timeline tell
-//! of: a service gone (its goodbye, or its TTL run out) and back, a device
+//! of: a service gone (its goodbye, or a query it did not answer once its
+//! TTL ran out; past its TTL alone it is only unconfirmed) and back, a device
 //! that stopped answering the queries for one ([`SILENT_AFTER`] missed in a
 //! row) and that answers again; each change once, the newest [`EVENTS`]
 //! kept. An offer first seen, or seen again after its AP's link came back,
@@ -22,7 +23,7 @@ use serde_json::{Map, Value, json};
 use u6e_proto::mac;
 use u6e_proto::msg::{
     MDNS_DEVICES, MDNS_OFFERS, MDNS_QUERIES, MdnsDevice, MdnsKey, MdnsOffer, MdnsQuery,
-    Services as Read,
+    Services as Read, Withdrawn,
 };
 
 pub use crate::timeline::ServiceChange as Change;
@@ -54,7 +55,7 @@ pub struct Table {
 }
 
 impl Table {
-    /// The offers that live (no goodbye, TTL not run out) and miss every
+    /// The offers that live (not withdrawn, TTL not run out) and miss every
     /// query in a row now.
     pub fn silent(&self, now_ms: u64) -> usize {
         let silent = |o: &&MdnsOffer| live(o, now_ms) && o.missed_in_row >= SILENT_AFTER;
@@ -62,15 +63,17 @@ impl Table {
     }
 }
 
-/// Whether `o` lives at `now_ms`.
+/// Whether `o` lives at `now_ms`: not withdrawn, within its TTL.
 pub fn live(o: &MdnsOffer, now_ms: u64) -> bool {
-    !o.goodbye && o.announced_ms + u64::from(o.ttl_s) * 1000 > now_ms
+    o.withdrawn.is_none() && o.announced_ms + u64::from(o.ttl_s) * 1000 > now_ms
 }
 
 /// How an offer stands, as the site sees it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Status {
     Gone,
+    /// Past its TTL, and nobody asked for it since.
+    Unconfirmed,
     Answering,
     /// Missing every query since `since_ms`.
     Silent {
@@ -242,8 +245,10 @@ impl Services {
         for (ap, o) in &site.offers {
             let key = (o.mac, o.instance.clone());
             let was = self.status.get(&key).copied();
-            let now = if !live(o, now_ms) {
+            let now = if o.withdrawn.is_some() {
                 Status::Gone
+            } else if !live(o, now_ms) {
+                Status::Unconfirmed
             } else if o.missed_in_row >= SILENT_AFTER {
                 let since_ms = match was {
                     Some(Status::Silent { since_ms }) => since_ms,
@@ -254,9 +259,10 @@ impl Services {
                 Status::Answering
             };
             let change = match (was, now) {
-                (Some(Status::Answering | Status::Silent { .. }), Status::Gone) => {
-                    Some(Change::Gone)
-                }
+                (
+                    Some(Status::Answering | Status::Silent { .. } | Status::Unconfirmed),
+                    Status::Gone,
+                ) => Some(Change::Gone),
                 (Some(Status::Gone), Status::Answering | Status::Silent { .. }) => {
                     Some(Change::Back)
                 }
@@ -281,7 +287,7 @@ impl Services {
                     change,
                     by: o.missed_by,
                     misses: o.missed_in_row,
-                    goodbye: o.goodbye,
+                    goodbye: o.withdrawn == Some(Withdrawn::Goodbye),
                     silent_ms,
                     wifi,
                 });
@@ -395,8 +401,10 @@ fn macs(list: &[[u8; 6]]) -> Value {
 }
 
 fn offer_json(o: &MdnsOffer, now_ms: u64) -> Value {
-    let status = if !live(o, now_ms) {
+    let status = if o.withdrawn.is_some() {
         "gone"
+    } else if !live(o, now_ms) {
+        "unconfirmed"
     } else if o.missed_in_row >= SILENT_AFTER {
         "silent"
     } else if o.answered_ms.is_some() || o.missed == 0 {
@@ -417,7 +425,10 @@ fn offer_json(o: &MdnsOffer, now_ms: u64) -> Value {
         "txt": txt,
         "ttl": o.ttl_s,
         "announced": o.announced_ms,
-        "goodbye": o.goodbye,
+        "withdrawn": o.withdrawn.map(|w| match w {
+            Withdrawn::Goodbye => "goodbye",
+            Withdrawn::Unanswered => "unanswered",
+        }),
         "status": status,
         "answered": o.answered,
         "missed": o.missed,
@@ -695,7 +706,7 @@ mod tests {
             ],
             ttl_s: 4500,
             announced_ms: BOOT,
-            goodbye: false,
+            withdrawn: None,
             answered: 1,
             missed: 0,
             missed_in_row: 0,
@@ -840,19 +851,40 @@ mod tests {
         assert_eq!(ev[0].change, Change::Answering);
         assert_eq!(ev[0].silent_ms, Some(61_000));
         // A goodbye, then back.
-        right.goodbye = true;
+        right.withdrawn = Some(Withdrawn::Goodbye);
         let ev = s.apply("ap1", delta(right.clone()), T0 + 63_000);
         assert_eq!((ev[0].change, ev[0].goodbye), (Change::Gone, true));
-        right.goodbye = false;
+        right.withdrawn = None;
         let ev = s.apply("ap1", delta(right.clone()), T0 + 64_000);
         assert_eq!(ev[0].change, Change::Back);
-        // A TTL running out is seen by a look alone.
-        let gone = s.watch(T0 + 4_600_000);
+        assert_eq!(s.events.len(), 4);
+    }
+
+    #[test]
+    fn a_lapse_is_unconfirmed_and_no_event_until_withdrawn() {
+        let mut s = Services::default();
+        let mut table = pair_table();
+        table.offers.iter_mut().for_each(|o| o.ttl_s = 120);
+        s.apply("ap1", table, T0);
+        // Past its TTL, with nobody asking: shown unconfirmed, no event.
+        assert!(s.watch(T0 + 121_000).is_empty());
+        let v = view(&s, None, None, &Names, T0 + 121_000);
+        assert_eq!(v["devices"][1]["offers"][0]["status"], "unconfirmed");
+        // A query it did not answer since: gone.
+        let mut right = offer(RIGHT, "Right", "G", false);
+        (right.ttl_s, right.withdrawn) = (120, Some(Withdrawn::Unanswered));
+        let delta = Read {
+            now_ms: BOOT + 130_000,
+            offers: vec![right],
+            ..Read::default()
+        };
+        let ev = s.apply("ap1", delta, T0 + 130_000);
         assert_eq!(
-            gone.iter().map(|e| e.change).collect::<Vec<_>>(),
-            [Change::Gone, Change::Gone]
+            ev.iter()
+                .map(|e| (e.mac, e.change, e.goodbye))
+                .collect::<Vec<_>>(),
+            [(RIGHT, Change::Gone, false)]
         );
-        assert_eq!(s.events.len(), 6);
     }
 
     #[test]

@@ -118,7 +118,7 @@ mod tests {
                 txt: vec![(dirty(), dirty())],
                 ttl_s: 1,
                 announced_ms: 0,
-                goodbye: false,
+                withdrawn: None,
                 answered: 0,
                 missed: 0,
                 missed_in_row: 0,

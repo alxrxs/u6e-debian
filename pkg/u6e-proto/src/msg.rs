@@ -982,17 +982,20 @@ pub struct MdnsOffer {
     pub mac: [u8; 6],
     /// The instance (`Living Room._airplay._tcp.local`), its service type
     /// (`_airplay._tcp.local`), the host and port its SRV record names and
-    /// the TXT keys `model`, `md`, `gid`, `igl` and `gpn` it carries.
+    /// the TXT keys `model`, `md`, `gid`, `igl`, `gpn` and `tsid` it
+    /// carries.
     pub instance: String,
     pub service: String,
     pub target: String,
     pub port: u16,
     pub txt: Vec<(String, String)>,
-    /// The TTL of its last announcement or answer, and when that came; a
-    /// goodbye (TTL 0) withdrew it.
+    /// How long it lives from when its records last came, the latest expiry
+    /// any of them gave; past that and not withdrawn it is unconfirmed.
     pub ttl_s: u32,
     pub announced_ms: u64,
-    pub goodbye: bool,
+    /// Withdrawn: by its goodbye, or, once unconfirmed, by a query for it
+    /// it did not answer.
+    pub withdrawn: Option<Withdrawn>,
     /// The queries for it it answered within a second and those it missed
     /// (neither answered nor listed as known by the asker), the misses since
     /// its last answer, when it last answered and last missed, and who
@@ -1026,6 +1029,17 @@ pub struct MdnsQuery {
     pub known: Vec<[u8; 6]>,
     /// Its queries that listed no known answer and that nothing answered.
     pub unanswered: u32,
+}
+
+/// How an offer was withdrawn.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Withdrawn {
+    /// A record of it with TTL 0 (RFC 6762 10.1).
+    Goodbye,
+    /// It did not answer a query for it after its TTL ran out.
+    Unanswered,
 }
 
 /// What names an entry of [`Services`].

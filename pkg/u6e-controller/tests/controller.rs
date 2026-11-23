@@ -4957,7 +4957,7 @@ fn pair_read(full: bool, missed: u16) -> Services {
         txt: vec![("gid".into(), "G1".into()), ("igl".into(), leader.into())],
         ttl_s: 4500,
         announced_ms: 990_000,
-        goodbye: false,
+        withdrawn: None,
         answered: 1,
         missed: u32::from(missed_in_row),
         missed_in_row,

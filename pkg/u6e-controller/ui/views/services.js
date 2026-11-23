@@ -37,13 +37,18 @@ const STATUS = {
   answering: ['ok', 'Answering'],
   missing: ['warn', 'Missed the last'],
   silent: ['bad', 'Not answering'],
+  unconfirmed: ['', 'Unconfirmed'],
   gone: ['', 'Gone'],
 };
 
 /** How an offer stands, in words beside its chip. */
 function offerDetail(o, macs) {
   if (o.status === 'gone') {
-    return o.goodbye ? `said goodbye ${ago(o.announced)}` : `its announcement ran out (TTL ${o.ttl} s, last ${when(o.announced)})`;
+    return o.withdrawn === 'goodbye' ? `said goodbye ${ago(o.announced)}`
+      : 'did not answer a query after its announcement ran out';
+  }
+  if (o.status === 'unconfirmed') {
+    return `its announcement ran out ${ago(o.announced + o.ttl * 1000)}; nobody has asked for it since`;
   }
   const parts = [];
   if (o.answered) parts.push(`answered ${o.answered}`);

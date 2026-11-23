@@ -11,7 +11,7 @@
 
 use std::collections::BTreeMap;
 
-use u6e_proto::msg::{MdnsDevice, MdnsKey, MdnsOffer, MdnsQuery, Services};
+use u6e_proto::msg::{MdnsDevice, MdnsKey, MdnsOffer, MdnsQuery, Services, Withdrawn};
 
 use super::{BSSS, CYCLE, World};
 
@@ -124,7 +124,7 @@ pub fn table(
             .collect(),
         ttl_s: 4500,
         announced_ms: ms(last_browse + 0.1),
-        goodbye: false,
+        withdrawn: None,
         answered: n,
         missed: 0,
         missed_in_row: 0,
@@ -172,7 +172,7 @@ pub fn table(
         }
         if last == LEFT && away {
             let gone = ms(t - t % CYCLE + AWAY.0);
-            (own[1].goodbye, own[1].announced_ms) = (true, gone);
+            (own[1].withdrawn, own[1].announced_ms) = (Some(Withdrawn::Goodbye), gone);
         }
         offers.extend(own);
     }
