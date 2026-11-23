@@ -4986,6 +4986,7 @@ fn pair_read(full: bool, missed: u16) -> Services {
             unanswered: 0,
         }],
         packets: 12,
+        limited: 3,
         ..Services::default()
     }
 }
@@ -5044,6 +5045,7 @@ fn services_reach_the_api_the_metrics_and_the_events() {
         "wifi_mdns_offers{ap=\"ap1\"} 2",
         "wifi_mdns_offers_silent{ap=\"ap1\"} 1",
         "wifi_mdns_packets_total{ap=\"ap1\"} 12",
+        "wifi_mdns_limited_total{ap=\"ap1\"} 3",
     ] {
         assert!(body.lines().any(|l| l == line), "missing {line}\n{body}");
     }

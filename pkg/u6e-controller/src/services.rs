@@ -49,6 +49,7 @@ pub struct Table {
     pub packets: u64,
     pub malformed: u64,
     pub evicted: u64,
+    pub limited: u64,
     pub at_ms: u64,
 }
 
@@ -188,7 +189,8 @@ impl Services {
                 table.queries.insert(k, q);
             }
         }
-        (table.packets, table.malformed, table.evicted) = (s.packets, s.malformed, s.evicted);
+        (table.packets, table.malformed) = (s.packets, s.malformed);
+        (table.evicted, table.limited) = (s.evicted, s.limited);
         table.at_ms = at_ms;
         self.watch(at_ms)
     }
@@ -552,6 +554,7 @@ fn aps_json(services: &Services, now_ms: u64) -> Value {
                 "packets": t.packets,
                 "malformed": t.malformed,
                 "evicted": t.evicted,
+                "limited": t.limited,
                 "at": t.at_ms,
             });
             (n.to_owned(), v)

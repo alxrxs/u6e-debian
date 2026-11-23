@@ -609,6 +609,7 @@ fn services() -> Services {
         packets: (1 << 33) + 5,
         malformed: 70_023,
         evicted: 70_024,
+        limited: 70_025,
     }
 }
 

@@ -9,8 +9,12 @@
 //! the payload; a compression pointer must point strictly before the part of
 //! the name it continues, so decompression always ends, and a name is at
 //! most 255 bytes on the wire; a message yields at most [`QUESTIONS`]
-//! questions and [`RECORDS`] records. A message cut short or malformed past
-//! its header yields what read whole before the fault, marked incomplete.
+//! questions and [`RECORDS`] records, and its names take at most [`STEPS`]
+//! labels and pointers in all, so no message costs more than a few times a
+//! real one. A name is read as a key and its kind alone; its text is made
+//! only for the names the table keeps, at most [`TEXT_MAX`] bytes. A message
+//! cut short, or malformed or over its steps past its header, yields what
+//! read whole before the fault, marked incomplete.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -22,9 +26,15 @@ pub const QUESTIONS: usize = 64;
 pub const RECORDS: usize = 128;
 /// The longest name on the wire, length bytes and root included (RFC 1035).
 const NAME_MAX: usize = 255;
+/// The labels and pointers all the names of one message may take: a
+/// response of 128 compressed records takes some 1200.
+pub const STEPS: usize = 2048;
+/// The longest text kept of a name, in bytes; a longer one ends in `…`.
+pub const TEXT_MAX: usize = 160;
 /// The TXT keys kept, each value at most [`TXT_VALUE_MAX`] bytes: the
-/// model, and an AirPlay group's id, leader flag and name.
-pub const TXT_KEYS: [&str; 5] = ["model", "md", "gid", "igl", "gpn"];
+/// model, and an AirPlay group's id, leader flag and name and the timing
+/// group (`tsid`) its members share.
+pub const TXT_KEYS: [&str; 6] = ["model", "md", "gid", "igl", "gpn", "tsid"];
 pub const TXT_VALUE_MAX: usize = 64;
 
 pub const PTR: u16 = 12;
@@ -47,27 +57,33 @@ pub enum Kind {
     Other,
 }
 
-/// A name as it reads: its labels joined by dots (a dot or backslash inside
-/// a label escaped with a backslash, control and format characters dropped),
-/// and a hash of its labels in lower case, which is what names compare by.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A name as the table compares it: a hash of its labels in lower case,
+/// its kind, of an instance its service type's hash, and where it starts in
+/// its message, to read its text from when it is kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Name {
-    pub text: String,
+    pub at: usize,
     pub key: u64,
     pub kind: Kind,
-    /// Of an instance: where its service type starts in `text`, and that
-    /// type's key.
-    pub service: Option<(usize, u64)>,
+    pub service: Option<u64>,
+    /// Its last label is `local`.
+    pub local: bool,
 }
 
 impl Name {
-    /// The service type of an instance.
-    pub fn service_text(&self) -> Option<&str> {
-        self.service.map(|(at, _)| &self.text[at..])
+    /// Its labels joined by dots (a dot or backslash inside a label escaped
+    /// with a backslash, control and format characters dropped).
+    pub fn text(&self, msg: &[u8]) -> String {
+        text_of(msg, self.at, 0)
+    }
+
+    /// The service type of an instance, as `text` reads it.
+    pub fn service_text(&self, msg: &[u8]) -> Option<String> {
+        self.service.map(|_| text_of(msg, self.at, 1))
     }
 
     pub fn service_key(&self) -> Option<u64> {
-        self.service.map(|(_, k)| k)
+        self.service
     }
 }
 
@@ -188,35 +204,34 @@ impl Hasher {
     }
 }
 
-/// The key of the name of `labels`.
-fn key_of<'a>(labels: impl IntoIterator<Item = &'a [u8]>) -> u64 {
-    let mut h = Hasher::new();
-    labels.into_iter().for_each(|l| h.label(l));
-    h.0
-}
-
-/// The name at `at` in `msg` and where the bytes after it start, or `None`
-/// for a name that does not read: past the end, a label type other than a
-/// plain one or a pointer, a pointer to itself or to anything not strictly
-/// before the part it continues, or longer than [`NAME_MAX`].
-pub fn name(msg: &[u8], at: usize) -> Option<(Name, usize)> {
-    let mut labels: Vec<&[u8]> = Vec::new();
+/// Walks the name at `at` in `msg`, label by label to `label`, taking a
+/// step of `steps` for each label and each pointer; where the bytes after
+/// it start, or `None` for a name that does not read: past the end, a label
+/// type other than a plain one or a pointer, a pointer to itself or to
+/// anything not strictly before the part it continues, longer than
+/// [`NAME_MAX`], or out of steps.
+fn walk<'a>(
+    msg: &'a [u8],
+    at: usize,
+    steps: &mut usize,
+    mut label: impl FnMut(&'a [u8]),
+) -> Option<usize> {
     let (mut pos, mut limit, mut after, mut wire) = (at, at, None, 1);
     loop {
         let len = *msg.get(pos)?;
+        if len != 0 {
+            *steps = steps.checked_sub(1)?;
+        }
         match len & 0xc0 {
-            0x00 if len == 0 => {
-                after.get_or_insert(pos + 1);
-                break;
-            }
+            0x00 if len == 0 => return Some(after.unwrap_or(pos + 1)),
             0x00 => {
-                let label = msg.get(pos + 1..pos + 1 + usize::from(len))?;
-                wire += 1 + label.len();
+                let l = msg.get(pos + 1..pos + 1 + usize::from(len))?;
+                wire += 1 + l.len();
                 if wire > NAME_MAX {
                     return None;
                 }
-                labels.push(label);
-                pos += 1 + label.len();
+                label(l);
+                pos += 1 + l.len();
             }
             0xc0 => {
                 let ptr = usize::from(u16_at(msg, pos)? & 0x3fff);
@@ -230,42 +245,77 @@ pub fn name(msg: &[u8], at: usize) -> Option<(Name, usize)> {
             _ => return None,
         }
     }
-    let kind = kind_of(&labels);
-    let service = (kind == Kind::Instance).then(|| key_of(labels[1..].iter().copied()));
-    let mut text = String::new();
-    let mut service_at = 0;
-    for (i, label) in labels.iter().enumerate() {
-        if i > 0 {
-            text.push('.');
-        }
-        if i == 1 {
-            service_at = text.len();
-        }
-        let s = text::clean(&String::from_utf8_lossy(label));
-        for c in s.chars() {
-            if c == '.' || c == '\\' {
-                text.push('\\');
-            }
-            text.push(c);
-        }
-    }
-    let name = Name {
-        key: key_of(labels.iter().copied()),
-        text,
-        kind,
-        service: service.map(|k| (service_at, k)),
-    };
-    Some((name, after?))
 }
 
-fn kind_of(labels: &[&[u8]]) -> Kind {
+/// The name at `at` in `msg` and where the bytes after it start, the steps
+/// it takes off `steps`; `None` for one that does not read (`walk`).
+pub fn name(msg: &[u8], at: usize, steps: &mut usize) -> Option<(Name, usize)> {
+    let mut all = Hasher::new();
+    let mut first: [&[u8]; 4] = [&[]; 4];
+    let (mut n, mut last): (usize, &[u8]) = (0, &[]);
+    let after = walk(msg, at, steps, |l| {
+        all.label(l);
+        if let Some(f) = first.get_mut(n) {
+            *f = l;
+        }
+        (n, last) = (n + 1, l);
+    })?;
+    let kind = kind_of(&first[..n.min(4)], n);
+    let name = Name {
+        at,
+        key: all.0,
+        kind,
+        // An instance has four labels, its type the last three.
+        service: (kind == Kind::Instance).then(|| {
+            let mut rest = Hasher::new();
+            first[1..].iter().for_each(|l| rest.label(l));
+            rest.0
+        }),
+        local: last.eq_ignore_ascii_case(b"local"),
+    };
+    Some((name, after))
+}
+
+/// The text of the name at `at` in `msg` (one that read), from its label
+/// `from`, at most [`TEXT_MAX`] bytes.
+fn text_of(msg: &[u8], at: usize, from: usize) -> String {
+    let mut text = String::new();
+    let mut i = 0;
+    let mut unlimited = usize::MAX;
+    walk(msg, at, &mut unlimited, |label| {
+        if i >= from {
+            if i > from {
+                text.push('.');
+            }
+            for c in text::clean(&String::from_utf8_lossy(label)).chars() {
+                if c == '.' || c == '\\' {
+                    text.push('\\');
+                }
+                text.push(c);
+            }
+        }
+        i += 1;
+    });
+    if text.len() > TEXT_MAX {
+        let mut end = TEXT_MAX - '…'.len_utf8();
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push('…');
+    }
+    text
+}
+
+/// The kind of a name of `n` labels, the first four `labels`.
+fn kind_of(labels: &[&[u8]], n: usize) -> Kind {
     // The name that lists the service types reads as an instance of one.
     let meta = labels
         .first()
         .is_some_and(|l| l.eq_ignore_ascii_case(b"_services"));
-    if is_service(labels) {
+    if n == 3 && is_service(labels) {
         Kind::Service
-    } else if labels.len() == 4 && is_service(&labels[1..]) && !meta {
+    } else if n == 4 && is_service(&labels[1..]) && !meta {
         Kind::Instance
     } else {
         Kind::Other
@@ -298,13 +348,13 @@ pub fn parse(payload: &[u8]) -> Option<Message> {
         records: Vec::new(),
         complete: payload.len() >= 12,
     };
-    let mut at = 12;
+    let (mut at, mut steps) = (12, STEPS);
     for _ in 0..qd {
         if m.questions.len() == QUESTIONS {
             m.complete = false;
             return Some(m);
         }
-        let Some((q, next)) = question(payload, at) else {
+        let Some((q, next)) = question(payload, at, &mut steps) else {
             m.complete = false;
             return Some(m);
         };
@@ -322,7 +372,7 @@ pub fn parse(payload: &[u8]) -> Option<Message> {
                 m.complete = false;
                 return Some(m);
             }
-            let Some((r, next)) = record(payload, at, section) else {
+            let Some((r, next)) = record(payload, at, section, &mut steps) else {
                 m.complete = false;
                 return Some(m);
             };
@@ -333,8 +383,8 @@ pub fn parse(payload: &[u8]) -> Option<Message> {
     Some(m)
 }
 
-fn question(msg: &[u8], at: usize) -> Option<(Question, usize)> {
-    let (qname, at) = name(msg, at)?;
+fn question(msg: &[u8], at: usize, steps: &mut usize) -> Option<(Question, usize)> {
+    let (qname, at) = name(msg, at, steps)?;
     let qtype = u16_at(msg, at)?;
     let class = u16_at(msg, at + 2)?;
     let q = Question {
@@ -345,8 +395,8 @@ fn question(msg: &[u8], at: usize) -> Option<(Question, usize)> {
     Some((q, at + 4))
 }
 
-fn record(msg: &[u8], at: usize, section: Section) -> Option<(Record, usize)> {
-    let (owner, at) = name(msg, at)?;
+fn record(msg: &[u8], at: usize, section: Section, steps: &mut usize) -> Option<(Record, usize)> {
+    let (owner, at) = name(msg, at, steps)?;
     let rtype = u16_at(msg, at)?;
     let ttl = u32_at(msg, at + 4)?;
     let len = usize::from(u16_at(msg, at + 8)?);
@@ -355,7 +405,7 @@ fn record(msg: &[u8], at: usize, section: Section) -> Option<(Record, usize)> {
     let rdata = msg.get(start..end)?;
     // A name in the data may point back into the message, but must end
     // within the data.
-    let name_in = |at| name(msg, at).filter(|(_, after)| *after <= end);
+    let mut name_in = |at| name(msg, at, steps).filter(|(_, after)| *after <= end);
     let data = match (rtype, len) {
         (PTR, _) => name_in(start).map_or(Data::Other, |(n, _)| Data::Ptr(n)),
         (SRV, 7..) => name_in(start + 6).map_or(Data::Other, |(target, _)| Data::Srv {
@@ -380,11 +430,12 @@ fn record(msg: &[u8], at: usize, section: Section) -> Option<(Record, usize)> {
     Some((r, end))
 }
 
-/// The keys of [`TXT_KEYS`] in a TXT record's strings, each the first time
-/// it comes (RFC 6763 6.4), with its value when that is short and reads as
-/// text.
+/// The keys of [`TXT_KEYS`] in a TXT record's strings, each only as it
+/// first comes (RFC 6763 6.4), with its value when that is short and reads
+/// as text.
 fn txt(mut rdata: &[u8]) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
+    let mut seen: Vec<&str> = Vec::new();
     while let Some((&len, rest)) = rdata.split_first() {
         let Some(s) = rest.get(..usize::from(len)) else {
             break;
@@ -400,7 +451,11 @@ fn txt(mut rdata: &[u8]) -> Vec<(String, String)> {
         else {
             continue;
         };
-        if out.iter().any(|(o, _)| o == key) || v.len() > TXT_VALUE_MAX {
+        if seen.contains(key) {
+            continue;
+        }
+        seen.push(key);
+        if v.len() > TXT_VALUE_MAX {
             continue;
         }
         if let Ok(v) = std::str::from_utf8(v) {
@@ -572,20 +627,26 @@ pub mod tests {
         assert!(m.response && m.complete && m.questions.is_empty());
         assert_eq!(m.records.len(), 5);
         let ptr = &m.records[0];
-        assert_eq!(ptr.name.text, "_airplay._tcp.local");
+        assert_eq!(ptr.name.text(&msg), "_airplay._tcp.local");
         assert_eq!(ptr.name.kind, Kind::Service);
         assert_eq!(ptr.section, Section::Answer);
         let Data::Ptr(instance) = &ptr.data else {
             panic!()
         };
-        assert_eq!(instance.text, "Living Room._airplay._tcp.local");
+        assert_eq!(instance.text(&msg), "Living Room._airplay._tcp.local");
         assert_eq!(instance.kind, Kind::Instance);
-        assert_eq!(instance.service_text(), Some("_airplay._tcp.local"));
+        assert_eq!(
+            instance.service_text(&msg).as_deref(),
+            Some("_airplay._tcp.local")
+        );
         assert_eq!(instance.service_key(), Some(ptr.name.key));
         let Data::Srv { port, target } = &m.records[1].data else {
             panic!()
         };
-        assert_eq!((*port, target.text.as_str()), (7000, "Living-Room.local"));
+        assert_eq!(
+            (*port, target.text(&msg).as_str()),
+            (7000, "Living-Room.local")
+        );
         assert_eq!(m.records[1].name.key, instance.key);
         assert_eq!(
             m.records[2].data,
@@ -609,14 +670,18 @@ pub mod tests {
             .question("a\\.b\\\\c._raop._udp.local", SRV, false)
             .question("_services._dns-sd._udp.local", PTR, false)
             .question("10.2.0.192.in-addr.arpa", PTR, false);
-        let m = parse(&b.bytes()).unwrap();
+        let msg = b.bytes();
+        let m = parse(&msg).unwrap();
         let q = &m.questions;
         assert_eq!(q[0].name.key, q[1].name.key);
-        assert_ne!(q[0].name.text, q[1].name.text);
+        assert_ne!(q[0].name.text(&msg), q[1].name.text(&msg));
         assert!(q[0].unicast && !q[1].unicast);
-        assert_eq!(q[2].name.text, "a\\.b\\\\c._raop._udp.local");
+        assert_eq!(q[2].name.text(&msg), "a\\.b\\\\c._raop._udp.local");
         assert_eq!(q[2].name.kind, Kind::Instance);
-        assert_eq!(q[2].name.service_text(), Some("_raop._udp.local"));
+        assert_eq!(
+            q[2].name.service_text(&msg).as_deref(),
+            Some("_raop._udp.local")
+        );
         assert_eq!(q[3].name.kind, Kind::Other);
         assert_eq!(q[4].name.kind, Kind::Other);
     }
@@ -648,6 +713,16 @@ pub mod tests {
                 ("gid".into(), "evil".into()),
             ]
         );
+        // A first copy too long to keep still wins over a later one.
+        let twice: Vec<u8> = [long.as_str(), "gpn=Room"]
+            .iter()
+            .flat_map(|s| {
+                let mut v = vec![s.len() as u8];
+                v.extend(s.as_bytes());
+                v
+            })
+            .collect();
+        assert_eq!(txt(&twice), []);
         assert_eq!(
             txt(&[0, 0, 3, b'i', b'g', b'l']),
             [("igl".into(), String::new())]
@@ -708,6 +783,11 @@ pub mod tests {
         assert_eq!(payload(&v4[..20]), None);
     }
 
+    /// The name at `at` of `msg`, with a whole message's steps.
+    fn name_at(msg: &[u8], at: usize) -> Option<(Name, usize)> {
+        name(msg, at, &mut STEPS.to_owned())
+    }
+
     /// A message with one question at 12 whose name is `name` (wire bytes).
     fn with_name(name: &[u8]) -> Vec<u8> {
         let mut m = vec![0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0];
@@ -716,7 +796,27 @@ pub mod tests {
         m
     }
 
+    /// Runs `f` on a thread of its own, failing the test past `limit`
+    /// rather than hanging it.
+    pub fn within<T: Send + 'static>(
+        limit: std::time::Duration,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(limit).expect("did not end in time")
+    }
+
     #[test]
+    fn hostile_names_are_refused_in_time() {
+        within(
+            std::time::Duration::from_secs(10),
+            hostile_names_are_refused,
+        );
+    }
+
     fn hostile_names_are_refused() {
         // A pointer to itself, to after itself, back into its own name, a
         // label type that is neither, a label past the end.
@@ -741,7 +841,7 @@ pub mod tests {
         let read = parse(&m).unwrap();
         assert!(!read.complete && read.questions.is_empty());
         // A pointer into the header reads what is there, and ends.
-        assert!(name(&with_name(&[0xc0, 2]), 12).is_some());
+        assert!(name_at(&with_name(&[0xc0, 2]), 12).is_some());
         // 63-byte labels up to 255 bytes on the wire read; one more does not.
         let label = |n: usize| {
             let mut l = vec![n as u8];
@@ -752,13 +852,17 @@ pub mod tests {
         fits.extend(label(61));
         fits.push(0);
         assert_eq!(fits.len(), 255);
-        let (n, after) = name(&with_name(&fits), 12).unwrap();
-        assert_eq!((n.text.len(), after), (63 * 3 + 61 + 3, 12 + 255));
+        let msg = with_name(&fits);
+        let (n, after) = name_at(&msg, 12).unwrap();
+        assert_eq!(after, 12 + 255);
+        // Its text is cut short, at a character.
+        let text = n.text(&msg);
+        assert!(text.len() <= TEXT_MAX && text.ends_with('…'), "{text}");
         let mut over: Vec<u8> = (0..3).flat_map(|_| label(63)).collect();
         over.extend(label(62));
         over.push(0);
-        assert_eq!(name(&with_name(&over), 12), None);
-        assert_eq!(name(&with_name(&label(64)), 12), None);
+        assert_eq!(name_at(&with_name(&over), 12), None);
+        assert_eq!(name_at(&with_name(&label(64)), 12), None);
         // A pointer chain backwards through many names reads, and each
         // jump is strictly backwards.
         let mut chain = vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, b'z', 0];
@@ -766,8 +870,8 @@ pub mod tests {
             let prev = if i == 0 { 12 } else { 15 + 4 * (i - 1) };
             chain.extend([1, b'y', 0xc0 | (prev >> 8) as u8, prev as u8]);
         }
-        let (n, _) = name(&chain, chain.len() - 4).unwrap();
-        assert_eq!(n.text.len(), 2 * 101 - 1);
+        let (n, _) = name_at(&chain, chain.len() - 4).unwrap();
+        assert!(n.text(&chain).starts_with("y.y.y"));
         // So does a run of pointers each to the one before: the walk takes
         // at most a jump per two bytes of the message.
         let mut run = vec![0; 12];
@@ -776,8 +880,8 @@ pub mod tests {
             let prev = 12 + if i == 0 { 0 } else { 1 + 2 * (i - 1) };
             run.extend([0xc0 | (prev >> 8) as u8, prev as u8]);
         }
-        let (n, after) = name(&run, run.len() - 2).unwrap();
-        assert_eq!((n.text.as_str(), after), ("", run.len()));
+        let (n, after) = name_at(&run, run.len() - 2).unwrap();
+        assert_eq!((n.text(&run).as_str(), after), ("", run.len()));
     }
 
     #[test]
@@ -815,6 +919,27 @@ pub mod tests {
         let m = parse(&lying).unwrap();
         assert!(!m.complete);
         assert_eq!(m.records.len(), 1);
+    }
+
+    #[test]
+    fn a_messages_names_take_at_most_its_steps() {
+        use crate::services::tests::{long_chain, long_names};
+        // 184 names of 127 labels: 8 read whole, then the steps run out.
+        let m = parse(&long_names()).unwrap();
+        assert!(!m.complete);
+        assert_eq!(m.records.len(), STEPS / (2 * 127));
+        // 110 walks of 382 steps: 2 read.
+        let m = parse(&long_chain()).unwrap();
+        assert!(!m.complete);
+        assert_eq!(m.records.len(), 1 + (STEPS - 1) / 382);
+        // A real response of 128 records fits.
+        let mut b = Builder::new(true);
+        for i in 0..RECORDS {
+            let instance = format!("Speaker {i}._airplay._tcp.local");
+            b.record(1, "_airplay._tcp.local", PTR, 4500, Rd::Ptr(&instance));
+        }
+        let m = parse(&b.bytes()).unwrap();
+        assert!(m.complete && m.records.len() == RECORDS);
     }
 
     #[test]
@@ -867,9 +992,7 @@ pub mod tests {
                 .map(|q| &q.name)
                 .chain(m.records.iter().map(|r| &r.name));
             for n in names {
-                // 255 wire bytes, each written at most as a 3-byte
-                // replacement or an escaped character.
-                assert!(n.text.len() <= 3 * NAME_MAX);
+                assert!(n.text(payload).len() <= TEXT_MAX);
             }
         }
     }

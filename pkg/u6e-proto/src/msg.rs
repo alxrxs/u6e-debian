@@ -943,10 +943,12 @@ pub struct Services {
     pub queries: Vec<MdnsQuery>,
     pub gone: Vec<MdnsKey>,
     /// Since the guards started: the mDNS messages read, those that did not
-    /// read whole, and the entries dropped for room.
+    /// read whole, the entries dropped for room, and the messages dropped
+    /// past the guards' rate.
     pub packets: u64,
     pub malformed: u64,
     pub evicted: u64,
+    pub limited: u64,
 }
 
 /// A device heard sending mDNS, by its source MAC.

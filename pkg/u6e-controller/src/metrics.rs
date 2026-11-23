@@ -23,9 +23,9 @@
 //! are counted per connected AP by how they stand there, every state always
 //! exported, and an AP whose offload a capture holds back says so. What an
 //! AP's client guards read of mDNS is counted per AP alone (its devices,
-//! offers, offers not answering, messages read, unreadable and evicted),
-//! never per device or service, and the clients whose traffic is kept are
-//! counted.
+//! offers, offers not answering, messages read, unreadable, evicted and
+//! dropped past the guards' rate), never per device or service, and the
+//! clients whose traffic is kept are counted.
 
 use std::collections::BTreeSet;
 use std::fmt::Write;
@@ -631,6 +631,12 @@ fn services(m: &mut Text, state: &State) {
         COUNTER,
         "mDNS table entries dropped for room, since the guards started.",
         &|t| t.evicted as usize,
+    );
+    per_ap(
+        "wifi_mdns_limited_total",
+        COUNTER,
+        "mDNS messages dropped past the guards' rate (a flood), since they started.",
+        &|t| t.limited as usize,
     );
 }
 

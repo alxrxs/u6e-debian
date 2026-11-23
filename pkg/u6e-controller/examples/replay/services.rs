@@ -301,6 +301,7 @@ pub fn table(
         packets: u64::from(n) * 14,
         malformed: 0,
         evicted: 0,
+        limited: 0,
     }
 }
 

@@ -15,6 +15,10 @@
 //! a unicast answer (QU) counts no miss: that answer may never reach the
 //! host (between two clients of one BSS it never does).
 //!
+//! Messages are taken at most [`RATE`] a second, in bursts of [`BURST`]; the
+//! rest are counted and dropped, so a client flooding mDNS costs the guards'
+//! thread a bounded share of a core whatever it sends.
+//!
 //! Bounds: [`MDNS_DEVICES`], [`MDNS_OFFERS`] (at most [`PER_DEVICE`] a
 //! device) and [`MDNS_QUERIES`] (as many a device), [`WINDOWS`] open
 //! windows of at most [`WINDOW_KEYS`] names each, the least recently heard
@@ -49,6 +53,10 @@ pub const WINDOW_MS: u64 = 1000;
 pub const IDLE_MS: u64 = 3600 * 1000;
 /// The forgotten entries logged for readers.
 pub const GONE: usize = 256;
+/// The messages taken a second, and in a burst: an AP's VLANs carry about
+/// one a second, a device waking a few dozen at once.
+pub const RATE: u64 = 40;
+pub const BURST: u64 = 200;
 
 struct Device {
     wire: MdnsDevice,
@@ -111,6 +119,11 @@ pub struct Table {
     packets: u64,
     malformed: u64,
     evicted: u64,
+    limited: u64,
+    /// The messages' allowance used and not yet given back, in thousandths
+    /// of a message, and when it was last given back.
+    spent: u64,
+    spent_at: u64,
 }
 
 fn push_unique<T: PartialEq>(list: &mut Vec<T>, v: T, cap: usize) {
@@ -140,6 +153,13 @@ impl Table {
     pub fn take(&mut self, port: &Port, src: [u8; 6], payload: &[u8], now: u64) {
         self.close(now);
         self.packets += 1;
+        let back = now.saturating_sub(self.spent_at) * RATE;
+        (self.spent, self.spent_at) = (self.spent.saturating_sub(back), now);
+        if self.spent + 1000 > BURST * 1000 {
+            self.limited += 1;
+            return;
+        }
+        self.spent += 1000;
         let Some(m) = mdns::parse(payload) else {
             self.malformed += 1;
             return;
@@ -149,9 +169,9 @@ impl Table {
         }
         self.touch(port, src, m.response, now);
         if m.response {
-            self.response(src, &m, now);
+            self.response(src, &m, payload, now);
         } else if !m.is_probe() {
-            self.query(src, &m, now);
+            self.query(src, &m, payload, now);
         }
     }
 
@@ -260,10 +280,16 @@ impl Table {
         }
     }
 
-    /// The offer of `src` for `name`, made if it is new; none when `name`
-    /// is no instance.
-    fn offer(&mut self, src: [u8; 6], name: &mdns::Name, now: u64) -> Option<&mut Offer> {
-        let (service, service_text) = (name.service_key()?, name.service_text()?);
+    /// The offer of `src` for `name` of message `msg`, made if it is new;
+    /// none when `name` is no instance.
+    fn offer(
+        &mut self,
+        src: [u8; 6],
+        name: &mdns::Name,
+        msg: &[u8],
+        now: u64,
+    ) -> Option<&mut Offer> {
+        let service = name.service_key()?;
         let key = (src, name.key);
         if !self.offers.contains_key(&key) {
             self.room_for_offer(src);
@@ -272,8 +298,8 @@ impl Table {
         let o = self.offers.entry(key).or_insert_with(|| Offer {
             wire: MdnsOffer {
                 mac: src,
-                instance: name.text.clone(),
-                service: service_text.to_owned(),
+                instance: name.text(msg),
+                service: name.service_text(msg).unwrap_or_default(),
                 target: String::new(),
                 port: 0,
                 txt: Vec::new(),
@@ -294,35 +320,36 @@ impl Table {
         Some(o)
     }
 
-    fn response(&mut self, src: [u8; 6], m: &Message, now: u64) {
+    fn response(&mut self, src: [u8; 6], m: &Message, msg: &[u8], now: u64) {
         for r in &m.records {
             match &r.data {
                 Data::Ptr(instance)
                     if r.name.kind == Kind::Service
                         && instance.service_key() == Some(r.name.key) =>
                 {
-                    if let Some(o) = self.offer(src, instance, now) {
+                    if let Some(o) = self.offer(src, instance, msg, now) {
                         announce(&mut o.wire, r.ttl, now);
                     }
                 }
                 Data::Srv { port, target } => {
-                    if let Some(o) = self.offer(src, &r.name, now) {
+                    if let Some(o) = self.offer(src, &r.name, msg, now) {
                         announce(&mut o.wire, r.ttl, now);
                         o.wire.port = *port;
-                        if o.wire.target != target.text {
-                            o.wire.target.clone_from(&target.text);
+                        let target = target.text(msg);
+                        if o.wire.target != target {
+                            o.wire.target = target;
                         }
                     }
                 }
                 Data::Txt(txt) => {
-                    if let Some(o) = self.offer(src, &r.name, now)
+                    if let Some(o) = self.offer(src, &r.name, msg, now)
                         && o.wire.txt != *txt
                     {
                         o.wire.txt.clone_from(txt);
                     }
                 }
-                Data::A(a) => self.address(src, &r.name, (*a).into()),
-                Data::Aaaa(a) => self.address(src, &r.name, (*a).into()),
+                Data::A(a) => self.address(src, &r.name, msg, (*a).into()),
+                Data::Aaaa(a) => self.address(src, &r.name, msg, (*a).into()),
                 _ => {}
             }
             // What answers each window: its own name, and an instance of
@@ -340,9 +367,9 @@ impl Table {
         }
     }
 
-    /// `src`'s address record of `host` for `ip`.
-    fn address(&mut self, src: [u8; 6], host: &mdns::Name, ip: std::net::IpAddr) {
-        if host.kind != Kind::Other || !host.text.to_ascii_lowercase().ends_with(".local") {
+    /// `src`'s address record of `host` (of message `msg`) for `ip`.
+    fn address(&mut self, src: [u8; 6], host: &mdns::Name, msg: &[u8], ip: std::net::IpAddr) {
+        if host.kind != Kind::Other || !host.local {
             return;
         }
         let g = self.bump();
@@ -350,8 +377,9 @@ impl Table {
             return;
         };
         let w = &mut d.wire;
-        if w.host != host.text {
-            w.host.clone_from(&host.text);
+        let text = host.text(msg);
+        if w.host != text {
+            w.host = text;
         }
         if w.addrs.first() != Some(&ip) {
             w.addrs.retain(|a| *a != ip);
@@ -361,7 +389,7 @@ impl Table {
         d.changed = g;
     }
 
-    fn query(&mut self, src: [u8; 6], m: &Message, now: u64) {
+    fn query(&mut self, src: [u8; 6], m: &Message, msg: &[u8], now: u64) {
         let answers: Vec<&mdns::Record> = (m.records.iter())
             .filter(|r| r.section == Section::Answer)
             .collect();
@@ -384,7 +412,7 @@ impl Table {
             let entry = self.queries.entry(key).or_insert_with(|| Query {
                 wire: MdnsQuery {
                     mac: src,
-                    name: q.name.text.clone(),
+                    name: q.name.text(msg),
                     qtype: q.qtype,
                     unicast: q.unicast,
                     count: 0,
@@ -568,6 +596,7 @@ impl Table {
             packets: self.packets,
             malformed: self.malformed,
             evicted: self.evicted,
+            limited: self.limited,
         };
         (self.generation, read)
     }
@@ -591,9 +620,9 @@ fn announce(o: &mut MdnsOffer, ttl: u32, now: u64) {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
-    use crate::mdns::tests::{Builder, Rd, airplay_response};
+    use crate::mdns::tests::{Builder, Rd, airplay_response, within};
     use crate::mdns::{A, PTR, SRV, TXT};
 
     const PHONE: [u8; 6] = [2, 0, 0, 0, 0, 1];
@@ -837,9 +866,9 @@ mod tests {
         let (g, _) = s.read(None, 0);
         for i in 0..=GONE {
             let q = browse(&format!("_s{i}._tcp.local"), true, &[]);
-            s.take(&wifi(), PHONE, &q, 0);
+            s.take(&wifi(), PHONE, &q, i as u64 * 1000);
         }
-        let (_, r) = s.read(Some(g), IDLE_MS + 2000);
+        let (_, r) = s.read(Some(g), IDLE_MS + 400_000);
         assert!(r.full && r.queries.is_empty() && r.devices.is_empty());
     }
 
@@ -979,15 +1008,102 @@ mod tests {
                 )
             })
             .collect();
-        let mut s = Table::default();
-        let started = std::time::Instant::now();
-        let n = 10_000;
-        for i in 0..n {
-            let (payload, src) = &frames[i % frames.len()];
-            s.take(&wifi(), *src, payload, i as u64 * 10);
-        }
-        let each = started.elapsed() / n as u32;
+        let each = cost(move |s, i| {
+            let (payload, src) = &frames[i as usize % frames.len()];
+            s.take(&wifi(), *src, payload, i * 1000);
+        });
         eprintln!("services: {each:?} a message");
-        assert!(each < std::time::Duration::from_micros(500));
+        assert!(each <= TARGET * DEBUG, "{each:?} a message");
+    }
+
+    #[test]
+    fn a_flood_is_cut_to_the_rate() {
+        let msg = browse(AIRPLAY, false, &[]);
+        let mut s = Table::default();
+        // A burst at once: the first BURST are taken.
+        for _ in 0..BURST + 50 {
+            s.take(&wifi(), PHONE, &msg, 1000);
+        }
+        assert_eq!((s.packets, s.limited), (BURST + 50, 50));
+        // A second later RATE more are taken, no more.
+        for _ in 0..RATE + 10 {
+            s.take(&wifi(), PHONE, &msg, 2000);
+        }
+        assert_eq!(s.limited, 60);
+        let (_, r) = s.read(None, 2000);
+        assert_eq!(r.limited, 60);
+    }
+
+    /// The plan's cost of a message on the build host, a release build: 5 µs
+    /// (the A53 is about 5 times slower). A hostile message may cost at most
+    /// [`WORST`] times that; a debug build runs about [`DEBUG`] times slower.
+    const TARGET: std::time::Duration = std::time::Duration::from_micros(5);
+    const WORST: u32 = 4;
+    const DEBUG: u32 = if cfg!(debug_assertions) { 30 } else { 1 };
+
+    /// What `take` costs a message, the `i`th, a second apart so no limit
+    /// holds one back: the best of 5 rounds of 1000, as other tests running
+    /// at once make the slower ones slower.
+    fn cost(mut take: impl FnMut(&mut Table, u64)) -> std::time::Duration {
+        (0..5)
+            .map(|round| {
+                let mut s = Table::default();
+                let started = std::time::Instant::now();
+                for i in 0..1000 {
+                    take(&mut s, round * 1000 + i);
+                }
+                started.elapsed() / 1000
+            })
+            .min()
+            .unwrap_or_default()
+    }
+
+    /// A response of 92 PTR records whose owner and data each point at one
+    /// name of 127 labels: 184 names of 127 labels to walk.
+    pub fn long_names() -> Vec<u8> {
+        let mut m = vec![0, 0, 0x84, 0, 0, 0, 0, 92, 0, 0, 0, 0];
+        for _ in 0..127 {
+            m.extend([1, b'a']);
+        }
+        m.push(0);
+        m.extend([0, 12, 0, 1, 0, 0, 0, 120, 0, 2, 0xc0, 12]);
+        for _ in 1..92 {
+            m.extend([0xc0, 12, 0, 12, 0, 1, 0, 0, 0, 120, 0, 2, 0xc0, 12]);
+        }
+        m
+    }
+
+    /// A response whose first record's data holds a chain of 381 pointers,
+    /// each to the one before, and 110 records named by its last: 110 walks
+    /// of 382 steps.
+    pub fn long_chain() -> Vec<u8> {
+        let mut m = vec![0, 0, 0x84, 0, 0, 0, 0, 111, 0, 0, 0, 0];
+        let rdlen = 3 + 2 * 381u16;
+        m.extend([0, 0, 16, 0, 1, 0, 0, 0, 120]);
+        m.extend(rdlen.to_be_bytes());
+        let first = m.len();
+        m.extend([1, b'x', 0]);
+        let mut prev = first;
+        for _ in 0..381 {
+            let here = m.len();
+            m.extend((0xc000 | prev as u16).to_be_bytes());
+            prev = here;
+        }
+        for _ in 0..110 {
+            m.extend((0xc000 | prev as u16).to_be_bytes());
+            m.extend([0, 99, 0, 1, 0, 0, 0, 120, 0, 0]);
+        }
+        m
+    }
+
+    #[test]
+    fn a_hostile_message_costs_a_few_times_a_real_one() {
+        for (what, msg) in [("long names", long_names()), ("a long chain", long_chain())] {
+            let each = within(std::time::Duration::from_secs(60), move || {
+                cost(move |s, i| s.take(&wifi(), LEFT, &msg, i * 1000))
+            });
+            eprintln!("{what}: {each:?} a message");
+            assert!(each <= TARGET * WORST * DEBUG, "{what}: {each:?} a message");
+        }
     }
 }
