@@ -1,8 +1,8 @@
 // A client's traffic over the last week, as the controller keeps it: its
-// volumes by hour (from the radio's byte counters) as bars, and where they
-// went (from the connections its access point reports, by far end) for
-// today or the whole week, each named by its reverse DNS, or by the client
-// it is when it is one. Fetched when shown, again a few seconds later (the
+// volumes by hour (from the radio's byte counters) as bars, and, for an
+// admin, where they went (from the connections its access point reports,
+// by far end) for today or the whole week, each named by its reverse DNS,
+// or by the client it is when it is one. Fetched when shown, again a few seconds later (the
 // names it asked for have come by then) and every minute after.
 
 import { h, bytes, dayOf, palette } from '../util.js';
@@ -109,11 +109,13 @@ export function trafficPanel(store, mac) {
       const otherDown = shown.reduce((s, d) => s + d.other_down, 0);
       const otherUp = shown.reduce((s, d) => s + d.other_up, 0);
       const dests = pick.span === 'day' ? today.dests : data.top;
+      const hidden = data.destinations === false;
       sums.replaceChildren(
         reading('Down', bytes(down), pick.span === 'day' ? dayOf(today.day)
           : `over ${days.length} day${days.length === 1 ? '' : 's'} kept`),
         reading('Up', bytes(up)),
-        reading('Destinations', String(dests.length), dests.length >= 20 ? 'the largest 20' : ''),
+        hidden ? reading('Destinations', '–', 'shown to members of wifi-admins')
+          : reading('Destinations', String(dests.length), dests.length >= 20 ? 'the largest 20' : ''),
         reading('Other', bytes(otherDown + otherUp), 'not in a listed connection'));
       // One bar an hour over the span, from midnight of its first day.
       const start = shown[0].day;
@@ -137,7 +139,8 @@ export function trafficPanel(store, mac) {
         start, step: HOUR, count, format: (v) => bytes(v),
         series: [{ label: 'Download', color, values: downs }, { label: 'Upload', color: p.ink3, values: ups }],
       }));
-      table.replaceChildren(dests.length ? destTable(dests, down + up) : h('p', { class: 'muted' }, 'No connection of it was listed.'));
+      table.replaceChildren(hidden ? h('p', { class: 'muted' }, 'Where it went online is shown to members of wifi-admins, as its captures are.')
+        : dests.length ? destTable(dests, down + up) : h('p', { class: 'muted' }, 'No connection of it was listed.'));
       note.textContent = 'Volumes from the radio’s byte counters; destinations from the connections its access point lists, its largest each time, so smaller ones count as other. Names from reverse DNS, looked up as this page shows them.';
     },
   };

@@ -30,8 +30,9 @@
 //! logs (the WebSocket's view carries both, the rollouts with their last
 //! lines). `GET /api/rf/plan` and `POST /api/rf/apply` are the RF
 //! planner's (`rf`). `GET /api/clients/{mac}/history` is a client's
-//! sessions and timeline, `GET /api/clients/{mac}/traffic` its volumes and
-//! destinations over the last week (`traffic`), `GET /api/auth-problems`
+//! sessions and timeline, `GET /api/clients/{mac}/traffic` its volumes and,
+//! for an admin, its destinations over the last week (`traffic`), `GET
+//! /api/auth-problems`
 //! the clients that failed to get on in the last day; all read only what
 //! the controller holds.
 //! `GET /api/services?ap=&device=` is what the APs read of mDNS (the site's
@@ -298,17 +299,22 @@ async fn api_history(
     }
 }
 
-/// A client's traffic; the far ends it shows that have no name yet are
-/// looked up, for the page's next read.
-async fn api_traffic(Ext(web): Ext<Web>, Path(m): Path<String>) -> Response {
+/// A client's traffic, its destinations an admin's alone; those shown that
+/// have no name yet are looked up, for the page's next read.
+async fn api_traffic(Ext(web): Ext<Web>, Path(m): Path<String>, req: HeaderMap) -> Response {
     let Some(m) = mac::parse(&m) else {
         return error(StatusCode::BAD_REQUEST, "not a MAC");
     };
+    let admin = actions::is_admin(&req, &web.access.admin_group);
     let (view, due) = {
         let mut s = web.state.write();
         let now = sessions::unix_ms(std::time::SystemTime::now());
-        let view = traffic::view(&s.traffic, &m, now, &*s);
-        let shown = traffic::shown(&s.traffic, &m, now);
+        let view = traffic::view(&s.traffic, &m, now, &*s, admin);
+        let shown = if admin {
+            traffic::shown(&s.traffic, &m, now)
+        } else {
+            Vec::new()
+        };
         (view, s.shown_due(shown, Instant::now()))
     };
     names::look_up(&web.state, &web.access.lookups, due);

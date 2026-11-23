@@ -485,10 +485,12 @@ struct Over<'a> {
 /// The view `/api/clients/{mac}/traffic` serves at `now_ms`: each day's of
 /// the last [`DAYS`] hourly volumes (Unix milliseconds of the hour), volume,
 /// "other" and largest destinations, newest last, and the largest
-/// destinations over them all with each day's bytes.
-pub fn view(t: &Traffic, mac: &[u8; 6], now_ms: u64, look: &dyn Look) -> Value {
+/// destinations over them all with each day's bytes. Where a client went
+/// online is an admin's to see, as its captures are: without `destinations`
+/// there are the volumes alone (`destinations: false`).
+pub fn view(t: &Traffic, mac: &[u8; 6], now_ms: u64, look: &dyn Look, destinations: bool) -> Value {
     let Some(c) = t.of(mac) else {
-        return json!({ "days": [], "top": [] });
+        return json!({ "days": [], "top": [], "destinations": destinations });
     };
     let days: Vec<Value> = week(c, now_ms)
         .map(|d| {
@@ -505,7 +507,7 @@ pub fn view(t: &Traffic, mac: &[u8; 6], now_ms: u64, look: &dyn Look) -> Value {
                 "other_up": o.up,
                 "other_down": o.down,
                 "hours": hours,
-                "dests": dests.iter().take(DESTS_SHOWN)
+                "dests": dests.iter().take(if destinations { DESTS_SHOWN } else { 0 })
                     .map(|x| dest_json(x.end, x.name.as_deref(), x.bytes, look))
                     .collect::<Vec<_>>(),
             })
@@ -522,14 +524,15 @@ pub fn view(t: &Traffic, mac: &[u8; 6], now_ms: u64, look: &dyn Look) -> Value {
     }
     let mut top: Vec<_> = all.into_iter().collect();
     top.sort_by_key(|(_, o)| std::cmp::Reverse(o.bytes.total()));
-    let top: Vec<Value> = (top.into_iter().take(DESTS_SHOWN))
+    let shown = if destinations { DESTS_SHOWN } else { 0 };
+    let top: Vec<Value> = (top.into_iter().take(shown))
         .map(|(end, o)| {
             let mut v = dest_json(end, o.name, o.bytes, look);
             v["days"] = o.days.iter().map(|(d, b)| json!([d, b])).collect();
             v
         })
         .collect();
-    json!({ "days": days, "top": top })
+    json!({ "days": days, "top": top, "destinations": destinations })
 }
 
 #[cfg(test)]
@@ -801,6 +804,41 @@ mod tests {
     }
 
     #[test]
+    fn only_an_admin_sees_where_a_client_went() {
+        let mut t = Traffic::default();
+        t.flows("ap1", &summary(vec![]), T0, named);
+        t.flows(
+            "ap1",
+            &summary(vec![flow(1, 1000, 10, 20, 30)]),
+            T0 + 60_000,
+            named,
+        );
+        t.snapshot(
+            &snap(vec![]),
+            at(T0),
+            &snap(vec![station(60, 300, 1)]),
+            at(T0 + 60_000),
+        );
+        let v = view(&t, &MAC, T0 + 60_000, &Lan, false);
+        assert_eq!(
+            (
+                v["destinations"].as_bool(),
+                v["top"].as_array().map(Vec::len)
+            ),
+            (Some(false), Some(0))
+        );
+        assert_eq!(v["days"][0]["dests"], json!([]));
+        assert_eq!(
+            (
+                v["days"][0]["down"].as_u64(),
+                v["days"][0]["hours"][0][2].as_u64()
+            ),
+            (Some(300), Some(300))
+        );
+        assert!(!v.to_string().contains("198.51.100") && !v.to_string().contains("example.org"));
+    }
+
+    #[test]
     fn a_week_is_kept_and_shown_and_no_more() {
         let mut t = Traffic::default();
         let other = [2, 0, 0, 0, 0, 2];
@@ -810,9 +848,9 @@ mod tests {
         t.dirty = false;
         // A week on, the first day is no longer shown, before any save.
         let later = T0 + 7 * DAY_MS;
-        assert_eq!(view(&t, &MAC, later, &Lan)["days"], json!([]));
+        assert_eq!(view(&t, &MAC, later, &Lan, true)["days"], json!([]));
         assert_eq!(
-            view(&t, &other, later, &Lan)["days"]
+            view(&t, &other, later, &Lan, true)["days"]
                 .as_array()
                 .unwrap()
                 .len(),
@@ -878,7 +916,7 @@ mod tests {
             &snap(vec![station(600, 3000, 1)]),
             at(T0 + 60_000),
         );
-        let v = view(&t, &MAC, T0 + 60_000, &Lan);
+        let v = view(&t, &MAC, T0 + 60_000, &Lan, true);
         let day = &v["days"][0];
         assert_eq!(
             (day["up"].as_u64(), day["down"].as_u64()),
@@ -893,6 +931,9 @@ mod tests {
         assert_eq!(v["top"][1]["client"], "02:00:00:00:00:09");
         assert_eq!(v["top"][1]["client_name"], "Speaker");
         assert_eq!(v["top"][0]["days"][0][1].as_u64(), Some(2010));
-        assert_eq!(view(&t, &[2, 0, 0, 0, 0, 7], T0, &Lan)["days"], json!([]));
+        assert_eq!(
+            view(&t, &[2, 0, 0, 0, 0, 7], T0, &Lan, true)["days"],
+            json!([])
+        );
     }
 }

@@ -810,7 +810,10 @@ fn the_history_and_traffic_are_saved_when_the_controller_stops() {
         &[(1, 600, 61_000), (2, 50, 70)],
     )))
     .unwrap();
-    let traffic = |http| json_get(http, "/api/clients/02:00:00:00:00:01/traffic");
+    let traffic = |http| {
+        let (_, body) = http_request(http, "/api/clients/02:00:00:00:00:01/traffic", ADMIN);
+        serde_json::from_str::<Value>(&body).unwrap()
+    };
     wait_for("its traffic", || {
         traffic(b.http)["top"]
             .as_array()
@@ -5072,7 +5075,18 @@ fn a_clients_destinations_are_named_once_a_page_shows_them() {
         !r.dns.asked.lock().unwrap().is_empty()
     });
     assert!(!r.dns.asked.lock().unwrap().contains(&far));
-    let traffic = || json_get(r.c.http, "/api/clients/02:00:00:00:00:01/traffic");
+    let path = "/api/clients/02:00:00:00:00:01/traffic";
+    let traffic = || serde_json::from_str::<Value>(&http_request(r.c.http, path, ADMIN).1).unwrap();
+    // A viewer sees its volumes alone, and looks nothing up.
+    let viewer = json_get(r.c.http, path);
+    assert_eq!(
+        (
+            viewer["destinations"].as_bool(),
+            viewer["top"].as_array().map(Vec::len)
+        ),
+        (Some(false), Some(0))
+    );
+    assert!(!r.dns.asked.lock().unwrap().contains(&far));
     let first = traffic();
     assert_eq!(first["top"][0]["ip"], "198.51.100.1");
     assert!(first["top"][0].get("name").is_none());
