@@ -1,17 +1,21 @@
 //! What the APs' client guards read of mDNS (`AgentMsg::Services`): each AP's
 //! table as its whole reads and changes build it, timed on the controller's
 //! clock, and the site's view of it. A device is taken whole (its offers and
-//! its queries too) from the AP whose Wi-Fi port hears it, else from the AP
-//! that heard it last: every AP on a VLAN hears the same multicast, the one
-//! a client is on first hand.
+//! its queries too) from its home AP: every AP on a VLAN hears the same
+//! multicast, the one a client is on first hand. A device's home is the AP
+//! whose Wi-Fi port heard it, else the one that heard it last, and stays so
+//! until that AP no longer holds it or another's Wi-Fi port hears it while
+//! its own does not: the APs' counts of one device differ (each counts from
+//! its own start), so a home moving back and forth would read as changes.
 //!
 //! The site view's offers are watched for what the UI and the timeline tell
 //! of: a service gone (its goodbye, or a query it did not answer once its
 //! TTL ran out; past its TTL alone it is only unconfirmed) and back, a device
 //! that stopped answering the queries for one ([`SILENT_AFTER`] missed in a
 //! row) and that answers again; each change once, the newest [`EVENTS`]
-//! kept. An offer first seen, or seen again after its AP's link came back,
-//! is no change. `see` answers whether one device's queries for what
+//! kept. An offer first seen, one whose device moved home, and those of an
+//! AP's whole table (its session, or its guards, began again) are no
+//! change: their counts start afresh. `see` answers whether one device's queries for what
 //! another offers are answered.
 //!
 //! Bounded as the APs bound their tables (`u6e_proto::msg::MDNS_*`): what
@@ -112,7 +116,12 @@ pub struct Event {
 #[derive(Debug, Default)]
 pub struct Services {
     aps: BTreeMap<String, Table>,
-    status: HashMap<OfferKey, Status>,
+    /// Each device's home, as the last look left it.
+    home: BTreeMap<[u8; 6], String>,
+    /// Each offer's status at the last look, and its home then.
+    status: HashMap<OfferKey, (Status, String)>,
+    /// The APs whose whole table came since the last look.
+    fresh: BTreeSet<String>,
     pub events: VecDeque<Event>,
 }
 
@@ -161,6 +170,7 @@ impl Services {
         let table = self.aps.entry(ap.to_owned()).or_default();
         if s.full {
             *table = Table::default();
+            self.fresh.insert(ap.to_owned());
         }
         for k in s.gone {
             match k {
@@ -203,8 +213,10 @@ impl Services {
         self.aps.remove(ap);
     }
 
-    /// The AP each device is taken from: the one whose Wi-Fi port heard it
-    /// last, else the one that heard it last.
+    /// The AP each device is taken from: its home as the last look left it
+    /// while that AP holds it and no other's Wi-Fi port hears it instead,
+    /// else the one whose Wi-Fi port heard it last, else the one that heard
+    /// it last.
     pub fn homes(&self) -> BTreeMap<[u8; 6], &str> {
         let mut best: BTreeMap<[u8; 6], (bool, u64, &str)> = BTreeMap::new();
         for (ap, t) in &self.aps {
@@ -216,7 +228,15 @@ impl Services {
                 }
             }
         }
-        best.into_iter().map(|(m, (_, _, ap))| (m, ap)).collect()
+        best.into_iter()
+            .map(|(m, (wifi, _, ap))| {
+                let kept = self.home.get(&m).and_then(|h| {
+                    let d = self.aps.get(h)?.devices.get(&m)?;
+                    (d.wifi || !wifi).then_some(h.as_str())
+                });
+                (m, kept.unwrap_or(ap))
+            })
+            .collect()
     }
 
     /// The site's view: each device with its AP, and what that AP says it
@@ -240,11 +260,16 @@ impl Services {
     /// look becomes an event.
     pub fn watch(&mut self, now_ms: u64) -> Vec<Event> {
         let site = self.site();
-        let mut seen: HashMap<OfferKey, Status> = HashMap::new();
+        let mut seen: HashMap<OfferKey, (Status, String)> = HashMap::new();
         let mut out = Vec::new();
         for (ap, o) in &site.offers {
             let key = (o.mac, o.instance.clone());
-            let was = self.status.get(&key).copied();
+            // Counts of another AP, or begun again, are no change.
+            let was = self
+                .status
+                .get(&key)
+                .filter(|(_, home)| home == ap && !self.fresh.contains(*ap));
+            let was = was.map(|(status, _)| *status);
             let now = if o.withdrawn.is_some() {
                 Status::Gone
             } else if !live(o, now_ms) {
@@ -292,9 +317,15 @@ impl Services {
                     wifi,
                 });
             }
-            seen.insert(key, now);
+            seen.insert(key, (now, (*ap).to_owned()));
         }
-        self.status = seen;
+        let home = site
+            .devices
+            .iter()
+            .map(|(ap, d)| (d.mac, (*ap).to_owned()))
+            .collect();
+        (self.status, self.home) = (seen, home);
+        self.fresh.clear();
         for e in &out {
             self.events.push_back(e.clone());
         }
@@ -885,6 +916,47 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(RIGHT, Change::Gone, false)]
         );
+    }
+
+    /// A wired device both APs hear, counted by each from its own start.
+    fn bridge(missed_in_row: u16, last: u64) -> Read {
+        let mut o = offer(LEFT, "Bridge", "", false);
+        (o.missed, o.missed_in_row, o.missed_by) =
+            (u32::from(missed_in_row), missed_in_row, Some(PHONE));
+        o.missed_ms = Some(BOOT);
+        full(vec![device(LEFT, false, last)], vec![o], vec![])
+    }
+
+    #[test]
+    fn an_ap_coming_back_moves_no_home_and_makes_no_event() {
+        let mut s = Services::default();
+        // ap1 has seen the bridge miss three; ap2, newer, counts none.
+        assert!(s.apply("ap1", bridge(3, BOOT), T0).is_empty());
+        assert!(s.apply("ap2", bridge(0, BOOT + 10), T0).is_empty());
+        assert_eq!(s.homes()[&LEFT], "ap1");
+        // ap1 reboots: the bridge moves to ap2, whose counts are its own.
+        s.drop_ap("ap1");
+        assert!(s.watch(T0 + 1000).is_empty());
+        assert_eq!(s.homes()[&LEFT], "ap2");
+        // ap1 is back, newer: the bridge stays on ap2.
+        assert!(
+            s.apply("ap1", bridge(0, BOOT + 100), T0 + 60_000)
+                .is_empty()
+        );
+        assert_eq!(s.homes()[&LEFT], "ap2");
+        // ap2's own counts still make changes.
+        let mut miss = bridge(3, BOOT + 200);
+        miss.full = false;
+        let ev = s.apply("ap2", miss, T0 + 61_000);
+        assert_eq!(
+            ev.iter().map(|e| e.change).collect::<Vec<_>>(),
+            [Change::Silent]
+        );
+        // A client heard on ap1's Wi-Fi now moves home there, quietly.
+        let mut roamed = bridge(0, BOOT + 300);
+        (roamed.full, roamed.devices[0].wifi) = (false, true);
+        assert!(s.apply("ap1", roamed, T0 + 62_000).is_empty());
+        assert_eq!(s.homes()[&LEFT], "ap1");
     }
 
     #[test]
