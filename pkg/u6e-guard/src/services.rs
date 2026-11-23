@@ -14,11 +14,13 @@
 //! answered, was listed as known by an asker (so its owner rightly kept
 //! quiet, RFC 6762 7.1), or missed. An offer past its TTL is unconfirmed,
 //! not gone: a device may stay quiet while nobody asks. A query for it that
-//! goes unanswered withdraws it then, as its goodbye would have. A window whose every question asked for
-//! a unicast answer (QU) counts no miss: that answer may never reach the
-//! host (between two clients of one BSS it never does). Nor does one that
-//! a query sent unicast or from another port than 5353 (a legacy query)
-//! joined: its answers go back the same way.
+//! goes unanswered withdraws it then, as its goodbye would have. A window
+//! whose every question asked for a unicast answer (QU) counts no miss:
+//! that answer may never reach the host (between two clients of one BSS it
+//! never does). Nor does one that a query sent unicast or from another
+//! port than 5353 (a legacy query) joined: its answers go back the same
+//! way. Nor does one whose lists of names filled up, which cannot tell who
+//! answered.
 //!
 //! Messages are taken at most [`RATE`] a second, in bursts of [`BURST`]; the
 //! rest are counted and dropped, so a client flooding mDNS costs the guards'

@@ -521,7 +521,8 @@ pub fn view(
         None => services.site(),
         Some(ap) => {
             let Some(t) = services.ap(ap) else {
-                return json!({ "aps": aps_json(services, now_ms), "devices": [], "groups": [], "services": [] });
+                let aps = aps_json(services, now_ms);
+                return json!({ "aps": aps, "devices": [], "groups": [], "services": [] });
             };
             Site {
                 devices: t.devices.values().map(|d| (ap, d)).collect(),

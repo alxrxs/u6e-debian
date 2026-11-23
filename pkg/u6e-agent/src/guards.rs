@@ -3,8 +3,9 @@
 //! each sent to the controller when it changed and at the start of each
 //! session, the violations recorded since the last read, sent as events,
 //! and what they read of mDNS, whole at the start of each session (and
-//! from guards that restarted) and then what changed; it hands them the seed of the leases and the mode the controller
-//! sends, and hands them both again (the seed first, so no enforcing mode
+//! from guards that restarted) and then what changed; it hands them the
+//! seed of the leases and the mode the controller sends, and hands them
+//! both again (the seed first, so no enforcing mode
 //! meets an empty table) to guards that restarted, which forget them. The
 //! violations are read across sessions, so those of an outage leave once
 //! the link is back (the newest of them: the guards keep 256), and the place
