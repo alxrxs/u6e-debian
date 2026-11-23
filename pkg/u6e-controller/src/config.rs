@@ -12,8 +12,9 @@
 //! none without it; in `[radius]`, the Loki the RADIUS servers' log is read
 //! from (`radius`), RADIUS's side of the clients' timelines missing without
 //! it; where the clients' sessions and timelines are kept (`history_path`,
-//! `sessions`), and their traffic (`traffic_path`, `traffic`); where the
-//! client captures' files are kept
+//! `sessions`), and their traffic (`traffic_path`, `traffic`); the signal
+//! below which a client another AP heard better is sticky (`sticky_dbm`,
+//! `roaming`, −72 dBm unless set); where the client captures' files are kept
 //! (`captures_path`, `captures`); in `[limits]`, the site's per-SSID rate
 //! limits, which an
 //! admin's limit of the same SSID overrides (`limits`); and, in `[guards]`,
@@ -33,6 +34,7 @@
 //! policy_path = "/var/lib/wifi-controller/policy.json"
 //! history_path = "/var/lib/wifi-controller/history"
 //! traffic_path = "/var/lib/wifi-controller/traffic"
+//! sticky_dbm = -72
 //! captures_path = "/var/lib/wifi-controller/captures"
 //! socket = "/run/wifi-controller/sock"
 //!
@@ -75,7 +77,7 @@ use serde::Deserialize;
 use u6e_proto::mac;
 use u6e_proto::msg::{Binding, GuardConfig, Limit, LimitTarget, Rate, check_limits};
 
-use crate::{configs, radius, rf, rollout};
+use crate::{configs, radius, rf, roaming, rollout};
 
 /// The parsed, checked configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +107,8 @@ pub struct Config {
     pub history_path: PathBuf,
     /// The clients' volumes and destinations.
     pub traffic_path: PathBuf,
+    /// The signal below which a client is sticky (`roaming`).
+    pub sticky_dbm: i8,
     /// The client captures' files.
     pub captures_path: PathBuf,
     /// The site's rate limits, per SSID.
@@ -147,6 +151,8 @@ struct File {
     history_path: PathBuf,
     #[serde(default = "default_traffic")]
     traffic_path: PathBuf,
+    #[serde(default = "default_sticky")]
+    sticky_dbm: i8,
     #[serde(default = "default_captures")]
     captures_path: PathBuf,
     #[serde(default = "default_socket")]
@@ -248,6 +254,10 @@ fn default_traffic() -> PathBuf {
     "/var/lib/wifi-controller/traffic".into()
 }
 
+fn default_sticky() -> i8 {
+    roaming::STICKY_DBM
+}
+
 fn default_captures() -> PathBuf {
     "/var/lib/wifi-controller/captures".into()
 }
@@ -290,6 +300,8 @@ pub enum ConfigError {
     Guards(String),
     /// A `[limits]` SSID is named twice, or its rate is out of range.
     Limits(String),
+    /// `sticky_dbm` is outside −90 to −50 dBm.
+    BadSticky,
 }
 
 impl fmt::Display for ConfigError {
@@ -311,6 +323,7 @@ impl fmt::Display for ConfigError {
             Self::Radius(e) => write!(f, "radius: {e}"),
             Self::Guards(e) => write!(f, "guards: {e}"),
             Self::Limits(e) => write!(f, "limits: {e}"),
+            Self::BadSticky => f.write_str("sticky_dbm is not between -90 and -50"),
         }
     }
 }
@@ -370,6 +383,9 @@ impl Config {
             .guards
             .map_or_else(|| Ok(GuardConfig::default()), guards)?;
         let limits = file.limits.map_or_else(|| Ok(BTreeMap::new()), limits)?;
+        if !(-90..=-50).contains(&file.sticky_dbm) {
+            return Err(ConfigError::BadSticky);
+        }
         Ok(Config {
             listen_agents: file.listen_agents,
             listen_http: file.listen_http,
@@ -383,6 +399,7 @@ impl Config {
             policy_path: file.policy_path,
             history_path: file.history_path,
             traffic_path: file.traffic_path,
+            sticky_dbm: file.sticky_dbm,
             captures_path: file.captures_path,
             limits,
             socket: file.socket,
@@ -729,6 +746,18 @@ mod tests {
         );
         let c = Config::parse(&format!("{ORIGIN}traffic_path = \"/t\"\n")).unwrap();
         assert_eq!(c.traffic_path, PathBuf::from("/t"));
+    }
+
+    #[test]
+    fn the_sticky_threshold_defaults_and_is_bounded() {
+        assert_eq!(Config::parse(ORIGIN).unwrap().sticky_dbm, -72);
+        let set = |v: i32| Config::parse(&format!("{ORIGIN}sticky_dbm = {v}\n"));
+        assert_eq!(set(-80).unwrap().sticky_dbm, -80);
+        assert_eq!(set(-90).unwrap().sticky_dbm, -90);
+        assert_eq!(set(-50).unwrap().sticky_dbm, -50);
+        assert_eq!(set(-91), Err(ConfigError::BadSticky));
+        assert_eq!(set(-49), Err(ConfigError::BadSticky));
+        assert!(matches!(set(-200), Err(ConfigError::Syntax(_))));
     }
 
     #[test]

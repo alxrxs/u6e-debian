@@ -9,7 +9,9 @@
 //! AP after its first key frame with the leases they are seeded with (seeded
 //! again whenever the leases change), and each AP's bindings and violations;
 //! the clients' sessions and timelines (`sessions`), fed from all of it and
-//! from RADIUS's verdicts (`radius`); the live Wi-Fi
+//! from RADIUS's verdicts (`radius`), and the roams, sticky clients and
+//! steering they and the agents' snapshots and events say (`roaming`); the
+//! live Wi-Fi
 //! configurations, signed here (`configs`) for the AP whose configured host
 //! name they name and known here by hash only once sent (each AP's last
 //! acknowledged one kept on disk too), the latest one of each AP signed again
@@ -51,6 +53,7 @@ use crate::oui;
 use crate::policy::{ApImages, Blocked, ConfigId, Hold, Phase, Policy, SavedRollout};
 use crate::radius::{self, Line};
 use crate::rf::history::{self, History};
+use crate::roaming::Roaming;
 use crate::services::{self, Services};
 use crate::sessions::{self, Sessions};
 use crate::spectrum::{self, Limits, Scan, Stopped};
@@ -610,6 +613,8 @@ pub struct State {
     pub history: History,
     /// The clients' sessions and timelines.
     pub sessions: Sessions,
+    /// The roams, sticky clients and steering.
+    pub roaming: Roaming,
     /// How the reads of RADIUS's log go, when it is read.
     pub radius: Option<radius::Health>,
     /// The rate limits admins set (kept in the policy), and the site
@@ -655,6 +660,7 @@ impl State {
             policy_dirty: false,
             history: History::new(history::WINDOW),
             sessions: Sessions::default(),
+            roaming: Roaming::default(),
             radius: None,
             limits: RateLimits::default(),
             site_limits: BTreeMap::new(),
@@ -692,6 +698,14 @@ impl State {
     /// The state going on from the sessions and timelines `sessions`.
     pub fn with_sessions(self, sessions: Sessions) -> Self {
         State { sessions, ..self }
+    }
+
+    /// The state taking a client below `sticky_dbm` for sticky.
+    pub fn with_sticky(self, sticky_dbm: i8) -> Self {
+        State {
+            roaming: Roaming::new(sticky_dbm),
+            ..self
+        }
     }
 
     /// The state keeping the clients' traffic as `traffic` holds it.
@@ -1151,10 +1165,29 @@ impl State {
         let now_ms = sessions::unix_ms(now);
         if let Some(a) = self.aps.get(ap) {
             match &change {
-                Some(Change::Event(_, ev)) => self.sessions.event(ap, &a.naming, ev, now_ms),
+                Some(Change::Event(_, ev)) => {
+                    self.sessions.event(ap, &a.naming, ev, now_ms);
+                    for r in self.sessions.take_roams() {
+                        self.roaming.roamed(r);
+                    }
+                    let at = sessions::event_ms(ev, now_ms);
+                    self.roaming.event(ap, &a.naming, ev, at, &self.sessions);
+                }
                 Some(Change::Snapshot(_)) => {
                     if let Some(snap) = &a.snapshot {
                         self.sessions.snapshot(ap, snap, &a.naming, now_ms, fresh);
+                        for r in self.sessions.take_roams() {
+                            self.roaming.roamed(r);
+                        }
+                        let aps = &self.aps;
+                        let radio = |name: &str, band| {
+                            let s = aps.get(name)?.snapshot.as_ref()?;
+                            let r = s.radios.iter().find(|r| r.band == band)?;
+                            Some((r.up, r.txpower_mbm))
+                        };
+                        self.roaming
+                            .snapshot(ap, snap, now_ms, &self.sessions, &radio);
+                        self.roaming.settle(now_ms, &self.sessions);
                     }
                 }
                 Some(Change::Flows(_)) => {
@@ -1364,6 +1397,7 @@ impl State {
             self.actions.pop_front();
         }
         self.sessions.action(&action);
+        self.roaming.action(&action);
         self.actions.push_back(action.clone());
         self.notify(Change::Action(action));
     }

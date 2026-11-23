@@ -42,6 +42,7 @@ pub mod oui;
 pub mod policy;
 pub mod radius;
 pub mod rf;
+pub mod roaming;
 pub mod rollout;
 pub mod script;
 pub mod services;
@@ -172,6 +173,7 @@ pub async fn start(
         .with_policy(saved)
         .with_sessions(sessions)
         .with_traffic(traffic)
+        .with_sticky(config.sticky_dbm)
         .with_spectrum(timing.spectrum)
         .with_history(window)
         .with_leases(&config.leases)

@@ -10,10 +10,12 @@
 //! A session ends with a reason. An association with another BSS while one
 //! is open, or within [`ROAM_WINDOW_MS`] of one ending elsewhere, is a roam,
 //! and the new session's `Joined` says where from (and whether it was a fast
-//! transition, once its AP says how it authenticated). A disassociation is a
-//! kick or a block when an operator's came within [`CAUSE_WINDOW_MS`], EAP's
-//! failure or timeout when one did, inactivity when the client had been
-//! silent past [`INACTIVE_MS`], and otherwise the client leaving. A session
+//! transition, once its AP says how it authenticated); each roam is handed
+//! on as it is decided ([`Sessions::take_roams`], for `roaming`). A
+//! disassociation is a kick or a block when an operator's came within
+//! [`CAUSE_WINDOW_MS`], EAP's failure or timeout when one did, inactivity
+//! when the client had been silent past [`INACTIVE_MS`], and otherwise the
+//! client leaving. A session
 //! whose client was gone when its AP was heard again (its link, or the
 //! controller, was away) ends unobserved at the time it was last heard, as
 //! does one of an AP not heard for an hour.
@@ -78,6 +80,8 @@ pub const IDENTITIES_MAX: usize = 256;
 const IDENTITY_KEEP_MS: u64 = 30 * DAY_MS;
 /// The clients whose recent causes are kept, at most.
 const RECENT_MAX: usize = 4096;
+/// The roams waiting to be taken, at most.
+const ROAMED_MAX: usize = 256;
 /// How often the history is saved, when it changed.
 pub const SAVE_EVERY: Duration = Duration::from_secs(300);
 /// What the file starts with, and the format of what follows, raised with
@@ -203,6 +207,23 @@ impl Recent {
     }
 }
 
+/// A roam as the sessions decided it: the session it began and when (its AP
+/// authorized the client then, or, heard of in a snapshot, it associated),
+/// and the session it left. The old AP last heard the client at `heard_ms`,
+/// and said it was gone at `gone_ms` when that came before the roam; the
+/// client's last sign to it lies between.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Roamed {
+    pub mac: [u8; 6],
+    pub session: u64,
+    pub began: u64,
+    pub to: Place,
+    pub from: Place,
+    pub from_start_ms: u64,
+    pub heard_ms: u64,
+    pub gone_ms: Option<u64>,
+}
+
 /// What the file holds: the history, copied while the state is locked and
 /// encoded after.
 #[derive(Serialize, Deserialize)]
@@ -230,6 +251,7 @@ pub struct Sessions {
     leases: Option<HashMap<([u8; 6], IpAddr), u64>>,
     next_id: u64,
     dirty: bool,
+    roamed: VecDeque<Roamed>,
 }
 
 /// Milliseconds since the epoch.
@@ -238,8 +260,18 @@ pub fn unix_ms(t: SystemTime) -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
+/// When `ev`, heard at `now_ms`, happened: its AP's time, unless that is so
+/// far from the controller's that the AP's clock is not set yet.
+pub fn event_ms(ev: &Event, now_ms: u64) -> u64 {
+    if ev.at_ms.abs_diff(now_ms) > SKEW_MS {
+        now_ms
+    } else {
+        ev.at_ms
+    }
+}
+
 /// Where a station of BSS `bss` of the AP is, as its `naming` says.
-fn place(ap: &str, naming: &Naming, bss: u16, vlan: Option<u16>) -> Option<Place> {
+pub fn place(ap: &str, naming: &Naming, bss: u16, vlan: Option<u16>) -> Option<Place> {
     let b = naming.bsss.get(usize::from(bss))?;
     let band = naming
         .bands
@@ -297,13 +329,14 @@ impl Sessions {
         End::Left
     }
 
+    /// The roams decided since this was last asked, oldest first.
+    pub fn take_roams(&mut self) -> Vec<Roamed> {
+        self.roamed.drain(..).collect()
+    }
+
     /// Takes an event of `ap` heard at `now_ms`.
     pub fn event(&mut self, ap: &str, naming: &Naming, ev: &Event, now_ms: u64) {
-        let at = if ev.at_ms.abs_diff(now_ms) > SKEW_MS {
-            now_ms
-        } else {
-            ev.at_ms
-        };
+        let at = event_ms(ev, now_ms);
         let eap = |step| What::Eap {
             ap: ap.to_owned(),
             step,
@@ -407,6 +440,7 @@ impl Sessions {
             .and_then(|a| a.1);
         let mut from = None;
         let mut prior = None;
+        let mut left = None;
         let carry = |s: &Session| Prior {
             signed_in_ms: s.signed_in_ms(),
             identity: s.identity(),
@@ -426,6 +460,7 @@ impl Sessions {
                     gap_ms: None,
                     steered_by: steered_by.clone(),
                 });
+                left = Some((open.place.clone(), open.start_ms, open.last_ms, None));
                 self.close_roamed(mac, began, &place.ap);
             }
         } else if let Some((id, ap, band, end)) = self.just_left(&mac, &place, began) {
@@ -437,6 +472,8 @@ impl Sessions {
             });
             if let Some(s) = self.closed.iter_mut().rev().find(|s| s.id == id) {
                 prior = Some(carry(s));
+                let gone = (end <= began).then_some(end);
+                left = Some((s.place.clone(), s.start_ms, s.last_ms, gone));
                 s.end = Some(End::Roamed {
                     to: place.ap.clone(),
                 });
@@ -463,6 +500,21 @@ impl Sessions {
             inactive_ms: 0,
         };
         self.open.insert(mac, session);
+        if let Some((from, from_start_ms, heard_ms, gone_ms)) = left {
+            if self.roamed.len() == ROAMED_MAX {
+                self.roamed.pop_front();
+            }
+            self.roamed.push_back(Roamed {
+                mac,
+                session: self.next_id,
+                began,
+                to: place.clone(),
+                from,
+                from_start_ms,
+                heard_ms,
+                gone_ms,
+            });
+        }
         let what = What::Joined {
             session: self.next_id,
             place,
