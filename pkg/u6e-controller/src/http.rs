@@ -306,8 +306,9 @@ async fn api_traffic(Ext(web): Ext<Web>, Path(m): Path<String>) -> Response {
     };
     let (view, due) = {
         let mut s = web.state.write();
-        let view = traffic::view(&s.traffic, &m, &*s);
-        let shown = traffic::shown(&s.traffic, &m);
+        let now = sessions::unix_ms(std::time::SystemTime::now());
+        let view = traffic::view(&s.traffic, &m, now, &*s);
+        let shown = traffic::shown(&s.traffic, &m, now);
         (view, s.shown_due(shown, Instant::now()))
     };
     names::look_up(&web.state, &web.access.lookups, due);

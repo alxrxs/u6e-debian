@@ -16,7 +16,9 @@
 //! volume less what its destinations account for, never below nothing.
 //!
 //! Bounded: [`CLIENTS`] clients (the one heard of least recently dropped for
-//! a new one), [`DAYS`] days, 24 hourly volumes a day, a day's
+//! a new one), [`DAYS`] days (older ones dropped at every save, and a client
+//! left with none, so a client gone for a week leaves nothing; and never
+//! shown), 24 hourly volumes a day, a day's
 //! [`DESTS_KEPT`] largest destinations (the smallest dropped for a new one,
 //! its bytes left to "other"), and [`CONNS`] connections' last counters
 //! (forgotten after [`CONN_IDLE_MS`] unlisted, the oldest first beyond).
@@ -298,6 +300,21 @@ impl Traffic {
         }
     }
 
+    /// Drops the days past [`DAYS`] at `now_ms`, and the clients left with
+    /// none.
+    pub fn prune(&mut self, now_ms: u64) {
+        let today = now_ms / DAY_MS;
+        let before = self.clients.len();
+        let mut dropped = false;
+        for c in self.clients.values_mut() {
+            let kept = c.days.len();
+            c.days.retain(|d| d.day + DAYS as u64 > today);
+            dropped |= c.days.len() != kept;
+        }
+        self.clients.retain(|_, c| !c.days.is_empty());
+        self.dirty |= dropped || self.clients.len() != before;
+    }
+
     pub fn clients(&self) -> usize {
         self.clients.len()
     }
@@ -380,6 +397,7 @@ fn add_dest(day: &mut Day, end: End, named: Option<String>, bytes: Bytes) {
 pub async fn save(state: &Shared, path: &Path) {
     let bytes = {
         let mut s = state.write();
+        s.traffic.prune(unix_ms(SystemTime::now()));
         if !s.traffic.dirty {
             return;
         }
@@ -433,14 +451,20 @@ fn dest_json(end: End, name: Option<&str>, bytes: Bytes, look: &dyn Look) -> Val
     o
 }
 
-/// The far ends the view of `mac` shows: each day's largest and the
-/// largest over the days.
-pub fn shown(t: &Traffic, mac: &[u8; 6]) -> Vec<IpAddr> {
+/// The days of `c` within the last [`DAYS`] at `now_ms`, oldest first.
+fn week(c: &Client, now_ms: u64) -> impl Iterator<Item = &Day> {
+    let today = now_ms / DAY_MS;
+    c.days.iter().filter(move |d| d.day + DAYS as u64 > today)
+}
+
+/// The far ends the view of `mac` at `now_ms` shows: each day's largest and
+/// the largest over the days.
+pub fn shown(t: &Traffic, mac: &[u8; 6], now_ms: u64) -> Vec<IpAddr> {
     let Some(c) = t.of(mac) else {
         return Vec::new();
     };
     let mut ips: Vec<IpAddr> = Vec::new();
-    for d in &c.days {
+    for d in week(c, now_ms) {
         let mut dests: Vec<&Dest> = d.dests.iter().collect();
         dests.sort_by_key(|x| std::cmp::Reverse(x.bytes.total()));
         ips.extend(dests.iter().take(DESTS_SHOWN).map(|x| x.end.ip));
@@ -458,15 +482,15 @@ struct Over<'a> {
     days: Vec<(u64, u64)>,
 }
 
-/// The view `/api/clients/{mac}/traffic` serves: each day's hourly volumes
-/// (Unix milliseconds of the hour), volume, "other" and largest
-/// destinations, newest last, and the largest destinations over them all
-/// with each day's bytes.
-pub fn view(t: &Traffic, mac: &[u8; 6], look: &dyn Look) -> Value {
+/// The view `/api/clients/{mac}/traffic` serves at `now_ms`: each day's of
+/// the last [`DAYS`] hourly volumes (Unix milliseconds of the hour), volume,
+/// "other" and largest destinations, newest last, and the largest
+/// destinations over them all with each day's bytes.
+pub fn view(t: &Traffic, mac: &[u8; 6], now_ms: u64, look: &dyn Look) -> Value {
     let Some(c) = t.of(mac) else {
         return json!({ "days": [], "top": [] });
     };
-    let days: Vec<Value> = (c.days.iter())
+    let days: Vec<Value> = week(c, now_ms)
         .map(|d| {
             let mut dests: Vec<&Dest> = d.dests.iter().collect();
             dests.sort_by_key(|x| std::cmp::Reverse(x.bytes.total()));
@@ -488,7 +512,7 @@ pub fn view(t: &Traffic, mac: &[u8; 6], look: &dyn Look) -> Value {
         })
         .collect();
     let mut all: BTreeMap<End, Over> = BTreeMap::new();
-    for d in &c.days {
+    for d in week(c, now_ms) {
         for x in &d.dests {
             let e = all.entry(x.end).or_default();
             e.name = x.name.as_deref().or(e.name);
@@ -777,6 +801,33 @@ mod tests {
     }
 
     #[test]
+    fn a_week_is_kept_and_shown_and_no_more() {
+        let mut t = Traffic::default();
+        let other = [2, 0, 0, 0, 0, 2];
+        t.day(MAC, T0).hours.insert(1, b(1, 2));
+        t.day(other, T0).hours.insert(1, b(1, 2));
+        t.day(other, T0 + 5 * DAY_MS).hours.insert(1, b(3, 4));
+        t.dirty = false;
+        // A week on, the first day is no longer shown, before any save.
+        let later = T0 + 7 * DAY_MS;
+        assert_eq!(view(&t, &MAC, later, &Lan)["days"], json!([]));
+        assert_eq!(
+            view(&t, &other, later, &Lan)["days"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        // The save's prune drops it, and the client left with no day.
+        t.prune(later);
+        assert!(t.dirty && t.of(&MAC).is_none());
+        assert_eq!(t.of(&other).unwrap().days.len(), 1);
+        t.dirty = false;
+        t.prune(later);
+        assert!(!t.dirty);
+    }
+
+    #[test]
     fn it_is_saved_whole_and_a_corrupt_file_set_aside() {
         let dir = TestDir::new();
         let path = dir.path().join("traffic");
@@ -827,7 +878,7 @@ mod tests {
             &snap(vec![station(600, 3000, 1)]),
             at(T0 + 60_000),
         );
-        let v = view(&t, &MAC, &Lan);
+        let v = view(&t, &MAC, T0 + 60_000, &Lan);
         let day = &v["days"][0];
         assert_eq!(
             (day["up"].as_u64(), day["down"].as_u64()),
@@ -842,6 +893,6 @@ mod tests {
         assert_eq!(v["top"][1]["client"], "02:00:00:00:00:09");
         assert_eq!(v["top"][1]["client_name"], "Speaker");
         assert_eq!(v["top"][0]["days"][0][1].as_u64(), Some(2010));
-        assert_eq!(view(&t, &[2, 0, 0, 0, 0, 7], &Lan)["days"], json!([]));
+        assert_eq!(view(&t, &[2, 0, 0, 0, 0, 7], T0, &Lan)["days"], json!([]));
     }
 }
