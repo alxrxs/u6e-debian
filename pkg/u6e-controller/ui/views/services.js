@@ -87,6 +87,7 @@ function queryRow(q, macs) {
   if (q.answered_by.length) how.push(['answered by ', names(macs, q.answered_by)]);
   if (q.missed_by.length) how.push([h('span', { class: 'q-poor' }, 'not by '), names(macs, q.missed_by)]);
   if (q.known.length) how.push(['already holds ', names(macs, q.known)]);
+  if (q.unlisted) how.push(`and ${q.unlisted} more the AP does not list`);
   if (q.unicast) how.push('asked for a unicast answer, which the AP may not see');
   if (q.unanswered) how.push(h('span', { class: 'q-poor' }, `${q.unanswered} asked from scratch got no answer`));
   const tone = q.missed_by.length || q.unanswered ? 'warn' : '';
@@ -141,6 +142,7 @@ export function verdict(v, from, to) {
     case 'answered': return ['ok', [to, ` answered ${asked}.`]];
     case 'known': return ['ok', [from, ' already holds it: ', asked, ' listed it as a known answer, so ', to, ' rightly kept quiet.']];
     case 'missed': return ['bad', [to, ` did not answer ${asked}.`]];
+    case 'unlisted': return ['', [from, `’s last query had more answers and misses than the access point lists (${v.query.unlisted} more): whether `, to, ' was among them cannot be told.']];
     case 'unclear': return ['', v.offer.status === 'gone'
       ? [to, ' had withdrawn it when ', from, ' last asked.']
       : [from, ' asked for a unicast answer, which the access point cannot always see.']];

@@ -921,9 +921,9 @@ pub struct CaptureState {
 pub const MDNS_DEVICES: usize = 96;
 pub const MDNS_OFFERS: usize = 256;
 pub const MDNS_QUERIES: usize = 256;
-/// The most devices each of a query's lists names, and the most addresses
-/// kept of a device.
-pub const MDNS_LISTED: usize = 8;
+/// The most devices each of a query's lists names (the rest counted), and
+/// the most addresses kept of a device.
+pub const MDNS_LISTED: usize = 16;
 pub const MDNS_ADDRS: usize = 4;
 
 /// What the AP's client guards read of the mDNS its bridges carry: the
@@ -989,6 +989,8 @@ pub struct MdnsOffer {
     pub target: String,
     pub port: u16,
     pub txt: Vec<(String, String)>,
+    /// When it was first heard.
+    pub first_ms: u64,
     /// How long it lives from when its records last came, the latest expiry
     /// any of them gave; past that and not withdrawn it is unconfirmed.
     pub ttl_s: u32,
@@ -1023,10 +1025,11 @@ pub struct MdnsQuery {
     pub last_ms: u64,
     /// Of its last query: the devices whose offers answered it, those whose
     /// live offers did not, and those whose offers it listed as known
-    /// answers, at most [`MDNS_LISTED`] each.
+    /// answers, at most [`MDNS_LISTED`] each, and how many more there were.
     pub answered_by: Vec<[u8; 6]>,
     pub missed_by: Vec<[u8; 6]>,
     pub known: Vec<[u8; 6]>,
+    pub unlisted: u16,
     /// Its queries that listed no known answer and that nothing answered.
     pub unanswered: u32,
 }

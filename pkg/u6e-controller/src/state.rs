@@ -2572,6 +2572,7 @@ mod tests {
             target: "Right.local".into(),
             port: 7000,
             txt: Vec::new(),
+            first_ms: 0,
             ttl_s: 4500,
             announced_ms: 1000,
             withdrawn: None,

@@ -15,7 +15,10 @@
 //! row) and that answers again; each change once, the newest [`EVENTS`]
 //! kept. An offer first seen, one whose device moved home, and those of an
 //! AP's whole table (its session, or its guards, began again) are no
-//! change: their counts start afresh. `see` answers whether one device's queries for what
+//! change: their counts start afresh. Nor is a service gone or back when
+//! its instance's name is one that rotates (Apple's nearby presence, remote
+//! pairing and device sync), or was first heard less than [`SETTLED_MS`]
+//! before. `see` answers whether one device's queries for what
 //! another offers are answered.
 //!
 //! Bounded as the APs bound their tables (`u6e_proto::msg::MDNS_*`): what
@@ -36,6 +39,16 @@ pub use crate::timeline::ServiceChange as Change;
 pub const SILENT_AFTER: u16 = 3;
 /// The service events kept.
 pub const EVENTS: usize = 1000;
+/// Service types whose instances are named anew now and then: their
+/// comings and goings are no change.
+const ROTATING: [&str; 3] = [
+    "_nearbypresence._tcp.local",
+    "_remotepairing._tcp.local",
+    "_apple-mobdev2._tcp.local",
+];
+/// An instance heard for less than this is not yet one whose comings and
+/// goings are changes.
+const SETTLED_MS: u64 = 10 * 60 * 1000;
 /// The service type whose TXT records group speakers (a stereo pair).
 const AIRPLAY: &str = "_airplay._tcp.local";
 const RAOP: &str = "_raop._tcp.local";
@@ -145,6 +158,7 @@ fn retime(s: &mut Read, at_ms: u64) {
         t(&mut d.last_ms);
     }
     for o in &mut s.offers {
+        t(&mut o.first_ms);
         t(&mut o.announced_ms);
         t_opt(&mut o.answered_ms);
         t_opt(&mut o.missed_ms);
@@ -295,6 +309,9 @@ impl Services {
                 (Some(Status::Silent { .. }), Status::Answering) => Some(Change::Answering),
                 _ => None,
             };
+            let settled = !ROTATING.contains(&o.service.to_ascii_lowercase().as_str())
+                && now_ms.saturating_sub(o.first_ms) >= SETTLED_MS;
+            let change = change.filter(|c| settled || !matches!(c, Change::Gone | Change::Back));
             if let Some(change) = change {
                 let wifi = site.device(o.mac).is_some_and(|d| d.wifi);
                 let silent_ms = match (change, was) {
@@ -362,6 +379,8 @@ pub enum Outcome {
     Known,
     /// Neither: it asked for a unicast answer, or the offer was not live.
     Unclear,
+    /// More devices than its lists name answered, missed or were known.
+    Unlisted,
     NotAsked,
 }
 
@@ -371,6 +390,7 @@ pub fn outcome_name(o: Outcome) -> &'static str {
         Outcome::Missed => "missed",
         Outcome::Known => "known",
         Outcome::Unclear => "unclear",
+        Outcome::Unlisted => "unlisted",
         Outcome::NotAsked => "not-asked",
     }
 }
@@ -398,6 +418,7 @@ pub fn see<'a>(
             Some(q) if q.answered_by.contains(&to) => Outcome::Answered,
             Some(q) if q.missed_by.contains(&to) => Outcome::Missed,
             Some(q) if q.known.contains(&to) => Outcome::Known,
+            Some(q) if q.unlisted > 0 => Outcome::Unlisted,
             Some(_) => Outcome::Unclear,
         };
         out.push((*o, asked, outcome));
@@ -480,6 +501,7 @@ fn query_json(q: &MdnsQuery) -> Value {
         "answered_by": macs(&q.answered_by),
         "missed_by": macs(&q.missed_by),
         "known": macs(&q.known),
+        "unlisted": q.unlisted,
         "unanswered": q.unanswered,
     })
 }
@@ -730,6 +752,7 @@ mod tests {
             service: AIRPLAY.into(),
             target: format!("{label}.local"),
             port: 7000,
+            first_ms: 0,
             txt: vec![
                 ("gid".into(), gid.into()),
                 ("igl".into(), if leader { "1" } else { "0" }.into()),
@@ -758,6 +781,7 @@ mod tests {
             answered_by: vec![LEFT],
             missed_by: vec![RIGHT],
             known: vec![],
+            unlisted: 0,
             unanswered: 0,
         }
     }
@@ -960,6 +984,44 @@ mod tests {
     }
 
     #[test]
+    fn a_rotating_or_new_name_comes_and_goes_quietly() {
+        let mut s = Services::default();
+        let mut nearby = offer(LEFT, "n-1234", "", false);
+        (nearby.instance, nearby.service) = (
+            "n-1234._nearbypresence._tcp.local".into(),
+            "_nearbypresence._tcp.local".into(),
+        );
+        // First heard just before the read: not yet settled.
+        let mut fresh = offer(RIGHT, "Fresh", "", false);
+        fresh.first_ms = BOOT - 60_000;
+        let settled = offer(PHONE, "Settled", "", false);
+        let devices = vec![
+            device(LEFT, true, BOOT),
+            device(RIGHT, true, BOOT),
+            device(PHONE, true, BOOT),
+        ];
+        s.apply(
+            "ap1",
+            full(
+                devices,
+                vec![nearby.clone(), fresh.clone(), settled.clone()],
+                vec![],
+            ),
+            T0,
+        );
+        let mut gone = Read {
+            now_ms: BOOT + 1000,
+            ..Read::default()
+        };
+        for mut o in [nearby, fresh, settled] {
+            o.withdrawn = Some(Withdrawn::Goodbye);
+            gone.offers.push(o);
+        }
+        let ev = s.apply("ap1", gone, T0 + 1000);
+        assert_eq!(ev.iter().map(|e| e.mac).collect::<Vec<_>>(), [PHONE]);
+    }
+
+    #[test]
     fn an_aps_session_ending_takes_its_table_without_events() {
         let mut s = Services::default();
         s.apply("ap1", pair_table(), T0);
@@ -995,6 +1057,14 @@ mod tests {
                 (RAOP.into(), Outcome::Known)
             ]
         );
+        // One the lists did not hold.
+        let mut s2 = Services::default();
+        let mut many = pair_table();
+        (many.queries[0].missed_by, many.queries[0].unlisted) = (vec![], 3);
+        s2.apply("ap1", many, T0);
+        let site2 = s2.site();
+        let right2: Vec<Outcome> = see(&site2, PHONE, RIGHT).iter().map(|v| v.2).collect();
+        assert_eq!(right2, [Outcome::Unlisted]);
         let none: Vec<Outcome> = see(&site, LEFT, RIGHT).iter().map(|v| v.2).collect();
         assert!(none.iter().all(|o| *o == Outcome::NotAsked));
     }

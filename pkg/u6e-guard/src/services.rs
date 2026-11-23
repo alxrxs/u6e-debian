@@ -320,6 +320,7 @@ impl Table {
                 target: String::new(),
                 port: 0,
                 txt: Vec::new(),
+                first_ms: now,
                 ttl_s: 0,
                 announced_ms: now,
                 withdrawn: None,
@@ -452,6 +453,7 @@ impl Table {
                     answered_by: Vec::new(),
                     missed_by: Vec::new(),
                     known: Vec::new(),
+                    unlisted: 0,
                     unanswered: 0,
                 },
                 changed: g,
@@ -527,6 +529,12 @@ impl Table {
     /// that did not answer is withdrawn.
     fn settle(&mut self, w: &Window, now: u64) {
         let (mut answered, mut missed, mut known) = (Vec::new(), Vec::new(), Vec::new());
+        let mut unlisted = 0u16;
+        let mut list = |l: &mut Vec<[u8; 6]>, mac: [u8; 6]| {
+            if !push_unique(l, mac, MDNS_LISTED) {
+                unlisted = unlisted.saturating_add(1);
+            }
+        };
         let g = self.bump();
         let asker = w.askers.first().map(|(mac, _, _)| *mac);
         let asked = self
@@ -537,9 +545,9 @@ impl Table {
             if w.answered.contains(instance) {
                 o.wire.answered = o.wire.answered.saturating_add(1);
                 (o.wire.missed_in_row, o.wire.answered_ms) = (0, Some(now));
-                push_unique(&mut answered, *mac, MDNS_LISTED);
+                list(&mut answered, *mac);
             } else if w.known.contains(instance) {
-                push_unique(&mut known, *mac, MDNS_LISTED);
+                list(&mut known, *mac);
                 continue;
             } else if w.unicast || w.overflowed {
                 continue;
@@ -549,7 +557,7 @@ impl Table {
                 o.wire.missed = o.wire.missed.saturating_add(1);
                 o.wire.missed_in_row = o.wire.missed_in_row.saturating_add(1);
                 (o.wire.missed_ms, o.wire.missed_by) = (Some(now), asker);
-                push_unique(&mut missed, *mac, MDNS_LISTED);
+                list(&mut missed, *mac);
             }
             o.changed = g;
         }
@@ -564,6 +572,7 @@ impl Table {
             q.wire.answered_by.clone_from(&answered);
             q.wire.missed_by.clone_from(&missed);
             q.wire.known.clone_from(&known);
+            q.wire.unlisted = unlisted;
             if silent && !lists && !w.unicast {
                 q.wire.unanswered = q.wire.unanswered.saturating_add(1);
             }
@@ -901,6 +910,94 @@ pub mod tests {
         s.take(&wifi(), LEFT, &srv_only("Left.local", 7000, 0), false, 2000);
         let (_, r) = s.read(None, 2000);
         assert_eq!(offer(&r, LEFT).withdrawn, Some(Withdrawn::Goodbye));
+    }
+
+    #[test]
+    fn a_query_lists_sixteen_of_each_and_counts_the_rest() {
+        let mut s = Table::default();
+        for i in 0..20u8 {
+            let msg = airplay_response(&format!("S{i}"), &format!("s{i}"), &[]);
+            s.take(&wifi(), [2, 1, 0, 0, 0, i], &msg, false, 0);
+        }
+        s.take(&wifi(), PHONE, &browse(AIRPLAY, false, &[]), false, 1000);
+        let (_, r) = s.read(None, 2100);
+        let q = query(&r, PHONE);
+        assert_eq!((q.missed_by.len(), q.unlisted), (MDNS_LISTED, 4));
+    }
+
+    #[test]
+    fn the_whole_table_at_its_caps_fits_well_within_a_frame() {
+        use std::net::{IpAddr, Ipv6Addr};
+        use u6e_proto::frame::{MAX_FRAME, write_frame};
+        // Every name at its longest, every list full: what the caps allow.
+        let name = || "x".repeat(mdns::TEXT_MAX);
+        let macs = vec![[0xff; 6]; MDNS_LISTED];
+        let device = MdnsDevice {
+            mac: [0xff; 6],
+            port: "x".repeat(15),
+            vlan: u16::MAX,
+            wifi: true,
+            host: name(),
+            addrs: vec![IpAddr::V6(Ipv6Addr::from([0xff; 16])); MDNS_ADDRS],
+            first_ms: u64::MAX,
+            last_ms: u64::MAX,
+            queries: u32::MAX,
+            responses: u32::MAX,
+        };
+        let offer = MdnsOffer {
+            mac: [0xff; 6],
+            instance: name(),
+            service: name(),
+            target: name(),
+            port: u16::MAX,
+            txt: mdns::TXT_KEYS
+                .iter()
+                .map(|k| ((*k).to_owned(), "x".repeat(mdns::TXT_VALUE_MAX)))
+                .collect(),
+            first_ms: u64::MAX,
+            ttl_s: u32::MAX,
+            announced_ms: u64::MAX,
+            withdrawn: Some(Withdrawn::Unanswered),
+            answered: u32::MAX,
+            missed: u32::MAX,
+            missed_in_row: u16::MAX,
+            answered_ms: Some(u64::MAX),
+            missed_ms: Some(u64::MAX),
+            missed_by: Some([0xff; 6]),
+        };
+        let query = MdnsQuery {
+            mac: [0xff; 6],
+            name: name(),
+            qtype: u16::MAX,
+            unicast: true,
+            count: u32::MAX,
+            last_ms: u64::MAX,
+            answered_by: macs.clone(),
+            missed_by: macs.clone(),
+            known: macs,
+            unlisted: u16::MAX,
+            unanswered: u32::MAX,
+        };
+        let worst = Services {
+            full: true,
+            now_ms: u64::MAX,
+            devices: vec![device; MDNS_DEVICES],
+            offers: vec![offer; MDNS_OFFERS],
+            queries: vec![query; MDNS_QUERIES],
+            gone: vec![MdnsKey::Query([0xff; 6], name(), u16::MAX); GONE],
+            packets: u64::MAX,
+            malformed: u64::MAX,
+            evicted: u64::MAX,
+            limited: u64::MAX,
+        };
+        let mut frame = Vec::new();
+        write_frame(&mut frame, &worst).unwrap();
+        eprintln!("the largest reply: {} bytes", frame.len());
+        assert!(
+            frame.len() < MAX_FRAME as usize / 2,
+            "{} bytes",
+            frame.len()
+        );
     }
 
     #[test]

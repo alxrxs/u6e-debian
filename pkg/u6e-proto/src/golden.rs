@@ -581,6 +581,7 @@ fn services() -> Services {
                 target: "Device-1.local".into(),
                 port: 60_003,
                 txt: vec![("model".into(), "Model1,1".into())],
+                first_ms: (1 << 33) + 6,
                 ttl_s: 70_018,
                 announced_ms: (1 << 33) + 2,
                 withdrawn: Some(w),
@@ -602,6 +603,7 @@ fn services() -> Services {
             answered_by: vec![mac],
             missed_by: vec![mac, other],
             known: vec![],
+            unlisted: 300,
             unanswered: 70_022,
         }],
         gone: vec![

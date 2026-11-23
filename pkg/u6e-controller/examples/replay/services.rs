@@ -122,6 +122,7 @@ pub fn table(
             .iter()
             .map(|(k, v)| ((*k).into(), (*v).into()))
             .collect(),
+        first_ms: 0,
         ttl_s: 4500,
         announced_ms: ms(last_browse + 0.1),
         withdrawn: None,
@@ -210,6 +211,7 @@ pub fn table(
             answered_by: vec![BRIDGE],
             missed_by: Vec::new(),
             known: Vec::new(),
+            unlisted: 0,
             unanswered: 0,
         });
     }
@@ -262,6 +264,7 @@ pub fn table(
             answered_by: answered,
             missed_by: missed,
             known: Vec::new(),
+            unlisted: 0,
             unanswered: 0,
         };
         let (left, right_one, tv) = (on_air(LEFT), on_air(RIGHT), on_air(TV));
