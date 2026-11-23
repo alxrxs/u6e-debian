@@ -45,6 +45,21 @@ pub struct Guards {
     config: Option<GuardConfig>,
     seed: Option<Vec<Binding>>,
     failed: String,
+    /// The last failure of a read of the mDNS table, logged apart: the
+    /// other reads working must not make it log again every tick.
+    services_failed: String,
+}
+
+/// Logs `failure` once, until another or a success clears `slot`.
+fn log_once(slot: &mut String, failure: Option<String>) {
+    match failure {
+        Some(e) if e != *slot => {
+            eprintln!("u6e-agent: client guards: {e}");
+            *slot = e;
+        }
+        Some(_) => {}
+        None => slot.clear(),
+    }
 }
 
 /// The guards' start and the last violation read, as `cursor` keeps them.
@@ -68,6 +83,7 @@ impl Guards {
             config: None,
             seed: None,
             failed: String::new(),
+            services_failed: String::new(),
         }
     }
 
@@ -93,14 +109,7 @@ impl Guards {
 
     /// Logs a failure once, until another or a success.
     fn note(&mut self, failure: Option<String>) {
-        match failure {
-            Some(e) if e != self.failed => {
-                eprintln!("u6e-agent: client guards: {e}");
-                self.failed = e;
-            }
-            Some(_) => {}
-            None => self.failed.clear(),
-        }
+        log_once(&mut self.failed, failure);
     }
 
     /// Hands the guards `req`, which they answer with `Done`.
@@ -187,17 +196,22 @@ impl Guards {
             self.keep();
         }
         let since = self.services;
-        if let Ok(Reply::Services {
-            started_ms,
-            generation,
-            services,
-        }) = self.ask(&Request::Services { since })
-        {
-            if services.full || !unchanged(&services) {
-                write_frame(out, &AgentMsg::Services(services))?;
+        let failure = match self.ask(&Request::Services { since }) {
+            Ok(Reply::Services {
+                started_ms,
+                generation,
+                services,
+            }) => {
+                if services.full || !unchanged(&services) {
+                    write_frame(out, &AgentMsg::Services(services))?;
+                }
+                self.services = Some((started_ms, generation));
+                None
             }
-            self.services = Some((started_ms, generation));
-        }
+            Ok(other) => Some(format!("mDNS table: unexpected answer {other:?}")),
+            Err(e) => Some(format!("mDNS table: {e}")),
+        };
+        log_once(&mut self.services_failed, failure);
         Ok(())
     }
 }
@@ -228,9 +242,10 @@ pub mod tests {
         pub dropped: Vec<(Guard, u64)>,
         pub violations: Vec<(u64, Event)>,
         /// The mDNS table's generation and what it answers with: whole to
-        /// a read without a place, else as it is.
+        /// a read without a place, else as it is; refused when `refuse`.
         pub services_generation: u64,
         pub services: Services,
+        pub refuse: bool,
     }
 
     /// Stand-in guards on `dir/guard.sock`: they record what they are asked
@@ -254,6 +269,7 @@ pub mod tests {
                 violations: Vec::new(),
                 services_generation: 0,
                 services: Services::default(),
+                refuse: false,
             }));
             let (a, s) = (Arc::clone(&asked), Arc::clone(&state));
             thread::spawn(move || {
@@ -276,6 +292,7 @@ pub mod tests {
                                 .filter(|(n, _)| n > after)
                                 .collect(),
                         },
+                        Request::Services { .. } if st.refuse => Reply::Refused("busy".into()),
                         Request::Services { since } => Reply::Services {
                             started_ms: st.started_ms,
                             generation: st.services_generation,
@@ -494,6 +511,27 @@ pub mod tests {
                 Some((1, 7))
             ]
         );
+    }
+
+    #[test]
+    fn a_failed_read_of_the_mdns_table_is_logged_once() {
+        let dir = TestDir::new();
+        let fake = Fake::start(&dir);
+        fake.state.lock().unwrap().refuse = true;
+        let mut g = guards(&fake, &dir);
+        let mut out = Vec::new();
+        g.read_into(&mut out).unwrap();
+        assert!(
+            g.services_failed.contains("mDNS table"),
+            "{:?}",
+            g.services_failed
+        );
+        // The other reads working leave it as it was, so it logs no more.
+        g.read_into(&mut out).unwrap();
+        assert!(!g.services_failed.is_empty() && g.failed.is_empty());
+        fake.state.lock().unwrap().refuse = false;
+        g.read_into(&mut out).unwrap();
+        assert!(g.services_failed.is_empty());
     }
 
     #[test]
