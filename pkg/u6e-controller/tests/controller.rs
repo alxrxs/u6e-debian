@@ -5091,8 +5091,13 @@ fn a_clients_destinations_are_named_once_a_page_shows_them() {
         (Some(false), Some(0))
     );
     assert!(!r.dns.asked.lock().unwrap().contains(&far));
-    let first = traffic();
-    assert_eq!(first["top"][0]["ip"], "198.51.100.1");
+    // The first summary's lookup can come before the second summary, the
+    // one that counts the far end, is taken.
+    let mut first = Value::Null;
+    wait_for("the far end counted", || {
+        first = traffic();
+        first["top"][0]["ip"] == "198.51.100.1"
+    });
     assert!(first["top"][0].get("name").is_none());
     wait_for("the far end named", || {
         traffic()["top"][0]["name"] == "one.example.org"
