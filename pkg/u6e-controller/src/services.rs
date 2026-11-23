@@ -628,27 +628,33 @@ fn aps_json(services: &Services, now_ms: u64) -> Value {
 }
 
 /// The AirPlay groups: offers of `_airplay._tcp` from two devices or more
-/// sharing a `gid`, named by their `gpn`, the leader `igl=1`.
+/// sharing a group, named by their `gpn`, the leader `igl=1`. A group is its
+/// `gid` (the AirPlay group, which a stereo pair's members share), else its
+/// `tsid` (the timing group, which they share too); both are read, as which
+/// one a HomePod pair sets is to be seen on the real pair.
 fn groups(site: &Site, device: Option<[u8; 6]>) -> Value {
-    let mut by_gid: BTreeMap<&str, Vec<&MdnsOffer>> = BTreeMap::new();
-    for (_, o) in &site.offers {
-        let gid = o
+    fn txt<'a>(o: &'a MdnsOffer, key: &str) -> Option<&'a str> {
+        let v = o
             .txt
             .iter()
-            .find(|(k, _)| k == "gid")
+            .find(|(k, _)| k == key)
             .map(|(_, v)| v.as_str());
-        if let Some(gid) = gid.filter(|g| !g.is_empty())
+        v.filter(|v| !v.is_empty())
+    }
+    let mut by_group: BTreeMap<(&str, &str), Vec<&MdnsOffer>> = BTreeMap::new();
+    for (_, o) in &site.offers {
+        let group =
+            (txt(o, "gid").map(|g| ("gid", g))).or_else(|| txt(o, "tsid").map(|t| ("tsid", t)));
+        if let Some(group) = group
             && o.service.eq_ignore_ascii_case(AIRPLAY)
         {
-            by_gid.entry(gid).or_default().push(o);
+            by_group.entry(group).or_default().push(o);
         }
     }
-    let txt =
-        |o: &MdnsOffer, key: &str| o.txt.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
-    let list: Vec<Value> = (by_gid.into_iter())
+    let list: Vec<Value> = (by_group.into_iter())
         .filter(|(_, members)| members.iter().map(|o| o.mac).collect::<BTreeSet<_>>().len() > 1)
         .filter(|(_, members)| device.is_none_or(|d| members.iter().any(|o| o.mac == d)))
-        .map(|(gid, members)| {
+        .map(|((by, id), members)| {
             let name = members.iter().find_map(|o| txt(o, "gpn"));
             let members: Vec<Value> = (members.iter())
                 .map(|o| {
@@ -656,11 +662,11 @@ fn groups(site: &Site, device: Option<[u8; 6]>) -> Value {
                         "mac": mac::format(o.mac),
                         "instance": o.instance,
                         "label": instance_label(&o.instance),
-                        "leader": txt(o, "igl").as_deref() == Some("1"),
+                        "leader": txt(o, "igl") == Some("1"),
                     })
                 })
                 .collect();
-            json!({ "gid": gid, "name": name, "members": members })
+            json!({ by: id, "name": name, "members": members })
         })
         .collect();
     Value::Array(list)
@@ -1128,6 +1134,19 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_pair_without_a_gid_is_grouped_by_its_tsid() {
+        let mut s = Services::default();
+        let mut table = pair_table();
+        for o in &mut table.offers {
+            o.txt = vec![("tsid".into(), "T1".into()), ("igl".into(), "0".into())];
+        }
+        s.apply("ap1", table, T0);
+        let v = view(&s, None, None, &Names, T0);
+        assert_eq!(v["groups"][0]["tsid"], "T1");
+        assert_eq!(v["groups"][0]["members"].as_array().unwrap().len(), 2);
     }
 
     #[test]
