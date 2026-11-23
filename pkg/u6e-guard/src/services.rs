@@ -107,6 +107,9 @@ struct Window {
     /// known.
     answered: Vec<u64>,
     known: Vec<u64>,
+    /// A name did not fit in those lists: whoever it was may have answered,
+    /// so no miss is counted.
+    overflowed: bool,
 }
 
 type OfferKey = ([u8; 6], u64);
@@ -133,10 +136,16 @@ pub struct Table {
     spent_at: u64,
 }
 
-fn push_unique<T: PartialEq>(list: &mut Vec<T>, v: T, cap: usize) {
-    if list.len() < cap && !list.contains(&v) {
-        list.push(v);
+/// Adds `v` to `list` unless it holds it; false when it is full.
+fn push_unique<T: PartialEq>(list: &mut Vec<T>, v: T, cap: usize) -> bool {
+    if list.contains(&v) {
+        return true;
     }
+    if list.len() < cap {
+        list.push(v);
+        return true;
+    }
+    false
 }
 
 impl Table {
@@ -373,14 +382,16 @@ impl Table {
             // What answers each window: its own name, and an instance of
             // its service type.
             for w in &mut self.windows {
+                let mut kept = true;
                 if r.name.key == w.name {
-                    push_unique(&mut w.answered, w.name, WINDOW_KEYS);
+                    kept &= push_unique(&mut w.answered, w.name, WINDOW_KEYS);
                     if let Data::Ptr(instance) = &r.data {
-                        push_unique(&mut w.answered, instance.key, WINDOW_KEYS);
+                        kept &= push_unique(&mut w.answered, instance.key, WINDOW_KEYS);
                     }
                 } else if r.name.service_key() == Some(w.name) {
-                    push_unique(&mut w.answered, r.name.key, WINDOW_KEYS);
+                    kept &= push_unique(&mut w.answered, r.name.key, WINDOW_KEYS);
                 }
+                w.overflowed |= !kept;
             }
         }
     }
@@ -478,6 +489,7 @@ impl Table {
                     askers: Vec::new(),
                     answered: Vec::new(),
                     known: Vec::new(),
+                    overflowed: false,
                 });
                 self.windows.len() - 1
             }
@@ -489,14 +501,15 @@ impl Table {
         let w = &mut self.windows[at];
         w.unicast &= unicast;
         for k in known {
-            push_unique(&mut w.known, *k, WINDOW_KEYS);
+            w.overflowed |= !push_unique(&mut w.known, *k, WINDOW_KEYS);
         }
         let asked = w
             .askers
             .iter()
             .any(|(mac, t, _)| *mac == src && *t == qtype);
         if !asked {
-            push_unique(&mut w.askers, (src, qtype, !known.is_empty()), ASKERS);
+            // A fifth asker goes untold; the window counts the same.
+            let _ = push_unique(&mut w.askers, (src, qtype, !known.is_empty()), ASKERS);
         }
         asked
     }
@@ -528,7 +541,7 @@ impl Table {
             } else if w.known.contains(instance) {
                 push_unique(&mut known, *mac, MDNS_LISTED);
                 continue;
-            } else if w.unicast {
+            } else if w.unicast || w.overflowed {
                 continue;
             } else if !o.live(now) {
                 o.wire.withdrawn = Some(Withdrawn::Unanswered);
@@ -543,7 +556,7 @@ impl Table {
         for list in [&mut answered, &mut missed, &mut known] {
             list.sort_unstable();
         }
-        let silent = !w.answered.contains(&w.name);
+        let silent = !w.answered.contains(&w.name) && !w.overflowed;
         for (mac, qtype, lists) in &w.askers {
             let Some(q) = self.queries.get_mut(&(*mac, w.name, *qtype)) else {
                 continue;
@@ -888,6 +901,30 @@ pub mod tests {
         s.take(&wifi(), LEFT, &srv_only("Left.local", 7000, 0), false, 2000);
         let (_, r) = s.read(None, 2000);
         assert_eq!(offer(&r, LEFT).withdrawn, Some(Withdrawn::Goodbye));
+    }
+
+    #[test]
+    fn a_window_too_full_to_tell_counts_no_miss() {
+        let mut s = Table::default();
+        // 40 instances of one type, of two devices; the browse's answers
+        // name them all, more than a window holds.
+        let mut answers = Builder::new(true);
+        for (mac, base) in [(LEFT, 0), (RIGHT, 20)] {
+            let mut b = Builder::new(true);
+            for i in base..base + 20 {
+                let instance = format!("S{i}.{AIRPLAY}");
+                b.record(1, AIRPLAY, PTR, 4500, Rd::Ptr(&instance));
+                answers.record(1, AIRPLAY, PTR, 4500, Rd::Ptr(&instance));
+            }
+            s.take(&wifi(), mac, &b.bytes(), false, 0);
+        }
+        s.take(&wifi(), PHONE, &browse(AIRPLAY, false, &[]), false, 1000);
+        // A third device answers for them all, as a sleep proxy would.
+        s.take(&wifi(), [2, 0, 0, 0, 0, 9], &answers.bytes(), false, 1100);
+        let (_, r) = s.read(None, 2100);
+        let owned = |m| r.offers.iter().filter(|o| o.mac == m).count();
+        assert_eq!((owned(LEFT), owned(RIGHT)), (20, 20));
+        assert!(r.offers.iter().all(|o| o.missed == 0), "{:?}", r.offers);
     }
 
     #[test]

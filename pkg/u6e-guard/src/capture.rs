@@ -9,7 +9,8 @@
 //! From a Wi-Fi port it takes every VLAN-tagged frame (its tag in the data,
 //! or taken off by the kernel before the tap, which the socket's auxiliary
 //! data then holds), ARP, IPv4 TCP SYNs outside fragments and UDP datagrams
-//! and fragments (DHCP and mDNS whole, the rest their headers), DHCPv6 from
+//! and fragments (DHCP whole, mDNS whole from its first fragment on, the
+//! rest and later fragments their headers), DHCPv6 from
 //! the servers' port, mDNS over IPv6 (whole), router advertisements, ICMPv6
 //! whose type `tc` cannot read (type 0, or cut short) and IPv6 behind
 //! extension headers (whole: an advertisement may hide there); from an
@@ -81,15 +82,20 @@ pub fn program(ports: &[Port]) -> Vec<libc::sock_filter> {
         Op(ALU | AND, 0x12),
         Jump(JMP | JEQ, 0x02, "short"),
         Op(RET, 0),
+        // A later fragment, its headers; mDNS whole from its first fragment
+        // on (its ports are there); any other first fragment, its headers.
         Label("udp"),
         Op(LD | H | ABS, 20),
-        Jump(JMP | JSET, 0x3fff, "short"),
+        Jump(JMP | JSET, 0x1fff, "short"),
         Op(LD | H | IND, 14),
-        Jump(JMP | JEQ, 67, "whole"),
-        Jump(JMP | JEQ, 68, "whole"),
         Jump(JMP | JEQ, MDNS, "whole"),
         Op(LD | H | IND, 16),
         Jump(JMP | JEQ, MDNS, "whole"),
+        Op(LD | H | ABS, 20),
+        Jump(JMP | JSET, 0x2000, "short"),
+        Op(LD | H | IND, 14),
+        Jump(JMP | JEQ, 67, "whole"),
+        Jump(JMP | JEQ, 68, "whole"),
         Op(RET, SHORT),
         Label("wifi6"),
         Op(LD | B | ABS, 20),
@@ -397,6 +403,14 @@ mod tests {
         let mut fragment = ipv4_frame(CLIENT, [192, 0, 2, 10], 17, &udp(5000, 53, &[]));
         fragment[20] = 0x01;
         assert_eq!(run(&prog, &fragment, 10), SHORT);
+        fragment[20] = 0x20;
+        assert_eq!(run(&prog, &fragment, 10), SHORT);
+        // mDNS whole from its first fragment, then only headers.
+        let mut mdns_first = ipv4_frame(CLIENT, [192, 0, 2, 10], 17, &udp(5353, 5353, &mdns));
+        mdns_first[20] = 0x20;
+        assert_eq!(run(&prog, &mdns_first, 10), WHOLE);
+        mdns_first[21] = 0x10;
+        assert_eq!(run(&prog, &mdns_first, 10), SHORT);
         let mut first = ipv4_frame(CLIENT, [192, 0, 2, 10], 6, &tcp(0x02));
         first[20] = 0x20;
         assert_eq!(run(&prog, &first, 10), 0);

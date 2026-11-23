@@ -844,6 +844,15 @@ pub mod tests {
         );
     }
 
+    #[test]
+    fn a_pointer_to_itself_is_refused_at_once() {
+        // Refused by the pointer rule, at its first step: not by running out
+        // of steps, which would also end a walk that loops.
+        let mut steps = STEPS;
+        assert!(name(&with_name(&[0xc0, 12]), 12, &mut steps).is_none());
+        assert_eq!(steps, STEPS - 1);
+    }
+
     fn hostile_names_are_refused() {
         // A pointer to itself, to after itself, back into its own name, a
         // label type that is neither, a label past the end.
@@ -1037,6 +1046,32 @@ pub mod tests {
             }
             bounded(&buf[..len]);
         }
+    }
+
+    #[test]
+    fn every_cut_and_bit_flip_of_the_fixtures_messages_parses_in_time() {
+        let fixture = include_bytes!("../tests/fixtures/mdns.pcap");
+        let mut at = 24;
+        let mut payloads = Vec::new();
+        while at + 16 <= fixture.len() {
+            let len = u32::from_le_bytes(fixture[at + 8..at + 12].try_into().unwrap()) as usize;
+            let frame = &fixture[at + 16..at + 16 + len];
+            payloads.push(payload(frame).unwrap().payload.to_vec());
+            at += 16 + len;
+        }
+        within(std::time::Duration::from_secs(60), move || {
+            for msg in &payloads {
+                for n in 0..=msg.len() {
+                    bounded(&msg[..n]);
+                }
+                let mut flipped = msg.clone();
+                for bit in 0..msg.len() * 8 {
+                    flipped[bit / 8] ^= 1 << (bit % 8);
+                    bounded(&flipped);
+                    flipped[bit / 8] ^= 1 << (bit % 8);
+                }
+            }
+        });
     }
 
     #[test]
