@@ -192,10 +192,10 @@ impl Server<'_> {
                     }
                     let frame = &buf[..r.len];
                     if r.tag.is_none()
-                        && let (Some((_, payload)), Some(src)) =
-                            (mdns::payload(frame), mac_at(frame))
+                        && let (Some(m), Some(src)) = (mdns::payload(frame), mac_at(frame))
                     {
-                        self.services.take(port, src, payload, now.boot_ms);
+                        self.services
+                            .take(port, src, m.payload, m.direct, now.boot_ms);
                     }
                 }
                 Ok(None) => return,

@@ -141,12 +141,22 @@ impl Message {
     }
 }
 
-/// The UDP payload of `frame` (Ethernet) and its sender's address, when it
-/// is UDP to or from the mDNS port: IPv4 (a first fragment as far as it
-/// goes, no later one) or IPv6 with UDP right after its header.
-pub fn payload(frame: &[u8]) -> Option<(IpAddr, &[u8])> {
+/// What a frame holds of mDNS: its sender's address, whether it is direct
+/// (sent to a unicast address, or from another port than 5353: a legacy
+/// query or its answer), and its UDP payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Udp<'a> {
+    pub src: IpAddr,
+    pub direct: bool,
+    pub payload: &'a [u8],
+}
+
+/// What `frame` (Ethernet) holds when it is UDP to or from the mDNS port:
+/// IPv4 (a first fragment as far as it goes, no later one) or IPv6 with UDP
+/// right after its header.
+pub fn payload(frame: &[u8]) -> Option<Udp<'_>> {
     let ip = frame.get(14..)?;
-    let (src, l4) = match u16::from_be_bytes([*frame.get(12)?, *frame.get(13)?]) {
+    let (src, dst, l4) = match u16::from_be_bytes([*frame.get(12)?, *frame.get(13)?]) {
         0x0800 => {
             let ihl = usize::from(*ip.first()? & 0x0f) * 4;
             let offset = u16::from_be_bytes([*ip.get(6)?, *ip.get(7)?]) & 0x1fff;
@@ -154,14 +164,17 @@ pub fn payload(frame: &[u8]) -> Option<(IpAddr, &[u8])> {
                 return None;
             }
             let src: [u8; 4] = ip.get(12..16)?.try_into().ok()?;
-            (IpAddr::from(src), ip.get(ihl..)?)
+            let dst: [u8; 4] = ip.get(16..20)?.try_into().ok()?;
+            let dst = IpAddr::from(dst);
+            (IpAddr::from(src), dst, ip.get(ihl..)?)
         }
         0x86dd => {
             if *ip.get(6)? != 17 {
                 return None;
             }
             let src: [u8; 16] = ip.get(8..24)?.try_into().ok()?;
-            (IpAddr::from(src), ip.get(40..)?)
+            let dst: [u8; 16] = ip.get(24..40)?.try_into().ok()?;
+            (IpAddr::from(src), IpAddr::from(dst), ip.get(40..)?)
         }
         _ => return None,
     };
@@ -177,7 +190,11 @@ pub fn payload(frame: &[u8]) -> Option<(IpAddr, &[u8])> {
     } else {
         l4.len()
     };
-    Some((src, l4.get(8..end)?))
+    Some(Udp {
+        src,
+        direct: sport != PORT || !dst.is_multicast(),
+        payload: l4.get(8..end)?,
+    })
 }
 
 fn u16_at(b: &[u8], at: usize) -> Option<u16> {
@@ -747,13 +764,23 @@ pub mod tests {
     fn the_payload_is_taken_from_either_ip() {
         use crate::frame::tests::{CLIENT, ipv4_frame, ipv6_frame, udp};
         let msg = airplay_response("A", "a", &[]);
-        let v4 = ipv4_frame(CLIENT, [192, 0, 2, 10], 17, &udp(PORT, PORT, &msg));
-        assert_eq!(payload(&v4), Some(([192, 0, 2, 10].into(), &msg[..])));
+        // The test frames go to 198.51.100.1 and the documentation's
+        // multicast group alike: to the mDNS group, and from its port, they
+        // are not direct.
+        let mut v4 = ipv4_frame(CLIENT, [192, 0, 2, 10], 17, &udp(PORT, PORT, &msg));
+        let unicast = payload(&v4).unwrap();
+        assert_eq!(unicast.src, IpAddr::from([192, 0, 2, 10]));
+        assert!(unicast.direct && unicast.payload == &msg[..]);
+        v4[14 + 16..14 + 20].copy_from_slice(&[224, 0, 0, 251]);
+        assert!(!payload(&v4).unwrap().direct);
         let v6 = ipv6_frame(CLIENT, 17, &udp(PORT, PORT, &msg));
-        assert_eq!(payload(&v6).map(|(_, p)| p), Some(&msg[..]));
-        // A legacy query's answer comes from 5353 to the asker's port.
-        let legacy = ipv4_frame(CLIENT, [192, 0, 2, 10], 17, &udp(PORT, 40_000, &msg));
-        assert!(payload(&legacy).is_some());
+        assert_eq!(payload(&v6).map(|m| m.payload), Some(&msg[..]));
+        // A legacy query goes from another port to 5353, its answer back.
+        let mut legacy = ipv4_frame(CLIENT, [192, 0, 2, 10], 17, &udp(40_000, PORT, &msg));
+        legacy[14 + 16..14 + 20].copy_from_slice(&[224, 0, 0, 251]);
+        assert!(payload(&legacy).unwrap().direct);
+        let answer = ipv4_frame(CLIENT, [192, 0, 2, 10], 17, &udp(PORT, 40_000, &msg));
+        assert!(payload(&answer).unwrap().direct);
         for (sport, dport) in [(53, 40_000), (5354, 5355)] {
             let other = ipv4_frame(CLIENT, [192, 0, 2, 10], 17, &udp(sport, dport, &msg));
             assert_eq!(payload(&other), None);
@@ -765,7 +792,7 @@ pub mod tests {
         let mut first = v4.clone();
         first[14 + 6] = 0x20;
         first.truncate(14 + 20 + 8 + 30);
-        assert_eq!(payload(&first).map(|(_, p)| p.len()), Some(30));
+        assert_eq!(payload(&first).map(|m| m.payload.len()), Some(30));
         // TCP, and IPv6 behind an extension header, are not looked into.
         assert_eq!(
             payload(&ipv4_frame(

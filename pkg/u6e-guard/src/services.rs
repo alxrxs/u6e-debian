@@ -13,7 +13,9 @@
 //! answered, was listed as known by an asker (so its owner rightly kept
 //! quiet, RFC 6762 7.1), or missed. A window whose every question asked for
 //! a unicast answer (QU) counts no miss: that answer may never reach the
-//! host (between two clients of one BSS it never does).
+//! host (between two clients of one BSS it never does). Nor does one that
+//! a query sent unicast or from another port than 5353 (a legacy query)
+//! joined: its answers go back the same way.
 //!
 //! Messages are taken at most [`RATE`] a second, in bursts of [`BURST`]; the
 //! rest are counted and dropped, so a client flooding mDNS costs the guards'
@@ -149,8 +151,9 @@ impl Table {
     }
 
     /// Takes one mDNS message `payload`, sent by `src` and read on `port`,
-    /// at `now` (the boot clock, in milliseconds).
-    pub fn take(&mut self, port: &Port, src: [u8; 6], payload: &[u8], now: u64) {
+    /// `direct` when it was sent unicast or from another port than 5353, at
+    /// `now` (the boot clock, in milliseconds).
+    pub fn take(&mut self, port: &Port, src: [u8; 6], payload: &[u8], direct: bool, now: u64) {
         self.close(now);
         self.packets += 1;
         let back = now.saturating_sub(self.spent_at) * RATE;
@@ -171,7 +174,7 @@ impl Table {
         if m.response {
             self.response(src, &m, payload, now);
         } else if !m.is_probe() {
-            self.query(src, &m, payload, now);
+            self.query(src, &m, payload, direct, now);
         }
     }
 
@@ -389,7 +392,7 @@ impl Table {
         d.changed = g;
     }
 
-    fn query(&mut self, src: [u8; 6], m: &Message, msg: &[u8], now: u64) {
+    fn query(&mut self, src: [u8; 6], m: &Message, msg: &[u8], direct: bool, now: u64) {
         let answers: Vec<&mdns::Record> = (m.records.iter())
             .filter(|r| r.section == Section::Answer)
             .collect();
@@ -403,7 +406,10 @@ impl Table {
                     _ => r.name.key,
                 })
                 .collect();
-            let asked = self.window(src, q, &known, now);
+            // An answer to a direct query goes back to it alone, which
+            // the host may never see, as a QU question's may not.
+            let unicast = q.unicast || direct;
+            let asked = self.window(src, q.name.key, q.qtype, unicast, &known, now);
             let key = (src, q.name.key, q.qtype);
             if !self.queries.contains_key(&key) {
                 self.room_for_query(src);
@@ -414,7 +420,7 @@ impl Table {
                     mac: src,
                     name: q.name.text(msg),
                     qtype: q.qtype,
-                    unicast: q.unicast,
+                    unicast,
                     count: 0,
                     last_ms: now,
                     answered_by: Vec::new(),
@@ -429,20 +435,29 @@ impl Table {
             if !asked {
                 entry.wire.count = entry.wire.count.saturating_add(1);
             }
-            (entry.wire.unicast, entry.wire.last_ms) = (q.unicast, now);
+            (entry.wire.unicast, entry.wire.last_ms) = (unicast, now);
             entry.changed = g;
         }
     }
 
-    /// Opens the window of `q`'s name, or joins it, as `src` asking with
-    /// `known` answers; whether `src` had asked it so in this window. With
-    /// every window taken the query goes unwatched, counted as evicted.
-    fn window(&mut self, src: [u8; 6], q: &mdns::Question, known: &[u64], now: u64) -> bool {
-        let at = match self.windows.iter().position(|w| w.name == q.name.key) {
+    /// Opens the window of `name`, or joins it, as `src` asking for
+    /// `qtype` (an answer it may not see when `unicast`) with `known`
+    /// answers; whether `src` had asked it so in this window. With every
+    /// window taken the query goes unwatched, counted as evicted.
+    fn window(
+        &mut self,
+        src: [u8; 6],
+        name: u64,
+        qtype: u16,
+        unicast: bool,
+        known: &[u64],
+        now: u64,
+    ) -> bool {
+        let at = match self.windows.iter().position(|w| w.name == name) {
             Some(at) => at,
             None if self.windows.len() < WINDOWS => {
                 self.windows.push(Window {
-                    name: q.name.key,
+                    name,
                     deadline: now + WINDOW_MS,
                     unicast: true,
                     askers: Vec::new(),
@@ -457,16 +472,16 @@ impl Table {
             }
         };
         let w = &mut self.windows[at];
-        w.unicast &= q.unicast;
+        w.unicast &= unicast;
         for k in known {
             push_unique(&mut w.known, *k, WINDOW_KEYS);
         }
         let asked = w
             .askers
             .iter()
-            .any(|(mac, t, _)| *mac == src && *t == q.qtype);
+            .any(|(mac, t, _)| *mac == src && *t == qtype);
         if !asked {
-            push_unique(&mut w.askers, (src, q.qtype, !known.is_empty()), ASKERS);
+            push_unique(&mut w.askers, (src, qtype, !known.is_empty()), ASKERS);
         }
         asked
     }
@@ -655,12 +670,14 @@ pub mod tests {
             &wifi(),
             LEFT,
             &airplay_response("Left", "Left", &["gid=G", "igl=1"]),
+            false,
             0,
         );
         s.take(
             &wifi(),
             RIGHT,
             &airplay_response("Right", "Right", &["gid=G", "igl=0"]),
+            false,
             0,
         );
         s
@@ -699,7 +716,7 @@ pub mod tests {
         // A goodbye withdraws it.
         let mut bye = Builder::new(true);
         bye.record(1, AIRPLAY, PTR, 0, Rd::Ptr("Left._airplay._tcp.local"));
-        s.take(&wifi(), LEFT, &bye.bytes(), 20);
+        s.take(&wifi(), LEFT, &bye.bytes(), false, 20);
         let (_, r) = s.read(None, 30);
         assert!(offer(&r, LEFT).goodbye);
     }
@@ -708,8 +725,14 @@ pub mod tests {
     fn a_window_tells_who_answered_who_kept_quiet_and_who_missed() {
         let mut s = pair();
         // The phone browses, listing neither; only the left answers.
-        s.take(&wifi(), PHONE, &browse(AIRPLAY, false, &[]), 100);
-        s.take(&wifi(), LEFT, &airplay_response("Left", "Left", &[]), 180);
+        s.take(&wifi(), PHONE, &browse(AIRPLAY, false, &[]), false, 100);
+        s.take(
+            &wifi(),
+            LEFT,
+            &airplay_response("Left", "Left", &[]),
+            false,
+            180,
+        );
         let (_, r) = s.read(None, 1200);
         let q = query(&r, PHONE);
         assert_eq!(
@@ -729,15 +752,16 @@ pub mod tests {
         // Two more misses in a row; then the right answers, which resets
         // the row.
         for t in [2000, 4000] {
-            s.take(&wifi(), PHONE, &browse(AIRPLAY, false, &[]), t);
+            s.take(&wifi(), PHONE, &browse(AIRPLAY, false, &[]), false, t);
         }
         let (_, r) = s.read(None, 5100);
         assert_eq!(offer(&r, RIGHT).missed_in_row, 3);
-        s.take(&wifi(), PHONE, &browse(AIRPLAY, false, &[]), 6000);
+        s.take(&wifi(), PHONE, &browse(AIRPLAY, false, &[]), false, 6000);
         s.take(
             &wifi(),
             RIGHT,
             &airplay_response("Right", "Right", &[]),
+            false,
             6100,
         );
         let (_, r) = s.read(None, 7100);
@@ -755,6 +779,7 @@ pub mod tests {
             &wifi(),
             PHONE,
             &browse(AIRPLAY, false, &["Left", "Right"]),
+            false,
             100,
         );
         let (_, r) = s.read(None, 1200);
@@ -762,7 +787,7 @@ pub mod tests {
         assert_eq!(q.known, [LEFT, RIGHT]);
         assert!(q.missed_by.is_empty() && q.unanswered == 0);
         // Unicast: nothing heard is no miss, and nothing unanswered.
-        s.take(&wifi(), PHONE, &browse(AIRPLAY, true, &[]), 2000);
+        s.take(&wifi(), PHONE, &browse(AIRPLAY, true, &[]), false, 2000);
         let (_, r) = s.read(None, 3100);
         assert_eq!(offer(&r, RIGHT).missed, 0);
         assert_eq!(query(&r, PHONE).unanswered, 0);
@@ -771,6 +796,7 @@ pub mod tests {
             &wifi(),
             PHONE,
             &browse("_raop._tcp.local", false, &[]),
+            false,
             4000,
         );
         let (_, r) = s.read(None, 5100);
@@ -783,11 +809,26 @@ pub mod tests {
     }
 
     #[test]
+    fn a_direct_query_is_no_miss() {
+        let mut s = pair();
+        // Sent unicast, or from another port: answers go back to it alone.
+        s.take(&wifi(), PHONE, &browse(AIRPLAY, false, &[]), true, 100);
+        let (_, r) = s.read(None, 1200);
+        assert_eq!(offer(&r, RIGHT).missed, 0);
+        assert!(query(&r, PHONE).unicast && query(&r, PHONE).unanswered == 0);
+        // A multicast query joining it later does not make it count.
+        s.take(&wifi(), PHONE, &browse(AIRPLAY, false, &[]), true, 2000);
+        s.take(&wifi(), LEFT, &browse(AIRPLAY, false, &[]), false, 2100);
+        let (_, r) = s.read(None, 3200);
+        assert_eq!(offer(&r, RIGHT).missed, 1);
+    }
+
+    #[test]
     fn copies_and_probes_are_not_new_queries() {
         let mut s = pair();
         let q = browse(AIRPLAY, false, &[]);
-        s.take(&wifi(), PHONE, &q, 100);
-        s.take(&wifi(), PHONE, &q, 101);
+        s.take(&wifi(), PHONE, &q, false, 100);
+        s.take(&wifi(), PHONE, &q, false, 101);
         let mut probe = Builder::new(false);
         probe
             .question("Left._airplay._tcp.local", 255, true)
@@ -798,7 +839,7 @@ pub mod tests {
                 120,
                 Rd::Srv(7000, "Left.local"),
             );
-        s.take(&wifi(), LEFT, &probe.bytes(), 102);
+        s.take(&wifi(), LEFT, &probe.bytes(), false, 102);
         let (_, r) = s.read(None, 1200);
         assert_eq!(query(&r, PHONE).count, 1);
         assert!(r.queries.iter().all(|q| q.mac != LEFT));
@@ -813,15 +854,15 @@ pub mod tests {
         let mut s = Table::default();
         let mut short = Builder::new(true);
         short.record(1, AIRPLAY, PTR, 2, Rd::Ptr("Left._airplay._tcp.local"));
-        s.take(&wifi(), LEFT, &short.bytes(), 0);
+        s.take(&wifi(), LEFT, &short.bytes(), false, 0);
         // Past its TTL by the time the window closes.
-        s.take(&wifi(), PHONE, &browse(AIRPLAY, false, &[]), 1500);
+        s.take(&wifi(), PHONE, &browse(AIRPLAY, false, &[]), false, 1500);
         let (_, r) = s.read(None, 2600);
         assert_eq!(offer(&r, LEFT).missed, 0);
         // Another device answering for it (a sleep proxy) answers it.
-        s.take(&wifi(), LEFT, &short.bytes(), 3000);
-        s.take(&wifi(), PHONE, &browse(AIRPLAY, false, &[]), 3100);
-        s.take(&wifi(), RIGHT, &short.bytes(), 3200);
+        s.take(&wifi(), LEFT, &short.bytes(), false, 3000);
+        s.take(&wifi(), PHONE, &browse(AIRPLAY, false, &[]), false, 3100);
+        s.take(&wifi(), RIGHT, &short.bytes(), false, 3200);
         let (_, r) = s.read(None, 4200);
         assert_eq!(offer(&r, LEFT).answered, 1);
     }
@@ -834,7 +875,7 @@ pub mod tests {
         let (g2, none) = s.read(Some(g), 20);
         assert_eq!((g2, none.full), (g, false));
         assert!(none.devices.is_empty() && none.offers.is_empty() && none.queries.is_empty());
-        s.take(&wifi(), PHONE, &browse(AIRPLAY, false, &[]), 100);
+        s.take(&wifi(), PHONE, &browse(AIRPLAY, false, &[]), false, 100);
         let (g3, delta) = s.read(Some(g2), 1200);
         assert_eq!(
             delta.devices.iter().map(|d| d.mac).collect::<Vec<_>>(),
@@ -866,7 +907,7 @@ pub mod tests {
         let (g, _) = s.read(None, 0);
         for i in 0..=GONE {
             let q = browse(&format!("_s{i}._tcp.local"), true, &[]);
-            s.take(&wifi(), PHONE, &q, i as u64 * 1000);
+            s.take(&wifi(), PHONE, &q, false, i as u64 * 1000);
         }
         let (_, r) = s.read(Some(g), IDLE_MS + 400_000);
         assert!(r.full && r.queries.is_empty() && r.devices.is_empty());
@@ -879,7 +920,7 @@ pub mod tests {
         for i in 0..=MDNS_DEVICES as u64 {
             let mac = [2, 1, 0, 0, (i >> 8) as u8, i as u8];
             let msg = airplay_response(&format!("D{i}"), &format!("d{i}"), &[]);
-            s.take(&wifi(), mac, &msg, i);
+            s.take(&wifi(), mac, &msg, false, i);
         }
         let (_, r) = s.read(None, 1000);
         assert_eq!(
@@ -900,12 +941,12 @@ pub mod tests {
                 Rd::Ptr(&format!("I{i}._airplay._tcp.local")),
             );
         }
-        s.take(&wifi(), LEFT, &b.bytes(), 0);
+        s.take(&wifi(), LEFT, &b.bytes(), false, 0);
         let mut q = Builder::new(false);
         for i in 0..PER_DEVICE + 5 {
             q.question(&format!("_s{i}._tcp.local"), PTR, false);
         }
-        s.take(&wifi(), PHONE, &q.bytes(), 0);
+        s.take(&wifi(), PHONE, &q.bytes(), false, 0);
         let (_, r) = s.read(None, 0);
         assert_eq!((r.offers.len(), r.queries.len()), (PER_DEVICE, PER_DEVICE));
         // Windows: the 65th name finds none open.
@@ -915,7 +956,7 @@ pub mod tests {
             for n in (0..WINDOWS + 1).skip(i * 31).take(31) {
                 q.question(&format!("n{n}.local"), A, false);
             }
-            s.take(&wifi(), mac, &q.bytes(), 0);
+            s.take(&wifi(), mac, &q.bytes(), false, 0);
         }
         assert_eq!((s.windows.len(), s.evicted), (WINDOWS, 1));
         assert_eq!(s.queries.len(), WINDOWS + 1);
@@ -926,7 +967,7 @@ pub mod tests {
             b.record(1, "h.local", A, 120, Rd::A([192, 0, 2, i]));
         }
         b.record(1, "h.local", TXT, 120, Rd::Txt(&[]));
-        s.take(&wifi(), LEFT, &b.bytes(), 0);
+        s.take(&wifi(), LEFT, &b.bytes(), false, 0);
         let (_, r) = s.read(None, 0);
         let addrs: Vec<String> = r.devices[0].addrs.iter().map(|a| a.to_string()).collect();
         assert_eq!(addrs, ["192.0.2.5", "192.0.2.4", "192.0.2.3", "192.0.2.2"]);
@@ -956,10 +997,11 @@ pub mod tests {
         let frames = pcap(FIXTURE);
         let start = frames[0].0;
         for (ms, f) in &frames {
-            let (_, payload) = mdns::payload(f).unwrap();
+            let m = mdns::payload(f).unwrap();
+            assert!(!m.direct);
             let src: [u8; 6] = f[6..12].try_into().unwrap();
-            s.take(&wifi(), src, payload, ms - start);
-            assert!(mdns::parse(payload).unwrap().complete);
+            s.take(&wifi(), src, m.payload, m.direct, ms - start);
+            assert!(mdns::parse(m.payload).unwrap().complete);
         }
         let end = frames.last().unwrap().0 - start + WINDOW_MS;
         let (_, r) = s.read(None, end);
@@ -1003,14 +1045,14 @@ pub mod tests {
             .iter()
             .map(|(_, f)| {
                 (
-                    mdns::payload(f).unwrap().1.to_vec(),
+                    mdns::payload(f).unwrap().payload.to_vec(),
                     f[6..12].try_into().unwrap(),
                 )
             })
             .collect();
         let each = cost(move |s, i| {
             let (payload, src) = &frames[i as usize % frames.len()];
-            s.take(&wifi(), *src, payload, i * 1000);
+            s.take(&wifi(), *src, payload, false, i * 1000);
         });
         eprintln!("services: {each:?} a message");
         assert!(each <= TARGET * DEBUG, "{each:?} a message");
@@ -1022,12 +1064,12 @@ pub mod tests {
         let mut s = Table::default();
         // A burst at once: the first BURST are taken.
         for _ in 0..BURST + 50 {
-            s.take(&wifi(), PHONE, &msg, 1000);
+            s.take(&wifi(), PHONE, &msg, false, 1000);
         }
         assert_eq!((s.packets, s.limited), (BURST + 50, 50));
         // A second later RATE more are taken, no more.
         for _ in 0..RATE + 10 {
-            s.take(&wifi(), PHONE, &msg, 2000);
+            s.take(&wifi(), PHONE, &msg, false, 2000);
         }
         assert_eq!(s.limited, 60);
         let (_, r) = s.read(None, 2000);
@@ -1100,7 +1142,7 @@ pub mod tests {
     fn a_hostile_message_costs_a_few_times_a_real_one() {
         for (what, msg) in [("long names", long_names()), ("a long chain", long_chain())] {
             let each = within(std::time::Duration::from_secs(60), move || {
-                cost(move |s, i| s.take(&wifi(), LEFT, &msg, i * 1000))
+                cost(move |s, i| s.take(&wifi(), LEFT, &msg, false, i * 1000))
             });
             eprintln!("{what}: {each:?} a message");
             assert!(each <= TARGET * WORST * DEBUG, "{what}: {each:?} a message");
