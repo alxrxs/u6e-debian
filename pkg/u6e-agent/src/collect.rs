@@ -417,6 +417,7 @@ impl Collector {
             clock_synced: root.join(&wificonf::SYNCHRONIZED[1..]).exists(),
             power_limits,
             auth,
+            caps: Vec::new(),
             offload_held: offload_held(root),
         }
     }

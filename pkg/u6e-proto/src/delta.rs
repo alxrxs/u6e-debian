@@ -5,8 +5,8 @@
 //! hold the same list in the same order. [`valid`] states what that takes;
 //! [`diff`] declines and [`apply`] refuses whatever is not valid, so a broken
 //! snapshot costs a key frame instead of misattributed counters. The
-//! stations' authentications travel whole, only those new or changed, and
-//! leave with their stations.
+//! stations' authentications and capabilities travel whole, only those new
+//! or changed, and leave with their stations.
 //!
 //! Which bit stands for which field is wire format too: a change to it bumps
 //! [`crate::PROTOCOL`].
@@ -15,7 +15,6 @@ use std::collections::{HashMap, HashSet};
 
 use crate::msg::{
     Band, FieldDelta, IDENTITY_MAX, Radio, RateMode, RecDelta, Snapshot, SnapshotDelta, Station,
-    StationAuth,
 };
 
 /// The base of a delta is not the snapshot it is applied to, or the delta is
@@ -37,9 +36,9 @@ const MAX_LIMITS: usize = 256;
 /// Whether the delta coding can work on `s`: stations sorted by MAC with each
 /// MAC once, each on a BSS of the list, every list within its cap, each
 /// radio, BSS and temperature zone named once (the names key the
-/// controller's metrics, where a duplicate would fail the whole scrape), and
-/// the authentications sorted by MAC, each a station's, each identity within
-/// [`IDENTITY_MAX`].
+/// controller's metrics, where a duplicate would fail the whole scrape), the
+/// authentications and the capabilities sorted by MAC, each a station's, and
+/// each identity within [`IDENTITY_MAX`].
 pub fn valid(s: &Snapshot) -> bool {
     s.temps.len() <= MAX_TEMPS
         && s.radios.len() <= MAX_RADIOS
@@ -51,11 +50,17 @@ pub fn valid(s: &Snapshot) -> bool {
         && unique(s.radios.iter().map(|r| &r.phy))
         && unique(s.bsss.iter().map(|b| &b.ifname))
         && unique(s.temps.iter().map(|t| &t.zone))
-        && s.auth.windows(2).all(|w| w[0].0 < w[1].0)
-        && s.auth.iter().all(|(mac, a)| {
-            a.identity.len() <= IDENTITY_MAX
-                && s.stations.binary_search_by_key(mac, |t| t.mac).is_ok()
-        })
+        && per_station(s, &s.auth)
+        && per_station(s, &s.caps)
+        && s.auth.iter().all(|(_, a)| a.identity.len() <= IDENTITY_MAX)
+}
+
+/// Whether `list` is sorted by MAC, each MAC a station's of `s`.
+fn per_station<T>(s: &Snapshot, list: &[([u8; 6], T)]) -> bool {
+    list.windows(2).all(|w| w[0].0 < w[1].0)
+        && list
+            .iter()
+            .all(|(mac, _)| s.stations.binary_search_by_key(mac, |t| t.mac).is_ok())
 }
 
 fn unique<'a>(mut names: impl Iterator<Item = &'a String>) -> bool {
@@ -89,13 +94,14 @@ fn same_shape(prev: &Snapshot, next: &Snapshot) -> bool {
 
 /// The difference from `prev` to `next`, stations matched by MAC; `None` when
 /// a delta cannot carry it (either is not [`valid`], the shape changed, or a
-/// station that stays lost its authentication) and the sender sends `next`
-/// as a key frame.
+/// station that stays lost its authentication or capabilities) and the
+/// sender sends `next` as a key frame.
 pub fn diff(prev: &Snapshot, next: &Snapshot) -> Option<SnapshotDelta> {
     if !(valid(prev) && valid(next) && same_shape(prev, next)) {
         return None;
     }
-    let auth = auth_diff(prev, next)?;
+    let auth = list_diff(&prev.auth, &next.auth, next)?;
+    let caps = list_diff(&prev.caps, &next.caps, next)?;
     let (mask, vals) = diff_fields(&scalar_fields(prev), &scalar_fields(next));
     let radios = prev
         .radios
@@ -142,31 +148,49 @@ pub fn diff(prev: &Snapshot, next: &Snapshot) -> Option<SnapshotDelta> {
         added,
         bsss: (prev.bsss != next.bsss).then(|| next.bsss.clone()),
         auth,
+        caps,
     })
 }
 
-/// The authentications of `next` that `prev` lacks or holds otherwise;
-/// `None` when one of `prev` is gone while its station stays, which only a
-/// key frame says.
-fn auth_diff(prev: &Snapshot, next: &Snapshot) -> Option<Vec<([u8; 6], StationAuth)>> {
-    let held = |mac: &[u8; 6]| {
-        let i = next.auth.binary_search_by_key(mac, |(m, _)| *m).ok()?;
-        Some(&next.auth[i].1)
-    };
-    let staying = |mac: &[u8; 6]| next.stations.binary_search_by_key(mac, |t| t.mac).is_ok();
+/// One of a station's entries in a per-station list, by MAC.
+fn entry<'a, T>(list: &'a [([u8; 6], T)], mac: &[u8; 6]) -> Option<&'a T> {
+    let i = list.binary_search_by_key(mac, |(m, _)| *m).ok()?;
+    Some(&list[i].1)
+}
+
+/// The entries of the per-station list `next` (of the snapshot `snap`)
+/// that `prev` lacks or holds otherwise; `None` when one of `prev` is gone
+/// while its station stays, which only a key frame says.
+fn list_diff<T: Clone + PartialEq>(
+    prev: &[([u8; 6], T)],
+    next: &[([u8; 6], T)],
+    snap: &Snapshot,
+) -> Option<Vec<([u8; 6], T)>> {
+    let staying = |mac: &[u8; 6]| snap.stations.binary_search_by_key(mac, |t| t.mac).is_ok();
     if prev
-        .auth
         .iter()
-        .any(|(mac, _)| staying(mac) && held(mac).is_none())
+        .any(|(mac, _)| staying(mac) && entry(next, mac).is_none())
     {
         return None;
     }
-    let was = |mac: &[u8; 6]| {
-        let i = prev.auth.binary_search_by_key(mac, |(m, _)| *m).ok()?;
-        Some(&prev.auth[i].1)
-    };
-    let changed = next.auth.iter().filter(|(mac, a)| was(mac) != Some(a));
+    let changed = next.iter().filter(|(mac, v)| entry(prev, mac) != Some(v));
     Some(changed.cloned().collect())
+}
+
+/// Brings the per-station list `list` up to a delta: the entries of the
+/// stations `removed` go, `changes` are set.
+fn list_apply<T: Clone>(
+    list: &mut Vec<([u8; 6], T)>,
+    removed: &HashSet<&[u8; 6]>,
+    changes: &[([u8; 6], T)],
+) {
+    list.retain(|(mac, _)| !removed.contains(mac));
+    for (mac, v) in changes {
+        match list.binary_search_by_key(mac, |(m, _)| *m) {
+            Ok(i) => list[i].1 = v.clone(),
+            Err(i) => list.insert(i, (*mac, v.clone())),
+        }
+    }
 }
 
 /// Rebuilds the snapshot `d` was made from, given the one it was made against;
@@ -212,13 +236,8 @@ pub fn apply(base: &Snapshot, d: &SnapshotDelta) -> Result<Snapshot, Gap> {
     }
     next.stations.extend(d.added.iter().cloned());
     next.stations.sort_by_key(|s| s.mac);
-    next.auth.retain(|(mac, _)| !removed.contains(mac));
-    for (mac, a) in &d.auth {
-        match next.auth.binary_search_by_key(mac, |(m, _)| *m) {
-            Ok(i) => next.auth[i].1 = a.clone(),
-            Err(i) => next.auth.insert(i, (*mac, a.clone())),
-        }
-    }
+    list_apply(&mut next.auth, &removed, &d.auth);
+    list_apply(&mut next.caps, &removed, &d.caps);
     if !valid(&next) {
         return Err(Gap);
     }
@@ -374,7 +393,9 @@ fn station_from(mac: [u8; 6], f: &[i64; 22]) -> Result<Station, Gap> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::msg::{Band, Bss, PowerLimit, Radio, RateMode, Station, Temp};
+    use crate::msg::{
+        Band, Bss, PowerLimit, Radio, RateMode, Station, StationAuth, StationCaps, Temp,
+    };
 
     struct Rng(u64);
 
@@ -501,14 +522,22 @@ mod tests {
             clock_synced: true,
             power_limits: Vec::new(),
             auth: Vec::new(),
+            caps: Vec::new(),
             offload_held: false,
         };
-        // Every third station authenticated over 802.1X.
+        // Every third station authenticated over 802.1X; every other one
+        // said what it supports.
         first.auth = first
             .stations
             .iter()
             .step_by(3)
             .map(|t| (t.mac, auth(&format!("host/pc{}", t.mac[5]))))
+            .collect();
+        first.caps = first
+            .stations
+            .iter()
+            .step_by(2)
+            .map(|t| (t.mac, caps(t.mac[5] % 4)))
             .collect();
         let mut second = first.clone();
         second.seq += 1;
@@ -538,6 +567,15 @@ mod tests {
         }
     }
 
+    fn caps(nss: u8) -> StationCaps {
+        StationCaps {
+            mode: RateMode::He,
+            nss,
+            mcs: 11,
+            width_mhz: 80,
+        }
+    }
+
     fn roundtrips(prev: &Snapshot, next: &Snapshot) {
         let d = diff(prev, next).unwrap();
         assert_eq!(&apply(prev, &d).unwrap(), next);
@@ -546,11 +584,12 @@ mod tests {
         assert_eq!(&apply(prev, &d2).unwrap(), next);
     }
 
-    /// Drops the authentications of stations no longer there, as a
-    /// collector does.
+    /// Drops the authentications and capabilities of stations no longer
+    /// there, as a collector does.
     fn settle(s: &mut Snapshot) {
         let stations: HashSet<_> = s.stations.iter().map(|t| t.mac).collect();
         s.auth.retain(|(m, _)| stations.contains(m));
+        s.caps.retain(|(m, _)| stations.contains(m));
     }
 
     fn successor(prev: &Snapshot) -> Snapshot {
@@ -778,6 +817,7 @@ mod tests {
             added: Vec::new(),
             bsss: None,
             auth: Vec::new(),
+            caps: Vec::new(),
         };
         assert_eq!(apply(&b, &d), Err(Gap));
     }
@@ -825,6 +865,7 @@ mod tests {
             added: Vec::new(),
             bsss: None,
             auth: Vec::new(),
+            caps: Vec::new(),
         };
         assert_eq!(apply(&a, &d), Err(Gap));
         assert_eq!(diff(&a, &successor(&a)), None);
@@ -972,6 +1013,48 @@ mod tests {
         assert_eq!(apply(&a, &d), Err(Gap));
     }
 
+    /// Capabilities travel as authentications do: a new station's and a
+    /// changed one's whole, a leaving station's with it, a lost one while
+    /// its station stays only in a key frame, and none that is no
+    /// station's.
+    #[test]
+    fn capabilities_round_trip() {
+        let (a, _) = fixture();
+        let mut n = successor(&a);
+        let (changed, gone) = (a.caps[0].0, a.caps[1].0);
+        let mut s = n.stations[3].clone();
+        s.mac = [0x02, 0, 0, 0, 0, 0x99];
+        n.stations.push(s);
+        n.stations.sort_by_key(|s| s.mac);
+        n.caps.push(([0x02, 0, 0, 0, 0, 0x99], caps(1)));
+        n.caps.sort_by_key(|(m, _)| *m);
+        for (mac, c) in &mut n.caps {
+            if *mac == changed {
+                c.width_mhz = 160;
+            }
+        }
+        n.stations.retain(|t| t.mac != gone);
+        settle(&mut n);
+        let d = diff(&a, &n).unwrap();
+        assert_eq!(d.caps.len(), 2, "the new and the changed only");
+        roundtrips(&a, &n);
+        assert!(diff(&n, &successor(&n)).unwrap().caps.is_empty());
+
+        let mut lost = successor(&a);
+        lost.caps.remove(0);
+        assert_eq!(diff(&a, &lost), None);
+
+        let mut s = a.clone();
+        s.caps.reverse();
+        assert!(!valid(&s));
+        let mut s = a.clone();
+        s.caps.push(([0xff; 6], caps(1)));
+        assert!(!valid(&s), "not a station's");
+        let mut d = diff(&a, &successor(&a)).unwrap();
+        d.caps.push(([0xff; 6], caps(1)));
+        assert_eq!(apply(&a, &d), Err(Gap));
+    }
+
     fn wire_len(v: &impl serde::Serialize) -> usize {
         postcard::to_stdvec(v).unwrap().len()
     }
@@ -981,7 +1064,8 @@ mod tests {
     /// station's VLAN and rate modes come on top, and the whole frames stay
     /// within what this fixture measures. The modes cost a key frame 4 B per
     /// station and a delta nothing while they hold; so do the
-    /// authentications, about 24 B each in a key frame.
+    /// authentications, about 24 B each in a key frame, and the
+    /// capabilities, 11 B each.
     #[test]
     fn delta_is_small() {
         let (a, b) = fixture();
@@ -1008,7 +1092,7 @@ mod tests {
             wire_len(&a.stations)
         );
         assert!(wire_len(&d) <= 500, "delta {} B", wire_len(&d));
-        assert!(wire_len(&a) <= 1700, "full {} B", wire_len(&a));
+        assert!(wire_len(&a) <= 1800, "full {} B", wire_len(&a));
     }
 
     #[test]

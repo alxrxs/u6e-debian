@@ -29,7 +29,7 @@ use crate::msg::{
     EventKind, FieldDelta, FilterProto, Flow, Flows, Guard, GuardConfig, Hello, Limit, LimitState,
     LimitStatus, LimitTarget, MdnsDevice, MdnsKey, MdnsOffer, MdnsQuery, Mechanism, PowerLimit,
     Radio, RadioApplied, RadioConfig, Rate, RateMode, RecDelta, Services, SignedConfig, Snapshot,
-    SnapshotDelta, SpectrumFrame, Station, StationAuth, Temp, Violation, Withdrawn,
+    SnapshotDelta, SpectrumFrame, Station, StationAuth, StationCaps, Temp, Violation, Withdrawn,
 };
 
 const HOW: &str = "bump u6e_proto::PROTOCOL (pkg/u6e-proto/src/version.rs) and write the \
@@ -93,6 +93,15 @@ fn station_auth() -> StationAuth {
         identity: format!("host/{}", "a".repeat(130)),
         eap_method: 200,
         reauth_s: 70_011,
+    }
+}
+
+fn station_caps() -> StationCaps {
+    StationCaps {
+        mode: RateMode::Vht,
+        nss: 200,
+        mcs: 201,
+        width_mhz: 300,
     }
 }
 
@@ -241,6 +250,7 @@ fn samples() -> Samples {
             dbm: -100,
         }],
         auth: vec![([0x02, 0, 0, 0, 0, 1], station_auth())],
+        caps: vec![([0x02, 0, 0, 0, 0, 1], station_caps())],
         offload_held: true,
     };
     let rec = |idx| RecDelta {
@@ -261,6 +271,7 @@ fn samples() -> Samples {
         added: vec![station(10, RateMode::He)],
         bsss: Some(vec![bss("wlan2", "phy2")]),
         auth: vec![([0x02, 0, 0, 0, 0, 10], station_auth())],
+        caps: vec![([0x02, 0, 0, 0, 0, 10], station_caps())],
     };
     let mac = [0x02, 0, 0, 0, 0, 1];
     let phy = || "phy1".to_owned();
@@ -301,6 +312,32 @@ fn samples() -> Samples {
         (
             "GuardViolationTag",
             EventKind::GuardViolation(violation(Guard::Tag)),
+        ),
+        (
+            "BtmQuery",
+            EventKind::BtmQuery {
+                mac,
+                bss: 300,
+                reason: 200,
+            },
+        ),
+        (
+            "BtmResponseAccept",
+            EventKind::BtmResponse {
+                mac,
+                bss: 300,
+                status: 0,
+                target: Some([0x02, 0, 0, 0, 0x10, 0xff]),
+            },
+        ),
+        (
+            "BtmResponseReject",
+            EventKind::BtmResponse {
+                mac,
+                bss: 300,
+                status: 200,
+                target: None,
+            },
         ),
     ];
     let mut agent = vec![

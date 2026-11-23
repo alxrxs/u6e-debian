@@ -901,6 +901,7 @@ mod tests {
             clock_synced: true,
             power_limits: Vec::new(),
             auth: Vec::new(),
+            caps: Vec::new(),
             offload_held: false,
         }
     }

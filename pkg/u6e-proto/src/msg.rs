@@ -189,6 +189,9 @@ pub struct Snapshot {
     /// How the stations authenticated, by MAC, sorted, each one a station's:
     /// a station hostapd could not be asked about yet has none.
     pub auth: Vec<([u8; 6], StationAuth)>,
+    /// What the stations support, from the same answer of hostapd's as
+    /// `auth`, kept the same way.
+    pub caps: Vec<([u8; 6], StationCaps)>,
     /// Whether a capture holds a client's flows off the NSS offload: its
     /// restore not done. A capture holds them at most 10 minutes; longer is
     /// a restore that failed.
@@ -263,6 +266,19 @@ impl StationAuth {
     pub fn fast_transition(&self) -> bool {
         self.auth_alg == 2
     }
+}
+
+/// What a client said it supports when it associated, on the band of its
+/// BSS: its newest PHY mode, the spatial streams and the highest MCS it
+/// receives (what the AP may send it), and its widest channel.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StationCaps {
+    pub mode: RateMode,
+    pub nss: u8,
+    pub mcs: u8,
+    pub width_mhz: u16,
 }
 
 /// The most a radio transmits with `first..=last` of `band` as its primary
@@ -392,6 +408,8 @@ pub struct SnapshotDelta {
     /// The stations' authentications that are new or changed, by MAC; a
     /// station's leaves with it.
     pub auth: Vec<([u8; 6], StationAuth)>,
+    /// The stations' capabilities that are new or changed, as `auth`.
+    pub caps: Vec<([u8; 6], StationCaps)>,
 }
 
 /// Changed fields of a record that has no index.
@@ -471,6 +489,23 @@ pub enum EventKind {
     },
     /// A client broke one of the client guards' rules.
     GuardViolation(Violation),
+    /// A client asked for BSS transition candidates (an 802.11v BSS
+    /// Transition Management Query, for the reason it gave), which hostapd
+    /// answers with a request.
+    BtmQuery {
+        mac: [u8; 6],
+        bss: u16,
+        reason: u8,
+    },
+    /// A client's answer to a BSS Transition Management request, whoever
+    /// sent it: its status (0 accepts; IEEE 802.11-2020 table 9-428) and,
+    /// accepting, the BSS it said it moves to.
+    BtmResponse {
+        mac: [u8; 6],
+        bss: u16,
+        status: u8,
+        target: Option<[u8; 6]>,
+    },
 }
 
 /// An address the client guards admit for a MAC: one its DHCP server

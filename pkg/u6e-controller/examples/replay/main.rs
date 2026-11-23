@@ -978,6 +978,7 @@ impl World {
             clock_synced: true,
             power_limits: power_limits(),
             auth,
+            caps: Vec::new(),
             offload_held: false,
         }
     }
