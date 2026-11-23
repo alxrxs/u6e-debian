@@ -431,13 +431,8 @@ fn btm_answer(sock: &UnixDatagram, mac: [u8; 6], wait: Duration) -> Option<u8> {
 /// The status code of hostapd's `BSS-TM-RESP <mac> status_code=<n> ...`
 /// event, if `msg` is that event about `mac`.
 fn btm_status(msg: &str, mac: [u8; 6]) -> Option<u8> {
-    let mut f = events::unprefixed(msg).split_whitespace();
-    if f.next()? != "BSS-TM-RESP" || mac::parse(f.next()?)? != mac {
-        return None;
-    }
-    f.find_map(|kv| kv.strip_prefix("status_code="))?
-        .parse()
-        .ok()
+    let (of, status, _) = events::btm_response(msg)?;
+    (of == mac).then_some(status)
 }
 
 /// Why a client declined, by its status code (IEEE 802.11-2020, table

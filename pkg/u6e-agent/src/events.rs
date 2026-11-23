@@ -1,7 +1,9 @@
 //! What happens between two snapshots: stations associating and leaving, EAP
 //! starting, succeeding, failing or timing out, a passphrase that does not
-//! match, a radio going up or down (hostapd's event stream, one attached
-//! control socket per BSS) and a Wi-Fi firmware crash (the kernel log). One
+//! match, a client asking for BSS transition candidates and answering a BSS
+//! transition request, a radio going up or down (hostapd's event stream, one
+//! attached control socket per BSS) and a Wi-Fi firmware crash (the kernel
+//! log). One
 //! thread owns all the sockets; it re-attaches to a hostapd that restarted
 //! and picks up BSSs that appear, so nothing has to restart it.
 
@@ -258,8 +260,41 @@ fn parse(msg: &str, bss: u16, phy: impl FnOnce() -> String) -> Option<EventKind>
         },
         "AP-ENABLED" => EventKind::RadioUp { phy: phy() },
         "AP-DISABLED" => EventKind::RadioDown { phy: phy() },
+        "BSS-TM-QUERY" => EventKind::BtmQuery {
+            mac: station(&mut f)?,
+            bss,
+            reason: f.find_map(|kv| kv.strip_prefix("reason="))?.parse().ok()?,
+        },
+        "BSS-TM-RESP" => {
+            let (mac, status, target) = btm_response(msg)?;
+            EventKind::BtmResponse {
+                mac,
+                bss,
+                status,
+                target,
+            }
+        }
         _ => return None,
     })
+}
+
+/// The station, the status and the target BSS of hostapd's `BSS-TM-RESP
+/// <mac> status_code=<n> … [target_bssid=<mac>]`, if `msg` is one.
+pub fn btm_response(msg: &str) -> Option<([u8; 6], u8, Option<[u8; 6]>)> {
+    let mut f = unprefixed(msg).split_whitespace();
+    if f.next()? != "BSS-TM-RESP" {
+        return None;
+    }
+    let mac = mac::parse(f.next()?)?;
+    let (mut status, mut target) = (None, None);
+    for kv in f {
+        if let Some(v) = kv.strip_prefix("status_code=") {
+            status = v.parse().ok();
+        } else if let Some(v) = kv.strip_prefix("target_bssid=") {
+            target = mac::parse(v);
+        }
+    }
+    Some((mac, status?, target))
 }
 
 #[cfg(test)]
@@ -427,6 +462,64 @@ mod tests {
             ]
         );
         assert_eq!(got.len(), 15 + 10 + 3 + 5 + 4);
+    }
+
+    /// A client's answer to a BTM request, with the BSS it accepted to move
+    /// to or without, and its query for candidates.
+    #[test]
+    fn steering_answers_and_queries_are_events() {
+        let a = "02:00:00:00:00:08";
+        let target = [2, 0, 0, 0, 0x10, 2];
+        assert_eq!(
+            parse(
+                &format!(
+                    "<3>BSS-TM-RESP {a} status_code=0 bss_termination_delay=0 \
+                     target_bssid=02:00:00:00:10:02"
+                ),
+                1,
+                phy1
+            ),
+            Some(EventKind::BtmResponse {
+                mac: STA,
+                bss: 1,
+                status: 0,
+                target: Some(target)
+            })
+        );
+        assert_eq!(
+            parse(
+                &format!("<3>BSS-TM-RESP {a} status_code=7 bss_termination_delay=0"),
+                2,
+                phy1
+            ),
+            Some(EventKind::BtmResponse {
+                mac: STA,
+                bss: 2,
+                status: 7,
+                target: None
+            })
+        );
+        assert_eq!(
+            parse(
+                &format!("<3>BSS-TM-QUERY {a} reason=16 neighbor=00ff"),
+                0,
+                phy1
+            ),
+            Some(EventKind::BtmQuery {
+                mac: STA,
+                bss: 0,
+                reason: 16
+            })
+        );
+        for junk in [
+            format!("<3>BSS-TM-RESP {a}"),
+            format!("<3>BSS-TM-RESP {a} status_code=256"),
+            "<3>BSS-TM-RESP 02:00:00:00 status_code=0".to_owned(),
+            format!("<3>BSS-TM-QUERY {a}"),
+            format!("<3>BSS-TM-QUERY {a} reason=x"),
+        ] {
+            assert_eq!(parse(&junk, 0, phy1), None, "{junk}");
+        }
     }
 
     #[test]
