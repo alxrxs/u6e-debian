@@ -298,14 +298,17 @@ export const ROAM_FAILURES = {
   dropped: 'disconnected within 30 s',
 };
 
-/** How long a client was between two APs: exact, at most, or between two
- * bounds, as the controller could tell. */
+/** How long a client was between two APs, as the controller could tell:
+ * none (the old AP heard it after the new one took it), at most (only the
+ * old AP's last report bounds it), between two bounds, or, with both bounds
+ * within a quarter of a second, that. */
 export function gapText(r) {
   if (r.gap_ms === undefined) return '–';
   const s = (ms) => (ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(ms < 10000 ? 1 : 0)} s`);
   if (r.gap_ms === 0) return 'no gap';
+  if (!r.gap_min_ms) return `≤ ${s(r.gap_ms)}`;
   if (r.gap_ms - r.gap_min_ms <= 250) return s(r.gap_ms);
-  return r.gap_min_ms ? `${s(r.gap_min_ms)} – ${s(r.gap_ms)}` : `≤ ${s(r.gap_ms)}`;
+  return `${s(r.gap_min_ms)} – ${s(r.gap_ms)}`;
 }
 
 /** good, fair or poor, for an experience score's colour. */
