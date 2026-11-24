@@ -31,7 +31,6 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
-use aws_lc_rs::digest;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
@@ -54,8 +53,6 @@ const REQUEST_WAIT: Duration = Duration::from_secs(10);
 /// The waits after a failed request.
 const BACKOFF_MIN: Duration = Duration::from_secs(2);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
-/// The largest token file read.
-const TOKEN_MAX: u64 = 4096;
 /// The most devices listed.
 pub const DEVICES_MAX: usize = 64;
 
@@ -369,32 +366,6 @@ enum Outcome {
     Failed(String),
 }
 
-/// A token read for one round of requests, wiped when dropped.
-struct Token(String);
-
-impl Drop for Token {
-    fn drop(&mut self) {
-        // SAFETY: zeros are valid UTF-8, and the string is not read after.
-        u6e_proto::frame::zeroize(unsafe { self.0.as_mut_vec() });
-    }
-}
-
-/// The token, trimmed, and its hash; why not.
-fn token(path: &std::path::Path) -> Result<(Token, [u8; 32]), String> {
-    use std::io::Read;
-    let mut text = Token(String::new());
-    std::fs::File::open(path)
-        .and_then(|f| f.take(TOKEN_MAX).read_to_string(&mut text.0))
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    let t = Token(text.0.trim().to_owned());
-    if t.0.is_empty() || t.0.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        return Err(format!("{}: no token", path.display()));
-    }
-    let hash = digest::digest(&digest::SHA256, t.0.as_bytes());
-    let hash = hash.as_ref().try_into().expect("SHA-256 is 32 bytes");
-    Ok((t, hash))
-}
-
 /// What one request came to.
 async fn post(settings: &Settings, token: &str, body: &str) -> Outcome {
     let target = format!("/api/events/{EVENT}");
@@ -481,7 +452,7 @@ async fn send(state: Shared, settings: Settings, wake: Arc<Notify>) {
         if tries.is_empty() {
             continue;
         }
-        let (token, hash) = match token(&settings.token) {
+        let (token, hash) = match fetch::read_token(&settings.token) {
             Ok(t) => t,
             Err(why) => {
                 fail_all(&state, &tries, &why);
@@ -963,7 +934,7 @@ mod tests {
         assert_eq!(reqs.len(), 2, "one 500, then the retry");
         let head = &reqs[1].head;
         assert!(
-            head.starts_with("POST /api/events/wifi_presence HTTP/1.1\r\n"),
+            head.starts_with("POST /api/events/wifi_presence HTTP/1.0\r\n"),
             "{head}"
         );
         assert!(

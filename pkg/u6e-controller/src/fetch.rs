@@ -4,16 +4,21 @@
 //! its cap or its time refused. Plain HTTP on the estate's own network: what
 //! is read is published there already, and nothing is sent but the request.
 //!
-//! And one HTTPS POST of JSON with a bearer token (Home Assistant's events,
-//! `presence`): TLS 1.3 by rustls on aws-lc-rs, the server's name and chain
-//! verified against a PEM bundle of trust anchors read at each connection,
-//! so a bundle that changes counts from the next request on, with no
-//! restart.
+//! And one HTTPS request ([`request_tls`]) carrying a secret in one header
+//! and, for a write, a JSON body: Home Assistant's events (`presence`, a
+//! bearer token). TLS 1.3 by
+//! rustls on aws-lc-rs, the server's name and chain verified against a PEM
+//! bundle of trust anchors read at each connection, so a bundle that
+//! changes counts from the next request on, with no restart. HTTP/1.0 too,
+//! so the answer is never chunked; the request, secret included, is wiped
+//! once sent. The secret is read from its file at each request
+//! ([`read_token`]) and wiped when dropped.
 
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aws_lc_rs::digest;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -23,8 +28,10 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore, crypto, version};
 use u6e_proto::frame::zeroize;
 
-/// The most of an HTTPS answer read: only its status line is wanted.
-const ANSWER_MAX: u64 = 64 << 10;
+/// The most of an HTTPS answer's status line and headers read.
+const HEAD_MAX: usize = 16 << 10;
+/// The largest token file read.
+const TOKEN_MAX: u64 = 4096;
 
 /// The body `address` (`host:port`) answers `target` (a path and query)
 /// with, of at most `max` bytes, within `wait`, connecting included; why
@@ -99,17 +106,26 @@ pub fn tls_client(ca: &Path) -> Result<Arc<ClientConfig>, String> {
     Ok(Arc::new(config))
 }
 
-/// The status `host`:`port` answers a POST of the JSON `body` to `target`
-/// with, sent with the bearer `token` over TLS that `ca` verifies, within
-/// `wait`, connecting included; why not, otherwise (never the token).
-pub async fn post_json_tls(
+/// An answer to [`request_tls`]: its status and its body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Answer {
+    pub status: u16,
+    pub body: String,
+}
+
+/// `method` `target` at `host`:`port` over TLS that `ca` verifies, with the
+/// header `auth` (its name and any scheme, then the secret) and, given one,
+/// the JSON `body`; the answer, its body at most `max` bytes, within `wait`,
+/// connecting included; why not, otherwise (never the secret).
+pub async fn request_tls(
     (host, port): (&str, u16),
-    target: &str,
+    (method, target): (&str, &str),
     ca: &Path,
-    token: &str,
-    body: &str,
+    (header, secret): (&str, &str),
+    body: Option<&str>,
+    max: usize,
     wait: Duration,
-) -> Result<u16, String> {
+) -> Result<Answer, String> {
     let config = tls_client(ca)?;
     let ask = async {
         let name = ServerName::try_from(host.to_owned()).map_err(|e| e.to_string())?;
@@ -120,32 +136,104 @@ pub async fn post_json_tls(
             .connect(name, sock)
             .await
             .map_err(|e| format!("TLS: {e}"))?;
-        let head = format!(
-            "POST {target} HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {token}\r\n\
-             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
+        let json = body.map_or_else(String::new, |b| {
+            format!(
+                "Content-Type: application/json\r\nContent-Length: {}\r\n",
+                b.len()
+            )
+        });
+        let head =
+            format!("{method} {target} HTTP/1.0\r\nHost: {host}\r\n{header}{secret}\r\n{json}\r\n");
         let mut out = head.into_bytes();
-        out.extend_from_slice(body.as_bytes());
+        out.extend_from_slice(body.unwrap_or_default().as_bytes());
         let sent = tls.write_all(&out).await;
         zeroize(&mut out);
         sent.map_err(|e| e.to_string())?;
         let mut answer = Vec::new();
-        let read = (&mut tls).take(ANSWER_MAX).read_to_end(&mut answer).await;
+        let cap = (HEAD_MAX + max + 4) as u64;
+        let read = (&mut tls).take(cap).read_to_end(&mut answer).await;
         // A server that ends without its close_notify still said what it said.
         if answer.is_empty() {
             read.map_err(|e| e.to_string())?;
         }
-        let line = answer.split(|&b| b == b'\n').next().unwrap_or_default();
-        let line = String::from_utf8_lossy(line);
-        line.split_whitespace()
-            .nth(1)
-            .and_then(|s| s.parse::<u16>().ok())
-            .ok_or_else(|| "no HTTP answer".to_owned())
+        parse_answer(&answer, max)
     };
     timeout(wait, ask)
         .await
         .map_err(|_| format!("no answer in {} s", wait.as_secs()))?
+}
+
+/// The status and the body of an HTTP/1.0 answer, its body at most `max`
+/// bytes and neither chunked nor compressed.
+fn parse_answer(answer: &[u8], max: usize) -> Result<Answer, String> {
+    let end = answer
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .filter(|&e| e <= HEAD_MAX)
+        .ok_or("no end of the headers")?;
+    let head = String::from_utf8_lossy(&answer[..end]);
+    let mut lines = head.lines();
+    let status = lines
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse::<u16>().ok())
+        .ok_or("no HTTP answer")?;
+    let encoded = lines.any(|l| {
+        let l = l.to_ascii_lowercase();
+        l.starts_with("transfer-encoding:") || l.starts_with("content-encoding:")
+    });
+    if encoded {
+        return Err("the body is encoded".into());
+    }
+    let body = &answer[end + 4..];
+    if body.len() > max {
+        return Err(format!("the answer is over {} KiB", max >> 10));
+    }
+    let body = String::from_utf8(body.to_vec()).map_err(|_| "the answer is not UTF-8")?;
+    Ok(Answer { status, body })
+}
+
+/// The status `host`:`port` answers a POST of the JSON `body` to `target`
+/// with, sent with the bearer `token` over TLS that `ca` verifies, within
+/// `wait`, connecting included; why not, otherwise (never the token).
+pub async fn post_json_tls(
+    host: (&str, u16),
+    target: &str,
+    ca: &Path,
+    token: &str,
+    body: &str,
+    wait: Duration,
+) -> Result<u16, String> {
+    let auth = ("Authorization: Bearer ", token);
+    let post = ("POST", target);
+    let answer = request_tls(host, post, ca, auth, Some(body), 64 << 10, wait).await?;
+    Ok(answer.status)
+}
+
+/// A secret read from its file, wiped when dropped.
+pub struct Token(pub String);
+
+impl Drop for Token {
+    fn drop(&mut self) {
+        // SAFETY: zeros are valid UTF-8, and the string is not read after.
+        zeroize(unsafe { self.0.as_mut_vec() });
+    }
+}
+
+/// The token in the file `path`, trimmed, and its hash; why not.
+pub fn read_token(path: &Path) -> Result<(Token, [u8; 32]), String> {
+    use std::io::Read;
+    let mut text = Token(String::new());
+    std::fs::File::open(path)
+        .and_then(|f| f.take(TOKEN_MAX).read_to_string(&mut text.0))
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let t = Token(text.0.trim().to_owned());
+    if t.0.is_empty() || t.0.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(format!("{}: no token", path.display()));
+    }
+    let hash = digest::digest(&digest::SHA256, t.0.as_bytes());
+    let hash = hash.as_ref().try_into().expect("SHA-256 is 32 bytes");
+    Ok((t, hash))
 }
 
 /// `s` as a URL's query value: every byte but the unreserved ones
@@ -165,6 +253,52 @@ pub fn query_value(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_answer_is_its_status_and_its_whole_body_or_refused() {
+        let ok = parse_answer(b"HTTP/1.0 200 OK\r\nContent-Type: a/b\r\n\r\n{\"x\":1}", 64);
+        let ok = ok.unwrap();
+        assert_eq!((ok.status, ok.body.as_str()), (200, "{\"x\":1}"));
+        let not_found = parse_answer(b"HTTP/1.1 404 Not Found\r\n\r\n", 64).unwrap();
+        assert_eq!((not_found.status, not_found.body.as_str()), (404, ""));
+        for (bad, why) in [
+            (
+                &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab"[..],
+                "encoded",
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\n\r\nxx",
+                "encoded",
+            ),
+            (b"HTTP/1.0 200 OK\r\n\r\n12345", "over"),
+            (b"HTTP/1.0 200 OK\r\n", "no end of the headers"),
+            (b"garbage\r\n\r\n", "no HTTP answer"),
+            (b"HTTP/1.0 200 OK\r\n\r\n\xff\xfe", "not UTF-8"),
+        ] {
+            let e = parse_answer(bad, 4).unwrap_err();
+            assert!(e.contains(why), "{e}");
+        }
+        let long = [
+            &b"HTTP/1.0 200 OK\r\nX: "[..],
+            &[b'a'; HEAD_MAX],
+            b"\r\n\r\n",
+        ]
+        .concat();
+        assert!(parse_answer(&long, 4).is_err(), "headers past their cap");
+    }
+
+    #[test]
+    fn a_token_is_one_word_from_its_file() {
+        let dir = crate::testdir::TestDir::new();
+        let p = dir.path().join("token");
+        std::fs::write(&p, "  s.abc123\n").unwrap();
+        assert_eq!(read_token(&p).unwrap().0.0, "s.abc123");
+        for bad in ["", "\n", "two words", "a\u{7}b"] {
+            std::fs::write(&p, bad).unwrap();
+            assert!(read_token(&p).is_err(), "{bad:?}");
+        }
+        assert!(read_token(&dir.path().join("none")).is_err());
+    }
 
     #[test]
     fn query_values_are_percent_encoded() {
