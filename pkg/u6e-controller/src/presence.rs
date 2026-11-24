@@ -12,23 +12,31 @@
 //! restart announces nothing.
 //!
 //! Each change is its device's one pending event: a newer change replaces
-//! it, one that undoes it cancels it. [`supervise`] looks every second and
-//! sends what is pending, one request at a time over HTTPS
-//! (`fetch::post_json_tls`, the token read from its file at each request,
-//! the CA bundle at each connection), backing off from 2 s to a minute
-//! while Home Assistant fails, dropping an event not delivered within
-//! [`STALE`] of its change, and stopping at a 401 or 403 until the token
-//! file changes, so a refused token does not get the controller's address
-//! banned. Nothing waits for any of it: Home Assistant away costs the
-//! presence events and nothing else. Each event delivered or dropped is an
-//! action `presence` on its device (its timeline).
+//! it, one that undoes it cancels it. [`supervise`] looks every second, and
+//! a sender of its own, woken by it, sends what is pending, one request at
+//! a time over HTTPS (`fetch::post_json_tls`, the token read from its file
+//! at each request and wiped after, the CA bundle at each connection),
+//! backing off from 2 s to a minute while Home Assistant fails, dropping an
+//! event not delivered within [`STALE`] of its change, and stopping at a
+//! 401 or 403 until the token file changes, so a refused token does not get
+//! the controller's address banned. Once an event was dropped, Home
+//! Assistant may hold its device's state wrong: as soon as it may be tried
+//! again (no backoff running), each such device's state now is queued as
+//! its event, so Home Assistant is put right when it is back. Nothing waits
+//! for any of it: Home Assistant away costs the presence events and nothing
+//! else. Each event delivered or dropped is an action `presence` on its
+//! device (its timeline), but for a re-sent state dropped again, which only
+//! the count says.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
 use aws_lc_rs::digest;
 use serde_json::{Value, json};
-use tokio::time::interval;
+use std::sync::Arc;
+
+use tokio::sync::Notify;
+use tokio::time::{interval, timeout};
 use u6e_proto::mac;
 
 use crate::fetch;
@@ -82,6 +90,9 @@ pub struct Pending {
     pub body: Value,
     /// Why the last try failed.
     pub why: Option<String>,
+    /// It re-sends the state Home Assistant lost track of with a dropped
+    /// event, rather than a change.
+    pub resync: bool,
     /// Told apart from a later one that replaced it.
     generation: u64,
 }
@@ -215,6 +226,7 @@ impl Presence {
                 at: SystemTime::now(),
                 body: event(d, home),
                 why: None,
+                resync: false,
                 generation: self.next_generation,
             });
         }
@@ -222,16 +234,20 @@ impl Presence {
     }
 
     /// The pending events to try now, each by its device and generation,
-    /// and the events dropped as stale.
+    /// and the events dropped as stale (a re-sent state dropped again left
+    /// out: only the count says so). With no backoff running, each device
+    /// whose state Home Assistant lost track of is queued again first.
     fn due(&mut self, now: Instant) -> (Vec<Try>, Vec<Device>) {
         let mut dropped = Vec::new();
         for d in &mut self.devices {
             let stale = d
                 .pending
                 .as_ref()
-                .is_some_and(|p| p.at.elapsed().unwrap_or_default() > STALE);
-            if stale {
-                dropped.push(d.clone());
+                .filter(|p| p.at.elapsed().unwrap_or_default() > STALE);
+            if let Some(p) = stale {
+                if !p.resync {
+                    dropped.push(d.clone());
+                }
                 d.pending = None;
                 // What Home Assistant holds is not known now.
                 d.told = None;
@@ -241,11 +257,27 @@ impl Presence {
         if self.next_try.is_some_and(|t| now < t) {
             return (Vec::new(), dropped);
         }
+        for d in &mut self.devices {
+            let lost = d.told.is_none() && d.pending.is_none();
+            let Some(home) = d.home.filter(|_| lost) else {
+                continue;
+            };
+            self.next_generation += 1;
+            d.pending = Some(Pending {
+                home,
+                at: SystemTime::now(),
+                body: event(d, home),
+                why: None,
+                resync: true,
+                generation: self.next_generation,
+            });
+        }
         let tries = self.devices.iter().filter_map(|d| {
             let p = d.pending.as_ref()?;
             Some(Try {
                 mac: d.mac,
                 generation: p.generation,
+                home: p.home,
                 body: p.body.to_string(),
             })
         });
@@ -265,23 +297,41 @@ impl Presence {
             }
         }
         let d = self.devices.iter_mut().find(|d| d.mac == t.mac)?;
-        let p = d
-            .pending
-            .as_mut()
-            .filter(|p| p.generation == t.generation)?;
+        let ours = |p: &Pending| p.generation == t.generation;
         match outcome {
             Outcome::Delivered => {
+                // What Home Assistant holds now, whatever came meanwhile.
                 d.told = Some(Told {
-                    home: p.home,
+                    home: t.home,
                     at: SystemTime::now(),
                 });
-                d.pending = None;
                 self.delivered += 1;
                 self.last_delivery = Some(SystemTime::now());
-                Some(d.clone())
+                let told = d.clone();
+                if d.pending
+                    .as_ref()
+                    .is_some_and(|p| ours(p) || p.home == t.home)
+                {
+                    d.pending = None;
+                }
+                // Undone while it was on its way: the state now goes too.
+                if let Some(home) = d.home.filter(|h| *h != t.home && d.pending.is_none()) {
+                    self.next_generation += 1;
+                    d.pending = Some(Pending {
+                        home,
+                        at: SystemTime::now(),
+                        body: event(d, home),
+                        why: None,
+                        resync: false,
+                        generation: self.next_generation,
+                    });
+                }
+                Some(told)
             }
             Outcome::Failed(why) | Outcome::Refused(why) => {
-                p.why = Some(why.clone());
+                if let Some(p) = d.pending.as_mut().filter(|p| ours(p)) {
+                    p.why = Some(why.clone());
+                }
                 None
             }
         }
@@ -307,6 +357,7 @@ fn event(d: &Device, home: bool) -> Value {
 struct Try {
     mac: [u8; 6],
     generation: u64,
+    home: bool,
     body: String,
 }
 
@@ -318,26 +369,34 @@ enum Outcome {
     Failed(String),
 }
 
+/// A token read for one round of requests, wiped when dropped.
+struct Token(String);
+
+impl Drop for Token {
+    fn drop(&mut self) {
+        // SAFETY: zeros are valid UTF-8, and the string is not read after.
+        u6e_proto::frame::zeroize(unsafe { self.0.as_mut_vec() });
+    }
+}
+
 /// The token, trimmed, and its hash; why not.
-fn token(path: &std::path::Path) -> Result<(String, [u8; 32]), String> {
+fn token(path: &std::path::Path) -> Result<(Token, [u8; 32]), String> {
     use std::io::Read;
-    let mut text = String::new();
+    let mut text = Token(String::new());
     std::fs::File::open(path)
-        .and_then(|f| f.take(TOKEN_MAX).read_to_string(&mut text))
+        .and_then(|f| f.take(TOKEN_MAX).read_to_string(&mut text.0))
         .map_err(|e| format!("{}: {e}", path.display()))?;
-    let t = text.trim().to_owned();
-    // SAFETY: zeros are valid UTF-8, and the text is not read after.
-    u6e_proto::frame::zeroize(unsafe { text.as_mut_vec() });
-    if t.is_empty() || t.chars().any(|c| c.is_whitespace() || c.is_control()) {
+    let t = Token(text.0.trim().to_owned());
+    if t.0.is_empty() || t.0.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err(format!("{}: no token", path.display()));
     }
-    let hash = digest::digest(&digest::SHA256, t.as_bytes());
+    let hash = digest::digest(&digest::SHA256, t.0.as_bytes());
     let hash = hash.as_ref().try_into().expect("SHA-256 is 32 bytes");
     Ok((t, hash))
 }
 
 /// What one request came to.
-async fn send(settings: &Settings, token: &str, body: &str) -> Outcome {
+async fn post(settings: &Settings, token: &str, body: &str) -> Outcome {
     let target = format!("/api/events/{EVENT}");
     let host = (settings.host.as_str(), settings.port);
     match fetch::post_json_tls(host, &target, &settings.ca, token, body, REQUEST_WAIT).await {
@@ -348,12 +407,19 @@ async fn send(settings: &Settings, token: &str, body: &str) -> Outcome {
     }
 }
 
-/// Records an event delivered or dropped (`d` as it was with it pending)
-/// as an action on its device.
+/// Records an event as an action on its device: delivered (`d` as Home
+/// Assistant was told), or dropped (`d` as it was with it pending).
 fn record(state: &mut crate::state::State, d: &Device, ok: bool) {
-    let home = d.pending.as_ref().map(|p| p.home);
-    let home = home.or(d.told.map(|t| t.home)).unwrap_or(false);
-    let word = if home { "home" } else { "not home" };
+    let home = if ok {
+        d.told.map(|t| t.home)
+    } else {
+        d.pending.as_ref().map(|p| p.home)
+    };
+    let word = if home.unwrap_or(false) {
+        "home"
+    } else {
+        "not home"
+    };
     let detail = if ok {
         format!("{word}: Home Assistant was told ({})", d.name)
     } else {
@@ -375,22 +441,39 @@ fn record(state: &mut crate::state::State, d: &Device, ok: bool) {
     });
 }
 
-/// Looks at the devices every second and sends their events, for the life
-/// of the process.
+/// Looks at the devices every second, for the life of the process, and
+/// starts the sender, which it wakes when there may be something to send:
+/// the tracker never waits for Home Assistant.
 pub async fn supervise(state: Shared, settings: Settings) {
+    let wake = Arc::new(Notify::new());
+    tokio::spawn(send(state.clone(), settings, Arc::clone(&wake)));
     let mut every = interval(Duration::from_secs(1));
     loop {
         every.tick().await;
+        let mut s = state.write();
+        let s = &mut *s;
+        let Some(p) = s.presence.as_mut() else { return };
+        if p.tick(unix_ms(SystemTime::now()), &s.sessions) {
+            s.notify(Change::Presence);
+        }
+        wake.notify_one();
+    }
+}
+
+/// Sends the events due whenever woken, and at least every second (a
+/// backoff ends, an event goes stale), for the life of the process.
+async fn send(state: Shared, settings: Settings, wake: Arc<Notify>) {
+    loop {
+        let _ = timeout(Duration::from_secs(1), wake.notified()).await;
         let tries = {
             let mut s = state.write();
             let s = &mut *s;
             let Some(p) = s.presence.as_mut() else { return };
-            let changed = p.tick(unix_ms(SystemTime::now()), &s.sessions);
             let (tries, dropped) = p.due(Instant::now());
             for d in &dropped {
                 record(s, d, false);
             }
-            if changed || !dropped.is_empty() {
+            if !dropped.is_empty() || !tries.is_empty() {
                 s.notify(Change::Presence);
             }
             tries
@@ -410,7 +493,7 @@ pub async fn supervise(state: Shared, settings: Settings) {
             continue;
         }
         for t in &tries {
-            let outcome = send(&settings, &token, &t.body).await;
+            let outcome = post(&settings, &token.0, &t.body).await;
             let mut s = state.write();
             let s = &mut *s;
             let Some(p) = s.presence.as_mut() else { return };
@@ -647,15 +730,87 @@ mod tests {
         ev(&mut s, "ap1", T0 + 7 * MIN, true);
         p.tick(T0 + 7 * MIN, &s);
         assert_eq!(pending(&p), None);
-        // One left undelivered for 5 minutes is dropped, and then what
-        // Home Assistant holds is not known.
+        // One left undelivered for 5 minutes, Home Assistant failing, is
+        // dropped, and then what Home Assistant holds is not known.
         ev(&mut s, "ap1", T0 + 8 * MIN, false);
         p.tick(T0 + 13 * MIN, &s);
+        let now = Instant::now();
+        let (tries, _) = p.due(now);
+        p.tried(&tries[0], &Outcome::Failed("down".into()), now);
         p.devices[0].pending.as_mut().unwrap().at -= STALE + Duration::from_secs(1);
-        let (tries, dropped) = p.due(Instant::now());
+        let (tries, dropped) = p.due(now);
         assert!(tries.is_empty());
         assert_eq!(dropped.len(), 1);
         assert_eq!((p.dropped, p.devices[0].told), (1, None));
+    }
+
+    /// A change undone while its event is on its way: Home Assistant took
+    /// it, so it is told, and the state now goes after it.
+    #[test]
+    fn an_event_undone_on_its_way_is_followed_by_the_state_now() {
+        let dir = TestDir::new();
+        let mut p = Presence::new(&settings(dir.path(), 1));
+        let mut s = Sessions::default();
+        p.tick(T0, &s);
+        ev(&mut s, "ap1", T0 + MIN, true);
+        p.tick(T0 + MIN, &s);
+        let now = Instant::now();
+        let (tries, _) = p.due(now);
+        // On its way, the device leaves again, past its leave time.
+        ev(&mut s, "ap1", T0 + 2 * MIN, false);
+        p.tick(T0 + 8 * MIN, &s);
+        assert!(p.devices[0].pending.is_none(), "undone");
+        let told = p.tried(&tries[0], &Outcome::Delivered, now).unwrap();
+        assert_eq!(told.told.map(|t| t.home), Some(true));
+        assert_eq!(p.devices[0].told.map(|t| t.home), Some(true));
+        let next = p.devices[0].pending.clone().unwrap();
+        assert!(!next.home && !next.resync);
+    }
+
+    /// Home Assistant away for longer than an event waits, while the device
+    /// leaves: once it may be tried again, the device's state now goes again,
+    /// however often it is dropped meanwhile, until Home Assistant takes it.
+    #[test]
+    fn home_assistant_is_put_right_once_it_is_back_after_a_drop() {
+        let dir = TestDir::new();
+        let mut p = Presence::new(&settings(dir.path(), 1));
+        let mut s = Sessions::default();
+        ev(&mut s, "ap1", T0, true);
+        p.tick(T0, &s);
+        ev(&mut s, "ap1", T0 + MIN, false);
+        p.tick(T0 + 6 * MIN, &s);
+        let t0 = Instant::now();
+        let (tries, _) = p.due(t0);
+        p.tried(&tries[0], &Outcome::Failed("down".into()), t0);
+        let age = |p: &mut Presence| {
+            p.devices[0].pending.as_mut().unwrap().at -= STALE + Duration::from_secs(1);
+        };
+        age(&mut p);
+        let (tries, dropped) = p.due(t0);
+        assert_eq!((tries.len(), dropped.len()), (0, 1));
+        // Past the backoff, the state now is queued again: not home.
+        let (tries, _) = p.due(t0 + Duration::from_secs(3));
+        assert_eq!(tries.len(), 1);
+        let pending = p.devices[0].pending.clone().unwrap();
+        assert!(pending.resync && !pending.home);
+        assert_eq!(pending.body["state"], "not_home");
+        // Still away: dropped again, counted, not on the timeline again.
+        p.tried(
+            &tries[0],
+            &Outcome::Failed("down".into()),
+            t0 + Duration::from_secs(3),
+        );
+        age(&mut p);
+        let (tries, dropped) = p.due(t0 + Duration::from_secs(4));
+        assert_eq!((tries.len(), dropped.len(), p.dropped), (0, 0, 2));
+        // Back: it takes the device's state.
+        let (tries, _) = p.due(t0 + Duration::from_secs(60));
+        assert_eq!(tries.len(), 1);
+        p.tried(&tries[0], &Outcome::Delivered, t0 + Duration::from_secs(60));
+        assert_eq!(p.devices[0].told.map(|t| t.home), Some(false));
+        assert!(p.devices[0].pending.is_none());
+        let (tries, _) = p.due(t0 + Duration::from_secs(61));
+        assert!(tries.is_empty(), "nothing more to put right");
     }
 
     #[derive(Debug, Clone)]
@@ -834,6 +989,45 @@ mod tests {
         ] {
             assert!(text.lines().any(|l| l == line), "missing {line}");
         }
+    }
+
+    /// Home Assistant that takes the connection and never answers holds the
+    /// sender for its request's time; the devices are followed meanwhile.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_tracker_does_not_wait_for_home_assistant() {
+        let dir = TestDir::new();
+        std::fs::write(dir.path().join("token"), "tok").unwrap();
+        let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = silent.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = silent.accept().await {
+                held.push(sock);
+            }
+        });
+        let mut set = settings(dir.path(), port);
+        set.leave_after = Duration::from_millis(200);
+        let state =
+            Shared::new(State::new([("ap1".to_owned(), "ap1".to_owned())]).with_presence(&set));
+        tokio::spawn(supervise(state.clone(), set));
+        let home = |state: &Shared| state.read().presence.as_ref().unwrap().devices[0].home;
+        wait_for("the first look", || home(&state).is_some()).await;
+        join(&state);
+        wait_for("the join", || home(&state) == Some(true)).await;
+        // The sender is now held by the request; the device leaves.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let now = unix_ms(SystemTime::now());
+        ev(&mut state.write().sessions, "ap1", now, false);
+        let start = Instant::now();
+        wait_for("the leave", || home(&state) == Some(false)).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+        // The join it undid, unsent, is not sent.
+        let p = state.read();
+        assert!(p.presence.as_ref().unwrap().devices[0].pending.is_none());
     }
 
     #[tokio::test]
