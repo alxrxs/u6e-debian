@@ -362,10 +362,13 @@ impl Client {
         });
         let better = |v: &View| i16::from(v.signal) >= i16::from(now.signal) + BETTER_DB;
         let sticky = now.signal < sticky_dbm && self.view.as_ref().is_some_and(better);
+        // A step counts when it ran from one sticky reading to another: the
+        // time before the first is not known to have been sticky.
+        let was = self.sticky_since.is_some();
         let step = self
             .at
             .as_ref()
-            .filter(|_| sticky)
+            .filter(|_| sticky && was)
             .map(|a| now.at_ms.saturating_sub(a.3).min(STEP_MS));
         if let Some(ms) = step.filter(|&ms| ms > 0) {
             let bucket = now.at_ms / BUCKET_MS;
@@ -1538,8 +1541,9 @@ mod tests {
             .insert(("ap1".to_owned(), Band::B5), (true, 2300));
         site.snap("ap2", at(150), &[Sta(1, 0, -77, 35, Some(EAP))]);
         site.snap("ap2", at(165), &[Sta(1, 0, -79, 50, Some(EAP))]);
+        // Sticky since 150, so the 15 s before it count nothing.
         let f = site.r.facts(&mac(1), at(165));
-        assert_eq!(f.sticky_ms, 30 * S);
+        assert_eq!(f.sticky_ms, 15 * S);
         let now = f.sticky.unwrap();
         assert_eq!(
             (now.ap.as_str(), now.band, now.signal, now.since_ms),
@@ -1552,7 +1556,7 @@ mod tests {
         // ap1 listing it a moment longer changes ap1's reading in nothing.
         site.snap("ap1", at(166), &[Sta(1, 0, -30, 666, Some(EAP))]);
         site.snap("ap2", at(265), &[Sta(1, 0, -78, 150, Some(EAP))]);
-        assert_eq!(site.r.facts(&mac(1), at(265)).sticky_ms, 60 * S);
+        assert_eq!(site.r.facts(&mac(1), at(265)).sticky_ms, 45 * S);
         assert_eq!(
             site.r.facts(&mac(1), at(265)).sticky.unwrap().view.signal,
             -45
@@ -1560,12 +1564,12 @@ mod tests {
         // Moved: 8 dB from where it began on ap2.
         site.snap("ap2", at(280), &[Sta(1, 0, -86, 165, Some(EAP))]);
         let f = site.r.facts(&mac(1), at(280));
-        assert_eq!((f.sticky, f.view, f.sticky_ms), (None, None, 60 * S));
-        assert_eq!(site.r.counts.sticky_ms.get("ap2"), Some(&(60 * S)));
+        assert_eq!((f.sticky, f.view, f.sticky_ms), (None, None, 45 * S));
+        assert_eq!(site.r.counts.sticky_ms.get("ap2"), Some(&(45 * S)));
         // Hours on, the day still counts it, the last hour does not.
         let later = site.r.facts(&mac(1), at(280) + 2 * 3600 * S);
-        assert_eq!((later.sticky_ms, later.sticky_share), (60 * S, 0.0));
-        assert!((site.r.facts(&mac(1), at(280)).sticky_share - 60.0 / 3600.0).abs() < 1e-9);
+        assert_eq!((later.sticky_ms, later.sticky_share), (45 * S, 0.0));
+        assert!((site.r.facts(&mac(1), at(280)).sticky_share - 45.0 / 3600.0).abs() < 1e-9);
     }
 
     /// A laptop read at -45 dBm on ap1 that left, and woke three hours later
