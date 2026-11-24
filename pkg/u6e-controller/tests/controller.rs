@@ -5184,7 +5184,10 @@ fn roams_steering_and_experience_reach_the_api_and_the_metrics() {
         (roam["from"]["ap"].as_str(), roam["to"]["ap"].as_str()),
         (Some("ap1"), Some("ap2"))
     );
-    assert_eq!(roam["before"], -74);
+    assert_eq!(
+        (roam["before"].as_i64(), roam["pending"].as_bool()),
+        (Some(-74), Some(true))
+    );
     assert_eq!(roam["steered"]["origin"], "ap");
     let steer = &v["steering"][0];
     assert_eq!(

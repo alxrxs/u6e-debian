@@ -64,7 +64,7 @@ export function roamsTable(store, list, { client = true } = {}) {
     ['Result', '', (r) => (r.failure
       ? h('span', { class: 'chip bad' }, attempt(r) ? `tried: ${ROAM_FAILURES[r.failure]}` : ROAM_FAILURES[r.failure])
       : h('span', { class: 'chip ok' }, 'roamed'))],
-    ['Signed in by', 'p2', (r) => (attempt(r) ? '–' : ROAM_KINDS[r.kind || 'unknown'])],
+    ['Signed in by', 'p2', (r) => (attempt(r) ? '–' : r.kind ? ROAM_KINDS[r.kind] : r.pending ? 'not known yet' : ROAM_KINDS.unknown)],
     ['Between APs', 'num', gapText],
     ['Signal', 'p2', (r) => [signal(r.before), ' → ', signal(r.after)]],
     ['Steered by', 'p3 wrap', (r) => (r.steered ? asker(r.steered) : '–')],

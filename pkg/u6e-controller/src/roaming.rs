@@ -1160,6 +1160,8 @@ impl Roaming {
         put("before", r.before.map(Into::into));
         put("after", r.after.map(Into::into));
         put("kind", r.kind.map(|k| k.name().into()));
+        // Its kind, failure and count wait for its first [`FAILED_MS`].
+        put("pending", (!r.settled).then_some(true.into()));
         put("failure", r.failure.map(|f| f.name().into()));
         let steer = r.steer.and_then(|id| self.steer(id));
         put(
