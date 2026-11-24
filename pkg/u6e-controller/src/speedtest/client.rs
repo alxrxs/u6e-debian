@@ -14,9 +14,9 @@
 //! the last byte read. A body is read as it comes, counted frame by frame
 //! and never held, at most [`IN_FLIGHT`] at once per test, while the
 //! upload's time runs from the first and [`UP_SLACK`] after; a body past
-//! that, or past the test's bytes, or of an ended test, is read no further. The client is the associated
-//! client one of whose addresses (leased, or seen in its flows) is the
-//! request's: the last `X-Forwarded-For` entry, which the sign-in proxy
+//! that, or past the test's bytes, or of an ended test, is read no further.
+//! The client is the associated client one of whose addresses (leased, or
+//! seen in its flows) is the request's: the last `X-Forwarded-For` entry, which the sign-in proxy
 //! sets and nothing else can, since only the proxy reaches the listener.
 //! Its AP, band, SSID, signal and rates are taken at the start, and a move
 //! during the test is noted; a device that is no Wi-Fi client of these APs

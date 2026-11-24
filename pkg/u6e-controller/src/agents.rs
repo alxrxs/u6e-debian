@@ -10,8 +10,9 @@
 //! queues for it (commands, requests for flows, signed configurations,
 //! captures); a capture's chunks are written to its file as they come, each
 //! then acknowledged (`captures`). A connection whose first message opens a
-//! speed test instead of saying Hello is that test's (`speedtest::ap`). After the first key frame of every
-//! connection it gives the AP the policy's blocks, all of them, since the AP
+//! speed test instead of saying Hello is that test's (`speedtest::ap`).
+//! After the first key frame of every connection it gives the AP the
+//! policy's blocks, all of them, since the AP
 //! keeps them in RAM only, the rate limits, all of them, which the AP keeps
 //! only until it restarts, its client guards' mode and the leases they are
 //! seeded with, and checks that it runs the latest configuration signed for

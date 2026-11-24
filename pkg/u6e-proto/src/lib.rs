@@ -8,8 +8,9 @@
 //! AP's own sockets between the agent and its client guards, its rate-limit
 //! helper and its capture helper; `local`, `bpf`, `ecm`, `netdev` and `nft`
 //! are what the AP's root helpers share; `text` cleans what a person reads of
-//! it; `speedtest` is the chunked stream of a speed test's own connection. Each end opens with the frozen version frame of `version`, so ends
-//! of different protocols tell so before either decodes a message.
+//! it; `speedtest` is the chunked stream of a speed test's own connection.
+//! Each end opens with the frozen version frame of `version`, so ends of
+//! different protocols tell so before either decodes a message.
 
 pub mod bpf;
 pub mod capture;
