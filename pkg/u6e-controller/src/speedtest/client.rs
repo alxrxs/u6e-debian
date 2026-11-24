@@ -271,12 +271,18 @@ impl SpeedTests {
     }
 }
 
-/// Where the associated client with the address `ip` is now.
+/// Where the associated client with the address `ip` is now; none when no
+/// client, or more than one, holds it (an address two clients claim says
+/// neither is the one asking).
 fn client_at(state: &State, ip: IpAddr) -> Option<At> {
-    let c = state
+    let mut holders = state
         .clients()
         .into_iter()
-        .find(|c| state.identity(&c.station.mac).addresses.contains(&ip))?;
+        .filter(|c| state.identity(&c.station.mac).addresses.contains(&ip));
+    let c = holders.next()?;
+    if holders.next().is_some() {
+        return None;
+    }
     let ap = state.ap(&c.ap)?;
     let place = sessions::place(&c.ap, &ap.naming, c.station.bss, None);
     Some(At {

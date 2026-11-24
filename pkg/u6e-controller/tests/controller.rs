@@ -5809,3 +5809,32 @@ fn a_slow_upload_body_is_cut_at_the_uploads_time_and_none_counts_after_the_end()
     );
     assert_eq!(mine["tests"][0]["up"]["bytes"], 4096);
 }
+
+#[test]
+fn an_address_two_clients_claim_names_neither() {
+    let r = controller(quick_client_tests());
+    let _a = ap_with_addressed_client(&r);
+    let other = [0x02, 0, 0, 0, 0, 0x02];
+    let mut b = Agent::hello(r.c.agents, KEY_AP2, "ap2");
+    let s = snapshot(1, vec![bss("wlan5", "Guest")], vec![station(other, 0, -60)]);
+    b.send(&AgentMsg::Key(s)).unwrap();
+    b.expect_sync();
+    let mut f = flows_of(1, &[(1, 10, 10)]);
+    f.clients[0].mac = other;
+    b.send(&AgentMsg::Flows(f)).unwrap();
+    let ip = IpAddr::from([192, 0, 2, 10]);
+    wait_for("the second client's address", || {
+        r.c.state.read().identity(&other).addresses.contains(&ip)
+    });
+    let (status, started) = post(
+        r.c.http,
+        "/api/speedtest",
+        &page_of("alice", "192.0.2.10"),
+        "{}",
+    );
+    assert_eq!(
+        (status, &started["client"]),
+        (200, &Value::Null),
+        "{started}"
+    );
+}
