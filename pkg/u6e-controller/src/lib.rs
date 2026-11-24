@@ -56,6 +56,7 @@ pub mod sessions;
 pub mod spectrum;
 pub mod speedtest;
 pub mod stage;
+mod stall;
 pub mod state;
 mod store;
 #[cfg(test)]
@@ -302,7 +303,12 @@ pub async fn start(
         access: access.clone(),
     };
     let web = http::router(state.clone(), access);
-    tokio::spawn(serve_http("http", http, web));
+    let web_listener = stall::Listener::new(http, timing.ui_stall);
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(web_listener, web).await {
+            eprintln!("u6e-controller: http listener: {e}");
+        }
+    });
     tokio::spawn(spectrum::supervise(state.clone()));
     tokio::spawn(serve_http("metrics", metrics, metrics::router(state)));
     Ok(controller)

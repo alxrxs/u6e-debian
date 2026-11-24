@@ -74,6 +74,9 @@ pub struct Timing {
     /// The longest a UI WebSocket is served: the page then connects again,
     /// and its user's groups are judged again.
     pub ui_session: Duration,
+    /// How long a write to a UI connection may make no progress before the
+    /// connection is ended (`stall`).
+    pub ui_stall: Duration,
     /// What the speed tests take.
     pub speedtest: speedtest::Limits,
 }
@@ -89,6 +92,7 @@ impl Default for Timing {
             resume: Duration::from_secs(120),
             reconcile: Duration::from_secs(30),
             ui_session: Duration::from_secs(3600),
+            ui_stall: Duration::from_secs(30),
             speedtest: speedtest::Limits::default(),
         }
     }

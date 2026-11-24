@@ -5838,3 +5838,42 @@ fn an_address_two_clients_claim_names_neither() {
         "{started}"
     );
 }
+
+/// A download nobody reads stalls the controller's writes; past its stall
+/// time the connection is ended, rather than resumed when the page reads
+/// again and run to the test's 10 s and gigabyte.
+#[test]
+fn a_download_nobody_reads_is_ended_at_its_stall_time() {
+    let r = controller(Timing {
+        ui_stall: Duration::from_secs(1),
+        ..Timing::default()
+    });
+    let id = alices_test(&r);
+    let mut sock = TcpStream::connect(r.c.http).unwrap();
+    write!(
+        sock,
+        "GET /api/speedtest/{id}/down HTTP/1.0\r\nHost: x\r\nX-Forwarded-Preferred-Username: alice\r\n\r\n"
+    )
+    .unwrap();
+    // The socket buffers fill, the writes stall, and the stall time passes.
+    thread::sleep(Duration::from_secs(3));
+    let start = Instant::now();
+    let mut got = 0u64;
+    let mut buf = vec![0; 1 << 16];
+    loop {
+        match sock.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => got += n as u64,
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "still sending after {got} B"
+        );
+    }
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        start.elapsed()
+    );
+    assert!(got < 200 << 20, "{got} B: the download went on");
+}

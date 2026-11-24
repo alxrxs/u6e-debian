@@ -46,6 +46,8 @@
 //! view's `speedtests`; `/api/speedtest` and its routes are a signed-in
 //! viewer's test of their own device (`speedtest::client`).
 //!
+//! A connection whose writes make no progress for 30 s is ended (`stall`).
+//!
 //! The listener is reached only through the reverse proxy that signs users
 //! in, which names the user in `X-Forwarded-Preferred-Username` and their
 //! groups in `X-Auth-Request-Groups`.
