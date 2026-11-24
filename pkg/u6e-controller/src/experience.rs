@@ -179,11 +179,13 @@ pub fn best_rate_kbps(caps: StationCaps, radio_width_mhz: u16) -> u32 {
     (bits * 1_000_000 / u64::from(den * ns)) as u32
 }
 
-/// A client's parts and score.
+/// A client's parts and score, and its failed roams in the last hour, which
+/// its roaming part's figure (its sticky share) does not say.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Experience {
     pub parts: Parts,
     pub score: Option<u8>,
+    pub failed_roams: u32,
 }
 
 /// An AP's: the mean of its clients' scores, each part's mean, its clients
@@ -219,6 +221,7 @@ pub fn site(state: &State, now_ms: u64) -> Site {
         let e = Experience {
             score: score(&parts),
             parts,
+            failed_roams: i.failed_roams,
         };
         by_ap
             .entry(c.ap)
@@ -299,10 +302,11 @@ fn station<'a>(s: &'a Snapshot, mac: &[u8; 6]) -> Option<&'a Station> {
     Some(&s.stations[i])
 }
 
-/// A client's experience as the UI and the API show it: the score, and
-/// each present part's score and figure by name.
+/// A client's experience as the UI and the API show it: the score, each
+/// present part's score and figure by name, and its failed roams in the
+/// last hour.
 pub fn json(e: &Experience) -> Value {
-    json!({ "score": e.score, "parts": parts_json(&e.parts) })
+    json!({ "score": e.score, "parts": parts_json(&e.parts), "failed_roams": e.failed_roams })
 }
 
 /// An AP's experience as the UI and the API show it.

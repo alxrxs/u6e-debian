@@ -1,12 +1,13 @@
 // Events: the live feed of what the APs report (joins, leaves, sign-ins,
-// radios, the services devices offer over mDNS) and of the operators'
-// actions on clients, newest first, by day; a client's own history uses the
+// clients asking for a better AP and answering requests to move, radios,
+// the services devices offer over mDNS) and of the operators' actions on
+// clients, newest first, by day; a client's own history uses the
 // same list.
 
 import { h, dayOf, describe, time } from '../util.js';
 
 const PAGE = 300;
-const GROUPS = [['', 'All'], ['conn', 'Joins and leaves'], ['auth', 'Sign-ins'], ['radio', 'Radios'], ['guard', 'Guards'], ['service', 'Services'], ['action', 'Actions']];
+const GROUPS = [['', 'All'], ['conn', 'Joins and leaves'], ['auth', 'Sign-ins'], ['roam', 'Steering'], ['radio', 'Radios'], ['guard', 'Guards'], ['service', 'Services'], ['action', 'Actions']];
 
 /** The radio an event names, with its band where the controller knows it. */
 function radioName(e) {

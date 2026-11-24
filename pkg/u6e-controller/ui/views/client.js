@@ -4,18 +4,22 @@
 // readings now, the actions an admin can take on it, its rate limit and its
 // captures (`tools`), its largest
 // connections, its signal, rates and traffic over the session as this page
-// has seen it, and, as the controller keeps them, its traffic over the week
-// (`traffic`), the services it offers and asks for over mDNS (`services`),
-// its sessions and its timeline, asked for again when an event of it comes
-// and every 15 s.
+// has seen it, its Wi-Fi experience score and its parts (`experience`),
+// and, as the controller keeps them, its roams, whether it is sticky and the
+// requests to move it with its answers (`roaming`), its traffic over the
+// week (`traffic`), the services it offers and asks for over mDNS
+// (`services`), its sessions and its timeline, asked for again when an
+// event of it comes and every 15 s.
 
-import { h, icon, ask, bandName, bits, bytes, dayOf, DID, duration, hm, mbps, palette, pct, phy, quality, time } from '../util.js';
+import { h, icon, ago, ask, bandName, bits, bytes, dayOf, DID, duration, hm, mbps, palette, pct, phy, quality, time } from '../util.js';
 import { lineChart } from '../charts.js';
 import { clientFlows, flowTable, offload, redraw, sampled, tick, topRows } from './flows.js';
 import { certificate, sessionsTable, timelineItems } from './history.js';
 import { capturePanel, limitPanel } from './tools.js';
 import { byMac, deviceCard } from './services.js';
 import { trafficPanel } from './traffic.js';
+import { clientExperience } from './experience.js';
+import { roamingLoader, roamsTable, steeringTable, stickyWords } from './roaming.js';
 
 const ADMIN_GROUP = 'wifi-admins';
 const REFRESH_MS = 15000;
@@ -221,6 +225,15 @@ export default {
     const flowBox = h('div');
     const flowsEl = h('section', { class: 'client-flows' },
       h('div', { class: 'head section-title' }, h('h2', {}, 'Flows'), flowSub), flowBox);
+    const xpBox = h('div', { class: 'panel' });
+    const xpEl = h('section', { class: 'client-xp' }, h('h2', { class: 'section-title' }, 'Experience'), xpBox);
+    const roamSum = h('div', { class: 'panel roam-sum' });
+    const roamBox = h('div', { class: 'panel table-wrap' });
+    const steerBox = h('div', { class: 'panel table-wrap' });
+    const roamEl = h('section', { class: 'client-roams' },
+      h('h2', { class: 'section-title' }, 'Roams'), roamSum, roamBox, steerBox);
+    const roaming = roamingLoader(store, mac, () => view.update());
+    let roamDrawn = '';
     const traffic = trafficPanel(store, mac);
     const svcBox = h('div');
     const svcEl = h('section', { class: 'client-services' }, h('h2', { class: 'section-title' }, 'Services'), svcBox);
@@ -236,7 +249,7 @@ export default {
     const noHistory = h('div', { class: 'panel empty' });
     root.append(
       h('a', { class: 'crumb', href: '#/clients' }, icon('M15 18l-6-6 6-6'), 'Clients'),
-      head, tools, chartsEl, flowsEl, traffic.el, svcEl,
+      head, xpEl, tools, chartsEl, flowsEl, roamEl, traffic.el, svcEl,
       h('h2', { class: 'section-title' }, 'Sessions'), sessions, allSessions,
       h('h2', { class: 'section-title' }, 'Timeline'), timeline, timelineNote, noHistory);
     /** The history the controller keeps, when it came, and its events seen
@@ -283,6 +296,33 @@ export default {
         !svc ? 'Loading what it offers over mDNS.'
           : svc.error !== undefined ? 'The controller cannot be reached; this page tries again.'
             : 'No access point has heard it speak mDNS (Bonjour, AirPlay, HomeKit) lately.')));
+    }
+
+    function updateRoams() {
+      roaming.due();
+      const d = roaming.data;
+      const stamp = `${roaming.fetched}|${Math.floor(Date.now() / 60000)}`;
+      if (stamp === roamDrawn) return;
+      roamDrawn = stamp;
+      if (!d || d.error !== undefined) {
+        roamSum.replaceChildren(h('p', {}, !d ? 'Loading its roams.' : 'The controller cannot be reached; this page tries again.'));
+        roamBox.hidden = steerBox.hidden = true;
+        return;
+      }
+      const c = d.client;
+      const sticky = d.sticky[0];
+      const heard = c.view && !sticky
+        ? h('p', { class: 'muted' }, `${c.view.ap} last heard it at ${c.view.signal} dBm, ${ago(c.view.at)}.`) : null;
+      fill(roamSum,
+        h('p', {}, `${c.roams} roam${c.roams === 1 ? '' : 's'} in the last day, `,
+          h('span', { class: c.failed ? 'q-poor' : null }, `${c.failed} failed`),
+          `, sticky ${duration(c.sticky_ms / 1000) || '0 s'} of it.`),
+        sticky ? h('p', {}, stickyWords(sticky, d.settings)) : null,
+        heard);
+      roamBox.hidden = !d.roams.length;
+      if (d.roams.length) roamBox.replaceChildren(roamsTable(store, d.roams, { client: false }));
+      steerBox.hidden = !d.steering.length;
+      if (d.steering.length) steerBox.replaceChildren(steeringTable(store, d.steering, { client: false }));
     }
 
     let flowsDrawn = '';
@@ -460,6 +500,9 @@ export default {
         limit.update();
         capture.update();
         updateFlows(c);
+        xpEl.hidden = !c;
+        if (c) xpBox.replaceChildren(clientExperience(c.experience));
+        updateRoams();
         traffic.update();
         updateServices();
         chartsEl.hidden = !c;

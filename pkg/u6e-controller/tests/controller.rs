@@ -5141,7 +5141,10 @@ fn roams_steering_and_experience_reach_the_api_and_the_metrics() {
     assert_eq!(e["parts"]["signal"], json!({"score": 30.0, "value": -74.0}));
     assert_eq!(e["parts"]["contention"]["value"], 2.5);
     assert_eq!(e["parts"]["rate"]["score"], 72.0);
-    assert_eq!(e["score"], 70);
+    assert_eq!(
+        (e["score"].as_u64(), e["failed_roams"].as_u64()),
+        (Some(70), Some(0))
+    );
     let aps = json_get(r.c.http, "/api/aps");
     assert_eq!(aps["ap1"]["experience"]["clients"], 1);
     assert_eq!(aps["ap1"]["experience"]["score"], 70);

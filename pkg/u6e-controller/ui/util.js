@@ -238,6 +238,81 @@ export function serviceWords(e, who = (m) => m) {
   }
 }
 
+/** Why a client declined to move, by its BSS transition status (IEEE
+ * 802.11-2020, table 9-428). */
+const BTM_STATUS = {
+  1: 'no reason given',
+  2: 'too few beacons received',
+  3: 'not enough capacity',
+  4: 'BSS termination undesired',
+  5: 'it asked for a termination delay',
+  6: 'it proposed candidates of its own',
+  7: 'no suitable candidate',
+  8: 'it is leaving the network',
+};
+
+/** Why a client asked for candidates, by its transition reason (table
+ * 9-427). */
+const BTM_REASON = {
+  0: 'no reason given',
+  1: 'too many frames lost',
+  2: 'too much delay',
+  3: 'not enough capacity',
+  5: 'load balancing',
+  6: 'it found a better AP',
+  12: 'too many retransmissions',
+  15: 'its last transition failed',
+  16: 'its signal is low',
+  18: 'it was asked to move',
+  20: 'it is leaving the network',
+};
+
+/** A client's answer to a steering request, in words. */
+export function btmAnswer(status, target) {
+  if (status === undefined || status === null) return 'no answer';
+  if (status === 0) return target ? `accepted, naming ${target}` : 'accepted';
+  return `declined: ${BTM_STATUS[status] || `status ${status}`}`;
+}
+
+/** Why a client asked for BSS transition candidates, in words. */
+export function btmReason(reason) {
+  return BTM_REASON[reason] || `reason ${reason}`;
+}
+
+/** How a client signed in where it roamed to. */
+export const ROAM_KINDS = {
+  ft: 'Fast transition',
+  eap: 'Full EAP sign-in',
+  cached: 'Cached keys',
+  psk: 'Passphrase',
+  sae: 'SAE',
+  open: 'Open',
+  unknown: 'Never authorized',
+};
+
+/** Why a roam failed. */
+export const ROAM_FAILURES = {
+  'eap-failed': 'refused by RADIUS',
+  'eap-timeout': 'sign-in timed out',
+  passphrase: 'passphrase did not match',
+  dropped: 'disconnected within 30 s',
+};
+
+/** How long a client was between two APs: exact, at most, or between two
+ * bounds, as the controller could tell. */
+export function gapText(r) {
+  if (r.gap_ms === undefined) return '–';
+  const s = (ms) => (ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(ms < 10000 ? 1 : 0)} s`);
+  if (r.gap_ms === 0) return 'no gap';
+  if (r.gap_ms - r.gap_min_ms <= 250) return s(r.gap_ms);
+  return r.gap_min_ms ? `${s(r.gap_min_ms)} – ${s(r.gap_ms)}` : `≤ ${s(r.gap_ms)}`;
+}
+
+/** good, fair or poor, for an experience score's colour. */
+export function scoreQuality(score) {
+  return score >= 80 ? 'good' : score >= 50 ? 'fair' : 'poor';
+}
+
 /** The client guards, by the name the controller gives them. */
 export const GUARDS = { arp: 'ARP inspection', dhcp: 'Rogue DHCP guard', ra: 'RA guard', source: 'IP source guard', tag: 'VLAN tag guard' };
 
@@ -263,6 +338,8 @@ export function describe(ev) {
       return { text: `broke the ${GUARDS[ev.guard] || ev.guard}: ${ev.detail}${more}.${fate}`, tone: 'bad', group: 'guard' };
     }
     case 'service': return { ...serviceWords(ev), group: 'service' };
+    case 'btm-query': return { text: `asked${on}${band} for a better access point: ${btmReason(ev.reason)}`, tone: '', group: 'roam' };
+    case 'btm-response': return { text: `answered a request to move: ${btmAnswer(ev.status, ev.target)}`, tone: ev.status === 0 ? 'ok' : 'warn', group: 'roam' };
     default: return { text: ev.kind, tone: '', group: 'other' };
   }
 }

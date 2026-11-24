@@ -1,9 +1,10 @@
-// Devices: each AP with what it runs and how it is doing, and its radios with
-// channel, power, noise, clients and how busy the air is; a radio's name
-// leads to its spectrum.
+// Devices: each AP with what it runs and how it is doing, its clients'
+// Wi-Fi experience, and its radios with channel, power, noise, clients and
+// how busy the air is; a radio's name leads to its spectrum.
 
-import { h, ago, bandName, duration, palette, pct } from '../util.js';
+import { h, ago, bandName, clientName, duration, palette, pct } from '../util.js';
 import { sparkline, stack } from '../charts.js';
+import { apExperience } from './experience.js';
 
 /** A temperature with its warning colour; ath11k throttles near 105 °C. */
 function temp(c) {
@@ -114,8 +115,10 @@ function apPanel(store, name, ap) {
     : h('p', { class: 'offline' }, ap.up
       ? `${name} has connected; its radios appear with its first report.`
       : `No live data while ${name} is offline. Wi-Fi on it keeps working without the controller; the figures return when its agent reconnects.`);
+  const xp = live ? apExperience(ap.experience, (m) => clientName(store, m)) : null;
   return h('section', { class: 'panel ap' }, top, facts,
     crashes.length ? h('p', { class: 'note' }, crashes.map(([phy, n]) => `${phy} firmware crashed ${n} time${n === 1 ? '' : 's'} since the controller started. `)) : null,
+    xp ? h('div', { class: 'ap-xp-box' }, h('h3', {}, 'Experience'), xp) : null,
     manifest, body);
 }
 

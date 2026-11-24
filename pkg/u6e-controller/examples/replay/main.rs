@@ -34,7 +34,15 @@
 //! read the mDNS of a HomePod stereo pair (`0e`, `0f`, with leases of their
 //! own) whose right speaker stops answering the iPhone's browses for part of
 //! each cycle, of a TV, a printer and a wired HomeKit bridge (`services`);
-//! each client's traffic builds up from its flows and counters.
+//! each client's traffic builds up from its flows and counters. Early in
+//! each cycle `ap1` reboots: its clients go to `ap2`, signing in there in
+//! full, and come back by fast transition once it is up, but for the
+//! speakers (the pair and a kitchen speaker), which stay on `ap2` 18 dB
+//! weaker, sticky, until `ap1` asks them back late in the cycle; one client
+//! fails to sign in on the other AP while it is on one, another asks for a
+//! better AP and declines what it is offered, and the doorbell declines
+//! every steer. Every steer is answered as a client answers it, and every
+//! station says what it supports (`roaming`).
 //! The RF planner commits to a site repository of its own in the temporary
 //! directory, made afresh at each start, and the radios' history starts a
 //! day full (`rf`). The controller signs configurations (`u6e-controller
@@ -53,6 +61,7 @@ mod keys;
 mod manage;
 mod radius;
 mod rf;
+mod roaming;
 mod services;
 mod spectrum;
 mod tools;
@@ -144,11 +153,13 @@ const DEVICES: [(u8, &str); 3] = [
     (6, "Bedroom thermostat"),
     (7, "Office printer"),
 ];
-/// The HomePod pair (`services`), by the last byte of their MAC: their
-/// leases' host names and devices.
-const SPEAKERS: [(u8, &str, &str); 2] = [
+/// The speakers, by the last byte of their MAC: the HomePod pair
+/// (`services`) and the kitchen speaker (`roaming`), their leases' host
+/// names and devices.
+const SPEAKERS: [(u8, &str, &str); 3] = [
     (services::LEFT, "homepod-left", "Living room speaker L"),
     (services::RIGHT, "homepod-right", "Living room speaker R"),
+    (roaming::KITCHEN, "kitchen-speaker", "Kitchen speaker"),
 ];
 
 /// The reverse DNS (`flows`): of the clients' addresses, their profiles'
@@ -287,17 +298,28 @@ enum Act {
     LinkDown(usize, f64),
     /// A client on an AP breaks a client guard's rule.
     Violation(u8, usize, Guard),
+    /// The AP reboots, its link down for so many seconds: its clients go to
+    /// the other AP, and all but the sticky speakers come back after.
+    ApReboot(usize, f64),
+    /// A client asks its AP for a better one, and declines what it gets.
+    Query(u8),
+    /// The AP asks a client on the other AP to come back to its BSS, where
+    /// it is heard at that signal, and the client does.
+    HomeBy(u8, usize, usize, f64),
 }
 
 /// The script, by second of the cycle and in that order; clients by the last
 /// byte of their MAC, APs and BSSs by index. A join of a client already
 /// somewhere is a roam.
-const SCRIPT: [(f64, Act); 18] = [
+const SCRIPT: [(f64, Act); 24] = [
+    (3.0, Act::ApReboot(0, 15.0)),
     (20.0, Act::Join(3, 1, 1, -58.0)),
+    (25.0, Act::Query(5)),
     (30.0, Act::EapTimeout(11, 0, 1)),
     (35.0, Act::Leave(7)),
     (40.0, Act::PskMismatch(12, 1, 0)),
     (45.0, Act::Violation(9, 0, Guard::Arp)),
+    (47.0, Act::EapFail(2, 1, 1)),
     (50.0, Act::EapFail(10, 1, 1)),
     (53.0, Act::Join(10, 1, 1, -67.0)),
     (60.0, Act::RadioDown(1, 2)),
@@ -309,6 +331,9 @@ const SCRIPT: [(f64, Act); 18] = [
     (86.0, Act::Join(8, 1, 3, -56.0)),
     (90.0, Act::Violation(9, 0, Guard::Tag)),
     (95.0, Act::Join(3, 0, 1, -63.0)),
+    (96.0, Act::HomeBy(services::LEFT, 0, 1, -60.0)),
+    (97.0, Act::HomeBy(services::RIGHT, 0, 1, -64.0)),
+    (98.0, Act::HomeBy(roaming::KITCHEN, 0, 0, -58.0)),
     (100.0, Act::LinkDown(1, 12.0)),
     (110.0, Act::Leave(10)),
 ];
@@ -449,6 +474,7 @@ impl World {
                 client(11, RateMode::He, 2, 1e6, None),
                 client(services::LEFT, RateMode::He, 2, 3e5, Some((0, 1, -60.0))),
                 client(services::RIGHT, RateMode::He, 2, 3e5, Some((0, 1, -64.0))),
+                client(roaming::KITCHEN, RateMode::Ht, 1, 2e5, Some((0, 0, -58.0))),
             ],
             blocked: BTreeSet::new(),
             homes: BTreeMap::new(),
@@ -608,6 +634,61 @@ impl World {
                 self.aps[ap].radios[radio].up = true;
                 let phy = RADIOS[radio].into();
                 self.event(ap, EventKind::RadioUp { phy });
+            }
+            Act::ApReboot(ap, secs) => {
+                self.aps[ap].away_until = self.start.elapsed().as_secs_f64() + secs;
+                let on: Vec<usize> = (0..self.clients.len())
+                    .filter(|&i| self.clients[i].at.is_some_and(|(a, _)| a == ap))
+                    .collect();
+                for i in on {
+                    // Gone with the AP, which says nothing of it.
+                    let Some((_, bss)) = self.clients[i].at.take() else {
+                        continue;
+                    };
+                    let (last, base) = (self.clients[i].last, self.clients[i].base);
+                    self.act(&Act::Join(last, 1 - ap, bss, base - roaming::FAR_DB));
+                    if !roaming::STICKY.contains(&last) {
+                        let back = Act::Join(last, ap, bss, base);
+                        self.later.push((self.t + secs + 3.0, back));
+                    }
+                }
+            }
+            Act::Query(last) => {
+                let Some((ap, bss)) = find(self, last).and_then(|i| self.clients[i].at) else {
+                    return;
+                };
+                let (mac, bss) = (World::mac(last), bss as u16);
+                let reason = roaming::LOW_SIGNAL;
+                self.event(ap, EventKind::BtmQuery { mac, bss, reason });
+                let status = roaming::DECLINED;
+                let target = None;
+                self.event(
+                    ap,
+                    EventKind::BtmResponse {
+                        mac,
+                        bss,
+                        status,
+                        target,
+                    },
+                );
+            }
+            Act::HomeBy(last, home, home_bss, signal) => {
+                let Some((ap, bss)) = find(self, last).and_then(|i| self.clients[i].at) else {
+                    return;
+                };
+                if ap == home {
+                    return;
+                }
+                let mac = World::mac(last);
+                let answer = EventKind::BtmResponse {
+                    mac,
+                    bss: bss as u16,
+                    status: 0,
+                    target: Some(bssid(home, home_bss)),
+                };
+                self.event(ap, answer);
+                let join = Act::Join(last, home, home_bss, signal);
+                self.later.push((self.t + 1.0, join));
             }
             Act::Violation(last, ap, guard) => {
                 let at = find(self, last).and_then(|i| self.clients[i].at);
@@ -842,7 +923,7 @@ impl World {
                 ok
             }
             CommandKind::Steer { target_bssid, .. } => {
-                let (i, _) = here?;
+                let (i, bss) = here?;
                 // Only a BSS on a radio that is up is in the neighbor reports.
                 let target = (0..self.aps.len()).find_map(|a| {
                     let b = (0..BSSS.len()).find(|&b| bssid(a, b) == target_bssid)?;
@@ -855,8 +936,39 @@ impl World {
                         "unknown target BSS: not in the neighbor reports".into(),
                     ));
                 };
-                let c = &self.clients[i];
-                let join = Act::Join(c.last, a, b, c.base + 3.0);
+                let (last, base) = (self.clients[i].last, self.clients[i].base);
+                let bss = bss as u16;
+                if last == roaming::DECLINER {
+                    let status = roaming::DECLINED;
+                    let target = None;
+                    self.event(
+                        ap,
+                        EventKind::BtmResponse {
+                            mac,
+                            bss,
+                            status,
+                            target,
+                        },
+                    );
+                    return Some((
+                        false,
+                        format!(
+                            "{}: declined: no suitable candidates",
+                            BSSS[usize::from(bss)].0
+                        ),
+                    ));
+                }
+                let target = Some(target_bssid);
+                self.event(
+                    ap,
+                    EventKind::BtmResponse {
+                        mac,
+                        bss,
+                        status: 0,
+                        target,
+                    },
+                );
+                let join = Act::Join(last, a, b, base + 3.0);
                 self.later.push((self.t + STEER_S, join));
                 ok
             }
@@ -948,6 +1060,13 @@ impl World {
             })
             .collect();
         auth.sort_by_key(|(m, _)| *m);
+        let mut caps: Vec<_> = self
+            .clients
+            .iter()
+            .filter(|c| c.at.is_some_and(|(x, _)| x == ap))
+            .map(|c| (World::mac(c.last), roaming::caps(c.phy, c.nss)))
+            .collect();
+        caps.sort_by_key(|(m, _)| *m);
         Snapshot {
             seq,
             uptime_s: a.booted_s + t as u32,
@@ -978,7 +1097,7 @@ impl World {
             clock_synced: true,
             power_limits: power_limits(),
             auth,
-            caps: Vec::new(),
+            caps,
             offload_held: false,
         }
     }
