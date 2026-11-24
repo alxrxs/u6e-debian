@@ -1,10 +1,12 @@
 // Devices: each AP with what it runs and how it is doing, its clients'
-// Wi-Fi experience, and its radios with channel, power, noise, clients and
-// how busy the air is; a radio's name leads to its spectrum.
+// Wi-Fi experience, its speed tests to the controller, and its radios with
+// channel, power, noise, clients and how busy the air is; a radio's name
+// leads to its spectrum.
 
 import { h, ago, bandName, clientName, duration, palette, pct } from '../util.js';
 import { sparkline, stack } from '../charts.js';
 import { apExperience } from './experience.js';
+import { apSpeedBox } from './speedtest.js';
 
 /** A temperature with its warning colour; ath11k throttles near 105 °C. */
 function temp(c) {
@@ -119,6 +121,7 @@ function apPanel(store, name, ap) {
   return h('section', { class: 'panel ap' }, top, facts,
     crashes.length ? h('p', { class: 'note' }, crashes.map(([phy, n]) => `${phy} firmware crashed ${n} time${n === 1 ? '' : 's'} since the controller started. `)) : null,
     xp ? h('div', { class: 'ap-xp-box' }, h('h3', {}, 'Experience'), xp) : null,
+    apSpeedBox(store, name, ap),
     manifest, body);
 }
 

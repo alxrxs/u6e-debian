@@ -48,14 +48,22 @@
 //! day full (`rf`). The controller signs configurations (`u6e-controller
 //! apply` reaches it on the socket in the temporary directory) and keeps
 //! images of each AP, whose staging is made up (`manage`).
+//! An AP asked for a speed test runs it over a connection of its own, paced
+//! to a gigabit AP's rates (`speedtest`). The printer and the client that
+//! leaves late in each cycle are listed for presence, which goes to a Home
+//! Assistant of the replay's own (`ha`) after a minute unseen: the printer's
+//! 40 s away announces nothing, the other's minute and more a leave.
 //! The web listener adds what the sign-in proxy in front of a controller
-//! would: a user, a member of the admin group unless `--viewer` is given.
+//! would: a user, a member of the admin group unless `--viewer` is given,
+//! and, unless the request names one, the address of the laptop
+//! (`02:00:00:00:00:02`) as the one it came from, so the Test page tests it.
 //!
 //!   cargo run -p u6e-controller --example replay [-- [<web address>] [--viewer]]
 //!
 //! The web address defaults to 127.0.0.1:8080.
 
 mod flows;
+mod ha;
 #[path = "../../tests/common/keys.rs"]
 mod keys;
 mod manage;
@@ -64,6 +72,7 @@ mod rf;
 mod roaming;
 mod services;
 mod spectrum;
+mod speedtest;
 mod tools;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -882,9 +891,7 @@ impl World {
             CommandKind::SyncLimits { limits } => {
                 return Some((true, format!("{} limits", limits.len())));
             }
-            CommandKind::SpeedTest { .. } => {
-                return Some((false, "speed tests are not simulated".into()));
-            }
+            CommandKind::SpeedTest { .. } => unreachable!("the agent runs it"),
         };
         let i = self.clients.iter().position(|c| World::mac(c.last) == mac);
         let here = i.and_then(|i| {
@@ -1198,7 +1205,12 @@ async fn send<W: AsyncWrite + Unpin>(w: &mut W, msg: &AgentMsg) -> io::Result<()
 }
 
 /// One AP's agent for as long as the controller keeps it.
-async fn agent(addr: SocketAddr, ap: usize, pem: &str, world: Arc<Mutex<World>>) -> io::Result<()> {
+async fn agent(
+    addr: SocketAddr,
+    ap: usize,
+    pem: &'static str,
+    world: Arc<Mutex<World>>,
+) -> io::Result<()> {
     let me = Identity::from_pem(pem).map_err(io::Error::other)?;
     let controller = Identity::from_pem(KEY_CONTROLLER).map_err(io::Error::other)?;
     let connector = TlsConnector::from(tls::client_config(&me, controller.public_key()));
@@ -1279,6 +1291,22 @@ async fn agent(addr: SocketAddr, ap: usize, pem: &str, world: Arc<Mutex<World>>)
                 }
                 CtlMsg::WantFlows { full } => send(&mut wr, &flows(&mut flows_seq, full)).await?,
                 CtlMsg::Command(cmd) => {
+                    if let CommandKind::SpeedTest { secs, .. } = cmd.kind {
+                        let secs = secs.min(speedtest_bounds());
+                        let detail = format!("started: {secs} s and 2048 MiB each way at most");
+                        let r = CommandResult {
+                            id: cmd.id,
+                            ok: true,
+                            detail,
+                        };
+                        send(&mut wr, &AgentMsg::Result(r)).await?;
+                        tokio::spawn(async move {
+                            if let Err(e) = speedtest::run(addr, pem, ap, cmd.id, secs).await {
+                                eprintln!("replay: ap{}: speed test: {e}", ap + 1);
+                            }
+                        });
+                        continue;
+                    }
                     if let CommandKind::SyncLimits { limits: given } = &cmd.kind {
                         limits = Some(given.clone());
                         sent_states = None;
@@ -1455,6 +1483,11 @@ async fn agent(addr: SocketAddr, ap: usize, pem: &str, world: Arc<Mutex<World>>)
     }
 }
 
+/// The longest a speed test's direction runs, as the agent holds it.
+fn speedtest_bounds() -> u8 {
+    u6e_proto::speedtest::SECS_MAX
+}
+
 async fn read<R: AsyncRead + Unpin>(r: &mut R, chunk: &mut [u8]) -> io::Result<usize> {
     match r.read(chunk).await? {
         0 => Err(io::ErrorKind::UnexpectedEof.into()),
@@ -1478,6 +1511,9 @@ async fn main() -> io::Result<()> {
     let (remote, clone) = rf::repository()?;
     // Its signing key and kept images, the staging of one made up.
     let managed = std::env::temp_dir().join("u6e-replay-manage");
+    // Home Assistant's token, as the role installs it.
+    let token = std::env::temp_dir().join("u6e-replay-ha-token");
+    std::fs::write(&token, "replay-token\n")?;
     let world = Arc::new(Mutex::new(World::new()));
     let stager: Arc<dyn Stage> = Arc::new(manage::SimStage(Arc::clone(&world)));
     // The controller's own web listener goes unused: the one below is its
@@ -1495,7 +1531,10 @@ async fn main() -> io::Result<()> {
          {{ channels = \"149-177\" }}]\n\
          \"6\" = [{{ channels = \"1-93\" }}]\n\
          [leases]\nexporters = [\"{}\"]\n\
-         [radius]\nloki = \"{}\"\nselector = '{{job=\"radius-auth\"}}'\n",
+         [radius]\nloki = \"{}\"\nselector = '{{job=\"radius-auth\"}}'\n\
+         [presence]\nurl = \"https://127.0.0.1:{}\"\nca = \"{}/ca.pem\"\ntoken = \"{}\"\n\
+         leave_after_secs = 60\ndevices = [{{ mac = \"{}\", name = \"office_printer\" }}, \
+         {{ mac = \"{}\", name = \"spare_phone\" }}]\n",
         policy.display(),
         history.display(),
         managed.join("captures").display(),
@@ -1508,17 +1547,30 @@ async fn main() -> io::Result<()> {
         rf::FILE,
         exporter()?,
         radius::serve(Arc::clone(&world))?,
+        ha::serve().await?.port(),
+        ha::TLS,
+        token.display(),
+        mac::format(World::mac(7)),
+        mac::format(World::mac(10)),
     );
     let config = Config::parse(&config).map_err(io::Error::other)?;
     let identity = Identity::from_pem(KEY_CONTROLLER).map_err(io::Error::other)?;
-    let timing = Timing::default();
+    // On loopback a gigabyte goes by in a blink, and a headless browser
+    // takes long to hand it to the page: a fifth of it keeps the Test page's
+    // run as long as a real one.
+    let mut timing = Timing::default();
+    timing.speedtest.client.max_bytes = 200_000_000;
     let c =
         u6e_controller::start(&config, &identity, timing, Arc::new(Names), Some(stager)).await?;
     let user = HeaderValue::from_static(if admin { "operator" } else { "viewer" });
     let groups = HeaderValue::from_str(&config.admin_group).map_err(io::Error::other)?;
+    let laptop = HeaderValue::from_static("192.0.2.12");
     let signed_in = move |mut req: Request| {
         let h = req.headers_mut();
         h.insert(USER_HEADER, user.clone());
+        if !h.contains_key("x-forwarded-for") {
+            h.insert("x-forwarded-for", laptop.clone());
+        }
         if admin {
             h.insert(GROUPS_HEADER, groups.clone());
         } else {

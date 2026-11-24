@@ -9,7 +9,8 @@
 // requests to move it with its answers (`roaming`), its traffic over the
 // week (`traffic`), the services it offers and asks for over mDNS
 // (`services`), its sessions and its timeline, asked for again when an
-// event of it comes and every 15 s.
+// event of it comes and every 15 s; and, for a device whose presence goes to
+// Home Assistant, whether it is home and what Home Assistant was told.
 
 import { h, icon, ago, ask, bandName, bits, bytes, dayOf, DID, duration, hm, mbps, palette, pct, phy, quality, time } from '../util.js';
 import { lineChart } from '../charts.js';
@@ -79,6 +80,21 @@ function identityFacts(c) {
     c.bound?.length ? fact('Guards bind', c.bound.map((b) => h('span', { class: 'mono addr' }, b.ip)), `on ${c.ap}`) : null,
     c.lease_expires ? fact('Lease', c.lease_expires > Date.now() ? `expires in ${duration((c.lease_expires - Date.now()) / 1000)}` : 'expired', until(c.lease_expires)) : null,
   ];
+}
+
+/** Its presence, when it is a device listed for Home Assistant: home or
+ * away and since when, and what Home Assistant was told or is to be. */
+function presenceFact(p, refused) {
+  if (!p) return null;
+  const since = p.since ? ` since ${dayOf(p.since) === 'Today' ? hm(p.since) : `${dayOf(p.since)}, ${hm(p.since)}`}` : '';
+  const chip = p.state === 'home' ? h('span', { class: 'chip' }, `Home${since}`)
+    : p.state === 'away' ? h('span', { class: 'chip warn' }, `Away${since}`)
+      : h('span', { class: 'chip wait' }, 'Not known yet');
+  const word = (home) => (home ? 'home' : 'not home');
+  const told = p.pending
+    ? `Home Assistant is to be told “${word(p.pending.home)}”${p.pending.why ? `: ${p.pending.why}` : ''}${refused ? ' (it refuses the controller’s token)' : ''}`
+    : p.told ? `Home Assistant was told “${word(p.told.home)}” at ${hm(p.told.at)}` : 'Home Assistant has been told nothing since the controller started';
+  return fact('Presence', chip, `${p.name} · ${told}`);
 }
 
 /** A chart panel: its canvas is kept across updates, so a pointer on it stays. */
@@ -396,7 +412,9 @@ export default {
       fill(sub, name ? h('span', { class: 'mono' }, mac) : null,
         c?.vendor ? h('span', {}, c.vendor) : null,
         blocked ? h('span', { class: 'chip bad' }, 'Blocked') : null);
-      fill(identity, ...signInFacts(c?.auth || hist?.identity), ...(c ? identityFacts(c) : []));
+      const presence = store.state.presence;
+      fill(identity, ...signInFacts(c?.auth || hist?.identity), ...(c ? identityFacts(c) : []),
+        presenceFact(presence?.devices[mac], presence?.refused));
       identity.hidden = !identity.childNodes.length;
       sub.hidden = !sub.childNodes.length;
       buttons.block.hidden = blocked;

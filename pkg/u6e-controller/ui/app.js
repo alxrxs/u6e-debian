@@ -8,9 +8,10 @@
 // watches the one radio whose spectrum is shown, if any: its scan's state
 // comes as JSON, its frames as binary messages straight to the view. The RF
 // plan shown beside it is fetched, and applied with a POST like an action,
-// as is an AP's upgrade, which the Config view follows from the state. A
-// client's history and traffic, the auth problems, the roams and steering
-// and the mDNS services are fetched by their views.
+// as is an AP's upgrade, which the Config view follows from the state, and
+// an AP's speed test, which Devices follows from the state. A client's
+// history and traffic, the auth problems, the roams and steering, the mDNS
+// services and the viewer's own speed tests are fetched by their views.
 
 import { icon } from './util.js';
 import devices from './views/devices.js';
@@ -23,6 +24,7 @@ import flows from './views/flows.js';
 import roaming from './views/roaming.js';
 import services from './views/services.js';
 import spectrum, { decodeFrame } from './views/spectrum.js';
+import speedtest from './views/speedtest.js';
 
 /** Samples kept per client and radio: an hour at one per tick. */
 const HISTORY = 1800;
@@ -74,10 +76,13 @@ const store = {
   rfPlan,
   rfApply,
   upgrade,
+  apSpeedTest,
+  startSpeedTest,
+  finishSpeedTest,
   watchSpectrum,
 };
 
-const views = { devices, clients, client, auth, flows, roaming, services, events, spectrum, config };
+const views = { devices, clients, client, auth, flows, roaming, services, events, spectrum, config, test: speedtest };
 let current = null;
 let currentName = '';
 
@@ -211,6 +216,37 @@ function rfPlan() {
 /** Rolls `ap` onto its newest kept image, `image`, as the admin saw it. */
 function upgrade(ap, image) {
   return adminPost(`/api/aps/${encodeURIComponent(ap)}/upgrade`, { image_id: image });
+}
+
+/** An admin's speed test of `ap` to the controller. */
+function apSpeedTest(ap) {
+  return adminPost(`/api/aps/${encodeURIComponent(ap)}/speedtest`, {});
+}
+
+/** Starts a speed test of this device: `{ status, id, secs, client }`. */
+function startSpeedTest() {
+  return post('/api/speedtest', {});
+}
+
+/** Ends speed test `id` with the browser's download, `{ down_bytes,
+ * down_ms }`: `{ http, test }`, the test as the controller recorded it (its
+ * own `status` is the test's, so the answer's is apart). */
+async function finishSpeedTest(id, down) {
+  try {
+    const r = await fetch(`/api/speedtest/${encodeURIComponent(id)}/done`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(down),
+      cache: 'no-store',
+    });
+    let test = {};
+    try {
+      test = await r.json();
+    } catch {}
+    return { http: r.status, test };
+  } catch {
+    return { http: 0, test: {} };
+  }
 }
 
 /** Commits the proposals confirmed (`{ plan, radios }`, each radio with the
@@ -431,7 +467,7 @@ function render() {
       ? `Live updates stopped: the controller cannot be reached. Trying again in ${s} s; the figures shown are the last received.`
       : `The controller cannot be reached. Trying again in ${s} s.`;
   }
-  const title = { devices: 'Devices', clients: 'Clients', client: 'Client', auth: 'Auth problems', flows: 'Flows', roaming: 'Roaming', services: 'Services', spectrum: 'Spectrum', config: 'Config', events: 'Events' }[currentName];
+  const title = { devices: 'Devices', clients: 'Clients', client: 'Client', auth: 'Auth problems', flows: 'Flows', roaming: 'Roaming', services: 'Services', spectrum: 'Spectrum', config: 'Config', events: 'Events', test: 'Test my connection' }[currentName];
   document.title = `${title} – Wi-Fi`;
   current?.update();
 }

@@ -941,3 +941,23 @@ table.roams td:nth-child(n+2) small, table.steering td small { display: block; }
   .xp-parts li small { grid-column: 1 / -1; }
   .client-xp > .panel { padding: 14px 16px; }
 }
+
+/* Speed tests: an AP's box on Devices, and the Test page. */
+.ap-st-box { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--rule-2); }
+.ap-st-box h3 { margin: 0; font-size: 12px; color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.04em; }
+.st-head { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; justify-content: space-between; margin-bottom: 8px; }
+.st-run .st-head { justify-content: flex-start; }
+.st-phase { margin: 0; }
+.st-figs { display: flex; flex-wrap: wrap; gap: 8px 40px; margin: 6px 0; }
+.st-fig { display: grid; gap: 2px; min-width: 0; }
+.st-label { font-size: 12px; color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.04em; }
+.st-value { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.st-value b { font-size: 26px; font-weight: 600; }
+.st-unit { font-size: 14px; color: var(--ink-2); }
+.st-run .st-value b { font-size: 34px; }
+.st-run .st-head { margin: 0; }
+.st-none { margin: 0; padding: 12px 16px; }
+.st-foot { margin: 6px 0 0; font-size: 13px; }
+.st-who { margin: 4px 0 8px; }
+.st-who:empty { display: none; }
+.st-table td.num, .st-table th:nth-child(2), .st-table th:nth-child(3) { text-align: right; }
