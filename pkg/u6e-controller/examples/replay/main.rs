@@ -52,13 +52,15 @@
 //! to a gigabit AP's rates (`speedtest`). The printer and the client that
 //! leaves late in each cycle are listed for presence, which goes to a Home
 //! Assistant of the replay's own (`ha`) after a minute unseen: the printer's
-//! 40 s away announces nothing, the other's minute and more a leave.
+//! 40 s away announces nothing, the other's minute and more a leave; with
+//! `--ha-down` that Home Assistant answers every event 503, so presence
+//! events waiting and dropped show.
 //! The web listener adds what the sign-in proxy in front of a controller
 //! would: a user, a member of the admin group unless `--viewer` is given,
 //! and, unless the request names one, the address of the laptop
 //! (`02:00:00:00:00:02`) as the one it came from, so the Test page tests it.
 //!
-//!   cargo run -p u6e-controller --example replay [-- [<web address>] [--viewer]]
+//!   cargo run -p u6e-controller --example replay [-- [<web address>] [--viewer] [--ha-down]]
 //!
 //! The web address defaults to 127.0.0.1:8080.
 
@@ -1499,6 +1501,7 @@ async fn read<R: AsyncRead + Unpin>(r: &mut R, chunk: &mut [u8]) -> io::Result<u
 async fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let admin = !args.iter().any(|a| a == "--viewer");
+    let ha_down = args.iter().any(|a| a == "--ha-down");
     let web = args
         .iter()
         .find(|a| !a.starts_with("--"))
@@ -1547,7 +1550,7 @@ async fn main() -> io::Result<()> {
         rf::FILE,
         exporter()?,
         radius::serve(Arc::clone(&world))?,
-        ha::serve().await?.port(),
+        ha::serve(ha_down).await?.port(),
         ha::TLS,
         token.display(),
         mac::format(World::mac(7)),

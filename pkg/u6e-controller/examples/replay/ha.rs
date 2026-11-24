@@ -1,6 +1,7 @@
 //! The replay's Home Assistant: an HTTPS server with the tests' certificate
 //! (`tests/fixtures/tls`, whose CA the controller's `[presence]` trusts),
-//! which takes every `wifi_presence` event, says so, and answers 200.
+//! which takes every `wifi_presence` event, says so, and answers 200; or,
+//! failing, answers every one 503, as a Home Assistant restarting does.
 
 use std::io;
 use std::net::SocketAddr;
@@ -16,8 +17,8 @@ use tokio_rustls::rustls::{ServerConfig, crypto, version};
 /// The test certificates.
 pub const TLS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tls");
 
-/// Serves until the process ends; its address.
-pub async fn serve() -> io::Result<SocketAddr> {
+/// Serves until the process ends, `failing` or not; its address.
+pub async fn serve(failing: bool) -> io::Result<SocketAddr> {
     let certs = CertificateDer::pem_file_iter(format!("{TLS}/server.pem"))
         .map_err(io::Error::other)?
         .collect::<Result<Vec<_>, _>>()
@@ -63,12 +64,17 @@ pub async fn serve() -> io::Result<SocketAddr> {
                         .unwrap_or(0);
                     if body.len() >= len {
                         let path = head.split_whitespace().nth(1).unwrap_or("");
-                        eprintln!("replay: Home Assistant took {path}: {body}");
+                        let took = if failing { "refused" } else { "took" };
+                        eprintln!("replay: Home Assistant {took} {path}: {body}");
                         break;
                     }
                 }
-                let ok = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
-                let _ = tls.write_all(ok).await;
+                let answer: &[u8] = if failing {
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                };
+                let _ = tls.write_all(answer).await;
                 let _ = tls.shutdown().await;
             });
         }
