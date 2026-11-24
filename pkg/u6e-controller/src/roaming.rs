@@ -47,8 +47,10 @@ pub const MOVED_DB: i16 = 6;
 pub const STEP_MS: u64 = 30_000;
 /// A roam whose session ends this soon failed.
 pub const FAILED_MS: u64 = 30_000;
-/// A client that roams this soon after a steer followed it.
+/// A client that roams this soon after a steer followed it, and how much
+/// earlier it may have, as two APs' clocks and reports have it.
 pub const MOVE_MS: u64 = 10_000;
+const SLACK_MS: u64 = 1000;
 /// How soon a client's answer follows a query's request, and an admin's
 /// steer the answer to it (the admin's result comes after the answer).
 const ANSWER_MS: u64 = 5_000;
@@ -497,15 +499,15 @@ impl Roaming {
         c.open_roam = true;
         let gap = r.began.saturating_sub(r.heard_ms);
         let gap_min = r.gone_ms.map_or(0, |g| r.began.saturating_sub(g)).min(gap);
-        let followed = self.steers.iter_mut().rev().find(|s| {
-            s.mac == r.mac
-                && s.outcome.is_none()
-                && (s.time()..=s.time() + MOVE_MS).contains(&r.began)
-        });
+        let followed = self
+            .steers
+            .iter_mut()
+            .rev()
+            .find(|s| s.mac == r.mac && s.outcome.is_none() && followed(s.time(), r.began));
         let steer = followed.map(|s| {
             s.outcome = Some(Outcome::Moved {
                 to: r.to.clone(),
-                after_ms: r.began - s.time(),
+                after_ms: r.began.saturating_sub(s.time()),
             });
             s.id
         });
@@ -841,15 +843,27 @@ impl Roaming {
                 *self.counts.failures.entry(r.to.ap.clone()).or_default() += 1;
             }
         }
+        // A client whose new association came before its answer to the
+        // request was reported (two APs, two links) moved all the same.
         let late = self
             .steers
             .iter_mut()
-            .filter(|s| s.outcome.is_none() && s.time() + MOVE_MS < now_ms);
+            .filter(|s| s.outcome.is_none() && s.time() + MOVE_MS + SLACK_MS < now_ms);
         for s in late {
-            s.outcome = Some(if sessions.open_of(&s.mac).is_some() {
-                Outcome::Stayed
-            } else {
-                Outcome::Left
+            let open = sessions.open_of(&s.mac);
+            s.outcome = Some(match open {
+                Some(o) if followed(s.time(), o.start_ms) => {
+                    let roam = self.roams.iter_mut().rev().find(|r| r.session == o.id);
+                    if let Some(r) = roam.filter(|r| r.steer.is_none()) {
+                        r.steer = Some(s.id);
+                    }
+                    Outcome::Moved {
+                        to: o.place.clone(),
+                        after_ms: o.start_ms.saturating_sub(s.time()),
+                    }
+                }
+                Some(_) => Outcome::Stayed,
+                None => Outcome::Left,
             });
             decided(&mut self.counts, s);
         }
@@ -1133,6 +1147,12 @@ fn steer_json(s: &Steer) -> Map<String, Value> {
     });
     put("outcome", outcome);
     o
+}
+
+/// Whether a client that began a session at `began` followed a steering
+/// request of `asked`: within [`MOVE_MS`] after it, [`SLACK_MS`] either way.
+fn followed(asked: u64, began: u64) -> bool {
+    (asked.saturating_sub(SLACK_MS)..=asked + MOVE_MS + SLACK_MS).contains(&began)
 }
 
 /// Counts a steer whose outcome is settled.
@@ -1721,6 +1741,42 @@ mod tests {
             (s.origin.clone(), s.status),
             (Origin::Admin(Some("admin".into())), Some(7))
         );
+    }
+
+    /// The new AP's word of the association came before the old AP's of
+    /// the client's answer, and two APs' clocks put the answer a little
+    /// after the roam: the client moved, and the roam followed the steer.
+    #[test]
+    fn a_move_reported_before_the_answer_is_a_move() {
+        let mut site = Site::new();
+        on_ap1(&mut site, 1, -70);
+        site.event("ap2", T0 + 3 * S, assoc(1, 0));
+        let answer = EventKind::BtmResponse {
+            mac: mac(1),
+            bss: 0,
+            status: 0,
+            target: Some([2, 0, 0, 0, 0x20, 1]),
+        };
+        site.event("ap1", T0 + 3400, answer);
+        site.snap("ap2", T0 + 20 * S, &[Sta(1, 0, -60, 17, Some(FT))]);
+        let s = site.steer(1).clone();
+        let Some(Outcome::Moved { to, after_ms }) = &s.outcome else {
+            panic!("{s:?}")
+        };
+        assert_eq!((to.ap.as_str(), *after_ms), ("ap2", 0));
+        assert_eq!(site.roam(1).steer, Some(s.id));
+        assert_eq!(site.r.counts.moved.get("ap1"), Some(&1));
+        // One that stays where it was asked to leave stayed.
+        on_ap1(&mut site, 2, -70);
+        let answer = EventKind::BtmResponse {
+            mac: mac(2),
+            bss: 0,
+            status: 0,
+            target: None,
+        };
+        site.event("ap1", T0 + 3 * S, answer);
+        site.snap("ap1", T0 + 20 * S, &[Sta(2, 0, -70, 80, Some(EAP))]);
+        assert_eq!(site.steer(2).outcome, Some(Outcome::Stayed));
     }
 
     /// Kept: the newest roams, the last week, and the clients heard last.
