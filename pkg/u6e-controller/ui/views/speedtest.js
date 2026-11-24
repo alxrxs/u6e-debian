@@ -91,7 +91,7 @@ export function apSpeedBox(store, name, ap) {
     h('div', { class: 'st-head' }, h('h3', {}, 'Speed test to the controller'), admin ? run : null),
     now, lastEl,
     earlier.length ? h('p', { class: 'muted st-foot' }, 'Before: ', earlier.map((t) => `${hm(t.at)} ${mbit(t.down.bits_per_second)} down, ${mbit(t.up.bits_per_second)} up`).join(' · ')) : null,
-    h('p', { class: 'muted st-foot' }, 'TCP over the agent’s own TLS link, from the AP’s CPU through its uplink and the switches to the controller: a figure well below the port’s speed with the test’s thread near 100 % is the AP’s CPU, not the network.'),
+    h('p', { class: 'muted st-foot' }, 'TCP over the agent’s own TLS link, from the AP’s CPU through its uplink, the router between the APs’ network and the controller’s, and the network to the controller: a figure well below the port’s speed with the test’s thread near 100 % is the AP’s CPU; otherwise any hop on the way may be the limit.'),
     admin ? null : h('p', { class: 'lock' }, `Running one needs membership of ${ADMIN_GROUP}.`),
     result);
 }
