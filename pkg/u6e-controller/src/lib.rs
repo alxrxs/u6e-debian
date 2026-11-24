@@ -21,7 +21,8 @@
 //! APs read of mDNS shows which device offers which service and whether it
 //! answers for it (`services`); the flows and the station counters each
 //! client's volumes and where they went (`traffic`). An admin measures an
-//! AP's throughput to the controller (`speedtest`).
+//! AP's throughput to the controller, and a signed-in viewer their own
+//! device's through the UI (`speedtest`).
 
 pub mod actions;
 pub mod agents;
@@ -312,8 +313,9 @@ fn bind_local(config: &Config) -> io::Result<UnixListener> {
 }
 
 /// Gives up on the configurations the APs have not answered in
-/// `Timing::apply`, ends the holds whose time is up and looks at the
-/// services again, for the life of the process.
+/// `Timing::apply`, ends the holds whose time is up, looks at the services
+/// again and abandons the client speed tests not finished in time, for the
+/// life of the process.
 async fn expire(state_of: Shared, timing: Timing) {
     let mut every = interval(timing.ping);
     loop {
@@ -322,6 +324,7 @@ async fn expire(state_of: Shared, timing: Timing) {
         state.expire_relays(Instant::now(), timing.apply);
         state.expire_holds();
         state.services_tick(SystemTime::now());
+        speedtest::client::expire(&mut state);
         drop(state);
         captures::supervise(&state_of, SystemTime::now());
     }

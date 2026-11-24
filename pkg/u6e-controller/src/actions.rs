@@ -131,10 +131,13 @@ pub enum Via {
     /// A WebSocket's handshake: it has no body, and a browser always says
     /// which page opens one.
     WebSocket,
+    /// A POST of bytes that are no JSON (a speed test's upload), which only
+    /// a page that knows the test's random id can name.
+    Bytes,
 }
 
 /// Whether the request could have come from another site's page.
-fn cross_site(req: &HeaderMap, origin: &str, via: Via) -> bool {
+pub(crate) fn cross_site(req: &HeaderMap, origin: &str, via: Via) -> bool {
     let kind = req.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok());
     let json = kind
         .and_then(|k| k.split(';').next())
@@ -142,7 +145,7 @@ fn cross_site(req: &HeaderMap, origin: &str, via: Via) -> bool {
     let ours = req
         .get(header::ORIGIN)
         .is_some_and(|o| o.as_bytes() == origin.as_bytes());
-    !(ours && (json || via == Via::WebSocket))
+    !(ours && (json || via != Via::Post))
 }
 
 /// Why `req` may not act, if it may not, and logs the refusal of `what`.

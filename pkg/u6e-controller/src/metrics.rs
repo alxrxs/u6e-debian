@@ -34,8 +34,8 @@
 //! DHCP server's device, a lease's host name or a DNS name; the first by
 //! name), labelled by MAC and name: one series per named device, not per
 //! MAC ever seen. The speed tests are counted by kind and result, every pair
-//! always exported, and each AP's last one gives its rate and CPU per
-//! direction.
+//! always exported, each AP's last one gives its rate and CPU per
+//! direction, and the clients' last one on each AP and band its rates.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
@@ -584,6 +584,28 @@ fn speedtests(m: &mut Text, state: &State) {
     );
     for (ap, t, _) in results() {
         m.sample(&[("ap", ap)], unix_seconds(t.at));
+    }
+    let clients = speedtest::client::last_by_place(tests);
+    m.family(
+        "wifi_client_speedtest_bytes_per_second",
+        GAUGE,
+        "The last client speed test on the AP and band: the download as the browser timed it, the upload as the controller did.",
+    );
+    for (ap, band, t) in &clients {
+        for (dir, d) in [("down", &t.down), ("up", &t.up)] {
+            if let Some(d) = d {
+                let labels = [("ap", *ap), ("band", *band), ("direction", dir)];
+                m.sample(&labels, d.bytes_per_second().round());
+            }
+        }
+    }
+    m.family(
+        "wifi_client_speedtest_timestamp_seconds",
+        GAUGE,
+        "When the last client speed test on the AP and band started.",
+    );
+    for (ap, band, t) in &clients {
+        m.sample(&[("ap", *ap), ("band", *band)], unix_seconds(t.at));
     }
 }
 

@@ -57,7 +57,7 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// to a configuration, when scans stop, how long a rollout's gate a
 /// restarted controller goes on with waits at least for the AP, how often
 /// the radios are compared with the site file's plan (`rf::live`), and what
-/// an AP's speed test takes.
+/// the speed tests take.
 #[derive(Debug, Clone, Copy)]
 pub struct Timing {
     pub ping: Duration,
@@ -73,8 +73,8 @@ pub struct Timing {
     /// The longest a UI WebSocket is served: the page then connects again,
     /// and its user's groups are judged again.
     pub ui_session: Duration,
-    /// What an AP's speed test takes.
-    pub speedtest: speedtest::ap::Limits,
+    /// What the speed tests take.
+    pub speedtest: speedtest::Limits,
 }
 
 impl Default for Timing {
@@ -88,7 +88,7 @@ impl Default for Timing {
             resume: Duration::from_secs(120),
             reconcile: Duration::from_secs(30),
             ui_session: Duration::from_secs(3600),
-            speedtest: speedtest::ap::Limits::default(),
+            speedtest: speedtest::Limits::default(),
         }
     }
 }

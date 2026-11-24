@@ -108,7 +108,7 @@ impl SpeedTests {
     /// it is that AP's running test, not opened yet, asked within its
     /// limits' time to open.
     pub fn open_ap(&mut self, id: u64, ap: &str) -> Result<(), &'static str> {
-        let (asked, open) = (self.asked.get(&id).copied(), self.limits.open);
+        let (asked, open) = (self.asked.get(&id).copied(), self.limits.ap.open);
         let t = self.ap_test_mut(id).filter(|t| t.ap == ap);
         let Some(t) = t.filter(|t| t.status == Status::Running) else {
             return Err("no such test runs on this AP");
@@ -196,7 +196,7 @@ pub async fn start(Ext(web): Ext<Web>, Path(ap): Path<String>, req: HeaderMap) -
         if state.ap(&ap).is_none() {
             return error(StatusCode::NOT_FOUND, "no such AP");
         }
-        let limits = state.speedtests.limits;
+        let limits = state.speedtests.limits.ap;
         let kind = CommandKind::SpeedTest {
             secs: limits.secs,
             max_bytes: limits.max_bytes,
@@ -253,7 +253,7 @@ pub async fn start(Ext(web): Ext<Web>, Path(ap): Path<String>, req: HeaderMap) -
 /// Ends test `id` as failed if its AP has not opened it in its limits'
 /// time to open.
 async fn unopened(state: Shared, id: u64) {
-    let wait = state.read().speedtests.limits.open;
+    let wait = state.read().speedtests.limits.ap.open;
     sleep(wait).await;
     let opened = state.read().speedtests.ap_test(id).is_none_or(|t| t.opened);
     if !opened {
@@ -274,7 +274,7 @@ pub(crate) async fn serve(
 ) {
     let opened = {
         let mut state = state.write();
-        let limits = state.speedtests.limits;
+        let limits = state.speedtests.limits.ap;
         state.speedtests.open_ap(id, ap).map(|()| limits)
     };
     let limits = match opened {
@@ -412,7 +412,7 @@ mod tests {
         assert_eq!(t.open_ap(2, "ap1"), Err("no such test runs on this AP"));
         assert_eq!(t.open_ap(1, "ap1"), Ok(()));
         assert_eq!(t.open_ap(1, "ap1"), Err("the test is opened already"));
-        t.limits.open = Duration::ZERO;
+        t.limits.ap.open = Duration::ZERO;
         t.begin_ap(3, "ap1", None);
         std::thread::sleep(Duration::from_millis(1));
         assert_eq!(t.open_ap(3, "ap1"), Err("opened too late"));

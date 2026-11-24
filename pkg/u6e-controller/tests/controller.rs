@@ -5224,15 +5224,14 @@ fn roams_steering_and_experience_reach_the_api_and_the_metrics() {
 /// What the AP speed tests of these tests take: a second each way, four
 /// chunks at most.
 fn quick_tests(open: Duration, run: Duration) -> Timing {
-    Timing {
-        speedtest: u6e_controller::speedtest::ap::Limits {
-            secs: 1,
-            max_bytes: 4 * CHUNK as u64,
-            open,
-            run,
-        },
-        ..Timing::default()
-    }
+    let mut t = Timing::default();
+    t.speedtest.ap = u6e_controller::speedtest::ap::Limits {
+        secs: 1,
+        max_bytes: 4 * CHUNK as u64,
+        open,
+        run,
+    };
+    t
 }
 
 impl Agent {
@@ -5517,4 +5516,199 @@ fn an_ap_that_stalls_its_test_fails_it_at_its_time() {
         e["action"] == "speedtest" && e["ok"] == false && e["detail"] == "not over in 1.5s"
     });
     assert!(failed, "{events}");
+}
+
+/// What the client speed tests of these tests take: a second each way,
+/// 3 MiB at most.
+fn quick_client_tests() -> Timing {
+    let mut t = Timing::default();
+    t.speedtest.client.secs = 1;
+    t.speedtest.client.max_bytes = 3 << 20;
+    t
+}
+
+/// The headers of the UI's own page of `user`, from `address` as the
+/// sign-in proxy says it.
+fn page_of(user: &str, address: &str) -> String {
+    format!("{SAME_SITE}X-Forwarded-Preferred-Username: {user}\r\nX-Forwarded-For: {address}\r\n")
+}
+
+/// An AP with `MAC` on it, whose flows show it at 192.0.2.10.
+fn ap_with_addressed_client(r: &Running) -> Agent {
+    let mut a = ap_with_client(r, KEY_AP1, "ap1", &[]);
+    a.send(&AgentMsg::Flows(flows_of(1, &[(1, 10, 10)])))
+        .unwrap();
+    let ip = IpAddr::from([192, 0, 2, 10]);
+    wait_for("the client's address", || {
+        r.c.state.read().identity(&MAC).addresses.contains(&ip)
+    });
+    a
+}
+
+#[test]
+fn a_client_speed_test_is_timed_both_ways_and_attributed_by_its_address() {
+    let r = controller(quick_client_tests());
+    let _a = ap_with_addressed_client(&r);
+    // The proxy's entry is the last; what the client sent before it is not.
+    let page = page_of("alice", "192.0.2.99, 192.0.2.10");
+    let (status, started) = post(r.c.http, "/api/speedtest", &page, "{}");
+    assert_eq!(status, 200, "{started}");
+    let id = started["id"].as_str().unwrap().to_owned();
+    assert_eq!(id.len(), 32);
+    assert_eq!(started["secs"], 1);
+    assert_eq!(started["client"]["mac"], "02:00:00:00:00:01");
+    assert_eq!(started["client"]["ap"], "ap1");
+    assert_eq!(started["client"]["band"], "5");
+    assert_eq!(started["client"]["signal"], -54);
+    let alice = "X-Forwarded-Preferred-Username: alice\r\n";
+    let (head, bytes) = http_get_full(r.c.http, &format!("/api/speedtest/{id}/down"), alice);
+    assert!(head.starts_with("HTTP/1.0 200"), "{head}");
+    // On loopback the bytes run out before the second does.
+    assert_eq!(bytes.len(), 3 << 20);
+    let (head, _) = http_get_full(r.c.http, &format!("/api/speedtest/{id}/down"), alice);
+    assert!(head.starts_with("HTTP/1.0 409"), "once a test");
+    let bytes_page = format!("Origin: {ORIGIN}\r\n{alice}");
+    let body = "u".repeat(1 << 20);
+    for _ in 0..2 {
+        let (head, _) = http_send(
+            r.c.http,
+            "POST",
+            &format!("/api/speedtest/{id}/up"),
+            &bytes_page,
+            &body,
+        );
+        assert!(head.starts_with("http/1.1 200"), "{head}");
+    }
+    // The browser claims more than was sent: it is held to what was.
+    let (status, done) = post(
+        r.c.http,
+        &format!("/api/speedtest/{id}/done"),
+        &page,
+        r#"{"down_bytes": 9999999, "down_ms": 100}"#,
+    );
+    assert_eq!(status, 200, "{done}");
+    assert_eq!(done["status"], "done");
+    assert_eq!(done["down"]["bytes"], 3 << 20);
+    assert_eq!(done["down"]["ms"], 100);
+    assert_eq!(done["up"]["bytes"], 2 << 20);
+    assert!(done.get("moved").is_none(), "{done}");
+    let events = json_get(r.c.http, "/api/events");
+    let ev = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["action"] == "speedtest")
+        .unwrap();
+    assert_eq!(
+        (&ev["ok"], &ev["mac"], &ev["ap"]),
+        (&json!(true), &json!("02:00:00:00:00:01"), &json!("ap1"))
+    );
+    let detail = ev["detail"].as_str().unwrap();
+    assert!(
+        detail.starts_with("download 252 Mbit/s, upload "),
+        "{detail}"
+    );
+    assert!(
+        detail.contains("from 192.0.2.10 on 5 GHz at -54 dBm, rates "),
+        "{detail}"
+    );
+    let mine = json_get_as(r.c.http, "/api/speedtest", alice);
+    assert_eq!(mine["tests"].as_array().unwrap().len(), 1);
+    let theirs = json_get_as(
+        r.c.http,
+        "/api/speedtest",
+        "X-Forwarded-Preferred-Username: bob\r\n",
+    );
+    assert!(theirs["tests"].as_array().unwrap().is_empty());
+    let body = http_get(r.c.metrics, "/metrics");
+    for line in [
+        "wifi_speedtests_total{kind=\"client\",result=\"ok\"} 1",
+        "wifi_client_speedtest_bytes_per_second{ap=\"ap1\",band=\"5\",direction=\"down\"} 31457280",
+    ] {
+        assert!(body.lines().any(|l| l == line), "missing {line}\n{body}");
+    }
+    assert!(promtool_accepts(&body));
+}
+
+fn json_get_as(addr: SocketAddr, path: &str, headers: &str) -> Value {
+    serde_json::from_str(&http_request(addr, path, headers).1).unwrap()
+}
+
+#[test]
+fn client_speed_tests_are_their_users_and_limited() {
+    let mut timing = quick_client_tests();
+    timing.speedtest.client.abandon = Duration::from_millis(300);
+    let r = controller(timing);
+    let start =
+        |user: &str, address: &str| post(r.c.http, "/api/speedtest", &page_of(user, address), "{}");
+    // An address no Wi-Fi client has: tested all the same, unattributed.
+    let (status, a) = start("alice", "198.51.100.7");
+    assert_eq!((status, &a["client"]), (200, &Value::Null));
+    let (status, again) = start("alice", "198.51.100.7");
+    assert_eq!(
+        (status, again["error"].as_str()),
+        (429, Some("a test of yours runs"))
+    );
+    let (status, b) = start("bob", "2001:db8::7");
+    assert_eq!(status, 200, "{b}");
+    let (status, c) = start("carol", "198.51.100.8");
+    assert_eq!(
+        (status, c["error"].as_str()),
+        (429, Some("2 tests run already: try again in a minute"))
+    );
+    // Not from the UI's page, not signed in, or no address said.
+    let no_origin = "Content-Type: application/json\r\nX-Forwarded-Preferred-Username: carol\r\nX-Forwarded-For: 198.51.100.8\r\n";
+    assert_eq!(post(r.c.http, "/api/speedtest", no_origin, "{}").0, 403);
+    let anon = format!("{SAME_SITE}X-Forwarded-For: 198.51.100.8\r\n");
+    assert_eq!(post(r.c.http, "/api/speedtest", &anon, "{}").0, 403);
+    let nowhere = format!("{SAME_SITE}X-Forwarded-Preferred-Username: carol\r\n");
+    assert_eq!(post(r.c.http, "/api/speedtest", &nowhere, "{}").0, 400);
+    // Another user's test is not found.
+    let bob_id = b["id"].as_str().unwrap();
+    let alice = "X-Forwarded-Preferred-Username: alice\r\n";
+    let (head, _) = http_get_full(r.c.http, &format!("/api/speedtest/{bob_id}/down"), alice);
+    assert!(head.starts_with("HTTP/1.0 404"), "{head}");
+    // A body past 8 MiB is refused.
+    let a_id = a["id"].as_str().unwrap();
+    let up = format!("/api/speedtest/{a_id}/up");
+    let big = "u".repeat((8 << 20) + 1);
+    let (head, _) = http_send(
+        r.c.http,
+        "POST",
+        &up,
+        &format!("Origin: {ORIGIN}\r\n{alice}"),
+        &big,
+    );
+    assert!(head.starts_with("http/1.1 413"), "{head}");
+    // An upload from another site's page is refused.
+    let (head, _) = http_send(r.c.http, "POST", &up, alice, "x");
+    assert!(head.starts_with("http/1.1 403"), "{head}");
+    // Unfinished, they are abandoned.
+    thread::sleep(Duration::from_millis(400));
+    u6e_controller::speedtest::client::expire(&mut r.c.state.write());
+    let (status, _) = post(
+        r.c.http,
+        &format!("/api/speedtest/{a_id}/done"),
+        &page_of("alice", "198.51.100.7"),
+        r#"{"down_bytes": 1, "down_ms": 1}"#,
+    );
+    assert_eq!(status, 409);
+    let events = json_get(r.c.http, "/api/events");
+    let abandoned = events.as_array().unwrap().iter().filter(|e| {
+        e["action"] == "speedtest"
+            && e["ok"] == false
+            && e["detail"]
+                .as_str()
+                .is_some_and(|d| d.starts_with("not finished in time"))
+    });
+    assert_eq!(abandoned.count(), 2, "{events}");
+    let (status, _) = start("carol", "198.51.100.8");
+    assert_eq!(status, 200);
+    let body = http_get(r.c.metrics, "/metrics");
+    for line in [
+        "wifi_speedtests_total{kind=\"client\",result=\"refused\"} 2",
+        "wifi_speedtests_total{kind=\"client\",result=\"failed\"} 2",
+    ] {
+        assert!(body.lines().any(|l| l == line), "missing {line}\n{body}");
+    }
 }

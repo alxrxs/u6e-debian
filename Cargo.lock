@@ -1046,6 +1046,7 @@ version = "1.0.0"
 dependencies = [
  "aws-lc-rs",
  "axum",
+ "futures-core",
  "libc",
  "postcard",
  "serde",

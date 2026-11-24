@@ -43,7 +43,8 @@
 //! clients sticky now and the steering, of the site or of one client
 //! (`roaming`). `POST /api/aps/{ap}/speedtest` is an admin's speed test of
 //! an AP to the controller (`speedtest::ap`), its progress and result in the
-//! view's `speedtests`.
+//! view's `speedtests`; `/api/speedtest` and its routes are a signed-in
+//! viewer's test of their own device (`speedtest::client`).
 //!
 //! The listener is reached only through the reverse proxy that signs users
 //! in, which names the user in `X-Forwarded-Preferred-Username` and their
@@ -198,6 +199,13 @@ pub fn router(state: Shared, access: Access) -> Router {
         .route("/api/rollouts", get(api_rollouts))
         .route("/api/aps/{ap}/upgrade", post(actions::upgrade))
         .route("/api/aps/{ap}/speedtest", post(speedtest::ap::start))
+        .route(
+            "/api/speedtest",
+            get(speedtest::client::list).post(speedtest::client::start),
+        )
+        .route("/api/speedtest/{id}/down", get(speedtest::client::down))
+        .route("/api/speedtest/{id}/up", post(speedtest::client::up))
+        .route("/api/speedtest/{id}/done", post(speedtest::client::done))
         .route("/api/rf/plan", get(rf::get_plan))
         .route("/api/rf/apply", post(rf::apply))
         .route("/ws", get(ws))

@@ -702,8 +702,8 @@ impl State {
         }
     }
 
-    /// The state whose AP speed tests take `limits`.
-    pub fn with_speedtests(mut self, limits: crate::speedtest::ap::Limits) -> Self {
+    /// The state whose speed tests take `limits`.
+    pub fn with_speedtests(mut self, limits: crate::speedtest::Limits) -> Self {
         self.speedtests.limits = limits;
         self
     }

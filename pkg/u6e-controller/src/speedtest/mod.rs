@@ -1,10 +1,14 @@
 //! The speed tests: an admin's of an AP's throughput to the controller
-//! (`ap`). Each is kept in RAM from its request to its end, the newest
-//! [`AP_KEEP`] for a week at most, its result an action on its AP (the
-//! events and the journal) and the AP's last result in the metrics; the
-//! live view carries the newest [`SHOWN`].
+//! (`ap`), and a signed-in viewer's of their own device through the UI
+//! (`client`). Each is kept in RAM from its request to its end, for a week
+//! at most (the newest [`AP_KEEP`] AP tests, the newest `client::KEEP`
+//! client tests), its result an action on its AP or client (the events, the
+//! journal and the client's timeline) and the last result of each AP, and of
+//! each AP and band for the clients, in the metrics; the live view carries
+//! the newest [`SHOWN`] AP tests, and each user fetches their own.
 
 pub mod ap;
+pub mod client;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
@@ -22,7 +26,7 @@ pub const KEEP: Duration = Duration::from_secs(7 * 24 * 3600);
 pub const SHOWN: usize = 20;
 /// The tests' kinds and results, as the metrics count them; every pair is
 /// exported.
-pub const KINDS: [&str; 1] = ["ap"];
+pub const KINDS: [&str; 2] = ["ap", "client"];
 pub const RESULTS: [&str; 3] = ["ok", "failed", "refused"];
 
 /// Where a test is.
@@ -125,17 +129,26 @@ impl ApTest {
     }
 }
 
+/// What the tests take.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Limits {
+    pub ap: ap::Limits,
+    pub client: client::Limits,
+}
+
 /// Every test kept, and the counts of their ends.
 #[derive(Debug, Default)]
 pub struct SpeedTests {
     /// AP tests, newest last.
     pub aps: VecDeque<ApTest>,
+    /// Client tests, newest last.
+    pub clients: VecDeque<client::ClientTest>,
     /// When each running AP test was asked, for its deadlines.
     asked: BTreeMap<u64, Instant>,
     /// Tests by kind and result.
     pub counts: BTreeMap<(&'static str, &'static str), u64>,
-    /// What an AP test takes.
-    pub limits: ap::Limits,
+    /// What the tests take.
+    pub limits: Limits,
 }
 
 impl SpeedTests {
