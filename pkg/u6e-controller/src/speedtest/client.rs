@@ -3,16 +3,18 @@
 //!
 //!   POST /api/speedtest               {}  → {"id", "secs", "max_bytes", "client"}
 //!   GET  /api/speedtest/{id}/down     filler for the test's time or bytes
-//!   POST /api/speedtest/{id}/up       a body of at most 8 MiB, again and again
+//!   POST /api/speedtest/{id}/up       a body of at most 8 MiB, two at a time
 //!   POST /api/speedtest/{id}/done     {"down_bytes", "down_ms"} → the result
 //!   GET  /api/speedtest               the user's own tests, newest first
 //!
 //! The download is timed by the browser, which says what it received and in
 //! how long, its bytes held to what was sent and its time to no less than
 //! the sending took (an engine may hand the page the body only once it is
-//! all in); the upload by the controller,
-//! from the first body's request to the end of the last, bodies taken while
-//! the upload's time runs, from the first. The client is the associated
+//! all in); the upload by the controller, from the first body's request to
+//! the last byte read. A body is read as it comes, counted frame by frame
+//! and never held, at most [`IN_FLIGHT`] at once per test, while the
+//! upload's time runs from the first and [`UP_SLACK`] after; a body past
+//! that, or past the test's bytes, or of an ended test, is read no further. The client is the associated
 //! client one of whose addresses (leased, or seen in its flows) is the
 //! request's: the last `X-Forwarded-For` entry, which the sign-in proxy
 //! sets and nothing else can, since only the proxy reaches the listener.
@@ -56,8 +58,12 @@ pub const PER_HOUR: usize = 6;
 pub const AT_ONCE: usize = 2;
 /// The client tests kept, newest last, for a week at most.
 pub const KEEP: usize = 500;
-/// The largest upload body.
+/// The largest upload body, and the bodies a test takes at once (the page
+/// keeps two in flight).
 pub const BODY_MAX: usize = 8 << 20;
+pub const IN_FLIGHT: u8 = 2;
+/// How long after the upload's time a body may still be read.
+pub const UP_SLACK: Duration = Duration::from_secs(2);
 /// A user's tests listed.
 const LISTED: usize = 20;
 /// The download's filler: random, so that nothing on the way compresses it,
@@ -139,6 +145,8 @@ pub struct ClientTest {
     up_bytes: u64,
     up_first: Option<Instant>,
     up_last: Option<Instant>,
+    /// Its upload bodies being read now.
+    up_in_flight: u8,
     /// The result: the browser's download, the controller's upload.
     pub down: Option<Measured>,
     pub up: Option<Measured>,
@@ -394,6 +402,7 @@ pub async fn start(Ext(web): Ext<Web>, req: HeaderMap) -> Response {
         up_bytes: 0,
         up_first: None,
         up_last: None,
+        up_in_flight: 0,
         down: None,
         up: None,
         detail: String::new(),
@@ -527,8 +536,14 @@ pub async fn up(
         Ok(u) => u,
         Err(why) => return error(StatusCode::FORBIDDEN, why),
     };
+    let length = req
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok()?.parse().ok());
+    if length.is_some_and(|n: usize| n > BODY_MAX) {
+        return error(StatusCode::PAYLOAD_TOO_LARGE, "a body is 8 MiB at most");
+    }
     let arrived = Instant::now();
-    {
+    let until = {
         let mut state = web.state.write();
         let limits = state.speedtests.limits.client;
         let Some(t) = state.speedtests.client_test(&id, &who) else {
@@ -537,22 +552,82 @@ pub async fn up(
         if t.status != Status::Running {
             return error(StatusCode::CONFLICT, "the test is over");
         }
+        if t.up_in_flight >= IN_FLIGHT {
+            return error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "two bodies are in flight already",
+            );
+        }
         let first = *t.up_first.get_or_insert(arrived);
         let window = Duration::from_secs(u64::from(limits.secs));
         if arrived > first + window || t.up_bytes >= limits.max_bytes {
             return error(StatusCode::CONFLICT, "the upload's time is up");
         }
+        t.up_in_flight += 1;
+        first + window + UP_SLACK
+    };
+    let flight = InFlight {
+        state: web.state.clone(),
+        id,
+        user: who,
+    };
+    match tokio::time::timeout_at(until.into(), flight.read(body)).await {
+        Ok(Ok(bytes)) => json_response(&json!({ "bytes": bytes })),
+        Ok(Err((status, why))) => error(status, why),
+        Err(_) => error(StatusCode::CONFLICT, "the upload's time is up"),
     }
-    let Ok(bytes) = axum::body::to_bytes(body, BODY_MAX).await else {
-        return error(StatusCode::PAYLOAD_TOO_LARGE, "a body is 8 MiB at most");
-    };
-    let mut state = web.state.write();
-    let Some(t) = state.speedtests.client_test(&id, &who) else {
-        return error(StatusCode::NOT_FOUND, "no such test");
-    };
-    t.up_bytes += bytes.len() as u64;
-    t.up_last = Some(Instant::now());
-    json_response(&json!({ "bytes": t.up_bytes }))
+}
+
+/// An upload body being read: counted in its test's bodies in flight until
+/// it is dropped, however its reading ends.
+struct InFlight {
+    state: Shared,
+    id: String,
+    user: String,
+}
+
+impl InFlight {
+    /// Reads the body frame by frame into its test's count, nothing kept;
+    /// the test's upload bytes once it ended, or why it was read no further.
+    async fn read(&self, body: Body) -> Result<u64, (StatusCode, &'static str)> {
+        let mut frames = body.into_data_stream();
+        let mut read = 0;
+        loop {
+            let frame = std::future::poll_fn(|cx| Pin::new(&mut frames).poll_next(cx)).await;
+            let Some(frame) = frame else {
+                let mut state = self.state.write();
+                let t = state.speedtests.client_test(&self.id, &self.user);
+                return Ok(t.map_or(0, |t| t.up_bytes));
+            };
+            let bytes = frame.map_err(|_| (StatusCode::BAD_REQUEST, "the body broke off"))?;
+            read += bytes.len();
+            if read > BODY_MAX {
+                return Err((StatusCode::PAYLOAD_TOO_LARGE, "a body is 8 MiB at most"));
+            }
+            let mut state = self.state.write();
+            let max = state.speedtests.limits.client.max_bytes;
+            let Some(t) = state.speedtests.client_test(&self.id, &self.user) else {
+                return Err((StatusCode::NOT_FOUND, "no such test"));
+            };
+            if t.status != Status::Running {
+                return Err((StatusCode::CONFLICT, "the test is over"));
+            }
+            t.up_bytes += bytes.len() as u64;
+            t.up_last = Some(Instant::now());
+            if t.up_bytes >= max {
+                return Err((StatusCode::CONFLICT, "the upload's bytes are used up"));
+            }
+        }
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        let mut state = self.state.write();
+        if let Some(t) = state.speedtests.client_test(&self.id, &self.user) {
+            t.up_in_flight = t.up_in_flight.saturating_sub(1);
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -671,6 +746,7 @@ mod tests {
             up_bytes: 0,
             up_first: None,
             up_last: None,
+            up_in_flight: 0,
             down: None,
             up: None,
             detail: String::new(),

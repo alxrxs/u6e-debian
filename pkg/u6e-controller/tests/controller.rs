@@ -5668,18 +5668,17 @@ fn client_speed_tests_are_their_users_and_limited() {
     let alice = "X-Forwarded-Preferred-Username: alice\r\n";
     let (head, _) = http_get_full(r.c.http, &format!("/api/speedtest/{bob_id}/down"), alice);
     assert!(head.starts_with("HTTP/1.0 404"), "{head}");
-    // A body past 8 MiB is refused.
+    // A body said to be past 8 MiB is refused before a byte of it is read.
     let a_id = a["id"].as_str().unwrap();
     let up = format!("/api/speedtest/{a_id}/up");
-    let big = "u".repeat((8 << 20) + 1);
-    let (head, _) = http_send(
+    let mut big = open_post(
         r.c.http,
-        "POST",
         &up,
         &format!("Origin: {ORIGIN}\r\n{alice}"),
-        &big,
+        (8 << 20) + 1,
+        &[],
     );
-    assert!(head.starts_with("http/1.1 413"), "{head}");
+    assert_eq!(status_on(&mut big), 413);
     // An upload from another site's page is refused.
     let (head, _) = http_send(r.c.http, "POST", &up, alice, "x");
     assert!(head.starts_with("http/1.1 403"), "{head}");
@@ -5711,4 +5710,102 @@ fn client_speed_tests_are_their_users_and_limited() {
     ] {
         assert!(body.lines().any(|l| l == line), "missing {line}\n{body}");
     }
+}
+
+/// A POST to `path` with `headers` saying a body of `len` bytes, of which
+/// only `part` is sent: the connection is left open, its answer unread.
+fn open_post(addr: SocketAddr, path: &str, headers: &str, len: usize, part: &[u8]) -> TcpStream {
+    let mut sock = TcpStream::connect(addr).unwrap();
+    sock.set_read_timeout(Some(WAIT)).unwrap();
+    write!(
+        sock,
+        "POST {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n{headers}Content-Length: {len}\r\n\r\n"
+    )
+    .unwrap();
+    sock.write_all(part).unwrap();
+    sock
+}
+
+/// The status of the answer on `sock`.
+fn status_on(sock: &mut TcpStream) -> u16 {
+    let mut head = [0; 12];
+    sock.read_exact(&mut head).unwrap();
+    String::from_utf8_lossy(&head[9..12]).parse().unwrap()
+}
+
+/// A started client test of alice's, from an address no client has; its id.
+fn alices_test(r: &Running) -> String {
+    let (status, started) = post(
+        r.c.http,
+        "/api/speedtest",
+        &page_of("alice", "198.51.100.7"),
+        "{}",
+    );
+    assert_eq!(status, 200, "{started}");
+    started["id"].as_str().unwrap().to_owned()
+}
+
+#[test]
+fn a_client_test_reads_two_upload_bodies_at_once_and_holds_none() {
+    let mut timing = quick_client_tests();
+    timing.speedtest.client.secs = 10;
+    let r = controller(timing);
+    let id = alices_test(&r);
+    let up = format!("/api/speedtest/{id}/up");
+    let alice = format!("Origin: {ORIGIN}\r\nX-Forwarded-Preferred-Username: alice\r\n");
+    // Two slow bodies of 8 MiB each hold their places; a third is refused.
+    let one = open_post(r.c.http, &up, &alice, 8 << 20, &[7; 4096]);
+    let two = open_post(r.c.http, &up, &alice, 8 << 20, &[7; 4096]);
+    thread::sleep(Duration::from_millis(500));
+    let (head, body) = http_send(r.c.http, "POST", &up, &alice, "x");
+    assert!(head.starts_with("http/1.1 429"), "{head} {body}");
+    // A body that broke off gives its place back.
+    drop(one);
+    drop(two);
+    thread::sleep(Duration::from_millis(300));
+    let (head, body) = http_send(r.c.http, "POST", &up, &alice, "x");
+    assert!(head.starts_with("http/1.1 200"), "{head} {body}");
+    // What came of the broken bodies counted, frame by frame: 8 KiB and 1.
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["bytes"], 8193);
+}
+
+#[test]
+fn a_slow_upload_body_is_cut_at_the_uploads_time_and_none_counts_after_the_end() {
+    let r = controller(quick_client_tests());
+    let id = alices_test(&r);
+    let up = format!("/api/speedtest/{id}/up");
+    let alice = format!("Origin: {ORIGIN}\r\nX-Forwarded-Preferred-Username: alice\r\n");
+    let start = Instant::now();
+    let mut slow = open_post(r.c.http, &up, &alice, 1 << 20, &[7; 4096]);
+    // Cut at the upload's second and its slack, not when the body ends.
+    assert_eq!(status_on(&mut slow), 409);
+    let took = start.elapsed();
+    assert!(
+        took >= Duration::from_secs(3) && took < Duration::from_secs(6),
+        "{took:?}"
+    );
+    // Ended, a test takes no more bytes.
+    let (h, _) = http_get_full(
+        r.c.http,
+        &format!("/api/speedtest/{id}/down"),
+        "X-Forwarded-Preferred-Username: alice\r\n",
+    );
+    assert!(h.starts_with("HTTP/1.0 200"), "{h}");
+    let mut late = open_post(r.c.http, &up, &alice, 1 << 20, &[]);
+    let (status, done) = post(
+        r.c.http,
+        &format!("/api/speedtest/{id}/done"),
+        &page_of("alice", "198.51.100.7"),
+        r#"{"down_bytes": 1, "down_ms": 1000}"#,
+    );
+    assert_eq!(status, 200, "{done}");
+    assert_eq!(done["up"]["bytes"], 4096);
+    late.write_all(&[7; 4096]).unwrap();
+    assert_eq!(status_on(&mut late), 409);
+    let mine = json_get_as(
+        r.c.http,
+        "/api/speedtest",
+        "X-Forwarded-Preferred-Username: alice\r\n",
+    );
+    assert_eq!(mine["tests"][0]["up"]["bytes"], 4096);
 }
