@@ -11,7 +11,9 @@
 // as is an AP's upgrade, which the Config view follows from the state, and
 // an AP's speed test, which Devices follows from the state. A client's
 // history and traffic, the auth problems, the roams and steering, the mDNS
-// services and the viewer's own speed tests are fetched by their views.
+// services and the viewer's own speed tests are fetched by their views. The
+// MAC authentication mapping comes with the state, and an admin's change of
+// an entry is a POST like an action.
 
 import { icon } from './util.js';
 import devices from './views/devices.js';
@@ -25,6 +27,7 @@ import roaming from './views/roaming.js';
 import services from './views/services.js';
 import spectrum, { decodeFrame } from './views/spectrum.js';
 import speedtest from './views/speedtest.js';
+import vlans from './views/vlans.js';
 
 /** Samples kept per client and radio: an hour at one per tick. */
 const HISTORY = 1800;
@@ -79,10 +82,11 @@ const store = {
   apSpeedTest,
   startSpeedTest,
   finishSpeedTest,
+  setVlan,
   watchSpectrum,
 };
 
-const views = { devices, clients, client, auth, flows, roaming, services, events, spectrum, config, test: speedtest };
+const views = { devices, clients, client, auth, vlans, flows, roaming, services, events, spectrum, config, test: speedtest };
 let current = null;
 let currentName = '';
 
@@ -171,6 +175,13 @@ async function adminPost(path, body) {
 /** Takes `action` (kick, block, unblock, steer) on client `mac`. */
 function act(mac, action, body = {}) {
   return adminPost(`/api/clients/${encodeURIComponent(mac)}/${action}`, body);
+}
+
+/** Sets client `mac`'s entry in the MAC authentication mapping: `{ vlan,
+ * expect, description }`, `vlan` null removing it, `expect` the VLAN the
+ * admin saw. */
+function setVlan(mac, body) {
+  return adminPost(`/api/clients/${encodeURIComponent(mac)}/vlan`, body);
 }
 
 /** Limits client `mac` to `{ down_kbit, up_kbit }`; both null removes it. */
@@ -467,7 +478,7 @@ function render() {
       ? `Live updates stopped: the controller cannot be reached. Trying again in ${s} s; the figures shown are the last received.`
       : `The controller cannot be reached. Trying again in ${s} s.`;
   }
-  const title = { devices: 'Devices', clients: 'Clients', client: 'Client', auth: 'Auth problems', flows: 'Flows', roaming: 'Roaming', services: 'Services', spectrum: 'Spectrum', config: 'Config', events: 'Events', test: 'Test my connection' }[currentName];
+  const title = { devices: 'Devices', clients: 'Clients', client: 'Client', auth: 'Auth problems', vlans: 'VLANs', flows: 'Flows', roaming: 'Roaming', services: 'Services', spectrum: 'Spectrum', config: 'Config', events: 'Events', test: 'Test my connection' }[currentName];
   document.title = `${title} – Wi-Fi`;
   current?.update();
 }

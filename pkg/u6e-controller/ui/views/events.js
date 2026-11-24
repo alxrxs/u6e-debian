@@ -4,7 +4,7 @@
 // clients, newest first, by day; a client's own history uses the
 // same list.
 
-import { h, dayOf, describe, time } from '../util.js';
+import { h, actor, dayOf, describe, time } from '../util.js';
 
 const PAGE = 300;
 const GROUPS = [['', 'All'], ['conn', 'Joins and leaves'], ['auth', 'Sign-ins'], ['roam', 'Steering'], ['radio', 'Radios'], ['guard', 'Guards'], ['service', 'Services'], ['action', 'Actions']];
@@ -21,14 +21,14 @@ const ADMIN_ACTIONS = new Set(['upgrade', 'rf-plan']);
  * controller's own and an admin's on an AP), and what came of it (hostapd's
  * bare "OK" says nothing a "done" does not). */
 function actionText(e, what, showMac) {
-  const who = e.user || (e.mac || ADMIN_ACTIONS.has(e.action) ? 'Someone' : 'The controller');
+  const who = ADMIN_ACTIONS.has(e.action) && !e.user ? 'Someone' : actor(e);
   const result = e.ok
     ? h('span', { class: 'muted' }, ` · ${!e.detail || e.detail === 'OK' ? 'done' : e.detail}`)
     : `: failed, ${e.detail || 'no reason given'}`;
   if (!e.mac) return [`${who} ${what.text}`, result];
   return showMac
     ? [who, ` ${what.text} `, h('a', { href: `#/client/${e.mac}` }, e.mac), result]
-    : [`${what.text[0].toUpperCase()}${what.text.slice(1)} by ${who}`, result];
+    : [`${what.text[0].toUpperCase()}${what.text.slice(1)} by ${who === 'The controller' ? 'the controller' : who}`, result];
 }
 
 /**

@@ -174,7 +174,20 @@ export const DID = {
   rollout: 'rolled an image out',
   image: 'kept or pruned an image',
   'rf-plan': 'applied an RF plan',
+  vlan: 'remapped',
+  speedtest: 'speed-tested',
+  presence: 'announced',
 };
+
+/** The actions on a client the controller takes by itself. */
+export const CONTROLLER_ACTIONS = new Set(['presence']);
+
+/** Who took action `e`: its user, else the controller for one of its own
+ * or an action on no client, else someone. */
+export function actor(e) {
+  if (e.user) return e.user;
+  return CONTROLLER_ACTIONS.has(e.action) || !e.mac ? 'The controller' : 'Someone';
+}
 
 /** The DNS-SD service types a person knows by a name. */
 const SERVICES = {

@@ -54,16 +54,21 @@
 //! Assistant of the replay's own (`ha`) after a minute unseen: the printer's
 //! 40 s away announces nothing, the other's minute and more a leave; with
 //! `--ha-down` that Home Assistant answers every event 503, so presence
-//! events waiting and dropped show.
+//! events waiting and dropped show. RADIUS's MAC authentication mapping of
+//! the clients on `ssid-b` is kept by an OpenBao of the replay's own
+//! (`vlans`), which puts each on its entry's VLAN as it joins; with
+//! `--bao-down` it answers every request 503, as a sealed one does.
 //! The web listener adds what the sign-in proxy in front of a controller
 //! would: a user, a member of the admin group unless `--viewer` is given,
 //! and, unless the request names one, the address of the laptop
 //! (`02:00:00:00:00:02`) as the one it came from, so the Test page tests it.
 //!
-//!   cargo run -p u6e-controller --example replay [-- [<web address>] [--viewer] [--ha-down]]
+//!   cargo run -p u6e-controller --example replay [-- [<web address>] [--viewer] [--ha-down] [--bao-down]]
 //!
 //! The web address defaults to 127.0.0.1:8080.
 
+#[path = "../../tests/common/bao.rs"]
+mod bao;
 mod flows;
 mod ha;
 #[path = "../../tests/common/keys.rs"]
@@ -76,6 +81,7 @@ mod services;
 mod spectrum;
 mod speedtest;
 mod tools;
+mod vlans;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -286,6 +292,8 @@ struct Client {
     ft: bool,
     /// Whether its AP has authorized it (one stuck in EAP is not).
     authorized: bool,
+    /// The VLAN it joined on.
+    vlan: u16,
 }
 
 /// What the script does at a moment of its cycle.
@@ -367,6 +375,8 @@ struct World {
     rng: u64,
     /// RADIUS's log of the clients' sign-ins.
     pub radius: radius::Log,
+    /// The OpenBao holding the MAC authentication mapping.
+    pub bao: Arc<Mutex<bao::Store>>,
 }
 
 fn client(
@@ -395,6 +405,7 @@ fn client(
         idle_s: 0.0,
         ft: false,
         authorized: true,
+        vlan: 0,
     }
 }
 
@@ -492,6 +503,7 @@ impl World {
             later: Vec::new(),
             rng: 0x9e37_79b9_7f4a_7c15,
             radius: radius::Log::new(now_ms()),
+            bao: vlans::store(),
         };
         for i in 0..w.clients.len() {
             if let Some((ap, bss)) = w.clients[i].at {
@@ -532,6 +544,9 @@ impl World {
         let mac = World::mac(last);
         let b = bss as u16;
         let ssid = BSSS[bss].1;
+        // MAC authentication puts it where its entry says, as RADIUS does.
+        let entry = (ssid == vlans::SSID).then(|| vlans::vlan_of(&self.bao, mac));
+        self.clients[i].vlan = entry.flatten().unwrap_or(BSSS[bss].3);
         if !self.clients[i].ft {
             // EAP takes about a second, which it was given before the join.
             if ssid == EAP_SSID {
@@ -1195,7 +1210,7 @@ fn station(c: &Client, bss: usize, t: f64) -> Station {
         rx_airtime_us: c.rx_airtime_us as u64,
         inactive_ms: (c.idle_s * 1000.0) as u32,
         connected_s: (t - c.since) as u32,
-        vlan: BSSS[bss].3,
+        vlan: c.vlan,
     }
 }
 
@@ -1502,6 +1517,7 @@ async fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let admin = !args.iter().any(|a| a == "--viewer");
     let ha_down = args.iter().any(|a| a == "--ha-down");
+    let bao_down = args.iter().any(|a| a == "--bao-down");
     let web = args
         .iter()
         .find(|a| !a.starts_with("--"))
@@ -1514,10 +1530,15 @@ async fn main() -> io::Result<()> {
     let (remote, clone) = rf::repository()?;
     // Its signing key and kept images, the staging of one made up.
     let managed = std::env::temp_dir().join("u6e-replay-manage");
+    // OpenBao's token, as the controller's timer keeps it.
+    let bao_token = std::env::temp_dir().join("u6e-replay-bao-token");
+    std::fs::write(&bao_token, vlans::TOKEN)?;
     // Home Assistant's token, as the role installs it.
     let token = std::env::temp_dir().join("u6e-replay-ha-token");
     std::fs::write(&token, "replay-token\n")?;
     let world = Arc::new(Mutex::new(World::new()));
+    let mapping = Arc::clone(&world.lock().unwrap_or_else(|e| e.into_inner()).bao);
+    mapping.lock().unwrap_or_else(|e| e.into_inner()).down = bao_down;
     let stager: Arc<dyn Stage> = Arc::new(manage::SimStage(Arc::clone(&world)));
     // The controller's own web listener goes unused: the one below is its
     // router behind what the sign-in proxy adds. The planner's channel table
@@ -1537,7 +1558,9 @@ async fn main() -> io::Result<()> {
          [radius]\nloki = \"{}\"\nselector = '{{job=\"radius-auth\"}}'\n\
          [presence]\nurl = \"https://127.0.0.1:{}\"\nca = \"{}/ca.pem\"\ntoken = \"{}\"\n\
          leave_after_secs = 60\ndevices = [{{ mac = \"{}\", name = \"office_printer\" }}, \
-         {{ mac = \"{}\", name = \"spare_phone\" }}]\n",
+         {{ mac = \"{}\", name = \"spare_phone\" }}]\n\
+         [mac_auth]\nurl = \"https://127.0.0.1:{}\"\nca = \"{}/ca.pem\"\ntoken = \"{}\"\n\
+         path = \"mac-auth\"\nvlans = [{}]\nssids = [\"{}\"]\n",
         policy.display(),
         history.display(),
         managed.join("captures").display(),
@@ -1555,6 +1578,11 @@ async fn main() -> io::Result<()> {
         token.display(),
         mac::format(World::mac(7)),
         mac::format(World::mac(10)),
+        bao::serve(mapping).await?.port(),
+        bao::TLS,
+        bao_token.display(),
+        vlans::VLANS.map(|v| v.to_string()).join(", "),
+        vlans::SSID,
     );
     let config = Config::parse(&config).map_err(io::Error::other)?;
     let identity = Identity::from_pem(KEY_CONTROLLER).map_err(io::Error::other)?;

@@ -5,7 +5,7 @@
 // in the feed's shape, and its sessions as a table. The client page and the
 // Auth problems page share the words.
 
-import { h, bandName, bytes, dayOf, DID, duration, GUARDS, hm, serviceWords, time } from '../util.js';
+import { h, actor, bandName, bytes, dayOf, DID, duration, GUARDS, hm, serviceWords, time } from '../util.js';
 
 /** Why a session ended, in words. */
 export function ended(e) {
@@ -86,8 +86,13 @@ function words(e) {
     case 'first-traffic':
       return { tone: 'ok', text: [`First traffic: ${e.conns} connection${e.conns === 1 ? '' : 's'}`] };
     case 'action': {
+      // These say what came of them: the VLANs or the kick, what Home
+      // Assistant was told, the speeds.
+      if (['vlan', 'presence', 'speedtest'].includes(e.action)) {
+        return { tone: e.ok ? '' : 'bad', text: [`${actor(e)} ${DID[e.action]} it`, h('span', { class: 'muted' }, ` · ${e.detail}`)] };
+      }
       const result = e.ok ? '' : `: failed, ${e.detail || 'no reason given'}`;
-      return { tone: e.ok ? '' : 'bad', text: [`${e.user || 'Someone'} ${DID[e.action] || e.action} it${result}`] };
+      return { tone: e.ok ? '' : 'bad', text: [`${actor(e)} ${DID[e.action] || e.action} it${result}`] };
     }
     case 'guard': {
       const more = e.repeats ? `, ${e.repeats} more times since the last report` : '';

@@ -9,8 +9,10 @@
 // requests to move it with its answers (`roaming`), its traffic over the
 // week (`traffic`), the services it offers and asks for over mDNS
 // (`services`), its sessions and its timeline, asked for again when an
-// event of it comes and every 15 s; and, for a device whose presence goes to
-// Home Assistant, whether it is home and what Home Assistant was told.
+// event of it comes and every 15 s; for a device whose presence goes to
+// Home Assistant, whether it is home and what Home Assistant was told; and,
+// when the controller edits RADIUS's MAC authentication mapping, its entry
+// there and an admin's change of it (`vlans`).
 
 import { h, icon, ago, ask, bandName, bits, bytes, dayOf, DID, duration, hm, mbps, palette, pct, phy, quality, time } from '../util.js';
 import { lineChart } from '../charts.js';
@@ -19,6 +21,7 @@ import { certificate, sessionsTable, timelineItems } from './history.js';
 import { capturePanel, limitPanel } from './tools.js';
 import { byMac, deviceCard } from './services.js';
 import { trafficPanel } from './traffic.js';
+import { vlanPanel } from './vlans.js';
 import { clientExperience } from './experience.js';
 import { roamingLoader, roamsTable, steeringTable, stickyWords } from './roaming.js';
 
@@ -234,7 +237,8 @@ export default {
       identity, result, readings, absent);
     const limit = limitPanel(store, mac);
     const capture = capturePanel(store, mac);
-    const tools = h('div', { class: 'tools-row' }, limit.el, capture.el);
+    const vlan = vlanPanel(store, mac, root);
+    const tools = h('div', { class: 'tools-row' }, vlan.el, limit.el, capture.el);
     const charts = [chartPanel('Signal'), chartPanel('Rates'), chartPanel('Throughput')];
     const chartsEl = h('div', { class: 'charts' }, charts.map((c) => c.el));
     const flowSub = h('p');
@@ -515,6 +519,7 @@ export default {
         const c = store.state.clients[mac];
         const p = palette();
         updateHead(c);
+        vlan.update();
         limit.update();
         capture.update();
         updateFlows(c);

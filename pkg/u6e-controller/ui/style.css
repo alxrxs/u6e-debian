@@ -961,3 +961,39 @@ table.roams td:nth-child(n+2) small, table.steering td small { display: block; }
 .st-who { margin: 4px 0 8px; }
 .st-who:empty { display: none; }
 .st-table td.num, .st-table th:nth-child(2), .st-table th:nth-child(3) { text-align: right; }
+
+/* RADIUS's MAC authentication mapping: the VLANs page, a client's VLAN
+   panel and the dialog of a change. */
+.vlan-effect { margin: 12px 0 0; min-height: 2.8em; color: var(--ink-2); font-size: 13px; }
+.vlan-desc { margin-top: 12px; }
+.vlan-desc input, .vlan-add .field input { width: 100%; max-width: 30ch; }
+.vlan-add { margin-top: 22px; }
+.vlan-group .section-title { display: flex; align-items: baseline; gap: 6px 10px; flex-wrap: wrap; }
+.vlan-group .section-title .muted { font-weight: 400; font-size: 14px; }
+/* One column width for every VLAN's table; a row opens nothing. */
+table.vlans { table-layout: fixed; }
+table.vlans th:nth-child(1) { width: 32%; }
+table.vlans th:nth-child(2) { width: 26%; }
+table.vlans th:nth-child(4) { width: 112px; }
+table.vlans td { white-space: normal; overflow-wrap: anywhere; }
+table.vlans td.v-act { text-align: right; }
+table.vlans tbody tr { cursor: default; }
+table.vlans tbody tr:hover td { background: none; }
+/* On a narrow screen: a card per device. */
+@media (max-width: 720px) {
+  table.vlans thead { display: none; }
+  table.vlans tr {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    grid-template-areas: "who act" "desc desc" "now now";
+    gap: 4px 12px;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--rule-2);
+  }
+  table.vlans tr:last-child { border-bottom: 0; }
+  table.vlans td { padding: 0; border: 0; min-width: 0; }
+  .v-who { grid-area: who; }
+  .v-desc { grid-area: desc; }
+  .v-now { grid-area: now; }
+  .v-act { grid-area: act; align-self: start; }
+}
