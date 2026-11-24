@@ -24,7 +24,9 @@
 //! AP's throughput to the controller, and a signed-in viewer their own
 //! device's through the UI (`speedtest`). The devices the configuration
 //! lists are announced to Home Assistant as they join and leave the Wi-Fi
-//! (`presence`).
+//! (`presence`). Admins set the VLAN RADIUS's MAC authentication puts a
+//! device in, in the mapping every RADIUS server reads from OpenBao
+//! (`macauth`).
 
 pub mod actions;
 pub mod agents;
@@ -41,6 +43,7 @@ pub mod images;
 pub mod leases;
 pub mod limits;
 pub mod local;
+pub mod macauth;
 pub mod metrics;
 pub mod names;
 pub mod oui;
@@ -211,6 +214,9 @@ pub async fn start(
     if let Some(p) = &config.presence {
         state = state.with_presence(p);
     }
+    if let Some(m) = &config.mac_auth {
+        state = state.with_mac_auth(m, timing.mac_auth);
+    }
     let state = Shared::new(state);
     let keys: HashMap<_, _> = config.aps.iter().map(|(n, k)| (*k, n.clone())).collect();
     let allowed: AllowedKeys = Arc::new(RwLock::new(keys));
@@ -283,6 +289,10 @@ pub async fn start(
     }
     if let Some(settings) = &config.presence {
         tokio::spawn(presence::supervise(state.clone(), settings.clone()));
+    }
+    if let Some(settings) = &config.mac_auth {
+        let read = timing.mac_auth.read;
+        tokio::spawn(macauth::supervise(state.clone(), settings.clone(), read));
     }
     tokio::spawn(sessions::keep(state.clone(), history.clone()));
     tokio::spawn(traffic::keep(state.clone(), traffic_path.clone()));

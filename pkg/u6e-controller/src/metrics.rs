@@ -38,7 +38,9 @@
 //! direction, and the clients' last one on each AP and band its rates.
 //! The presence events exist only when they go to Home Assistant: per
 //! listed device (at most `presence::DEVICES_MAX`) its state, and counted
-//! by result.
+//! by result. The MAC authentication mapping's exist only when admins edit
+//! it: whether its last read worked and when one last did, its entries and
+//! version, and the changes by result, every result always exported.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
@@ -488,6 +490,9 @@ pub fn render(state: &State) -> String {
     if let Some(p) = &state.presence {
         presence(&mut m, p);
     }
+    if let Some(a) = &state.mac_auth {
+        mac_auth(&mut m, a);
+    }
     m.family(
         "wifi_traffic_clients",
         GAUGE,
@@ -656,6 +661,50 @@ fn presence(m: &mut Text, p: &crate::presence::Presence) {
     );
     if let Some(t) = p.last_delivery {
         m.sample(&[], unix_seconds(t));
+    }
+}
+
+/// RADIUS's MAC authentication mapping, when admins edit it: how reading it
+/// goes, what it holds, and the changes by result.
+fn mac_auth(m: &mut Text, a: &crate::macauth::MacAuth) {
+    m.family(
+        "wifi_mac_auth_read_up",
+        GAUGE,
+        "Whether the controller's last read of the MAC authentication mapping in OpenBao worked.",
+    );
+    m.sample(
+        &[],
+        f64::from(u8::from(a.error.is_none() && a.read_at.is_some())),
+    );
+    m.family(
+        "wifi_mac_auth_last_read_timestamp_seconds",
+        GAUGE,
+        "When a read of the MAC authentication mapping last worked.",
+    );
+    if let Some(t) = a.read_at {
+        m.sample(&[], unix_seconds(t));
+    }
+    if let Some(map) = &a.mapping {
+        m.family(
+            "wifi_mac_auth_entries",
+            GAUGE,
+            "The entries of the MAC authentication mapping as last read.",
+        );
+        m.sample(&[], map.entries.len() as f64);
+        m.family(
+            "wifi_mac_auth_version",
+            GAUGE,
+            "The KV version of the MAC authentication mapping as last read or written.",
+        );
+        m.sample(&[], map.version as f64);
+    }
+    m.family(
+        "wifi_mac_auth_changes_total",
+        COUNTER,
+        "Admins' changes of the MAC authentication mapping, by result.",
+    );
+    for (result, n) in &a.changes {
+        m.sample(&[("result", result)], *n as f64);
     }
 }
 

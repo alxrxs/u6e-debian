@@ -26,8 +26,9 @@
 //! for a large connection table, up to the minute), otherwise every minute.
 //! The session follows per-AP channels holding what the watchers want. The
 //! scans of the APs' radios are kept here too, watched as `spectrum` says,
-//! and so are the speed tests (`speedtest`) and the listed devices'
-//! presence (`presence`).
+//! and so are the speed tests (`speedtest`), the listed devices'
+//! presence (`presence`) and RADIUS's MAC authentication mapping
+//! (`macauth`).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::net::IpAddr;
@@ -50,6 +51,7 @@ use crate::configs::unix_ms;
 use crate::identity::Identity;
 use crate::leases::{Lease, Leases};
 use crate::limits::{self, RateLimits};
+use crate::macauth::{self, MacAuth};
 use crate::names::{self, Names};
 use crate::oui;
 use crate::policy::{ApImages, Blocked, ConfigId, Hold, Phase, Policy, SavedRollout};
@@ -123,6 +125,9 @@ pub enum Change {
     /// A listed device came or went, or what Home Assistant was told of it
     /// changed.
     Presence,
+    /// The MAC authentication mapping was read or written, or a device's
+    /// kick to join its new VLAN moved on.
+    MacAuth,
 }
 
 /// One action on one AP (or on none, when no AP was connected to carry a
@@ -641,6 +646,8 @@ pub struct State {
     pub speedtests: SpeedTests,
     /// The listed devices' presence, when it goes to Home Assistant.
     pub presence: Option<Presence>,
+    /// RADIUS's MAC authentication mapping, when admins edit it.
+    pub mac_auth: Option<MacAuth>,
 }
 
 impl State {
@@ -683,6 +690,7 @@ impl State {
             traffic: Traffic::default(),
             speedtests: SpeedTests::default(),
             presence: None,
+            mac_auth: None,
         }
     }
 
@@ -714,6 +722,13 @@ impl State {
     /// The state telling Home Assistant of the devices `settings` lists.
     pub fn with_presence(mut self, settings: &presence::Settings) -> Self {
         self.presence = Some(Presence::new(settings));
+        self
+    }
+
+    /// The state whose admins edit the MAC authentication mapping `settings`
+    /// names.
+    pub fn with_mac_auth(mut self, settings: &macauth::Settings, waits: macauth::Waits) -> Self {
+        self.mac_auth = Some(MacAuth::new(settings, waits));
         self
     }
 

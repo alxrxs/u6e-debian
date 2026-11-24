@@ -44,7 +44,10 @@
 //! (`roaming`). `POST /api/aps/{ap}/speedtest` is an admin's speed test of
 //! an AP to the controller (`speedtest::ap`), its progress and result in the
 //! view's `speedtests`; `/api/speedtest` and its routes are a signed-in
-//! viewer's test of their own device (`speedtest::client`).
+//! viewer's test of their own device (`speedtest::client`). `GET
+//! /api/mac-auth` is RADIUS's MAC authentication mapping as last read, and
+//! `POST /api/clients/{mac}/vlan` an admin's change of one device's entry
+//! (`macauth`).
 //!
 //! A connection whose writes make no progress for 30 s is ended (`stall`).
 //!
@@ -74,7 +77,7 @@ use crate::services;
 use crate::spectrum::{self, Watching};
 use crate::state::{Change, Full, ROLLOUT_LOG_CAP, Shared, WatchGuard};
 use crate::view;
-use crate::{captures, limits, names, rf, sessions, speedtest, traffic};
+use crate::{captures, limits, macauth, names, rf, sessions, speedtest, traffic};
 
 /// How long a new WebSocket may take to say what it watches.
 const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -209,6 +212,8 @@ pub fn router(state: Shared, access: Access) -> Router {
         .route("/api/speedtest/{id}/down", get(speedtest::client::down))
         .route("/api/speedtest/{id}/up", post(speedtest::client::up))
         .route("/api/speedtest/{id}/done", post(speedtest::client::done))
+        .route("/api/mac-auth", get(macauth::get))
+        .route("/api/clients/{mac}/vlan", post(macauth::change))
         .route("/api/rf/plan", get(rf::get_plan))
         .route("/api/rf/apply", post(rf::apply))
         .route("/ws", get(ws))
@@ -742,7 +747,8 @@ async fn live(
                 | Change::Deploy
                 | Change::Limits
                 | Change::SpeedTests
-                | Change::Presence,
+                | Change::Presence
+                | Change::MacAuth,
             ) => (true, None),
             Ok(Change::Captures) => (admin, None),
             // A block or an unblock changes the list of clients blocked.

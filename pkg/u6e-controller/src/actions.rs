@@ -405,7 +405,7 @@ impl Ctx<'_> {
     }
 
     /// A kick or a steer, on the AP the client is on.
-    async fn where_it_is(&self, access: &Access, kind: CommandKind) -> Response {
+    pub(crate) async fn where_it_is(&self, access: &Access, kind: CommandKind) -> Response {
         let clients = self.state.read().clients();
         let Some(ap) = clients
             .into_iter()

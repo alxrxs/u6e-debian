@@ -46,6 +46,8 @@ use u6e_proto::speedtest::{CHUNK, Chunks};
 use u6e_proto::tls::{self, Identity};
 use u6e_proto::{mac, speedtest, version};
 
+#[path = "common/bao.rs"]
+mod bao;
 #[path = "common/keys.rs"]
 mod keys;
 #[path = "common/tempdir.rs"]
@@ -5876,4 +5878,366 @@ fn a_download_nobody_reads_is_ended_at_its_stall_time() {
         start.elapsed()
     );
     assert!(got < 200 << 20, "{got} B: the download went on");
+}
+
+/// A controller whose admins edit the MAC authentication mapping in a
+/// stand-in OpenBao holding `mapping` (none: no secret yet), the VLANs 42
+/// and 43 to choose from and `iot` the MAC-authenticated SSID, each wait
+/// short; the stand-in's store, and the runtime serving it.
+fn with_mapping(mapping: Option<Value>) -> (Running, Arc<Mutex<bao::Store>>, Runtime) {
+    let rt = Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let store = Arc::new(Mutex::new(bao::Store {
+        token: "s.test".into(),
+        ..bao::Store::default()
+    }));
+    if let Some(m) = mapping {
+        let mut s = store.lock().unwrap();
+        s.secrets
+            .entry("mac-auth".into())
+            .or_default()
+            .versions
+            .push(m);
+    }
+    let addr = rt.block_on(bao::serve(Arc::clone(&store))).unwrap();
+    let dir = TempDir::new("controller");
+    fs::write(dir.0.join("bao-token"), "s.test\n").unwrap();
+    let extra = format!(
+        "[mac_auth]\nurl = \"https://127.0.0.1:{}\"\nca = \"{}/ca.pem\"\ntoken = \"{}\"\n\
+         path = \"mac-auth\"\nvlans = [42, 43]\nssids = [\"iot\"]\n",
+        addr.port(),
+        bao::TLS,
+        dir.0.join("bao-token").display()
+    );
+    let timing = Timing {
+        mac_auth: u6e_controller::macauth::Waits {
+            read: Duration::from_millis(200),
+            settle: Duration::from_millis(500),
+            back: Duration::from_secs(5),
+        },
+        ..Timing::default()
+    };
+    let mut r = configured(timing, &dir.0, 420, Arc::new(FakeStage::default()), &extra);
+    r._dir = Some(dir);
+    (r, store, rt)
+}
+
+/// The site's mapping: `MAC` on VLAN 42, `02:..:02` on 43.
+fn site_mapping() -> Value {
+    json!({"vlans": {
+        "common": {"id": 42, "devices": [{"mac": "02-00-00-00-00-01", "description": "laptop"}]},
+        "iot": {"id": 43, "devices": [{"mac": "02-00-00-00-00-02", "description": "plug"}]},
+    }})
+}
+
+/// An AP with `MAC` on the SSID `ssid`, on VLAN 42.
+fn ap_with_mab_client(r: &Running, ssid: &str) -> Agent {
+    let mut a = Agent::hello(r.c.agents, KEY_AP1, "ap1");
+    let s = snapshot(1, vec![bss("wlan2", ssid)], vec![station(MAC, 0, -54)]);
+    a.send(&AgentMsg::Key(s)).unwrap();
+    assert!(a.expect_sync().is_empty());
+    a
+}
+
+/// The writes the stand-in OpenBao took: each one's check-and-set version
+/// and data.
+fn writes(store: &Arc<Mutex<bao::Store>>) -> Vec<(u64, Value)> {
+    let s = store.lock().unwrap();
+    let posts = s.requests.iter().filter(|(r, _)| r.starts_with("POST "));
+    posts
+        .map(|(_, b)| {
+            let b = b.clone().unwrap();
+            (b["options"]["cas"].as_u64().unwrap(), b["data"].clone())
+        })
+        .collect()
+}
+
+fn set_vlan(r: &Running, headers: &str, body: &str) -> (u16, Value) {
+    post(r.c.http, &format!("{CLIENT}/vlan"), headers, body)
+}
+
+/// The last action recorded.
+fn last_action(r: &Running) -> (String, Option<String>, bool, String) {
+    let s = r.c.state.read();
+    let a = s.actions.back().unwrap();
+    (a.action.into(), a.user.clone(), a.ok, a.detail.clone())
+}
+
+#[test]
+fn a_move_is_written_over_the_version_read_and_the_device_kicked_once_into_it() {
+    let (r, store, _rt) = with_mapping(Some(site_mapping()));
+    let mut a = ap_with_mab_client(&r, "iot");
+    wait_for("the mapping read", || {
+        let v = json_get(r.c.http, "/api/mac-auth");
+        v["entries"]["02:00:00:00:00:01"]["vlan"] == 42
+    });
+    let v = json_get(r.c.http, "/api/mac-auth");
+    assert_eq!(v["version"], 1);
+    assert_eq!(
+        v["vlans"],
+        json!([{"id": 42, "group": "common"}, {"id": 43, "group": "iot"}])
+    );
+    assert_eq!(v["ssids"], json!(["iot"]));
+
+    let body = r#"{"vlan": 43, "expect": 42}"#;
+    let (status, answer) = set_vlan(&r, &format!("{SAME_SITE}{ADMIN}"), body);
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer["detail"], "VLAN 42 → VLAN 43 (mapping version 2)");
+    assert_eq!(answer["kick"], "once, in 0 s, to join again on VLAN 43");
+    let w = writes(&store);
+    assert_eq!(w.len(), 1);
+    assert_eq!(w[0].0, 1, "written over the version read");
+    assert_eq!(
+        w[0].1,
+        json!({"vlans": {
+            "common": {"id": 42, "devices": []},
+            "iot": {"id": 43, "devices": [
+                {"mac": "02-00-00-00-00-02", "description": "plug"},
+                {"mac": "02-00-00-00-00-01", "description": "laptop"},
+            ]},
+        }})
+    );
+    let recorded = last_action(&r);
+    let want = (
+        "vlan".into(),
+        Some("alice".into()),
+        true,
+        "VLAN 42 → VLAN 43 (mapping version 2)".into(),
+    );
+    assert_eq!(recorded, want);
+    let v = json_get(r.c.http, "/api/mac-auth");
+    assert_eq!(v["entries"]["02:00:00:00:00:01"]["vlan"], 43);
+    assert_eq!(v["follows"]["02:00:00:00:00:01"]["to"], 43);
+
+    // The kick, after the settle time, by the admin.
+    let id = a.expect_command(CommandKind::Kick { mac: MAC });
+    a.reply(id, true, "wlan2: OK");
+    wait_for("the kick recorded", || last_action(&r).0 == "kick");
+    let (_, user, ok, detail) = last_action(&r);
+    assert_eq!((user.as_deref(), ok), (Some("alice"), true));
+    assert!(detail.starts_with("to join again on VLAN 43: "), "{detail}");
+    // It comes back on its new VLAN: a new association.
+    thread::sleep(Duration::from_millis(1100));
+    let mut back = station(MAC, 0, -54);
+    back.connected_s = 0;
+    back.vlan = 43;
+    a.send(&AgentMsg::Key(snapshot(
+        2,
+        vec![bss("wlan2", "iot")],
+        vec![back],
+    )))
+    .unwrap();
+    wait_for("its return recorded", || {
+        last_action(&r).3 == "back on VLAN 43"
+    });
+    assert!(last_action(&r).2);
+    assert!(
+        json_get(r.c.http, "/api/mac-auth")["follows"]
+            .as_object()
+            .unwrap()
+            .is_empty()
+    );
+    a.hears_nothing(Duration::from_millis(800));
+    let m = metrics_of(&r, "wifi_mac_auth_");
+    assert!(
+        m.contains(&"wifi_mac_auth_changes_total{result=\"ok\"} 1".to_owned()),
+        "{m:?}"
+    );
+    assert!(m.contains(&"wifi_mac_auth_read_up 1".to_owned()), "{m:?}");
+    assert!(m.contains(&"wifi_mac_auth_version 2".to_owned()), "{m:?}");
+}
+
+#[test]
+fn a_device_back_on_its_old_vlan_says_radius_had_not_taken_the_change() {
+    let (r, _store, _rt) = with_mapping(Some(site_mapping()));
+    let mut a = ap_with_mab_client(&r, "iot");
+    let (status, _) = set_vlan(
+        &r,
+        &format!("{SAME_SITE}{ADMIN}"),
+        r#"{"vlan": 43, "expect": 42}"#,
+    );
+    assert_eq!(status, 200);
+    let id = a.expect_command(CommandKind::Kick { mac: MAC });
+    a.reply(id, true, "wlan2: OK");
+    thread::sleep(Duration::from_millis(1100));
+    let mut back = station(MAC, 0, -54);
+    back.connected_s = 0;
+    a.send(&AgentMsg::Key(snapshot(
+        2,
+        vec![bss("wlan2", "iot")],
+        vec![back],
+    )))
+    .unwrap();
+    wait_for("its return recorded", || {
+        last_action(&r).3.starts_with("back on")
+    });
+    let (_, _, ok, detail) = last_action(&r);
+    assert!(!ok);
+    assert_eq!(
+        detail,
+        "back on VLAN 42, not 43: RADIUS had not taken the change"
+    );
+}
+
+#[test]
+fn another_writers_change_is_read_again_and_a_stale_confirmation_refused() {
+    let (r, store, _rt) = with_mapping(Some(site_mapping()));
+    // Another writer comes first once: the change is read and made again.
+    store.lock().unwrap().races = 1;
+    let body = r#"{"vlan": 43, "expect": 42, "description": "work laptop"}"#;
+    let (status, answer) = set_vlan(&r, &format!("{SAME_SITE}{ADMIN}"), body);
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer["detail"], "VLAN 42 → VLAN 43 (mapping version 3)");
+    let w = writes(&store);
+    assert_eq!(w.iter().map(|w| w.0).collect::<Vec<_>>(), vec![1, 2]);
+    let laptop = &w[1].1["vlans"]["iot"]["devices"][1];
+    assert_eq!(
+        laptop,
+        &json!({"mac": "02-00-00-00-00-01", "description": "work laptop"})
+    );
+    // Not on a MAC-authenticated SSID now: nothing to kick.
+    assert!(
+        answer["kick"]
+            .as_str()
+            .unwrap()
+            .starts_with("none: it is on no")
+    );
+    // What the admin saw is no longer so: refused, nothing written.
+    let (status, answer) = set_vlan(
+        &r,
+        &format!("{SAME_SITE}{ADMIN}"),
+        r#"{"vlan": null, "expect": 42}"#,
+    );
+    assert_eq!(status, 409);
+    assert_eq!(answer["detail"], "changed meanwhile: it has VLAN 43 now");
+    assert_eq!(writes(&store).len(), 2);
+    // The same again: nothing to write.
+    let body = r#"{"vlan": 43, "expect": 43, "description": "work laptop"}"#;
+    let (status, answer) = set_vlan(&r, &format!("{SAME_SITE}{ADMIN}"), body);
+    assert_eq!(
+        (status, answer["result"].as_str()),
+        (200, Some("unchanged"))
+    );
+    assert_eq!(writes(&store).len(), 2);
+    // Removed: its group is left empty, nothing kicked.
+    let (status, answer) = set_vlan(
+        &r,
+        &format!("{SAME_SITE}{ADMIN}"),
+        r#"{"vlan": null, "expect": 43}"#,
+    );
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer["detail"], "VLAN 43 → no entry (mapping version 4)");
+    assert!(
+        answer["kick"]
+            .as_str()
+            .unwrap()
+            .starts_with("none: a removed device")
+    );
+    let m = metrics_of(&r, "wifi_mac_auth_changes_total");
+    for want in [
+        "ok\"} 2",
+        "conflict\"} 1",
+        "unchanged\"} 1",
+        "refused\"} 0",
+        "failed\"} 0",
+    ] {
+        assert!(m.iter().any(|l| l.ends_with(want)), "{want}: {m:?}");
+    }
+}
+
+#[test]
+fn a_change_is_an_admins_from_the_uis_page_onto_a_vlan_the_site_allows() {
+    let (r, store, _rt) = with_mapping(Some(site_mapping()));
+    let body = r#"{"vlan": 43, "expect": 42}"#;
+    let viewer = "X-Auth-Request-Groups: staff\r\nX-Forwarded-Preferred-Username: bob\r\n";
+    assert_eq!(set_vlan(&r, &format!("{SAME_SITE}{viewer}"), body).0, 403);
+    assert_eq!(set_vlan(&r, ADMIN, body).0, 403);
+    let other =
+        format!("Content-Type: application/json\r\nOrigin: https://elsewhere.example\r\n{ADMIN}");
+    assert_eq!(set_vlan(&r, &other, body).0, 403);
+    for bad in [
+        r#"{"vlan": 44, "expect": 42}"#,
+        r#"{"vlan": 43}"#,
+        "{\"vlan\": 43, \"expect\": 42, \"description\": \"a\\nb\"}",
+    ] {
+        let (status, answer) = set_vlan(&r, &format!("{SAME_SITE}{ADMIN}"), bad);
+        assert_eq!(status, 400, "{bad}: {answer}");
+    }
+    let (status, _) = post(
+        r.c.http,
+        "/api/clients/01:00:5e:00:00:01/vlan",
+        &format!("{SAME_SITE}{ADMIN}"),
+        body,
+    );
+    assert_eq!(status, 400);
+    assert!(writes(&store).is_empty());
+}
+
+#[test]
+fn a_newer_change_replaces_a_pending_kick() {
+    let (r, _store, _rt) = with_mapping(Some(site_mapping()));
+    let mut a = ap_with_mab_client(&r, "iot");
+    let h = format!("{SAME_SITE}{ADMIN}");
+    assert_eq!(set_vlan(&r, &h, r#"{"vlan": 43, "expect": 42}"#).0, 200);
+    assert_eq!(set_vlan(&r, &h, r#"{"vlan": 42, "expect": 43}"#).0, 200);
+    let id = a.expect_command(CommandKind::Kick { mac: MAC });
+    a.reply(id, true, "wlan2: OK");
+    // Back on 42, the newer change's VLAN; one kick in all.
+    thread::sleep(Duration::from_millis(1100));
+    let mut back = station(MAC, 0, -54);
+    back.connected_s = 0;
+    a.send(&AgentMsg::Key(snapshot(
+        2,
+        vec![bss("wlan2", "iot")],
+        vec![back],
+    )))
+    .unwrap();
+    wait_for("its return recorded", || {
+        last_action(&r).3.starts_with("back on")
+    });
+    assert_eq!(last_action(&r).3, "back on VLAN 42");
+    a.hears_nothing(Duration::from_secs(1));
+}
+
+#[test]
+fn openbao_away_changes_nothing_and_says_so() {
+    let (r, store, _rt) = with_mapping(None);
+    // No secret yet: the first entry makes it.
+    let h = format!("{SAME_SITE}{ADMIN}");
+    let (status, answer) = set_vlan(
+        &r,
+        &h,
+        r#"{"vlan": 42, "expect": null, "description": "tv"}"#,
+    );
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(writes(&store)[0].0, 0, "created over no version");
+    store.lock().unwrap().down = true;
+    let (status, answer) = set_vlan(&r, &h, r#"{"vlan": 43, "expect": 42}"#);
+    assert_eq!(status, 502);
+    assert_eq!(answer["detail"], "OpenBao answered 503: Vault is sealed");
+    let (_, _, ok, detail) = last_action(&r);
+    assert!(!ok);
+    assert_eq!(detail, "OpenBao answered 503: Vault is sealed");
+    wait_for("the read failing", || {
+        json_get(r.c.http, "/api/mac-auth")["error"] == "OpenBao answered 503: Vault is sealed"
+    });
+    // The mapping last read is kept, and said to be old.
+    let v = json_get(r.c.http, "/api/mac-auth");
+    assert_eq!(v["entries"]["02:00:00:00:00:01"]["vlan"], 42);
+    assert!(
+        metrics_of(&r, "wifi_mac_auth_read_up").contains(&"wifi_mac_auth_read_up 0".to_owned())
+    );
+    // A token OpenBao refuses: the same.
+    let mut s = store.lock().unwrap();
+    s.down = false;
+    s.token = "s.other".into();
+    drop(s);
+    let (status, answer) = set_vlan(&r, &h, r#"{"vlan": 43, "expect": 42}"#);
+    assert_eq!(
+        (status, answer["detail"].as_str()),
+        (502, Some("OpenBao answered 403: permission denied"))
+    );
 }

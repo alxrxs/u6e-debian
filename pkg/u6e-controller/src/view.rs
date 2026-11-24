@@ -36,7 +36,9 @@
 //! rollouts with their step, gate, result and log (`rollouts`), and the
 //! newest speed tests of the APs with their figures (`speedtests`), and,
 //! when presence goes to Home Assistant, each listed device's state, place
-//! and what Home Assistant was told (`presence`).
+//! and what Home Assistant was told (`presence`), and, when admins edit it,
+//! RADIUS's MAC authentication mapping with the VLANs they may choose and
+//! the kicks pending (`mac_auth`).
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -73,6 +75,9 @@ pub fn view(state: &State, wanted: impl Fn(&str) -> bool, flows: bool, admin: bo
     });
     if let Some(p) = &state.presence {
         v["presence"] = crate::presence::view(p);
+    }
+    if let Some(m) = &state.mac_auth {
+        v["mac_auth"] = crate::macauth::view(m);
     }
     if admin {
         v["captures"] = crate::captures::view(state);

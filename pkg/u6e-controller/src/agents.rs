@@ -47,7 +47,7 @@ use crate::names::{self, Lookups};
 use crate::policy::{self, Store};
 use crate::spectrum::Limits;
 use crate::state::{FLOWS_WATCHED, Registration, Shared, TICK_WATCHED};
-use crate::{captures, clean, speedtest};
+use crate::{captures, clean, macauth, speedtest};
 
 /// Longest a handshake, or a write to a stalled peer, may take.
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
@@ -79,6 +79,9 @@ pub struct Timing {
     pub ui_stall: Duration,
     /// What the speed tests take.
     pub speedtest: speedtest::Limits,
+    /// How often the MAC authentication mapping is read, and how long a
+    /// device moved to another VLAN waits for its kick and then to come back.
+    pub mac_auth: macauth::Waits,
 }
 
 impl Default for Timing {
@@ -94,6 +97,7 @@ impl Default for Timing {
             ui_session: Duration::from_secs(3600),
             ui_stall: Duration::from_secs(30),
             speedtest: speedtest::Limits::default(),
+            mac_auth: macauth::Waits::default(),
         }
     }
 }

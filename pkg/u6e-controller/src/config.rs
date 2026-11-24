@@ -28,7 +28,14 @@
 //! its certificate chains to (the system's unless set), the file of its
 //! long-lived token, the minutes unseen that make a leave
 //! (`leave_after_secs`, 300 unless set, 60 to 3600) and the devices, each
-//! by MAC and a name of lower case letters, digits and `_`; none without it.
+//! by MAC and a name of lower case letters, digits and `_`; none without it;
+//! and, in `[mac_auth]`, RADIUS's MAC authentication mapping admins edit
+//! (`macauth`): OpenBao's `https://` address, its CA bundle (the system's
+//! unless set), the file of the token it is read and written with, the
+//! KV-v2 mount (`secret` unless set) and path, the VLANs an admin may put a
+//! device in, the SSIDs whose clients MAC authentication places, the most
+//! entries the mapping may hold (`entries_max`, 512 unless set); the
+//! mapping is not shown or edited without it.
 //!
 //! ```toml
 //! listen_agents = "[::]:8443"
@@ -77,6 +84,13 @@
 //! url = "https://ha.example.org"
 //! token = "/etc/wifi-controller/ha-token"
 //! devices = [{ mac = "02:00:00:00:00:01", name = "phone_alice" }]
+//!
+//! [mac_auth]
+//! url = "https://bao.example.org"
+//! token = "/run/bao-approle/wifi-controller/token"
+//! path = "mac-auth"
+//! vlans = [42, 43]
+//! ssids = ["iot"]
 //! ```
 
 use std::collections::{BTreeMap, HashMap};
@@ -88,7 +102,7 @@ use serde::Deserialize;
 use u6e_proto::mac;
 use u6e_proto::msg::{Binding, GuardConfig, Limit, LimitTarget, Rate, check_limits};
 
-use crate::{configs, presence, radius, rf, roaming, rollout};
+use crate::{configs, macauth, presence, radius, rf, roaming, rollout};
 
 /// The parsed, checked configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +154,8 @@ pub struct Config {
     pub guards: GuardConfig,
     /// The presence events to Home Assistant, if they are on.
     pub presence: Option<presence::Settings>,
+    /// RADIUS's MAC authentication mapping, if admins edit it.
+    pub mac_auth: Option<macauth::Settings>,
 }
 
 #[derive(Deserialize)]
@@ -178,6 +194,23 @@ struct File {
     guards: Option<GuardsFile>,
     limits: Option<LimitsFile>,
     presence: Option<PresenceFile>,
+    mac_auth: Option<MacAuthFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MacAuthFile {
+    url: String,
+    #[serde(default = "default_ca")]
+    ca: PathBuf,
+    token: PathBuf,
+    #[serde(default = "default_mount")]
+    mount: String,
+    path: String,
+    vlans: Vec<u16>,
+    ssids: Vec<String>,
+    #[serde(default = "default_entries_max")]
+    entries_max: usize,
 }
 
 #[derive(Deserialize)]
@@ -307,6 +340,14 @@ fn default_leave_after() -> u64 {
     300
 }
 
+fn default_mount() -> String {
+    "secret".into()
+}
+
+fn default_entries_max() -> usize {
+    macauth::ENTRIES_MAX
+}
+
 /// Why a configuration was refused.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ConfigError {
@@ -345,6 +386,8 @@ pub enum ConfigError {
     BadSticky,
     /// `[presence]` is not one: why.
     Presence(String),
+    /// `[mac_auth]` is not one: why.
+    MacAuth(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -368,6 +411,7 @@ impl fmt::Display for ConfigError {
             Self::Limits(e) => write!(f, "limits: {e}"),
             Self::BadSticky => f.write_str("sticky_dbm is not between -90 and -50"),
             Self::Presence(e) => write!(f, "presence: {e}"),
+            Self::MacAuth(e) => write!(f, "mac_auth: {e}"),
         }
     }
 }
@@ -431,6 +475,7 @@ impl Config {
             return Err(ConfigError::BadSticky);
         }
         let presence = file.presence.map(presence_settings).transpose()?;
+        let mac_auth = file.mac_auth.map(mac_auth_settings).transpose()?;
         Ok(Config {
             listen_agents: file.listen_agents,
             listen_http: file.listen_http,
@@ -455,6 +500,7 @@ impl Config {
             radius,
             guards,
             presence,
+            mac_auth,
         })
     }
 }
@@ -464,25 +510,7 @@ impl Config {
 /// station's MAC and a name Home Assistant takes as it is, each once.
 fn presence_settings(file: PresenceFile) -> Result<presence::Settings, ConfigError> {
     let bad = |e: String| ConfigError::Presence(e);
-    let hostport = file
-        .url
-        .strip_prefix("https://")
-        .ok_or_else(|| bad(format!("url: {:?} is not https://host[:port]", file.url)))?;
-    let (host, port) = if is_host_port(hostport) {
-        let (h, p) = hostport.rsplit_once(':').expect("host:port");
-        (h, p.parse().expect("a port"))
-    } else {
-        (hostport, 443)
-    };
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    let ok_host =
-        host.parse::<std::net::IpAddr>().is_ok() || (!host.contains(':') && is_address(host));
-    if !ok_host {
-        return Err(bad(format!(
-            "url: {:?} is not https://host[:port]",
-            file.url
-        )));
-    }
+    let (host, port) = https_host_port(&file.url).map_err(bad)?;
     if !(60..=3600).contains(&file.leave_after_secs) {
         return Err(bad("leave_after_secs is not between 60 and 3600".into()));
     }
@@ -512,12 +540,79 @@ fn presence_settings(file: PresenceFile) -> Result<presence::Settings, ConfigErr
         devices.push((mac, d.name));
     }
     Ok(presence::Settings {
-        host: host.to_owned(),
+        host,
         port,
         ca: file.ca,
         token: file.token,
         leave_after: std::time::Duration::from_secs(file.leave_after_secs),
         devices,
+    })
+}
+
+/// The host and port of an `https://host[:port]` with nothing after it.
+fn https_host_port(url: &str) -> Result<(String, u16), String> {
+    let bad = || format!("url: {url:?} is not https://host[:port]");
+    let hostport = url.strip_prefix("https://").ok_or_else(bad)?;
+    let (host, port) = if is_host_port(hostport) {
+        let (h, p) = hostport.rsplit_once(':').expect("host:port");
+        (h, p.parse().expect("a port"))
+    } else {
+        (hostport, 443)
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let ok_host =
+        host.parse::<std::net::IpAddr>().is_ok() || (!host.contains(':') && is_address(host));
+    if !ok_host {
+        return Err(bad());
+    }
+    Ok((host.to_owned(), port))
+}
+
+/// The MAC authentication mapping's section, checked: OpenBao's
+/// `https://host[:port]`, a KV-v2 mount and path of plain segments, 1 to 64
+/// VLANs (1-4094) an admin may choose, the MAC-authenticated SSIDs, and an
+/// entry cap of 1 to 4096.
+fn mac_auth_settings(file: MacAuthFile) -> Result<macauth::Settings, ConfigError> {
+    let bad = |e: String| ConfigError::MacAuth(e);
+    let (host, port) = https_host_port(&file.url).map_err(bad)?;
+    let plain = |p: &str| {
+        !p.is_empty()
+            && p.split('/').all(|s| {
+                !s.is_empty()
+                    && s != "."
+                    && s != ".."
+                    && s.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+            })
+    };
+    if !plain(&file.mount) || !plain(&file.path) {
+        return Err(bad("mount and path are not plain path segments".into()));
+    }
+    if file.vlans.is_empty() || file.vlans.len() > 64 {
+        return Err(bad("vlans: 1 to 64 are listed".into()));
+    }
+    if file.vlans.iter().any(|v| !(1..=4094).contains(v)) {
+        return Err(bad("vlans: each is 1 to 4094".into()));
+    }
+    if file.ssids.is_empty() || file.ssids.iter().any(|s| s.is_empty() || s.len() > 32) {
+        return Err(bad("ssids: at least one, each 1 to 32 bytes".into()));
+    }
+    if !(1..=4096).contains(&file.entries_max) {
+        return Err(bad("entries_max is not between 1 and 4096".into()));
+    }
+    let mut vlans = file.vlans;
+    vlans.sort_unstable();
+    vlans.dedup();
+    Ok(macauth::Settings {
+        host,
+        port,
+        ca: file.ca,
+        token: file.token,
+        mount: file.mount,
+        path: file.path,
+        vlans,
+        ssids: file.ssids,
+        entries_max: file.entries_max,
     })
 }
 
@@ -932,6 +1027,52 @@ mod tests {
             with("https://ha.example.org", &format!("port = 1\n{one}")),
             Err(ConfigError::Syntax(_))
         ));
+    }
+
+    #[test]
+    fn the_mac_auth_mapping_is_one_kv_secret_and_the_vlans_admins_may_choose() {
+        assert_eq!(Config::parse(ORIGIN).unwrap().mac_auth, None);
+        let with = |rest: &str| {
+            Config::parse(&format!(
+                "{ORIGIN}[mac_auth]\nurl = \"https://bao.example.org\"\ntoken = \"/t\"\n{rest}\n"
+            ))
+        };
+        let base = "path = \"mac-auth\"\nvlans = [43, 42, 43]\nssids = [\"iot\"]";
+        let m = with(base).unwrap().mac_auth.unwrap();
+        assert_eq!(
+            m,
+            macauth::Settings {
+                host: "bao.example.org".into(),
+                port: 443,
+                ca: "/etc/ssl/certs/ca-certificates.crt".into(),
+                token: "/t".into(),
+                mount: "secret".into(),
+                path: "mac-auth".into(),
+                vlans: vec![42, 43],
+                ssids: vec!["iot".into()],
+                entries_max: 512,
+            }
+        );
+        let refused = |rest: &str| matches!(with(rest), Err(ConfigError::MacAuth(_)));
+        for bad in [
+            "path = \"../x\"\nvlans = [42]\nssids = [\"iot\"]",
+            "path = \"a//b\"\nvlans = [42]\nssids = [\"iot\"]",
+            "path = \"m\"\nmount = \"\"\nvlans = [42]\nssids = [\"iot\"]",
+            "path = \"m\"\nvlans = []\nssids = [\"iot\"]",
+            "path = \"m\"\nvlans = [0]\nssids = [\"iot\"]",
+            "path = \"m\"\nvlans = [4095]\nssids = [\"iot\"]",
+            "path = \"m\"\nvlans = [42]\nssids = []",
+            "path = \"m\"\nvlans = [42]\nssids = [\"\"]",
+            "path = \"m\"\nvlans = [42]\nssids = [\"iot\"]\nentries_max = 0",
+            "path = \"m\"\nvlans = [42]\nssids = [\"iot\"]\nentries_max = 4097",
+        ] {
+            assert!(refused(bad), "{bad}");
+        }
+        let plain = Config::parse(&format!(
+            "{ORIGIN}[mac_auth]\nurl = \"http://bao.example.org\"\ntoken = \"/t\"\n{base}\n"
+        ));
+        assert!(matches!(plain, Err(ConfigError::MacAuth(_))));
+        assert!(matches!(with("path = \"m\""), Err(ConfigError::Syntax(_))));
     }
 
     #[test]

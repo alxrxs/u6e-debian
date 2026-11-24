@@ -6,7 +6,7 @@
 //!
 //! And one HTTPS request ([`request_tls`]) carrying a secret in one header
 //! and, for a write, a JSON body: Home Assistant's events (`presence`, a
-//! bearer token). TLS 1.3 by
+//! bearer token) and OpenBao's KV (`macauth`, its token). TLS 1.3 by
 //! rustls on aws-lc-rs, the server's name and chain verified against a PEM
 //! bundle of trust anchors read at each connection, so a bundle that
 //! changes counts from the next request on, with no restart. HTTP/1.0 too,
