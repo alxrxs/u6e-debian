@@ -8,7 +8,9 @@
 //! One test at a time: the command is answered at once, started or refused.
 //! Each direction is held to what `speedtest::bounds` allows whatever the
 //! command asks, a download past them ends the test, and the whole of it
-//! ends [`TEST_MAX`] after the command whatever the controller does, so a
+//! ends [`TEST_MAX`] after the command whatever the controller does (every
+//! read and write of its socket is held to that one deadline, `deadline`),
+//! so a
 //! test costs at most a thread, a connection and two 64 KiB buffers for
 //! that long. The AP's CPU is read from `/proc/stat` (all cores) and
 //! `/proc/thread-self/stat` (the test's thread) around each direction.
@@ -29,10 +31,12 @@ use u6e_proto::msg::{AgentMsg, CommandResult, CpuUse, SpeedTestReport};
 use u6e_proto::speedtest::{self, CHUNK, Chunks};
 use u6e_proto::{PROTOCOL, version};
 
+use crate::deadline::Deadline;
+
 /// Where the CPU's counters are read.
 pub const PROC: &str = "/proc";
 /// The longest a whole test may take from its command: the handshake, both
-/// directions at their longest and some.
+/// directions at their longest ([`speedtest::SECS_MAX`] each) and some.
 pub const TEST_MAX: Duration = Duration::from_secs(40);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How far past its time or size a download may run before it is cut off:
@@ -54,6 +58,8 @@ pub struct SpeedTests {
     client: Arc<ClientConfig>,
     proc: PathBuf,
     running: Arc<AtomicBool>,
+    /// How long a test may take from its command: [`TEST_MAX`].
+    limit: Duration,
 }
 
 impl SpeedTests {
@@ -65,6 +71,7 @@ impl SpeedTests {
             client,
             proc,
             running: Arc::new(AtomicBool::new(false)),
+            limit: TEST_MAX,
         }
     }
 
@@ -83,7 +90,7 @@ impl SpeedTests {
             self.proc.clone(),
         );
         let running = Arc::clone(&self.running);
-        let deadline = Instant::now() + TEST_MAX;
+        let deadline = Instant::now() + self.limit;
         let spawned = thread::Builder::new()
             .name("speedtest".into())
             .spawn(move || {
@@ -114,7 +121,7 @@ impl SpeedTests {
     }
 }
 
-type Tls = StreamOwned<ClientConnection, TcpStream>;
+type Tls<'a> = StreamOwned<ClientConnection, Deadline<'a>>;
 
 /// One test, from the dial to the report sent; the report.
 fn run(
@@ -125,17 +132,24 @@ fn run(
     plan: Plan,
     deadline: Instant,
 ) -> io::Result<SpeedTestReport> {
-    let mut tls = connect(controller, client, deadline)?;
+    let sock = dial(controller, deadline)?;
+    // The verifier pins the key; the name only has to be well formed.
+    let host = controller.rsplit_once(':').map_or(controller, |(h, _)| h);
+    let name = ServerName::try_from(host.trim_matches(['[', ']']).to_owned())
+        .map_err(|e| io::Error::new(ErrorKind::InvalidInput, e))?;
+    let conn = ClientConnection::new(client, name).map_err(io::Error::other)?;
+    let mut tls = StreamOwned::new(conn, Deadline::new(&sock, deadline));
+    while tls.conn.is_handshaking() {
+        tls.conn.complete_io(&mut tls.sock)?;
+    }
     let mut open = version::frame(PROTOCOL).to_vec();
     write_frame(&mut open, &AgentMsg::SpeedTestOpen { id })?;
-    within(&tls, deadline)?;
     tls.write_all(&open)?;
     tls.flush()?;
     let mut buf = vec![0; CHUNK];
-    let early = versions(&mut tls, &mut buf, deadline)?;
-    let (down_bytes, down_us, cpu_down) =
-        download(&mut tls, &mut buf, early, proc, plan, deadline)?;
-    let cpu_up = upload(&mut tls, &mut buf, proc, plan, deadline)?;
+    let early = versions(&mut tls, &mut buf)?;
+    let (down_bytes, down_us, cpu_down) = download(&mut tls, &mut buf, early, proc, plan)?;
+    let cpu_up = upload(&mut tls, &mut buf, proc, plan)?;
     let report = SpeedTestReport {
         id,
         down_bytes,
@@ -143,7 +157,6 @@ fn run(
         cpu_down,
         cpu_up,
     };
-    within(&tls, deadline)?;
     write_frame(&mut tls, &AgentMsg::SpeedTestReport(report.clone()))?;
     tls.conn.send_close_notify();
     tls.flush()?;
@@ -151,53 +164,24 @@ fn run(
 }
 
 /// The TCP connection to the first of `controller`'s addresses that
-/// answers, and the TLS session on it.
-fn connect(controller: &str, client: Arc<ClientConfig>, deadline: Instant) -> io::Result<Tls> {
+/// answers by `deadline`.
+fn dial(controller: &str, deadline: Instant) -> io::Result<TcpStream> {
     let mut err = io::Error::new(ErrorKind::NotFound, "no address");
-    let mut found = None;
     for addr in controller.to_socket_addrs()? {
-        let wait = CONNECT_TIMEOUT.min(left(deadline)?);
-        match TcpStream::connect_timeout(&addr, wait) {
-            Ok(s) => {
-                found = Some(s);
-                break;
-            }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(ErrorKind::TimedOut, "past the test's time"));
+        }
+        match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT.min(left)) {
+            Ok(s) => return Ok(s),
             Err(e) => err = e,
         }
     }
-    let sock = found.ok_or(err)?;
-    // The verifier pins the key; the name only has to be well formed.
-    let host = controller.rsplit_once(':').map_or(controller, |(h, _)| h);
-    let name = ServerName::try_from(host.trim_matches(['[', ']']).to_owned())
-        .map_err(|e| io::Error::new(ErrorKind::InvalidInput, e))?;
-    let conn = ClientConnection::new(client, name).map_err(io::Error::other)?;
-    let mut tls = StreamOwned::new(conn, sock);
-    while tls.conn.is_handshaking() {
-        within(&tls, deadline)?;
-        tls.conn.complete_io(&mut tls.sock)?;
-    }
-    Ok(tls)
-}
-
-/// The time left until `deadline`; an error once it passed.
-fn left(deadline: Instant) -> io::Result<Duration> {
-    let left = deadline.saturating_duration_since(Instant::now());
-    if left.is_zero() {
-        return Err(io::Error::new(ErrorKind::TimedOut, "past the test's time"));
-    }
-    Ok(left)
-}
-
-/// Bounds the socket's next reads and writes by `deadline`.
-fn within(tls: &Tls, deadline: Instant) -> io::Result<()> {
-    let left = left(deadline)?;
-    tls.sock.set_read_timeout(Some(left))?;
-    tls.sock.set_write_timeout(Some(left))
+    Err(err)
 }
 
 /// Reads into `buf`; an error when the controller closed.
-fn read(tls: &mut Tls, buf: &mut [u8], deadline: Instant, what: &str) -> io::Result<usize> {
-    within(tls, deadline)?;
+fn read(tls: &mut Tls, buf: &mut [u8], what: &str) -> io::Result<usize> {
     match tls.read(buf)? {
         0 => Err(io::Error::new(
             ErrorKind::UnexpectedEof,
@@ -208,7 +192,7 @@ fn read(tls: &mut Tls, buf: &mut [u8], deadline: Instant, what: &str) -> io::Res
 }
 
 /// Reads the controller's version frame; the bytes that came after it.
-fn versions(tls: &mut Tls, buf: &mut [u8], deadline: Instant) -> io::Result<Vec<u8>> {
+fn versions(tls: &mut Tls, buf: &mut [u8]) -> io::Result<Vec<u8>> {
     let mut got = Vec::new();
     loop {
         if let Some((body, n)) = frame_body(&got)? {
@@ -220,7 +204,7 @@ fn versions(tls: &mut Tls, buf: &mut [u8], deadline: Instant) -> io::Result<Vec<
             return Ok(got.split_off(n));
         }
         // A version frame is 10 bytes: more is the download's.
-        let n = read(tls, buf, deadline, "the version frames")?;
+        let n = read(tls, buf, "the version frames")?;
         got.extend_from_slice(&buf[..n]);
     }
 }
@@ -234,7 +218,6 @@ fn download(
     early: Vec<u8>,
     proc: &Path,
     plan: Plan,
-    deadline: Instant,
 ) -> io::Result<(u64, u64, CpuUse)> {
     let mut down = Download {
         chunks: Chunks::default(),
@@ -243,7 +226,7 @@ fn download(
     };
     down.take(&early, proc)?;
     while !down.chunks.ended() {
-        let n = read(tls, buf, deadline, "the download")?;
+        let n = read(tls, buf, "the download")?;
         down.take(&buf[..n], proc)?;
     }
     let (t0, cpu0) = down.first.expect("bytes came before the end");
@@ -283,24 +266,16 @@ impl Download {
 
 /// Sends the upload: chunks for the plan's time or bytes, then the end;
 /// the CPU over it.
-fn upload(
-    tls: &mut Tls,
-    buf: &mut [u8],
-    proc: &Path,
-    plan: Plan,
-    deadline: Instant,
-) -> io::Result<CpuUse> {
+fn upload(tls: &mut Tls, buf: &mut [u8], proc: &Path, plan: Plan) -> io::Result<CpuUse> {
     buf.fill(0);
     let (t0, cpu0) = (Instant::now(), Cpu::read(proc));
     let mut sent = 0u64;
     while t0.elapsed() < plan.secs && sent < plan.bytes {
         let len = (plan.bytes - sent).min(CHUNK as u64) as usize;
-        within(tls, deadline)?;
         tls.write_all(&speedtest::header(len))?;
         tls.write_all(&buf[..len])?;
         sent += len as u64;
     }
-    within(tls, deadline)?;
     tls.write_all(&speedtest::header(0))?;
     tls.flush()?;
     let us = t0.elapsed().as_micros() as u64;
@@ -534,7 +509,9 @@ mod tests {
             send_chunks(&mut p, &[0]);
             let at = Instant::now();
             let up = take_upload(&mut p, &mut got);
-            (up, at.elapsed())
+            let took = at.elapsed();
+            next(&mut p, &mut got, |b| decode_frame::<AgentMsg>(b).unwrap());
+            (up, took)
         });
         let deadline = Instant::now() + WAIT;
         run(
@@ -663,6 +640,82 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.to_string().contains("speaks protocol"), "{e}");
+        ctl.join().unwrap();
+    }
+
+    /// A controller that answers with its version frame a byte every
+    /// 300 ms, each byte its own TCP segment: every read is short, and the
+    /// test ends at its deadline all the same.
+    fn trickler(l: TcpListener) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            let mut p = accept(&l);
+            let mut got = Vec::new();
+            let v = next(&mut p, &mut got, |b| {
+                frame_body(b).unwrap().map(|(b, n)| (version::decode(b), n))
+            });
+            assert_eq!(v, PROTOCOL);
+            p.conn
+                .writer()
+                .write_all(&version::frame(PROTOCOL))
+                .unwrap();
+            let mut record = Vec::new();
+            while p.conn.wants_write() {
+                p.conn.write_tls(&mut record).unwrap();
+            }
+            p.sock.set_nodelay(true).unwrap();
+            for b in record {
+                if p.sock.write_all(&[b]).is_err() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(300));
+            }
+        })
+    }
+
+    #[test]
+    fn a_trickling_controller_is_left_at_the_deadline() {
+        let (l, addr) = listen();
+        let ctl = trickler(l);
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(700);
+        let e = run(
+            &addr,
+            client(),
+            Path::new("/proc"),
+            1,
+            plan(60_000, 1 << 20),
+            deadline,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut),
+            "{e}"
+        );
+        let took = start.elapsed();
+        assert!(took < Duration::from_millis(1200), "{took:?}");
+        ctl.join().unwrap();
+    }
+
+    /// A test is given [`TEST_MAX`] from its command, which holds both
+    /// directions at their longest and little more, and is held to it.
+    #[test]
+    fn a_test_ends_at_its_limit_from_the_command() {
+        let (l, addr) = listen();
+        let mut tests = SpeedTests::new(addr, client(), "/proc".into());
+        assert_eq!(tests.limit, TEST_MAX);
+        let both = Duration::from_secs(2 * u64::from(speedtest::SECS_MAX));
+        assert!(TEST_MAX >= both && TEST_MAX <= both + Duration::from_secs(20));
+        tests.limit = Duration::from_millis(700);
+        let ctl = trickler(l);
+        let start = Instant::now();
+        assert!(tests.start(1, 10, 1 << 20).ok);
+        while tests.running.load(Ordering::Acquire) {
+            assert!(
+                start.elapsed() < Duration::from_millis(1200),
+                "past its limit"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
         ctl.join().unwrap();
     }
 

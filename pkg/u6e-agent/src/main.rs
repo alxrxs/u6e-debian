@@ -33,6 +33,7 @@ mod capture;
 mod clientsock;
 mod collect;
 mod command;
+mod deadline;
 mod ecm;
 mod events;
 mod guards;

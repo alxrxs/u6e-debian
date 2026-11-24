@@ -54,14 +54,16 @@ use u6e_proto::tls::{self, Identity};
 use u6e_proto::{PROTOCOL, delta, version};
 
 use crate::capture::Captures;
+use crate::deadline::Deadline;
 use crate::guards::Guards;
 use crate::limits::{self, Limits};
 use crate::spectrum::{self, Spectrum};
 use crate::speedtest::{self, SpeedTests};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// Longest the handshake or the controller's version frame may take, or a
-/// write wait for the socket.
+/// Longest the handshake, the controller's version frame or the sending of
+/// one buffer may take, the whole of it rather than each system call
+/// (`deadline`), so a controller that trickles cannot hold the link.
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -93,6 +95,9 @@ pub struct Config {
     /// How long the controller may say nothing before the session is taken
     /// for dead and dialed again.
     pub silence: Duration,
+    /// How long the handshake, the controller's version frame or the
+    /// sending of one buffer may take.
+    pub io: Duration,
     /// The wait before a redial: the start after a useful session, doubled
     /// after each dial that brought none, up to the end.
     pub backoff: RangeInclusive<Duration>,
@@ -123,6 +128,7 @@ impl Config {
             controller_key,
             hello,
             silence: SILENCE,
+            io: IO_TIMEOUT,
             backoff: BACKOFF_MIN..=BACKOFF_MAX,
             spectrum: spectrum::SOCKET.into(),
             spectrum_limit: spectrum::LIMIT,
@@ -349,20 +355,21 @@ fn connect(cfg: &Config, client: &Arc<ClientConfig>) -> io::Result<Session> {
             Err(e) => err = e,
         }
     }
-    let mut sock = found.ok_or(err)?;
+    let sock = found.ok_or(err)?;
     sock.set_nodelay(true)?;
-    sock.set_read_timeout(Some(IO_TIMEOUT))?;
-    sock.set_write_timeout(Some(IO_TIMEOUT))?;
+    sock.set_read_timeout(Some(cfg.io))?;
+    sock.set_write_timeout(Some(cfg.io))?;
     // The verifier pins the key; the name only has to be well formed.
     let host = controller.rsplit_once(':').map_or(controller, |(h, _)| h);
     let name = ServerName::try_from(host.trim_matches(['[', ']']).to_owned())
         .map_err(|e| io::Error::new(ErrorKind::InvalidInput, e))?;
     let mut conn = ClientConnection::new(Arc::clone(client), name).map_err(io::Error::other)?;
+    let mut by = Deadline::new(&sock, Instant::now() + cfg.io);
     while conn.is_handshaking() {
-        conn.complete_io(&mut sock)?;
+        conn.complete_io(&mut by)?;
     }
     let spectrum = Spectrum::new(&cfg.spectrum, cfg.spectrum_limit);
-    let mut s = Session::new(conn, sock, spectrum, Captures::new(&cfg.capture));
+    let mut s = Session::new(conn, sock, cfg.io, spectrum, Captures::new(&cfg.capture));
     s.agree()?;
     Ok(s)
 }
@@ -396,6 +403,9 @@ fn key_due(want_key: bool, since_key: Duration) -> bool {
 struct Session {
     conn: ClientConnection,
     sock: TcpStream,
+    /// How long the controller's version frame or the sending of one buffer
+    /// may take.
+    io: Duration,
     /// Decrypted bytes not yet a whole frame.
     inbuf: Vec<u8>,
     tick: Duration,
@@ -434,6 +444,7 @@ impl Session {
     fn new(
         conn: ClientConnection,
         sock: TcpStream,
+        io: Duration,
         spectrum: Spectrum,
         captures: Captures,
     ) -> Self {
@@ -441,6 +452,7 @@ impl Session {
         Session {
             conn,
             sock,
+            io,
             inbuf: Vec::new(),
             tick: TICK_DEFAULT,
             due: now,
@@ -479,8 +491,10 @@ impl Session {
         Ok(())
     }
 
-    /// The protocol the controller's first frame states.
+    /// The protocol the controller's first frame states, within the time
+    /// of one exchange.
     fn version(&mut self) -> io::Result<u16> {
+        let at = Instant::now() + self.io;
         loop {
             let closed = self.take_plaintext()?;
             if let Some((body, n)) = frame_body(&self.inbuf)? {
@@ -491,7 +505,7 @@ impl Session {
             if closed {
                 return Err(ErrorKind::UnexpectedEof.into());
             }
-            self.read_records()?;
+            self.read_records(at)?;
         }
     }
 
@@ -656,13 +670,15 @@ impl Session {
         n > 0 && fds[0].revents != 0
     }
 
-    /// Writes `buf` through TLS and waits until the socket took it; a buffer
-    /// up to the record size limit goes out as one record.
+    /// Writes `buf` through TLS and waits until the socket took it, within
+    /// the time of one exchange; a buffer up to the record size limit goes
+    /// out as one record.
     fn send(&mut self, mut buf: &[u8]) -> io::Result<()> {
+        let at = Instant::now() + self.io;
         while !buf.is_empty() {
             let n = self.conn.writer().write(buf)?;
             buf = &buf[n..];
-            self.flush()?;
+            self.flush(at)?;
         }
         Ok(())
     }
@@ -674,9 +690,11 @@ impl Session {
         self.send(&out)
     }
 
-    fn flush(&mut self) -> io::Result<()> {
+    /// Sends what TLS holds by `at`.
+    fn flush(&mut self, at: Instant) -> io::Result<()> {
+        let mut by = Deadline::new(&self.sock, at);
         while self.conn.wants_write() {
-            self.conn.write_tls(&mut self.sock)?;
+            self.conn.write_tls(&mut by)?;
         }
         Ok(())
     }
@@ -689,7 +707,7 @@ impl Session {
         applier: &mut impl ConfigApplier,
         held: &mut Held,
     ) -> io::Result<()> {
-        self.read_records()?;
+        self.read_records(Instant::now() + self.io)?;
         let closed = self.take_plaintext()?;
         self.process(command, applier, held)?;
         if closed {
@@ -698,14 +716,14 @@ impl Session {
         Ok(())
     }
 
-    /// Reads what the socket holds into the TLS session.
-    fn read_records(&mut self) -> io::Result<()> {
-        if self.conn.read_tls(&mut self.sock)? == 0 {
+    /// Reads what the socket holds into the TLS session, by `at`.
+    fn read_records(&mut self, at: Instant) -> io::Result<()> {
+        if self.conn.read_tls(&mut Deadline::new(&self.sock, at))? == 0 {
             return Err(ErrorKind::UnexpectedEof.into());
         }
         self.conn.process_new_packets().map_err(io::Error::other)?;
         // A key update asks for an answer.
-        self.flush()
+        self.flush(at)
     }
 
     /// Moves the decrypted bytes to `inbuf`; true when the controller closed
@@ -1903,6 +1921,39 @@ mod tests {
         let gone = secs(started, Instant::now());
         assert!((0.9..4.0).contains(&gone), "{gone}");
         again.start();
+    }
+
+    /// A controller that trickles its version frame a byte every 300 ms keeps
+    /// each read short; the agent drops it at its I/O time all the same and
+    /// dials again after the first backoff.
+    #[test]
+    fn a_controller_that_trickles_its_version_frame_is_dropped_at_the_io_time() {
+        let fake = Fake::new();
+        let _agent = Agent::spawn_with(&fake, 0, |c| c.io = Duration::from_millis(700), blank);
+        let (mut p, at) = fake.accept_tls();
+        p.recv_body().expect("the agent's version frame");
+        p.conn
+            .writer()
+            .write_all(&version::frame(PROTOCOL))
+            .unwrap();
+        let mut record = Vec::new();
+        while p.conn.wants_write() {
+            p.conn.write_tls(&mut record).unwrap();
+        }
+        let trickle = thread::spawn(move || {
+            p.sock.set_nodelay(true).unwrap();
+            for b in record {
+                if p.sock.write_all(&[b]).is_err() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(300));
+            }
+        });
+        let (_again, again) = fake.accept_tls();
+        // 0.7 s for the version frame, then the first backoff, 1 s.
+        let gone = secs(at, again);
+        assert!((1.5..3.0).contains(&gone), "{gone}");
+        trickle.join().unwrap();
     }
 
     #[test]
