@@ -22,7 +22,9 @@
 //! answers for it (`services`); the flows and the station counters each
 //! client's volumes and where they went (`traffic`). An admin measures an
 //! AP's throughput to the controller, and a signed-in viewer their own
-//! device's through the UI (`speedtest`).
+//! device's through the UI (`speedtest`). The devices the configuration
+//! lists are announced to Home Assistant as they join and leave the Wi-Fi
+//! (`presence`).
 
 pub mod actions;
 pub mod agents;
@@ -43,6 +45,7 @@ pub mod metrics;
 pub mod names;
 pub mod oui;
 pub mod policy;
+pub mod presence;
 pub mod radius;
 pub mod rf;
 pub mod roaming;
@@ -204,6 +207,9 @@ pub async fn start(
     if config.radius.is_some() {
         state = state.with_radius();
     }
+    if let Some(p) = &config.presence {
+        state = state.with_presence(p);
+    }
     let state = Shared::new(state);
     let keys: HashMap<_, _> = config.aps.iter().map(|(n, k)| (*k, n.clone())).collect();
     let allowed: AllowedKeys = Arc::new(RwLock::new(keys));
@@ -273,6 +279,9 @@ pub async fn start(
     }
     if let Some(settings) = &config.radius {
         tokio::spawn(radius::supervise(state.clone(), settings.clone()));
+    }
+    if let Some(settings) = &config.presence {
+        tokio::spawn(presence::supervise(state.clone(), settings.clone()));
     }
     tokio::spawn(sessions::keep(state.clone(), history.clone()));
     tokio::spawn(traffic::keep(state.clone(), traffic_path.clone()));

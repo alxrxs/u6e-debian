@@ -36,6 +36,9 @@
 //! MAC ever seen. The speed tests are counted by kind and result, every pair
 //! always exported, each AP's last one gives its rate and CPU per
 //! direction, and the clients' last one on each AP and band its rates.
+//! The presence events exist only when they go to Home Assistant: per
+//! listed device (at most `presence::DEVICES_MAX`) its state, and counted
+//! by result.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
@@ -482,6 +485,9 @@ pub fn render(state: &State) -> String {
     roaming(&mut m, state, &aps);
     experience(&mut m, state);
     speedtests(&mut m, state);
+    if let Some(p) = &state.presence {
+        presence(&mut m, p);
+    }
     m.family(
         "wifi_traffic_clients",
         GAUGE,
@@ -606,6 +612,50 @@ fn speedtests(m: &mut Text, state: &State) {
     );
     for (ap, band, t) in &clients {
         m.sample(&[("ap", *ap), ("band", *band)], unix_seconds(t.at));
+    }
+}
+
+/// The presence events, when they go to Home Assistant: each listed
+/// device's state, the events by result (every result exported), those
+/// waiting, whether Home Assistant refused the token, and the last delivery.
+fn presence(m: &mut Text, p: &crate::presence::Presence) {
+    m.family(
+        "wifi_presence_home",
+        GAUGE,
+        "Whether the listed device is on the Wi-Fi (1) or has left it (0), by its Home Assistant name.",
+    );
+    for d in &p.devices {
+        if let Some(home) = d.home {
+            m.sample(&[("device", d.name.as_str())], f64::from(u8::from(home)));
+        }
+    }
+    m.family(
+        "wifi_presence_events_total",
+        COUNTER,
+        "Presence events: delivered to Home Assistant, or dropped undelivered after 5 minutes.",
+    );
+    m.sample(&[("result", "delivered")], p.delivered as f64);
+    m.sample(&[("result", "dropped")], p.dropped as f64);
+    m.family(
+        "wifi_presence_pending",
+        GAUGE,
+        "Presence events waiting to be delivered.",
+    );
+    let pending = p.devices.iter().filter(|d| d.pending.is_some()).count();
+    m.sample(&[], pending as f64);
+    m.family(
+        "wifi_presence_refused",
+        GAUGE,
+        "Whether Home Assistant refused the token the controller holds (no event goes until it changes).",
+    );
+    m.sample(&[], f64::from(u8::from(p.refused.is_some())));
+    m.family(
+        "wifi_presence_last_delivery_timestamp_seconds",
+        GAUGE,
+        "When Home Assistant last took a presence event.",
+    );
+    if let Some(t) = p.last_delivery {
+        m.sample(&[], unix_seconds(t));
     }
 }
 

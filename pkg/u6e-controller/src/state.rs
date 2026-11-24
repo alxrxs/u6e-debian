@@ -25,7 +25,9 @@
 //! while one watches its flows they come every 10 s (an AP stretches that
 //! for a large connection table, up to the minute), otherwise every minute.
 //! The session follows per-AP channels holding what the watchers want. The
-//! scans of the APs' radios are kept here too, watched as `spectrum` says.
+//! scans of the APs' radios are kept here too, watched as `spectrum` says,
+//! and so are the speed tests (`speedtest`) and the listed devices'
+//! presence (`presence`).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::net::IpAddr;
@@ -51,6 +53,7 @@ use crate::limits::{self, RateLimits};
 use crate::names::{self, Names};
 use crate::oui;
 use crate::policy::{ApImages, Blocked, ConfigId, Hold, Phase, Policy, SavedRollout};
+use crate::presence::{self, Presence};
 use crate::radius::{self, Line};
 use crate::rf::history::{self, History};
 use crate::roaming::Roaming;
@@ -117,6 +120,9 @@ pub enum Change {
     Service(services::Event),
     /// A speed test started, or ended.
     SpeedTests,
+    /// A listed device came or went, or what Home Assistant was told of it
+    /// changed.
+    Presence,
 }
 
 /// One action on one AP (or on none, when no AP was connected to carry a
@@ -633,6 +639,8 @@ pub struct State {
     pub traffic: Traffic,
     /// The speed tests.
     pub speedtests: SpeedTests,
+    /// The listed devices' presence, when it goes to Home Assistant.
+    pub presence: Option<Presence>,
 }
 
 impl State {
@@ -674,6 +682,7 @@ impl State {
             services: Services::default(),
             traffic: Traffic::default(),
             speedtests: SpeedTests::default(),
+            presence: None,
         }
     }
 
@@ -700,6 +709,12 @@ impl State {
             site_limits,
             ..self
         }
+    }
+
+    /// The state telling Home Assistant of the devices `settings` lists.
+    pub fn with_presence(mut self, settings: &presence::Settings) -> Self {
+        self.presence = Some(Presence::new(settings));
+        self
     }
 
     /// The state whose speed tests take `limits`.

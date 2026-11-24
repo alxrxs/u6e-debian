@@ -22,7 +22,13 @@
 //! enforce on (only with `[leases]`: without the seed of the leases a client
 //! that roamed in is unknown to its new AP), the clients with a static
 //! address, and the site's DHCP servers and relays, whose acknowledgements
-//! alone bind addresses; the guards only report without it.
+//! alone bind addresses; the guards only report without it; and, in
+//! `[presence]`, the devices whose joining and leaving the Wi-Fi go to Home
+//! Assistant as events (`presence`): its `https://` address, the CA bundle
+//! its certificate chains to (the system's unless set), the file of its
+//! long-lived token, the minutes unseen that make a leave
+//! (`leave_after_secs`, 300 unless set, 60 to 3600) and the devices, each
+//! by MAC and a name of lower case letters, digits and `_`; none without it.
 //!
 //! ```toml
 //! listen_agents = "[::]:8443"
@@ -66,6 +72,11 @@
 //! static = [{ mac = "02:00:00:00:00:01", ip = "192.0.2.5" }]
 //! dhcp_servers = ["192.0.2.53"]
 //! dhcp_relays = ["192.0.2.2", "198.51.100.2"]
+//!
+//! [presence]
+//! url = "https://ha.example.org"
+//! token = "/etc/wifi-controller/ha-token"
+//! devices = [{ mac = "02:00:00:00:00:01", name = "phone_alice" }]
 //! ```
 
 use std::collections::{BTreeMap, HashMap};
@@ -77,7 +88,7 @@ use serde::Deserialize;
 use u6e_proto::mac;
 use u6e_proto::msg::{Binding, GuardConfig, Limit, LimitTarget, Rate, check_limits};
 
-use crate::{configs, radius, rf, roaming, rollout};
+use crate::{configs, presence, radius, rf, roaming, rollout};
 
 /// The parsed, checked configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,6 +138,8 @@ pub struct Config {
     pub radius: Option<radius::Settings>,
     /// How the APs' client guards run.
     pub guards: GuardConfig,
+    /// The presence events to Home Assistant, if they are on.
+    pub presence: Option<presence::Settings>,
 }
 
 #[derive(Deserialize)]
@@ -164,6 +177,26 @@ struct File {
     radius: Option<RadiusFile>,
     guards: Option<GuardsFile>,
     limits: Option<LimitsFile>,
+    presence: Option<PresenceFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PresenceFile {
+    url: String,
+    #[serde(default = "default_ca")]
+    ca: PathBuf,
+    token: PathBuf,
+    #[serde(default = "default_leave_after")]
+    leave_after_secs: u64,
+    devices: Vec<PresenceDeviceFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PresenceDeviceFile {
+    mac: String,
+    name: String,
 }
 
 #[derive(Deserialize)]
@@ -266,6 +299,14 @@ fn default_socket() -> PathBuf {
     "/run/wifi-controller/sock".into()
 }
 
+fn default_ca() -> PathBuf {
+    "/etc/ssl/certs/ca-certificates.crt".into()
+}
+
+fn default_leave_after() -> u64 {
+    300
+}
+
 /// Why a configuration was refused.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ConfigError {
@@ -302,6 +343,8 @@ pub enum ConfigError {
     Limits(String),
     /// `sticky_dbm` is outside −90 to −50 dBm.
     BadSticky,
+    /// `[presence]` is not one: why.
+    Presence(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -324,6 +367,7 @@ impl fmt::Display for ConfigError {
             Self::Guards(e) => write!(f, "guards: {e}"),
             Self::Limits(e) => write!(f, "limits: {e}"),
             Self::BadSticky => f.write_str("sticky_dbm is not between -90 and -50"),
+            Self::Presence(e) => write!(f, "presence: {e}"),
         }
     }
 }
@@ -386,6 +430,7 @@ impl Config {
         if !(-90..=-50).contains(&file.sticky_dbm) {
             return Err(ConfigError::BadSticky);
         }
+        let presence = file.presence.map(presence_settings).transpose()?;
         Ok(Config {
             listen_agents: file.listen_agents,
             listen_http: file.listen_http,
@@ -409,8 +454,71 @@ impl Config {
             leases,
             radius,
             guards,
+            presence,
         })
     }
+}
+
+/// The presence section, checked: an `https://host[:port]` with nothing
+/// after it, a leave of 1 to 60 minutes, and 1 to 64 devices, each a
+/// station's MAC and a name Home Assistant takes as it is, each once.
+fn presence_settings(file: PresenceFile) -> Result<presence::Settings, ConfigError> {
+    let bad = |e: String| ConfigError::Presence(e);
+    let hostport = file
+        .url
+        .strip_prefix("https://")
+        .ok_or_else(|| bad(format!("url: {:?} is not https://host[:port]", file.url)))?;
+    let (host, port) = if is_host_port(hostport) {
+        let (h, p) = hostport.rsplit_once(':').expect("host:port");
+        (h, p.parse().expect("a port"))
+    } else {
+        (hostport, 443)
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let ok_host =
+        host.parse::<std::net::IpAddr>().is_ok() || (!host.contains(':') && is_address(host));
+    if !ok_host {
+        return Err(bad(format!(
+            "url: {:?} is not https://host[:port]",
+            file.url
+        )));
+    }
+    if !(60..=3600).contains(&file.leave_after_secs) {
+        return Err(bad("leave_after_secs is not between 60 and 3600".into()));
+    }
+    if file.devices.is_empty() || file.devices.len() > presence::DEVICES_MAX {
+        return Err(bad(format!(
+            "devices: 1 to {} are listed",
+            presence::DEVICES_MAX
+        )));
+    }
+    let mut devices: Vec<([u8; 6], String)> = Vec::new();
+    for d in file.devices {
+        let mac = mac::parse(&d.mac).filter(|m| mac::is_station(*m));
+        let mac = mac.ok_or_else(|| bad(format!("devices: {:?} is no station's MAC", d.mac)))?;
+        let named = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_';
+        if d.name.is_empty() || d.name.len() > 64 || !d.name.chars().all(named) {
+            return Err(bad(format!(
+                "devices: {:?} is not a name of a-z, 0-9 and _",
+                d.name
+            )));
+        }
+        if devices.iter().any(|(m, n)| *m == mac || *n == d.name) {
+            return Err(bad(format!(
+                "devices: {} or {:?} is listed twice",
+                d.mac, d.name
+            )));
+        }
+        devices.push((mac, d.name));
+    }
+    Ok(presence::Settings {
+        host: host.to_owned(),
+        port,
+        ca: file.ca,
+        token: file.token,
+        leave_after: std::time::Duration::from_secs(file.leave_after_secs),
+        devices,
+    })
 }
 
 /// The RADIUS log's section, checked: a `host:port`, and a stream selector
@@ -746,6 +854,84 @@ mod tests {
         );
         let c = Config::parse(&format!("{ORIGIN}traffic_path = \"/t\"\n")).unwrap();
         assert_eq!(c.traffic_path, PathBuf::from("/t"));
+    }
+
+    #[test]
+    fn presence_goes_to_an_https_home_assistant_for_named_devices() {
+        assert_eq!(Config::parse(ORIGIN).unwrap().presence, None);
+        let with = |url: &str, rest: &str| {
+            Config::parse(&format!(
+                "{ORIGIN}[presence]\nurl = \"{url}\"\ntoken = \"/t\"\n{rest}\n"
+            ))
+        };
+        let one = "devices = [{ mac = \"02:00:00:00:00:01\", name = \"phone_alice\" }]";
+        let p = with("https://ha.example.org", one)
+            .unwrap()
+            .presence
+            .unwrap();
+        assert_eq!(
+            p,
+            presence::Settings {
+                host: "ha.example.org".into(),
+                port: 443,
+                ca: "/etc/ssl/certs/ca-certificates.crt".into(),
+                token: "/t".into(),
+                leave_after: Duration::from_secs(300),
+                devices: vec![([2, 0, 0, 0, 0, 1], "phone_alice".into())],
+            }
+        );
+        let p = with(
+            "https://[2001:db8::8]:8123",
+            &format!("leave_after_secs = 60\nca = \"/c\"\n{one}"),
+        );
+        let p = p.unwrap().presence.unwrap();
+        assert_eq!(
+            (p.host.as_str(), p.port, p.leave_after.as_secs()),
+            ("2001:db8::8", 8123, 60)
+        );
+        assert_eq!(p.ca, PathBuf::from("/c"));
+        let refused =
+            |url: &str, rest: &str| matches!(with(url, rest), Err(ConfigError::Presence(_)));
+        for url in [
+            "http://ha.example.org",
+            "https://ha.example.org/api",
+            "https://",
+            "https://-x",
+        ] {
+            assert!(refused(url, one), "{url}");
+        }
+        assert!(refused(
+            "https://ha.example.org",
+            &format!("leave_after_secs = 59\n{one}")
+        ));
+        assert!(refused(
+            "https://ha.example.org",
+            &format!("leave_after_secs = 3601\n{one}")
+        ));
+        assert!(refused("https://ha.example.org", "devices = []"));
+        for d in [
+            r#"{ mac = "03:00:00:00:00:01", name = "x" }"#,
+            r#"{ mac = "02:00:00:00:00:01", name = "Phone Alice" }"#,
+            r#"{ mac = "02:00:00:00:00:01", name = "" }"#,
+            r#"{ mac = "02:00:00:00:00:01", name = "a" }, { mac = "02:00:00:00:00:01", name = "b" }"#,
+            r#"{ mac = "02:00:00:00:00:01", name = "a" }, { mac = "02:00:00:00:00:02", name = "a" }"#,
+        ] {
+            assert!(
+                refused("https://ha.example.org", &format!("devices = [{d}]")),
+                "{d}"
+            );
+        }
+        let many: Vec<String> = (0..65)
+            .map(|i| format!("{{ mac = \"02:00:00:00:01:{i:02x}\", name = \"d{i}\" }}"))
+            .collect();
+        assert!(refused(
+            "https://ha.example.org",
+            &format!("devices = [{}]", many.join(", "))
+        ));
+        assert!(matches!(
+            with("https://ha.example.org", &format!("port = 1\n{one}")),
+            Err(ConfigError::Syntax(_))
+        ));
     }
 
     #[test]

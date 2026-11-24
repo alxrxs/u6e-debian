@@ -734,9 +734,13 @@ async fn live(
                 (wanted(&ap), None)
             }
             Ok(Change::Flows(ap)) => (flows && wanted(&ap), None),
-            Ok(Change::Names | Change::Deploy | Change::Limits | Change::SpeedTests) => {
-                (true, None)
-            }
+            Ok(
+                Change::Names
+                | Change::Deploy
+                | Change::Limits
+                | Change::SpeedTests
+                | Change::Presence,
+            ) => (true, None),
             Ok(Change::Captures) => (admin, None),
             // A block or an unblock changes the list of clients blocked.
             Ok(Change::Action(a)) if a.ap.as_deref().is_none_or(wanted) => {

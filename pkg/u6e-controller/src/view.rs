@@ -34,7 +34,9 @@
 //! static clients, and, when it rolls
 //! images out, each AP's kept images and those it runs) and the image
 //! rollouts with their step, gate, result and log (`rollouts`), and the
-//! newest speed tests of the APs with their figures (`speedtests`).
+//! newest speed tests of the APs with their figures (`speedtests`), and,
+//! when presence goes to Home Assistant, each listed device's state, place
+//! and what Home Assistant was told (`presence`).
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -69,6 +71,9 @@ pub fn view(state: &State, wanted: impl Fn(&str) -> bool, flows: bool, admin: bo
         "limits": crate::limits::view(state),
         "speedtests": crate::speedtest::view(&state.speedtests),
     });
+    if let Some(p) = &state.presence {
+        v["presence"] = crate::presence::view(p);
+    }
     if admin {
         v["captures"] = crate::captures::view(state);
     }
