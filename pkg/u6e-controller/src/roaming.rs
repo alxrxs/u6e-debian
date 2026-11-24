@@ -587,8 +587,11 @@ impl Roaming {
         }
     }
 
-    /// An admin's steer: the answer it drew, which came first (the agent
-    /// waits for it), or a request of its own when the AP sent it.
+    /// An admin's steer: the answer it drew, when that came first (the agent
+    /// waits for it before it answers), or a request of its own when the AP
+    /// sent it: the steer worked, or failed as the client declined (the
+    /// agent's word for a request sent and refused; one it never sent says
+    /// why it was not).
     pub fn action(&mut self, a: &Action) {
         let (Some(mac), Some(ap)) = (a.mac, a.ap.as_deref()) else {
             return;
@@ -603,7 +606,7 @@ impl Roaming {
         });
         if let Some(s) = answer {
             s.origin = by;
-        } else if a.ok {
+        } else if a.ok || a.detail.contains("declined") {
             self.push_steer(Steer {
                 id: 0,
                 at_ms: at,
@@ -1587,6 +1590,36 @@ mod tests {
             (Some(1), Some(1), Some(1))
         );
         assert_eq!(site.r.counts.moved.get("ap1"), None);
+    }
+
+    /// An admin's steer the client declined, its result here before the
+    /// client's answer: one request, the admin's, answered.
+    #[test]
+    fn a_declined_steer_is_the_admins_whichever_word_comes_first() {
+        let mut site = Site::new();
+        on_ap1(&mut site, 1, -70);
+        site.r.action(&Action {
+            at: UNIX_EPOCH + Duration::from_millis(T0 + 3 * S),
+            user: Some("admin".into()),
+            action: "steer",
+            mac: Some(mac(1)),
+            ap: Some("ap1".into()),
+            ok: false,
+            detail: "wlan5: declined: no suitable candidates".into(),
+        });
+        let answer = EventKind::BtmResponse {
+            mac: mac(1),
+            bss: 0,
+            status: 7,
+            target: None,
+        };
+        site.event("ap1", T0 + 3200, answer);
+        assert_eq!(site.r.steers().count(), 1);
+        let s = site.steer(1);
+        assert_eq!(
+            (s.origin.clone(), s.status),
+            (Origin::Admin(Some("admin".into())), Some(7))
+        );
     }
 
     /// Kept: the newest roams, the last week, and the clients heard last.
