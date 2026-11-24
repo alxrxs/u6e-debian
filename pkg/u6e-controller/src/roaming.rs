@@ -57,8 +57,11 @@ const ANSWER_MS: u64 = 5_000;
 const ADMIN_MS: u64 = 10_000;
 /// The admins' steers remembered for their answers, at most.
 const ADMIN_STEERS: usize = 64;
-/// An EAP start this near a new association is that association's.
-const EAP_NEAR_MS: u64 = 60_000;
+/// An EAP start is a roam's when it came after the old AP last heard the
+/// client, or this soon before the new AP authorized it, and no later than
+/// this after (a session learnt from a snapshot begins at its association,
+/// which EAP follows).
+const EAP_SLACK_MS: u64 = 5000;
 /// The same power, within a dB (mBm).
 const SAME_POWER_MBM: i32 = 100;
 /// The roams and steering records `/api/roaming` shows of the site.
@@ -812,16 +815,17 @@ impl Roaming {
 
     /// Completes the roam into `session` of `mac`: its signal after, and,
     /// once the new AP authorized the client, its kind (EAP when an EAP
-    /// exchange at that AP came near the roam).
+    /// exchange at that AP started within the roam: [`EAP_SLACK_MS`]).
     fn complete(&mut self, mac: [u8; 6], session: u64, signal: i8, auth: Option<&StationAuth>) {
         let eap = self.clients.get(&mac).and_then(|c| c.eap_start.clone());
         let open = match self.roams.iter_mut().rev().find(|r| r.session == session) {
             Some(r) => {
                 r.after.get_or_insert(signal);
                 if let Some(a) = auth.filter(|a| a.authorized && r.kind.is_none()) {
-                    let near = eap.filter(|(at_ap, t)| {
-                        *at_ap == r.to.ap && t.abs_diff(r.at_ms) <= EAP_NEAR_MS
-                    });
+                    let heard = r.at_ms - r.gap_ms.unwrap_or(0);
+                    let from = heard.min(r.at_ms.saturating_sub(EAP_SLACK_MS));
+                    let within = from..=r.at_ms + EAP_SLACK_MS;
+                    let near = eap.filter(|(at_ap, t)| *at_ap == r.to.ap && within.contains(t));
                     r.kind = Some(Kind::of(a, near.is_some()));
                 }
                 r.kind.is_none()
@@ -1444,6 +1448,36 @@ mod tests {
             let r = site.roam(last);
             assert_eq!((r.gap_ms, r.gap_min_ms), (Some(1300), 700), "{last}");
             assert_eq!(r.kind, Some(kind), "{last}");
+        }
+    }
+
+    /// An EAP exchange at the new AP is the roam's only within it: one
+    /// started before the old AP last heard the client (beyond the 5 s
+    /// before the new AP authorized it) or well after is another sign-in's.
+    #[test]
+    fn eap_counts_for_a_roam_only_within_it() {
+        let mut site = Site::new();
+        // The old AP last heard each client at T0 + 1900; the new one
+        // authorized it at `began`.
+        let (soon, late) = (T0 + 3200, T0 + 20 * S);
+        for (last, started, began, kind) in [
+            (1, T0 - 50 * S, soon, Kind::Cached),
+            (2, T0 + 1800, late, Kind::Cached),
+            (3, T0 + 2000, late, Kind::Eap),
+            (4, soon - 5000, soon, Kind::Eap),
+            (5, soon - 5001, soon, Kind::Cached),
+            (6, soon + 5000, soon, Kind::Eap),
+            (7, soon + 5001, soon, Kind::Cached),
+        ] {
+            let start = EventKind::EapStart {
+                mac: mac(last),
+                bss: 0,
+            };
+            on_ap1(&mut site, last, -71);
+            site.event("ap2", started, start);
+            site.event("ap2", began, assoc(last, 0));
+            site.snap("ap2", began + 6 * S, &[Sta(last, 0, -55, 6, Some(EAP))]);
+            assert_eq!(site.roam(last).kind, Some(kind), "{last}");
         }
     }
 
