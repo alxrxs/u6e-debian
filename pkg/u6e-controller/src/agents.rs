@@ -9,7 +9,8 @@
 //! and flow cadence from the AP's watchers, and passes on what the state
 //! queues for it (commands, requests for flows, signed configurations,
 //! captures); a capture's chunks are written to its file as they come, each
-//! then acknowledged (`captures`). After the first key frame of every
+//! then acknowledged (`captures`). A connection whose first message opens a
+//! speed test instead of saying Hello is that test's (`speedtest::ap`). After the first key frame of every
 //! connection it gives the AP the policy's blocks, all of them, since the AP
 //! keeps them in RAM only, the rate limits, all of them, which the AP keeps
 //! only until it restarts, its client guards' mode and the leases they are
@@ -45,7 +46,7 @@ use crate::names::{self, Lookups};
 use crate::policy::{self, Store};
 use crate::spectrum::Limits;
 use crate::state::{FLOWS_WATCHED, Registration, Shared, TICK_WATCHED};
-use crate::{captures, clean};
+use crate::{captures, clean, speedtest};
 
 /// Longest a handshake, or a write to a stalled peer, may take.
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
@@ -54,8 +55,9 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// before dropping it (the agent keeps the same 60 s on its side), how long
 /// an operator waits for a command's result and an apply for an AP's answer
 /// to a configuration, when scans stop, how long a rollout's gate a
-/// restarted controller goes on with waits at least for the AP, and how
-/// often the radios are compared with the site file's plan (`rf::live`).
+/// restarted controller goes on with waits at least for the AP, how often
+/// the radios are compared with the site file's plan (`rf::live`), and what
+/// an AP's speed test takes.
 #[derive(Debug, Clone, Copy)]
 pub struct Timing {
     pub ping: Duration,
@@ -71,6 +73,8 @@ pub struct Timing {
     /// The longest a UI WebSocket is served: the page then connects again,
     /// and its user's groups are judged again.
     pub ui_session: Duration,
+    /// What an AP's speed test takes.
+    pub speedtest: speedtest::ap::Limits,
 }
 
 impl Default for Timing {
@@ -84,6 +88,7 @@ impl Default for Timing {
             resume: Duration::from_secs(120),
             reconcile: Duration::from_secs(30),
             ui_session: Duration::from_secs(3600),
+            speedtest: speedtest::ap::Limits::default(),
         }
     }
 }
@@ -165,7 +170,16 @@ async fn connection(l: Listener, sock: TcpStream, peer: SocketAddr) {
         pings: 0,
     };
     let r = match s.agree().await {
-        Ok(true) => s.run().await,
+        Ok(true) => match s.first().await {
+            Ok(First::Hello(hello)) => s.run(hello).await,
+            Ok(First::SpeedTest(id)) => {
+                let inbuf = std::mem::take(&mut s.conn.inbuf);
+                speedtest::ap::serve(&s.state, &s.name, peer, id, &mut s.conn.tls, inbuf).await;
+                s.conn.shutdown().await;
+                return;
+            }
+            Err(e) => Err(e),
+        },
         Ok(false) => {
             s.conn.shutdown().await;
             return;
@@ -267,6 +281,14 @@ impl Conn {
     }
 }
 
+/// What a connection's first message opens.
+enum First {
+    /// The agent's session.
+    Hello(Hello),
+    /// The speed test of this id.
+    SpeedTest(u64),
+}
+
 /// One agent's connection after the handshake.
 struct Session {
     conn: Conn,
@@ -303,9 +325,9 @@ impl Session {
         Ok(false)
     }
 
-    /// Serves the session until it fails, goes silent or is replaced.
-    async fn run(&mut self) -> io::Result<Infallible> {
-        let hello = self.hello().await?;
+    /// Serves the session its agent's `hello` opened until it fails, goes
+    /// silent or is replaced.
+    async fn run(&mut self, hello: Hello) -> io::Result<Infallible> {
         self.state
             .write()
             .check_identity(&self.name, &hello.ap)
@@ -366,8 +388,9 @@ impl Session {
         }
     }
 
-    /// Waits for the agent's first message, which must be its Hello.
-    async fn hello(&mut self) -> io::Result<Hello> {
+    /// Waits for the agent's first message: its Hello, or the opening of a
+    /// speed test.
+    async fn first(&mut self) -> io::Result<First> {
         match self
             .conn
             .wait_frame(decode_frame::<AgentMsg>, "Hello")
@@ -375,8 +398,9 @@ impl Session {
         {
             AgentMsg::Hello(mut h) => {
                 clean::hello(&mut h);
-                Ok(h)
+                Ok(First::Hello(h))
             }
+            AgentMsg::SpeedTestOpen { id } => Ok(First::SpeedTest(id)),
             _ => Err(io::Error::new(ErrorKind::InvalidData, "no Hello first")),
         }
     }

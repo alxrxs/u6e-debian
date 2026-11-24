@@ -57,6 +57,7 @@ use crate::roaming::Roaming;
 use crate::services::{self, Services};
 use crate::sessions::{self, Sessions};
 use crate::spectrum::{self, Limits, Scan, Stopped};
+use crate::speedtest::SpeedTests;
 use crate::traffic::{self, Traffic};
 
 /// Events kept per AP, newest last.
@@ -114,6 +115,8 @@ pub enum Change {
     Captures,
     /// A service a device offers over mDNS changed.
     Service(services::Event),
+    /// A speed test started, or ended.
+    SpeedTests,
 }
 
 /// One action on one AP (or on none, when no AP was connected to carry a
@@ -628,6 +631,8 @@ pub struct State {
     pub services: Services,
     /// Each client's volumes and destinations.
     pub traffic: Traffic,
+    /// The speed tests.
+    pub speedtests: SpeedTests,
 }
 
 impl State {
@@ -668,6 +673,7 @@ impl State {
             captures: Captures::default(),
             services: Services::default(),
             traffic: Traffic::default(),
+            speedtests: SpeedTests::default(),
         }
     }
 
@@ -694,6 +700,12 @@ impl State {
             site_limits,
             ..self
         }
+    }
+
+    /// The state whose AP speed tests take `limits`.
+    pub fn with_speedtests(mut self, limits: crate::speedtest::ap::Limits) -> Self {
+        self.speedtests.limits = limits;
+        self
     }
 
     /// The state going on from the sessions and timelines `sessions`.
@@ -1426,7 +1438,7 @@ impl State {
 
     /// Why `ap` may not be sent a configuration or a radio command now; it
     /// must be connected, have no configuration on its way and not be under
-    /// a rollout.
+    /// a rollout or a speed test.
     pub(crate) fn sendable(&self, ap: &str) -> Result<(), String> {
         let entry = self.aps.get(ap).ok_or_else(|| format!("no AP {ap:.64}"))?;
         if let Some(h) = self.held(ap) {
@@ -1434,6 +1446,9 @@ impl State {
         }
         if self.rollouts.iter().any(|r| r.ap == ap && r.is_open()) {
             return Err(format!("{ap} is being rolled out to"));
+        }
+        if self.speedtests.ap_running(ap) {
+            return Err(format!("a speed test of {ap} runs"));
         }
         if entry.session.is_none() {
             return Err(format!("{ap} is not connected"));
@@ -1664,6 +1679,9 @@ impl State {
                 "the rollout of {} to {} is not over",
                 r.image_id, r.ap
             ));
+        }
+        if self.speedtests.ap_running(ap) {
+            return Err(format!("a speed test of {ap} runs"));
         }
         let snap = entry.snapshot.as_ref();
         let radios = snap.map_or(0, |s| s.radios.iter().filter(|r| r.up).count());

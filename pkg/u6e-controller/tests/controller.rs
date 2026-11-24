@@ -40,10 +40,11 @@ use u6e_proto::msg::{
     AgentMsg, Band, Binding, Bss, ClientFlows, CommandKind, CommandResult, ConfigApplied, CtlMsg,
     Event, EventKind, FieldDelta, Flow, Flows, Guard, GuardConfig, Hello, MdnsDevice, MdnsOffer,
     MdnsQuery, Mechanism, Radio, RadioApplied, RadioConfig, RateMode, Services, SignedConfig,
-    Snapshot, SnapshotDelta, SpectrumFrame, Station, StationCaps, Temp, Violation,
+    Snapshot, SnapshotDelta, SpectrumFrame, SpeedTestReport, Station, StationCaps, Temp, Violation,
 };
+use u6e_proto::speedtest::{CHUNK, Chunks};
 use u6e_proto::tls::{self, Identity};
-use u6e_proto::{mac, version};
+use u6e_proto::{mac, speedtest, version};
 
 #[path = "common/keys.rs"]
 mod keys;
@@ -5218,4 +5219,302 @@ fn roams_steering_and_experience_reach_the_api_and_the_metrics() {
     // A client without a name has no series of its own.
     assert!(!body.contains("wifi_client_experience{"), "{body}");
     assert!(promtool_accepts(&body));
+}
+
+/// What the AP speed tests of these tests take: a second each way, four
+/// chunks at most.
+fn quick_tests(open: Duration, run: Duration) -> Timing {
+    Timing {
+        speedtest: u6e_controller::speedtest::ap::Limits {
+            secs: 1,
+            max_bytes: 4 * CHUNK as u64,
+            open,
+            run,
+        },
+        ..Timing::default()
+    }
+}
+
+impl Agent {
+    /// A test connection of the AP `pem` opening test `id`, the protocols
+    /// agreed.
+    fn open_test(addr: SocketAddr, pem: &str, id: u64) -> Agent {
+        let (mut t, theirs) = Agent::versioned(addr, pem, PROTOCOL);
+        assert_eq!(theirs, PROTOCOL);
+        t.send(&AgentMsg::SpeedTestOpen { id }).unwrap();
+        t
+    }
+
+    /// Reads one direction's chunks to their end; their filler bytes.
+    fn take_chunks(&mut self) -> io::Result<u64> {
+        let mut c = Chunks::default();
+        loop {
+            let closed = match self.conn.reader().read_to_end(&mut self.buf) {
+                Ok(_) => true,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => false,
+                Err(e) => return Err(e),
+            };
+            let used = c.take(&self.buf).map_err(io::Error::other)?;
+            self.buf.drain(..used);
+            if c.ended() {
+                return Ok(c.bytes());
+            }
+            if closed || self.conn.read_tls(&mut self.sock)? == 0 {
+                return Err(ErrorKind::UnexpectedEof.into());
+            }
+            self.conn.process_new_packets().map_err(io::Error::other)?;
+        }
+    }
+
+    /// Sends chunks of `lens` and the end.
+    fn send_chunks(&mut self, lens: &[usize]) {
+        let zeros = vec![0; CHUNK];
+        for &len in lens {
+            self.send_bytes(&speedtest::header(len)).unwrap();
+            self.send_bytes(&zeros[..len]).unwrap();
+        }
+        self.send_bytes(&speedtest::header(0)).unwrap();
+    }
+}
+
+/// An admin asks `ap` for a speed test, which `a` answers as started; the
+/// test's id.
+fn ask_test(r: &Running, a: &mut Agent, ap: &str) -> u64 {
+    let http = r.c.http;
+    let path = format!("/api/aps/{ap}/speedtest");
+    let asked = thread::spawn(move || post(http, &path, &format!("{SAME_SITE}{ADMIN}"), "{}"));
+    let kind = CommandKind::SpeedTest {
+        secs: 1,
+        max_bytes: 4 * CHUNK as u64,
+    };
+    let id = a.expect_command(kind);
+    a.reply(id, true, "started");
+    let (status, body) = asked.join().unwrap();
+    assert_eq!(status, 202, "{body}");
+    assert_eq!(body["id"], id.to_string());
+    id
+}
+
+fn test_status(r: &Running, id: u64) -> Option<&'static str> {
+    let s = r.c.state.read();
+    s.speedtests.ap_test(id).map(|t| t.status.name())
+}
+
+#[test]
+fn an_ap_speed_test_runs_on_a_connection_of_its_own() {
+    let r = controller(quick_tests(WAIT, WAIT));
+    let mut a = ap_with_client(&r, KEY_AP1, "ap1", &[]);
+    let id = ask_test(&r, &mut a, "ap1");
+    assert_eq!(test_status(&r, id), Some("running"));
+    let mut t = Agent::open_test(r.c.agents, KEY_AP1, id);
+    // The download: the four chunks the limits allow, well within its second.
+    assert_eq!(t.take_chunks().unwrap(), 4 * CHUNK as u64);
+    t.send_chunks(&[CHUNK, CHUNK, 7]);
+    let report = SpeedTestReport {
+        id,
+        down_bytes: 4 * CHUNK as u64,
+        down_us: 200_000,
+        cpu_down: u6e_proto::msg::CpuUse {
+            busy_permille: 615,
+            thread_permille: 980,
+        },
+        cpu_up: u6e_proto::msg::CpuUse {
+            busy_permille: 700,
+            thread_permille: 990,
+        },
+    };
+    t.send(&AgentMsg::SpeedTestReport(report)).unwrap();
+    wait_for("the test's end", || test_status(&r, id) == Some("done"));
+    let res =
+        r.c.state
+            .read()
+            .speedtests
+            .ap_test(id)
+            .unwrap()
+            .result
+            .unwrap();
+    assert_eq!(res.down.bytes, 4 * CHUNK as u64);
+    assert_eq!(res.up.bytes, 2 * CHUNK as u64 + 7);
+    // 262 144 B in 0.2 s, as the agent timed it.
+    assert_eq!(res.down.bits_per_second().round(), 10_485_760.0);
+    assert!(res.up.us > 0);
+    let v = ws_speedtests(&r);
+    assert_eq!(v[0]["status"], "done");
+    assert_eq!(v[0]["cpu"]["down"]["busy"], 61.5);
+    assert_eq!(v[0]["user"], "alice");
+    let events = json_get(r.c.http, "/api/events");
+    let ev = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["action"] == "speedtest")
+        .unwrap();
+    assert_eq!(ev["ok"], true, "{ev}");
+    let detail = ev["detail"].as_str().unwrap();
+    assert!(
+        detail.starts_with("download 10.5 Mbit/s, upload ")
+            && detail
+                .ends_with("the AP's CPU 61 % and 70 %, the test's own 98 % and 99 % of a core"),
+        "{detail}"
+    );
+    let body = http_get(r.c.metrics, "/metrics");
+    for line in [
+        "wifi_speedtests_total{kind=\"ap\",result=\"ok\"} 1",
+        "wifi_speedtests_total{kind=\"ap\",result=\"refused\"} 0",
+        "wifi_ap_speedtest_bytes_per_second{ap=\"ap1\",direction=\"down\"} 1310720",
+        "wifi_ap_speedtest_cpu_busy_ratio{ap=\"ap1\",direction=\"up\"} 0.7",
+    ] {
+        assert!(body.lines().any(|l| l == line), "missing {line}\n{body}");
+    }
+    assert!(metrics_of(&r, "wifi_ap_speedtest_timestamp_seconds{ap=\"ap1\"}").len() == 1);
+    assert!(promtool_accepts(&body));
+}
+
+/// The live view's speed tests, as a WebSocket's first state has them.
+fn ws_speedtests(r: &Running) -> Value {
+    let mut ui = Ui::subscribe(r.c.http, json!("*"));
+    ui.recv()["key"]["speedtests"]["aps"].clone()
+}
+
+#[test]
+fn an_ap_speed_test_is_an_admins_and_one_at_a_time() {
+    let r = controller(quick_tests(WAIT, WAIT));
+    let mut a1 = ap_with_client(&r, KEY_AP1, "ap1", &[]);
+    let path = "/api/aps/ap1/speedtest";
+    let viewer = format!("{SAME_SITE}X-Forwarded-Preferred-Username: bob\r\n");
+    assert_eq!(post(r.c.http, path, &viewer, "{}").0, 403);
+    assert_eq!(post(r.c.http, path, ADMIN, "{}").0, 403, "cross-site");
+    let admin = format!("{SAME_SITE}{ADMIN}");
+    // ap2 is configured but not connected.
+    let (status, body) = post(r.c.http, "/api/aps/ap2/speedtest", &admin, "{}");
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (409, Some("ap2 is not connected"))
+    );
+    assert_eq!(
+        post(r.c.http, "/api/aps/ap9/speedtest", &admin, "{}").0,
+        404
+    );
+    // A held AP is not tested.
+    r.c.state.write().hold("ap1", "maintenance").unwrap();
+    let (status, body) = post(r.c.http, path, &admin, "{}");
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (409, Some("ap1 is held: maintenance"))
+    );
+    r.c.state.write().release("ap1").unwrap();
+    // Refused by the AP (one runs there already).
+    let http = r.c.http;
+    let asked = thread::spawn(move || post(http, path, &format!("{SAME_SITE}{ADMIN}"), "{}"));
+    let kind = CommandKind::SpeedTest {
+        secs: 1,
+        max_bytes: 4 * CHUNK as u64,
+    };
+    let id = a1.expect_command(kind.clone());
+    a1.reply(id, false, "a speed test runs already");
+    let (status, body) = asked.join().unwrap();
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (409, Some("a speed test runs already"))
+    );
+    assert_eq!(test_status(&r, id), Some("failed"));
+    // While one runs, no other, and no configuration or radio command to its AP.
+    let mut a2 = ap_with_client(&r, KEY_AP2, "ap2", &[]);
+    let id = ask_test(&r, &mut a1, "ap1");
+    let (status, body) = post(r.c.http, "/api/aps/ap2/speedtest", &admin, "{}");
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (409, Some("a speed test of ap1 runs"))
+    );
+    let refused =
+        r.c.state
+            .write()
+            .apply_config("ap1", Vec::new())
+            .unwrap_err();
+    assert_eq!(refused, "a speed test of ap1 runs");
+    a2.hears_nothing(Duration::from_millis(100));
+    let body = http_get(r.c.metrics, "/metrics");
+    let refusals = "wifi_speedtests_total{kind=\"ap\",result=\"refused\"} 3";
+    assert!(body.lines().any(|l| l == refusals), "{body}");
+    drop(Agent::open_test(r.c.agents, KEY_AP1, id));
+    wait_for("the test's end", || test_status(&r, id) == Some("failed"));
+}
+
+#[test]
+fn only_the_ap_a_test_was_asked_of_opens_it_once_and_in_time() {
+    let r = controller(quick_tests(Duration::from_millis(600), WAIT));
+    let mut a1 = ap_with_client(&r, KEY_AP1, "ap1", &[]);
+    let _a2 = ap_with_client(&r, KEY_AP2, "ap2", &[]);
+    let id = ask_test(&r, &mut a1, "ap1");
+    // Another AP's key, or an id no test has: closed without a byte.
+    for (pem, id) in [(KEY_AP2, id), (KEY_AP1, id + 100)] {
+        let mut t = Agent::open_test(r.c.agents, pem, id);
+        assert_eq!(
+            t.take_chunks().unwrap_err().kind(),
+            ErrorKind::UnexpectedEof
+        );
+    }
+    assert_eq!(test_status(&r, id), Some("running"));
+    let mut t = Agent::open_test(r.c.agents, KEY_AP1, id);
+    assert_eq!(t.take_chunks().unwrap(), 4 * CHUNK as u64);
+    // A second opening of the same test is refused while the first runs.
+    let mut again = Agent::open_test(r.c.agents, KEY_AP1, id);
+    assert_eq!(
+        again.take_chunks().unwrap_err().kind(),
+        ErrorKind::UnexpectedEof
+    );
+    drop(t);
+    wait_for("the test's end", || test_status(&r, id) == Some("failed"));
+    // A test its AP never opens fails once its time to open is up.
+    let id = ask_test(&r, &mut a1, "ap1");
+    wait_for("the unopened test's end", || {
+        test_status(&r, id) == Some("failed")
+    });
+    let detail =
+        r.c.state
+            .read()
+            .speedtests
+            .ap_test(id)
+            .unwrap()
+            .detail
+            .clone();
+    assert_eq!(detail, "the AP did not open the test's connection in 600ms");
+    let mut late = Agent::open_test(r.c.agents, KEY_AP1, id);
+    assert_eq!(
+        late.take_chunks().unwrap_err().kind(),
+        ErrorKind::UnexpectedEof
+    );
+}
+
+#[test]
+fn an_ap_that_stalls_its_test_fails_it_at_its_time() {
+    let r = controller(quick_tests(WAIT, Duration::from_millis(1500)));
+    let mut a = ap_with_client(&r, KEY_AP1, "ap1", &[]);
+    let id = ask_test(&r, &mut a, "ap1");
+    let mut t = Agent::open_test(r.c.agents, KEY_AP1, id);
+    t.take_chunks().unwrap();
+    // No upload, no report.
+    let start = Instant::now();
+    wait_for("the stalled test's end", || {
+        test_status(&r, id) == Some("failed")
+    });
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        start.elapsed()
+    );
+    let detail =
+        r.c.state
+            .read()
+            .speedtests
+            .ap_test(id)
+            .unwrap()
+            .detail
+            .clone();
+    assert_eq!(detail, "not over in 1.5s");
+    let events = json_get(r.c.http, "/api/events");
+    let failed = events.as_array().unwrap().iter().any(|e| {
+        e["action"] == "speedtest" && e["ok"] == false && e["detail"] == "not over in 1.5s"
+    });
+    assert!(failed, "{events}");
 }

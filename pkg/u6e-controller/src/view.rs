@@ -33,7 +33,8 @@
 //! the client guards enforce on as sent (none without the leases) and their
 //! static clients, and, when it rolls
 //! images out, each AP's kept images and those it runs) and the image
-//! rollouts with their step, gate, result and log (`rollouts`).
+//! rollouts with their step, gate, result and log (`rollouts`), and the
+//! newest speed tests of the APs with their figures (`speedtests`).
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -66,6 +67,7 @@ pub fn view(state: &State, wanted: impl Fn(&str) -> bool, flows: bool, admin: bo
         "manage": manage(state),
         "rollouts": rollouts(state, LIVE_LOG),
         "limits": crate::limits::view(state),
+        "speedtests": crate::speedtest::view(&state.speedtests),
     });
     if admin {
         v["captures"] = crate::captures::view(state);

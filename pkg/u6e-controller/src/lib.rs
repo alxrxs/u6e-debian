@@ -20,7 +20,8 @@
 //! that and from RADIUS's verdicts, read from its log (`radius`). What the
 //! APs read of mDNS shows which device offers which service and whether it
 //! answers for it (`services`); the flows and the station counters each
-//! client's volumes and where they went (`traffic`).
+//! client's volumes and where they went (`traffic`). An admin measures an
+//! AP's throughput to the controller (`speedtest`).
 
 pub mod actions;
 pub mod agents;
@@ -49,6 +50,7 @@ pub mod script;
 pub mod services;
 pub mod sessions;
 pub mod spectrum;
+pub mod speedtest;
 pub mod stage;
 pub mod state;
 mod store;
@@ -176,6 +178,7 @@ pub async fn start(
         .with_traffic(traffic)
         .with_sticky(config.sticky_dbm)
         .with_spectrum(timing.spectrum)
+        .with_speedtests(timing.speedtest)
         .with_history(window)
         .with_leases(&config.leases)
         .with_guards(config.guards.clone())

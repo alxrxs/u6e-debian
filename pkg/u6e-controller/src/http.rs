@@ -41,7 +41,9 @@
 //! another offers are answered (`services`); a service's change is an
 //! event of kind `service`. `GET /api/roaming?client=` is the roams, the
 //! clients sticky now and the steering, of the site or of one client
-//! (`roaming`).
+//! (`roaming`). `POST /api/aps/{ap}/speedtest` is an admin's speed test of
+//! an AP to the controller (`speedtest::ap`), its progress and result in the
+//! view's `speedtests`.
 //!
 //! The listener is reached only through the reverse proxy that signs users
 //! in, which names the user in `X-Forwarded-Preferred-Username` and their
@@ -69,7 +71,7 @@ use crate::services;
 use crate::spectrum::{self, Watching};
 use crate::state::{Change, Full, ROLLOUT_LOG_CAP, Shared, WatchGuard};
 use crate::view;
-use crate::{captures, limits, names, rf, sessions, traffic};
+use crate::{captures, limits, names, rf, sessions, speedtest, traffic};
 
 /// How long a new WebSocket may take to say what it watches.
 const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -195,6 +197,7 @@ pub fn router(state: Shared, access: Access) -> Router {
         .route("/api/manage", get(api_manage))
         .route("/api/rollouts", get(api_rollouts))
         .route("/api/aps/{ap}/upgrade", post(actions::upgrade))
+        .route("/api/aps/{ap}/speedtest", post(speedtest::ap::start))
         .route("/api/rf/plan", get(rf::get_plan))
         .route("/api/rf/apply", post(rf::apply))
         .route("/ws", get(ws))
@@ -723,7 +726,9 @@ async fn live(
                 (wanted(&ap), None)
             }
             Ok(Change::Flows(ap)) => (flows && wanted(&ap), None),
-            Ok(Change::Names | Change::Deploy | Change::Limits) => (true, None),
+            Ok(Change::Names | Change::Deploy | Change::Limits | Change::SpeedTests) => {
+                (true, None)
+            }
             Ok(Change::Captures) => (admin, None),
             // A block or an unblock changes the list of clients blocked.
             Ok(Change::Action(a)) if a.ap.as_deref().is_none_or(wanted) => {

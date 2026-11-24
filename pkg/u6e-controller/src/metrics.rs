@@ -33,7 +33,9 @@
 //! at most [`EXPERIENCE_CLIENTS`] associated clients that have a name (the
 //! DHCP server's device, a lease's host name or a DNS name; the first by
 //! name), labelled by MAC and name: one series per named device, not per
-//! MAC ever seen.
+//! MAC ever seen. The speed tests are counted by kind and result, every pair
+//! always exported, and each AP's last one gives its rate and CPU per
+//! direction.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
@@ -55,6 +57,7 @@ use crate::services::Table;
 use crate::sessions::Totals;
 use crate::sessions::unix_ms;
 use crate::spectrum::{RADIOS, Scan};
+use crate::speedtest;
 use crate::state::{Ap, OUTCOMES, Shared, State, is_failure};
 use crate::view::{band, guard_name};
 
@@ -478,6 +481,7 @@ pub fn render(state: &State) -> String {
     services(&mut m, state);
     roaming(&mut m, state, &aps);
     experience(&mut m, state);
+    speedtests(&mut m, state);
     m.family(
         "wifi_traffic_clients",
         GAUGE,
@@ -522,6 +526,65 @@ pub fn render(state: &State) -> String {
         }
     }
     m.out
+}
+
+/// The speed tests: counted by kind and result, every pair exported; each
+/// AP's last result, from the tests kept.
+fn speedtests(m: &mut Text, state: &State) {
+    let tests = &state.speedtests;
+    m.family(
+        "wifi_speedtests_total",
+        COUNTER,
+        "Speed tests by kind and result (refused: one could not start).",
+    );
+    for kind in speedtest::KINDS {
+        for result in speedtest::RESULTS {
+            let n = tests.counts.get(&(kind, result)).copied().unwrap_or(0);
+            m.sample(&[("kind", kind), ("result", result)], n as f64);
+        }
+    }
+    let mut last: BTreeMap<&str, &speedtest::ApTest> = BTreeMap::new();
+    for t in tests.aps.iter().filter(|t| t.result.is_some()) {
+        last.insert(&t.ap, t);
+    }
+    let results = || {
+        last.iter()
+            .filter_map(|(ap, t)| Some((*ap, t, t.result.as_ref()?)))
+    };
+    m.family(
+        "wifi_ap_speedtest_bytes_per_second",
+        GAUGE,
+        "The AP's last speed test to the controller, each direction as its receiver timed it.",
+    );
+    for (ap, _, r) in results() {
+        for (dir, d) in [("down", &r.down), ("up", &r.up)] {
+            m.sample(
+                &[("ap", ap), ("direction", dir)],
+                d.bytes_per_second().round(),
+            );
+        }
+    }
+    m.family(
+        "wifi_ap_speedtest_cpu_busy_ratio",
+        GAUGE,
+        "The AP's CPU busy over all its cores during each direction of its last speed test.",
+    );
+    for (ap, _, r) in results() {
+        for (dir, c) in [("down", &r.cpu_down), ("up", &r.cpu_up)] {
+            m.sample(
+                &[("ap", ap), ("direction", dir)],
+                f64::from(c.busy_permille) / 1000.0,
+            );
+        }
+    }
+    m.family(
+        "wifi_ap_speedtest_timestamp_seconds",
+        GAUGE,
+        "When the AP's last speed test was asked.",
+    );
+    for (ap, t, _) in results() {
+        m.sample(&[("ap", ap)], unix_seconds(t.at));
+    }
 }
 
 /// The lease exporters, when the leases are read: whether each answered its
