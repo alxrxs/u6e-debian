@@ -1,0 +1,11 @@
+#!/bin/sh
+# The guard tests' tc: each test links it into its own directory, where it
+# prints the file `show` for a `show` or `ls`, logs every other call's
+# arguments and stdin (log) and fails a batch holding "fail". Linked, never
+# written by a test: an executable a test wrote could still be open for
+# writing in a child another test thread forked (ETXTBSY).
+d=$(dirname "$0")
+case "$*" in *show*|*ls*) [ -e "$d/show" ] && cat "$d/show"; exit 0;; esac
+in=$(cat)
+printf '%s\n%s\n--\n' "$*" "$in" >> "$d/log"
+case "$in" in *fail*) echo 'Error: Cannot find device "fail0"' >&2; exit 1;; esac

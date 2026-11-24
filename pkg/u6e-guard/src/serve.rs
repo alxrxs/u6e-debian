@@ -324,14 +324,6 @@ mod tests {
     use std::thread;
     use u6e_proto::msg::{EventKind, Guard};
 
-    /// A stand-in for tc that shows nothing and does nothing.
-    fn quiet_tc(dir: &TestDir) -> PathBuf {
-        let tc = dir.path().join("tc");
-        std::fs::write(&tc, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&tc, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-        tc
-    }
-
     /// A guard serving `dir/sock` with no ports, until `stop` is written to.
     fn start(dir: &TestDir, gid: u32) -> (UnixDatagram, thread::JoinHandle<io::Result<()>>) {
         let sock = dir.path().join("sock");
@@ -342,7 +334,7 @@ mod tests {
         let cfg = Config {
             gid,
             net,
-            tc: quiet_tc(dir),
+            tc: crate::testdir::fake_tc(dir.path(), ""),
             rescan: Duration::from_millis(50),
         };
         let run = thread::spawn(move || {

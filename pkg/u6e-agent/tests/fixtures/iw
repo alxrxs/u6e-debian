@@ -1,0 +1,6 @@
+#!/bin/sh
+# The helper tests' iw: it appends its arguments to the log named in iw.to
+# beside the link. Linked into the test's directory, never written by a
+# test: an executable a test wrote could still be open for writing in a
+# child another test thread forked (ETXTBSY).
+echo iw "$@" >> "$(cat "$(dirname "$0")/iw.to")"

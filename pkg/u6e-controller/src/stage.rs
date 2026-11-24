@@ -889,17 +889,7 @@ mod tests {
             .parse()
             .unwrap();
         // The stand-in: the partition is the image, starting at sector 2048.
-        let ssh = t.path().join("ssh");
-        fs::write(
-            &ssh,
-            format!(
-                "#!/bin/sh\ncase \"$1\" in *start) echo 2048 ;; \
-                 *) sh -c \"$(echo \"$1\" | sed 's#{PARTITION}#{}#')\" ;; esac\n",
-                img.display()
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&ssh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let ssh = link_fixture(t.path(), "partition-ssh", "ssh");
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../boot/ext4map.py");
         let py = Std::new("python3")
             .arg("-I")
@@ -937,51 +927,29 @@ mod tests {
         assert!(rt.block_on(map(&mut Image(vec![0; 4096]), 0, ino)).is_err());
     }
 
-    /// A stand-in for an AP's two systems over SSH, in `dir`: `state` says
-    /// which runs (`debian`, `stock`, or anything else for neither), the
-    /// other refuses the login; stock's payload directory, its RAM file and
-    /// its partition (an ext4 image whose file `ino` every `ls -i` names)
-    /// are files of `dir`. Every call is logged to `calls`.
+    /// The fixture `name` (tests/fixtures/stage) linked into `dir` as
+    /// `as_name`. Linked, never written: an executable a test wrote could
+    /// still be open for writing in a child another test thread forked, and
+    /// exec'ing it would fail (ETXTBSY).
+    fn link_fixture(dir: &Path, name: &str, as_name: &str) -> PathBuf {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/stage");
+        let link = dir.join(as_name);
+        std::os::unix::fs::symlink(fixture.join(name), &link).unwrap();
+        link
+    }
+
+    /// A stand-in for an AP's two systems over SSH, in `dir`
+    /// (tests/fixtures/stage/ap-ssh): `state` says which runs (`debian`,
+    /// `stock`, or anything else for neither), the other refuses the login;
+    /// stock's payload directory, its RAM file and its partition (an ext4
+    /// image whose file `ino` every `ls -i` names) are files of `dir`. Every
+    /// call is logged to `calls`.
     fn fake_ap(dir: &Path, ino: u64) -> (PathBuf, PathBuf) {
-        let ssh = dir.join("ssh");
-        let d = dir.display();
-        let script = format!(
-            r#"#!/bin/bash
-sys=${{FAKE_SYSTEM:-image}}
-while [ "$1" != -- ]; do shift; done; shift
-cmd=$2
-echo "$sys $1 $cmd" >> {d}/calls
-want=debian; [ "$sys" = stock ] && want=stock
-[ "$(cat {d}/state)" = "$want" ] || exit 255
-case $cmd in
-true) exit 0 ;;
-'/usr/local/sbin/u6e-arm disarm && systemctl reboot') echo stock > {d}/state; exit 255 ;;
-reboot) echo debian > {d}/state; exit 255 ;;
-'fw_setenv -s -') cat > {d}/env; exit 0 ;;
-'fw_printenv bootcmd_real') sed -n 's/^bootcmd_real /bootcmd_real=/p' {d}/env; exit 0 ;;
-'cat /sys/block/mmcblk0/mmcblk0p5/start') echo 2048; exit 0 ;;
-'ls -i '*) echo "{ino} ${{cmd#ls -i }}"; exit 0 ;;
-esac
-cmd=${{cmd//\/tmp\/log\/.u6e/{d}/stage}}
-cmd=${{cmd//\/tmp\/u6e-chunk/{d}/chunk}}
-cmd=${{cmd//\/dev\/mmcblk0p5/{d}/p5.img}}
-exec sh -c "$cmd"
-"#
-        );
-        fs::write(&ssh, script).unwrap();
-        let sshpass = dir.join("sshpass");
-        fs::write(
-            &sshpass,
-            format!(
-                "#!/bin/bash\n[ -e {d}/refuse ] && grep -qx stock {d}/state && exit 5\n\
-                 shift 2\nexec env FAKE_SYSTEM=stock \"$@\"\n"
-            ),
+        fs::write(dir.join("ino"), ino.to_string()).unwrap();
+        (
+            link_fixture(dir, "ap-ssh", "ssh"),
+            link_fixture(dir, "ap-sshpass", "sshpass"),
         )
-        .unwrap();
-        for p in [&ssh, &sshpass] {
-            fs::set_permissions(p, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-        }
-        (ssh, sshpass)
     }
 
     /// The staging's steps against the stand-in: from the image into stock,

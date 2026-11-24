@@ -1,0 +1,28 @@
+#!/bin/bash
+# stage.rs's stand-in for an AP's two systems over SSH: `state` beside the
+# link says which runs (debian, stock, or anything else for neither), the
+# other refuses the login; stock's payload directory, its RAM file and its
+# partition (an ext4 image whose file `ino` names, which every `ls -i`
+# answers) are files beside it, and every call is logged to `calls`.
+# Linked into the test's directory, never written by a test (ETXTBSY: see
+# partition-ssh).
+d=$(dirname "$0")
+sys=${FAKE_SYSTEM:-image}
+while [ "$1" != -- ]; do shift; done; shift
+cmd=$2
+echo "$sys $1 $cmd" >> "$d/calls"
+want=debian; [ "$sys" = stock ] && want=stock
+[ "$(cat "$d/state")" = "$want" ] || exit 255
+case $cmd in
+true) exit 0 ;;
+'/usr/local/sbin/u6e-arm disarm && systemctl reboot') echo stock > "$d/state"; exit 255 ;;
+reboot) echo debian > "$d/state"; exit 255 ;;
+'fw_setenv -s -') cat > "$d/env"; exit 0 ;;
+'fw_printenv bootcmd_real') sed -n 's/^bootcmd_real /bootcmd_real=/p' "$d/env"; exit 0 ;;
+'cat /sys/block/mmcblk0/mmcblk0p5/start') echo 2048; exit 0 ;;
+'ls -i '*) echo "$(cat "$d/ino") ${cmd#ls -i }"; exit 0 ;;
+esac
+cmd=${cmd//\/tmp\/log\/.u6e/$d/stage}
+cmd=${cmd//\/tmp\/u6e-chunk/$d/chunk}
+cmd=${cmd//\/dev\/mmcblk0p5/$d/p5.img}
+exec sh -c "$cmd"

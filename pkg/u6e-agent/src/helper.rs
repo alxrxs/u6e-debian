@@ -513,15 +513,15 @@ pub mod tests {
         ]
     }
 
-    /// An `iw` in `dir` that appends its arguments to `log`.
+    /// An `iw` in `dir` that appends its arguments to `log`
+    /// (tests/fixtures/iw). Linked, never written: an executable a test
+    /// wrote could still be open for writing in a child another test thread
+    /// forked, and exec'ing it would fail (ETXTBSY).
     pub fn iw(dir: &Path, log: &Path) -> String {
         let iw = dir.join("iw");
-        fs::write(
-            &iw,
-            format!("#!/bin/sh\necho iw \"$@\" >> {}\n", log.display()),
-        )
-        .unwrap();
-        fs::set_permissions(&iw, fs::Permissions::from_mode(0o755)).unwrap();
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/iw");
+        std::os::unix::fs::symlink(fixture, &iw).unwrap();
+        fs::write(dir.join("iw.to"), log.as_os_str().as_encoded_bytes()).unwrap();
         iw.display().to_string()
     }
 

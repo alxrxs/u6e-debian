@@ -1,0 +1,11 @@
+#!/bin/sh
+# stage.rs's extents test: stock's SSH as ext4map.py uses it, the partition
+# (stage.rs's PARTITION) being p5.img beside the link, starting at sector
+# 2048. Linked into the test's directory, never written by a test: an
+# executable a test wrote could still be open for writing in a child another
+# test thread forked (ETXTBSY).
+d=$(dirname "$0")
+case "$1" in
+*start) echo 2048 ;;
+*) sh -c "$(echo "$1" | sed "s#/dev/mmcblk0p5#$d/p5.img#")" ;;
+esac

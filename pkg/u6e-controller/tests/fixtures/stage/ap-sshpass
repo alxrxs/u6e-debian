@@ -1,0 +1,9 @@
+#!/bin/bash
+# stage.rs's sshpass beside ap-ssh: it refuses stock's password while
+# `refuse` exists beside the link, else runs the ssh it is given as stock's.
+# Linked into the test's directory, never written by a test (ETXTBSY: see
+# partition-ssh).
+d=$(dirname "$0")
+[ -e "$d/refuse" ] && grep -qx stock "$d/state" && exit 5
+shift 2
+exec env FAKE_SYSTEM=stock "$@"

@@ -595,29 +595,13 @@ mod tests {
         );
     }
 
-    /// A stand-in for tc that logs its arguments and stdin, prints `out`
-    /// for a `show` or `ls`, and fails a batch holding `fail`.
-    fn fake_tc(dir: &Path, out: &str) -> PathBuf {
-        let tc = dir.join("tc");
-        let log = dir.join("log");
-        let script = format!(
-            "#!/bin/sh\ncase \"$*\" in *show*|*ls*) printf '%s' '{out}'; exit 0;; esac\nin=$(cat)\n\
-             printf '%s\\n%s\\n--\\n' \"$*\" \"$in\" >> {}\n\
-             case \"$in\" in *fail*) echo 'Error: Cannot find device \"fail0\"' >&2; exit 1;; esac\n",
-            log.display()
-        );
-        std::fs::write(&tc, script).unwrap();
-        std::fs::set_permissions(&tc, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-        tc
-    }
-
     #[test]
     fn clear_removes_the_guards_qdiscs_and_actions_and_says_why_it_cannot() {
         let t = crate::testdir::TestDir::new();
         let shown = "qdisc ingress ffff: dev wlan5 parent ffff:fff1 ingress_block 64 ----------------\n\
                      qdisc ingress ffff: dev eth9 parent ffff:fff1 ----------------\n\
                      \t index 64001 ref 1 bind 0\n\tSent 0 bytes 0 pkt (dropped 0, overlimits 0)\n";
-        let tc = fake_tc(t.path(), shown);
+        let tc = crate::testdir::fake_tc(t.path(), shown);
         clear(&tc).unwrap();
         let log = std::fs::read_to_string(t.path().join("log")).unwrap();
         assert_eq!(
@@ -625,7 +609,7 @@ mod tests {
             "-batch -\nqdisc del dev wlan5 ingress\n--\n-batch -\nactions delete action gact index 64001\n--\n"
         );
         let failing = "qdisc ingress ffff: dev fail0 parent ffff:fff1 ingress_block 64\n";
-        let tc = fake_tc(t.path(), failing);
+        let tc = crate::testdir::fake_tc(t.path(), failing);
         let e = clear(&tc).unwrap_err();
         assert_eq!(e.to_string(), "tc: Error: Cannot find device \"fail0\"");
     }
@@ -633,7 +617,7 @@ mod tests {
     #[test]
     fn a_failed_batch_leaves_nothing_dropping() {
         let t = crate::testdir::TestDir::new();
-        let tc = fake_tc(t.path(), "");
+        let tc = crate::testdir::fake_tc(t.path(), "");
         let mut e = Enforcer::new(tc);
         let ports = [port("fail0", 10, 42, true)];
         assert!(e.sync(&ports, &[42], &[], &[]).is_err());
