@@ -543,6 +543,15 @@ mod tests {
                 score: 55,
             },
             Case {
+                what: "the plug at -78 dBm the reading its retries showed, 2 of 51 frames",
+                inputs: Inputs {
+                    retries: 2,
+                    ..client(-78, 49, 24_000, caps(RateMode::Ht, 1, 7, 20), 20, 0.135)
+                },
+                parts: [Some(10.0), Some(90.0), Some(100.0), Some(44.0), Some(100.0)],
+                score: 50,
+            },
+            Case {
                 what: "an idle speaker on 5 GHz",
                 inputs: client(-55, 3, 72_200, caps(RateMode::Ht, 1, 7, 20), 80, 0.021),
                 parts: [Some(100.0), None, Some(100.0), None, Some(100.0)],

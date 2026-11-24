@@ -323,6 +323,16 @@ mod tests {
         assert_eq!(caps(HE, 0x23, Band::B6), sc(He, 2, 11, 160));
         // The same phone on 2.4 GHz: HE without 40 MHz there.
         assert_eq!(caps(HE, 0x23, Band::B24), sc(He, 2, 11, 20));
+        // Of 80 MHz only (bit 2 of the PHY's first byte, not bit 3), and of
+        // 20 MHz only.
+        let phy0 = |b: &str| {
+            HE.replace(
+                "he_capab=0174889845884c",
+                &format!("he_capab=017488984588{b}"),
+            )
+        };
+        assert_eq!(caps(&phy0("44"), 0x23, Band::B5), sc(He, 2, 11, 80));
+        assert_eq!(caps(&phy0("40"), 0x23, Band::B6), sc(He, 2, 11, 20));
         assert_eq!(caps(VHT, 0x24, Band::B5), sc(Vht, 1, 9, 80));
         let two = VHT.replace("rx_vht_mcs_map=fffe", "rx_vht_mcs_map=fffa");
         assert_eq!(caps(&two, 0x24, Band::B5), sc(Vht, 2, 9, 80));

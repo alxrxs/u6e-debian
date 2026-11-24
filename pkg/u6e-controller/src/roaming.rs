@@ -1460,6 +1460,40 @@ mod tests {
         }
     }
 
+    /// A client's answer is its query's within 5 s of it; one later is an
+    /// answer to a request of the AP's own, and the query stays unanswered.
+    #[test]
+    fn a_query_is_answered_within_five_seconds() {
+        let mut site = Site::new();
+        for (last, after, answered) in [(1, 5000, true), (2, 5001, false)] {
+            let query = EventKind::BtmQuery {
+                mac: mac(last),
+                bss: 0,
+                reason: 16,
+            };
+            let answer = EventKind::BtmResponse {
+                mac: mac(last),
+                bss: 0,
+                status: 7,
+                target: None,
+            };
+            site.event("ap1", T0, query);
+            site.event("ap1", T0 + after, answer);
+            let mine: Vec<(Origin, Option<u8>)> = site
+                .r
+                .steers()
+                .filter(|s| s.mac == mac(last))
+                .map(|s| (s.origin.clone(), s.status))
+                .collect();
+            let want = if answered {
+                vec![(Origin::Query, Some(7))]
+            } else {
+                vec![(Origin::Query, None), (Origin::Ap, Some(7))]
+            };
+            assert_eq!(mine, want, "{last}");
+        }
+    }
+
     /// An EAP exchange at the new AP is the roam's only within it: one
     /// started before the old AP last heard the client (beyond the 5 s
     /// before the new AP authorized it) or well after is another sign-in's.
