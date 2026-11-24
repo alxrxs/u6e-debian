@@ -52,21 +52,22 @@ function table(cls, columns, list) {
     h('tbody', {}, list.map((x) => h('tr', {}, columns.map(([, k, cell]) => h('td', { class: k || null }, cell(x)))))));
 }
 
-/** The roams (newest first); the client column unless `client` is false. */
+/** The roams (newest first); the client column unless `client` is false.
+ * What came of each comes right after where it went, so a narrow screen
+ * that scrolls the table never hides it. */
 export function roamsTable(store, list, { client = true } = {}) {
   const attempt = (r) => r.gap_ms === undefined;
   return table('roams', [
     ['Time', '', (r) => when(r.at)],
     client ? ['Client', '', (r) => who(store, r)] : null,
-    ['From', '', (r) => place(r.from)],
-    ['To', '', (r) => place(r.to)],
+    ['Roam', '', (r) => [...place(r.from), ' → ', ...place(r.to)]],
+    ['Result', '', (r) => (r.failure
+      ? h('span', { class: 'chip bad' }, attempt(r) ? `tried: ${ROAM_FAILURES[r.failure]}` : ROAM_FAILURES[r.failure])
+      : h('span', { class: 'chip ok' }, 'roamed'))],
     ['Signed in by', 'p2', (r) => (attempt(r) ? '–' : ROAM_KINDS[r.kind || 'unknown'])],
     ['Between APs', 'num', gapText],
     ['Signal', 'p2', (r) => [signal(r.before), ' → ', signal(r.after)]],
     ['Steered by', 'p3 wrap', (r) => (r.steered ? asker(r.steered) : '–')],
-    ['Result', '', (r) => (r.failure
-      ? h('span', { class: 'chip bad' }, attempt(r) ? `tried: ${ROAM_FAILURES[r.failure]}` : ROAM_FAILURES[r.failure])
-      : h('span', { class: 'chip ok' }, 'roamed'))],
   ].filter(Boolean), list);
 }
 
