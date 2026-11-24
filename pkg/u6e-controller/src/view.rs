@@ -57,9 +57,10 @@ use crate::timeline::{EapStep, End, Entry, Place, What};
 /// blocked, as one object, with their flows when `flows` and the captures
 /// for an `admin` (who captured whom is no one else's).
 pub fn view(state: &State, wanted: impl Fn(&str) -> bool, flows: bool, admin: bool) -> Value {
+    let site = experience::site(state, unix_ms(SystemTime::now()));
     let mut v = json!({
-        "aps": aps(state, &wanted),
-        "clients": clients(state, &wanted),
+        "aps": aps_of(state, &site, &wanted),
+        "clients": clients_of(state, &site, &wanted),
         "blocked": blocked(state),
         "config": config(state),
         "manage": manage(state),
@@ -302,7 +303,15 @@ pub fn action(a: &Action, admin: bool) -> Value {
 
 /// Every wanted AP by name.
 pub fn aps(state: &State, wanted: impl Fn(&str) -> bool) -> Value {
-    let site = experience::site(state, unix_ms(SystemTime::now()));
+    aps_of(
+        state,
+        &experience::site(state, unix_ms(SystemTime::now())),
+        wanted,
+    )
+}
+
+/// Every wanted AP by name, with its experience as `site` has it.
+fn aps_of(state: &State, site: &experience::Site, wanted: impl Fn(&str) -> bool) -> Value {
     let aps = state
         .aps()
         .filter(|(name, _)| wanted(name))
@@ -318,7 +327,16 @@ pub fn aps(state: &State, wanted: impl Fn(&str) -> bool) -> Value {
 
 /// Every client of a wanted AP by MAC.
 pub fn clients(state: &State, wanted: impl Fn(&str) -> bool) -> Value {
-    let site = experience::site(state, unix_ms(SystemTime::now()));
+    clients_of(
+        state,
+        &experience::site(state, unix_ms(SystemTime::now())),
+        wanted,
+    )
+}
+
+/// Every client of a wanted AP by MAC, with its experience as `site` has
+/// it.
+fn clients_of(state: &State, site: &experience::Site, wanted: impl Fn(&str) -> bool) -> Value {
     let clients = state.clients();
     let clients = clients.iter().filter(|c| wanted(&c.ap)).map(|c| {
         let mut v = client_view(state, c);

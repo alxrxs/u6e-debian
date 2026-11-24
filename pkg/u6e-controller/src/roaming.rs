@@ -396,6 +396,25 @@ impl Client {
         step
     }
 
+    /// Whether its last reading is recent enough for its state to stand.
+    fn fresh(&self, now_ms: u64) -> bool {
+        self.at
+            .as_ref()
+            .is_some_and(|a| a.3 + 2 * STEP_MS >= now_ms)
+    }
+
+    /// Where it is sticky now, while its last reading is fresh.
+    fn sticky_now(&self, now_ms: u64) -> Option<StickyNow> {
+        let (ap, band, signal, _) = self.at.as_ref().filter(|_| self.fresh(now_ms))?;
+        Some(StickyNow {
+            ap: ap.clone(),
+            band: *band,
+            signal: *signal,
+            since_ms: self.sticky_since?,
+            view: self.view.clone()?,
+        })
+    }
+
     fn sticky_in(&self, from_ms: u64) -> u64 {
         let b = self
             .buckets
@@ -403,6 +422,14 @@ impl Client {
             .filter(|(b, _)| b * BUCKET_MS + BUCKET_MS > from_ms);
         b.map(|(_, ms)| ms).sum()
     }
+}
+
+/// A client's roams over the last day, as [`Facts`] counts them.
+#[derive(Debug, Clone, Copy, Default)]
+struct Tally {
+    roams: usize,
+    failed: usize,
+    failed_hour: u32,
 }
 
 /// What the metrics count, since the controller started.
@@ -921,50 +948,70 @@ impl Roaming {
 
     /// What `roaming` says of `mac` at `now_ms`.
     pub fn facts(&self, mac: &[u8; 6], now_ms: u64) -> Facts {
-        let day = now_ms.saturating_sub(DAY_MS);
-        let hour = now_ms.saturating_sub(HOUR_MS);
-        let mine = || {
-            self.roams
-                .iter()
-                .rev()
-                .take_while(move |r| r.at_ms >= day)
-                .filter(|r| r.mac == *mac)
-        };
-        let c = self.clients.get(mac);
-        // Sticky now only while its last reading is fresh.
-        let fresh = c
-            .and_then(|c| c.at.as_ref())
-            .filter(|a| a.3 + 2 * STEP_MS >= now_ms);
-        let sticky = fresh.zip(c).and_then(|((ap, band, signal, _), c)| {
-            Some(StickyNow {
-                ap: ap.clone(),
-                band: *band,
-                signal: *signal,
-                since_ms: c.sticky_since?,
-                view: c.view.clone()?,
-            })
+        let tally = self.tallies(now_ms, Some(mac)).remove(mac);
+        self.facts_of(mac, now_ms, tally.unwrap_or_default())
+    }
+
+    /// What `roaming` says of every client of `macs` at `now_ms`, the roams
+    /// gone through once for them all.
+    pub fn all_facts<'a>(
+        &self,
+        macs: impl IntoIterator<Item = &'a [u8; 6]>,
+        now_ms: u64,
+    ) -> HashMap<[u8; 6], Facts> {
+        let mut tallies = self.tallies(now_ms, None);
+        let facts = macs.into_iter().map(|m| {
+            let tally = tallies.remove(m).unwrap_or_default();
+            (*m, self.facts_of(m, now_ms, tally))
         });
+        facts.collect()
+    }
+
+    /// Each client's roams over the last day, of `only` when given: those
+    /// that got on, those that failed, and those that failed in the last
+    /// hour.
+    fn tallies(&self, now_ms: u64, only: Option<&[u8; 6]>) -> HashMap<[u8; 6], Tally> {
+        let (day, hour) = (
+            now_ms.saturating_sub(DAY_MS),
+            now_ms.saturating_sub(HOUR_MS),
+        );
+        let mut out: HashMap<[u8; 6], Tally> = HashMap::new();
+        let recent = self.roams.iter().rev().take_while(|r| r.at_ms >= day);
+        for r in recent.filter(|r| only.is_none_or(|m| *m == r.mac)) {
+            let t = out.entry(r.mac).or_default();
+            t.roams += usize::from(r.session != 0);
+            if r.failure.is_some() {
+                t.failed += 1;
+                t.failed_hour += u32::from(r.at_ms >= hour);
+            }
+        }
+        out
+    }
+
+    fn facts_of(&self, mac: &[u8; 6], now_ms: u64, t: Tally) -> Facts {
+        let (day, hour) = (
+            now_ms.saturating_sub(DAY_MS),
+            now_ms.saturating_sub(HOUR_MS),
+        );
+        let c = self.clients.get(mac);
         Facts {
-            roams: mine().filter(|r| r.session != 0).count(),
-            failed: mine().filter(|r| r.failure.is_some()).count(),
+            roams: t.roams,
+            failed: t.failed,
             sticky_ms: c.map_or(0, |c| c.sticky_in(day)),
             sticky_share: c.map_or(0.0, |c| {
                 (c.sticky_in(hour) as f64 / HOUR_MS as f64).min(1.0)
             }),
-            failed_hour: mine()
-                .filter(|r| r.at_ms >= hour && r.failure.is_some())
-                .count() as u32,
-            sticky,
-            view: fresh.and(c).and_then(|c| c.view.clone()),
+            failed_hour: t.failed_hour,
+            sticky: c.and_then(|c| c.sticky_now(now_ms)),
+            view: c.filter(|c| c.fresh(now_ms)).and_then(|c| c.view.clone()),
         }
     }
 
     /// The clients sticky now.
     pub fn sticky(&self, now_ms: u64) -> Vec<([u8; 6], StickyNow)> {
-        let mut out: Vec<_> = self
-            .clients
-            .keys()
-            .filter_map(|m| Some((*m, self.facts(m, now_ms).sticky?)))
+        let all = self.clients.iter();
+        let mut out: Vec<_> = all
+            .filter_map(|(m, c)| Some((*m, c.sticky_now(now_ms)?)))
             .collect();
         out.sort_by_key(|(m, s)| (s.since_ms, *m));
         out
@@ -1551,6 +1598,34 @@ mod tests {
         assert_eq!(site.r.counts.failures.get("ap2"), Some(&1));
         let f = site.r.facts(&mac(1), T0 + 80 * S);
         assert_eq!((f.roams, f.failed, f.failed_hour), (1, 1, 1));
+    }
+
+    /// Every client's facts at once are each one's alone, the roams gone
+    /// through once.
+    #[test]
+    fn all_facts_are_each_clients_facts() {
+        let mut site = Site::new();
+        on_ap1(&mut site, 1, -70);
+        on_ap1(&mut site, 2, -70);
+        site.event("ap2", T0 + 3 * S, assoc(1, 0));
+        site.event(
+            "ap2",
+            T0 + 5 * S,
+            EventKind::EapFail {
+                mac: mac(2),
+                bss: 0,
+            },
+        );
+        site.event("ap2", T0 + 8 * S, disassoc(1, 0));
+        site.snap("ap2", T0 + 40 * S, &[]);
+        let now = T0 + 41 * S;
+        let macs = [mac(1), mac(2), mac(3)];
+        let all = site.r.all_facts(&macs, now);
+        for m in &macs {
+            assert_eq!(all[m], site.r.facts(m, now), "{m:?}");
+        }
+        assert_eq!((all[&mac(1)].roams, all[&mac(1)].failed), (1, 1));
+        assert_eq!((all[&mac(2)].roams, all[&mac(2)].failed_hour), (0, 1));
     }
 
     /// A sign-in that fails on another AP or band while the client is on

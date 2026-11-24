@@ -30,6 +30,7 @@ use std::collections::BTreeMap;
 use serde_json::{Map, Value, json};
 use u6e_proto::msg::{RateMode, Snapshot, Station, StationCaps};
 
+use crate::roaming::Facts;
 use crate::state::{ClientView, State};
 
 /// The parts, in the order they are shown.
@@ -213,8 +214,11 @@ const WEAKEST: usize = 3;
 pub fn site(state: &State, now_ms: u64) -> Site {
     let mut site = Site::default();
     let mut by_ap: BTreeMap<String, Vec<([u8; 6], Experience)>> = BTreeMap::new();
-    for c in state.clients() {
-        let Some(i) = inputs(state, &c, now_ms) else {
+    let clients = state.clients();
+    let macs = clients.iter().map(|c| &c.station.mac);
+    let facts = state.roaming.all_facts(macs, now_ms);
+    for c in clients {
+        let Some(i) = inputs(state, &c, facts.get(&c.station.mac)) else {
             continue;
         };
         let parts = parts(&i);
@@ -260,7 +264,7 @@ pub fn site(state: &State, now_ms: u64) -> Site {
 /// What a client's parts come from: its station in its AP's last two
 /// snapshots, its radio's survey between them, what it supports, and what
 /// `roaming` says of it.
-fn inputs(state: &State, c: &ClientView, now_ms: u64) -> Option<Inputs> {
+fn inputs(state: &State, c: &ClientView, facts: Option<&Facts>) -> Option<Inputs> {
     let ap = state.ap(&c.ap)?;
     let snap = ap.snapshot.as_ref()?;
     let st = &c.station;
@@ -279,7 +283,6 @@ fn inputs(state: &State, c: &ClientView, now_ms: u64) -> Option<Inputs> {
         Some((busy.saturating_sub(own) as f64 / active as f64).min(1.0))
     });
     let caps = snap.caps.binary_search_by_key(&st.mac, |(m, _)| *m);
-    let facts = state.roaming.facts(&st.mac, now_ms);
     Some(Inputs {
         signal: if st.signal_avg != 0 {
             st.signal_avg
@@ -292,8 +295,8 @@ fn inputs(state: &State, c: &ClientView, now_ms: u64) -> Option<Inputs> {
         caps: caps.ok().map(|i| snap.caps[i].1),
         radio_width_mhz: radio.width_mhz,
         contention,
-        sticky: facts.sticky_share,
-        failed_roams: facts.failed_hour,
+        sticky: facts.map_or(0.0, |f| f.sticky_share),
+        failed_roams: facts.map_or(0, |f| f.failed_hour),
     })
 }
 
