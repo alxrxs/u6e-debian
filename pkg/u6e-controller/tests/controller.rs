@@ -5584,12 +5584,12 @@ fn a_client_speed_test_is_timed_both_ways_and_attributed_by_its_address() {
         r.c.http,
         &format!("/api/speedtest/{id}/done"),
         &page,
-        r#"{"down_bytes": 9999999, "down_ms": 100}"#,
+        r#"{"down_bytes": 9999999, "down_ms": 2000}"#,
     );
     assert_eq!(status, 200, "{done}");
     assert_eq!(done["status"], "done");
     assert_eq!(done["down"]["bytes"], 3 << 20);
-    assert_eq!(done["down"]["ms"], 100);
+    assert_eq!(done["down"]["ms"], 2000);
     assert_eq!(done["up"]["bytes"], 2 << 20);
     assert!(done.get("moved").is_none(), "{done}");
     let events = json_get(r.c.http, "/api/events");
@@ -5605,7 +5605,7 @@ fn a_client_speed_test_is_timed_both_ways_and_attributed_by_its_address() {
     );
     let detail = ev["detail"].as_str().unwrap();
     assert!(
-        detail.starts_with("download 252 Mbit/s, upload "),
+        detail.starts_with("download 12.6 Mbit/s, upload "),
         "{detail}"
     );
     assert!(
@@ -5623,7 +5623,7 @@ fn a_client_speed_test_is_timed_both_ways_and_attributed_by_its_address() {
     let body = http_get(r.c.metrics, "/metrics");
     for line in [
         "wifi_speedtests_total{kind=\"client\",result=\"ok\"} 1",
-        "wifi_client_speedtest_bytes_per_second{ap=\"ap1\",band=\"5\",direction=\"down\"} 31457280",
+        "wifi_client_speedtest_bytes_per_second{ap=\"ap1\",band=\"5\",direction=\"down\"} 1572864",
     ] {
         assert!(body.lines().any(|l| l == line), "missing {line}\n{body}");
     }

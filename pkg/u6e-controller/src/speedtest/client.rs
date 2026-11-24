@@ -8,7 +8,9 @@
 //!   GET  /api/speedtest               the user's own tests, newest first
 //!
 //! The download is timed by the browser, which says what it received and in
-//! how long (its bytes held to what was sent); the upload by the controller,
+//! how long, its bytes held to what was sent and its time to no less than
+//! the sending took (an engine may hand the page the body only once it is
+//! all in); the upload by the controller,
 //! from the first body's request to the end of the last, bodies taken while
 //! the upload's time runs, from the first. The client is the associated
 //! client one of whose addresses (leased, or seen in its flows) is the
@@ -588,10 +590,10 @@ pub async fn done(
     let Some(t) = state.speedtests.client_test(&id, &who) else {
         return error(StatusCode::NOT_FOUND, "no such test");
     };
-    let sent = t.sent.map_or(0, |s| s.bytes);
+    let (sent, sent_us) = t.sent.map_or((0, 0), |s| (s.bytes, s.us));
     t.down = Some(Measured {
         bytes: b.down_bytes.min(sent),
-        us: b.down_ms.max(1) * 1000,
+        us: (b.down_ms.max(1) * 1000).max(sent_us),
     });
     let span = t.up_first.zip(t.up_last).map(|(a, z)| z - a);
     t.up = Some(Measured {
