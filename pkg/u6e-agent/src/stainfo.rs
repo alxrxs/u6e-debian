@@ -99,7 +99,11 @@ fn caps<'a>(get: impl Fn(&str) -> Option<&'a str>, band: Band) -> Option<Station
     let vht = || {
         let (nss, code) = streams(u16::from_str_radix(get("rx_vht_mcs_map")?, 16).ok()?)?;
         let info = u32::from_str_radix(get("vht_caps_info")?.strip_prefix("0x")?, 16).ok()?;
-        // Its supported channel width set: 0 is up to 80 MHz.
+        // Its supported channel width set: 0 is up to 80 MHz. Extended NSS
+        // BW support (bits 30-31) is not read: it gives such a client 160 MHz
+        // with only a half or three quarters of its streams, which is never
+        // faster than 80 MHz with all of them for a client of fewer than
+        // four, and the best rate is all the width is for.
         let width_mhz = if info >> 2 & 3 == 0 { 80 } else { 160 };
         Some(StationCaps {
             mode: RateMode::Vht,
@@ -338,6 +342,9 @@ mod tests {
         assert_eq!(caps(&two, 0x24, Band::B5), sc(Vht, 2, 9, 80));
         let wide = VHT.replace("vht_caps_info=0x33907120", "vht_caps_info=0x33907124");
         assert_eq!(caps(&wide, 0x24, Band::B5), sc(Vht, 1, 9, 160));
+        // Extended NSS BW support on a width set of 80 MHz stays 80.
+        let ext = VHT.replace("vht_caps_info=0x33907120", "vht_caps_info=0xf3907120");
+        assert_eq!(caps(&ext, 0x24, Band::B5), sc(Vht, 1, 9, 80));
         assert_eq!(caps(PSK, 0x21, Band::B24), sc(Ht, 1, 7, 40));
         let narrow = PSK.replace("ht_caps_info=0x116e", "ht_caps_info=0x116c");
         assert_eq!(caps(&narrow, 0x21, Band::B24), sc(Ht, 1, 7, 20));
