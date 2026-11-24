@@ -25,11 +25,12 @@ use crate::config::{config_sha256, payload};
 use crate::mac::hex;
 use crate::msg::{
     AgentMsg, Band, Binding, Bss, CaptureChunk, CaptureFilter, CaptureMechanism, CaptureRequest,
-    CaptureState, ClientFlows, Command, CommandKind, CommandResult, ConfigApplied, CtlMsg, Event,
-    EventKind, FieldDelta, FilterProto, Flow, Flows, Guard, GuardConfig, Hello, Limit, LimitState,
-    LimitStatus, LimitTarget, MdnsDevice, MdnsKey, MdnsOffer, MdnsQuery, Mechanism, PowerLimit,
-    Radio, RadioApplied, RadioConfig, Rate, RateMode, RecDelta, Services, SignedConfig, Snapshot,
-    SnapshotDelta, SpectrumFrame, Station, StationAuth, StationCaps, Temp, Violation, Withdrawn,
+    CaptureState, ClientFlows, Command, CommandKind, CommandResult, ConfigApplied, CpuUse, CtlMsg,
+    Event, EventKind, FieldDelta, FilterProto, Flow, Flows, Guard, GuardConfig, Hello, Limit,
+    LimitState, LimitStatus, LimitTarget, MdnsDevice, MdnsKey, MdnsOffer, MdnsQuery, Mechanism,
+    PowerLimit, Radio, RadioApplied, RadioConfig, Rate, RateMode, RecDelta, Services, SignedConfig,
+    Snapshot, SnapshotDelta, SpectrumFrame, SpeedTestReport, Station, StationAuth, StationCaps,
+    Temp, Violation, Withdrawn,
 };
 
 const HOW: &str = "bump u6e_proto::PROTOCOL (pkg/u6e-proto/src/version.rs) and write the \
@@ -436,6 +437,23 @@ fn samples() -> Samples {
         agent.push((name, AgentMsg::Capture(state)));
     }
     agent.push(("Services", AgentMsg::Services(services())));
+    agent.push(("SpeedTestOpen", AgentMsg::SpeedTestOpen { id: 1 << 42 }));
+    agent.push((
+        "SpeedTestReport",
+        AgentMsg::SpeedTestReport(SpeedTestReport {
+            id: 1 << 42,
+            down_bytes: (1 << 33) + 3,
+            down_us: (1 << 34) + 4,
+            cpu_down: CpuUse {
+                busy_permille: 60_016,
+                thread_permille: 60_017,
+            },
+            cpu_up: CpuUse {
+                busy_permille: 1000,
+                thread_permille: 200,
+            },
+        }),
+    ));
     let mut ctl = vec![
         ("SetTick", CtlMsg::SetTick { secs: 300 }),
         ("WantKey", CtlMsg::WantKey),
@@ -497,6 +515,13 @@ fn samples() -> Samples {
                         },
                     },
                 ],
+            },
+        ),
+        (
+            "SpeedTest",
+            CommandKind::SpeedTest {
+                secs: 200,
+                max_bytes: (1 << 33) + 5,
             },
         ),
     ];

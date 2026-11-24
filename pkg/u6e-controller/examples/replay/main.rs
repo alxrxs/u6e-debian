@@ -882,6 +882,9 @@ impl World {
             CommandKind::SyncLimits { limits } => {
                 return Some((true, format!("{} limits", limits.len())));
             }
+            CommandKind::SpeedTest { .. } => {
+                return Some((false, "speed tests are not simulated".into()));
+            }
         };
         let i = self.clients.iter().position(|c| World::mac(c.last) == mac);
         let here = i.and_then(|i| {
@@ -911,7 +914,8 @@ impl World {
             CommandKind::SyncBlocks { .. }
             | CommandKind::ChannelSwitch { .. }
             | CommandKind::TxPower { .. }
-            | CommandKind::SyncLimits { .. } => unreachable!("answered above"),
+            | CommandKind::SyncLimits { .. }
+            | CommandKind::SpeedTest { .. } => unreachable!("answered above"),
             _ if here.is_none() => Some((false, "not associated here".into())),
             CommandKind::Kick { .. } if mac[5] == SILENT => None,
             CommandKind::Kick { .. } => {

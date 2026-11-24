@@ -58,6 +58,16 @@ pub enum AgentMsg {
     /// session and after the guards restarted, then what changed, at most
     /// every tick.
     Services(Services),
+    /// The first message of a speed test's own connection, in place of a
+    /// Hello: the test the controller asked for by the command `id`
+    /// ([`CommandKind::SpeedTest`]). Its chunks follow
+    /// ([`crate::speedtest`]).
+    SpeedTestOpen {
+        id: u64,
+    },
+    /// The last message of a speed test's connection: what the agent
+    /// measured.
+    SpeedTestReport(SpeedTestReport),
 }
 
 /// Everything the controller sends.
@@ -703,6 +713,42 @@ pub enum CommandKind {
     SyncLimits {
         limits: Vec<Limit>,
     },
+    /// Measure the AP's throughput to the controller over a connection of
+    /// its own ([`AgentMsg::SpeedTestOpen`]): take the controller's
+    /// download, then send for `secs` or `max_bytes`, each direction held to
+    /// [`crate::speedtest::bounds`], and report. Answered at once: started,
+    /// or refused while another runs.
+    SpeedTest {
+        secs: u8,
+        max_bytes: u64,
+    },
+}
+
+/// What the agent measured of a speed test.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpeedTestReport {
+    pub id: u64,
+    /// The download's filler bytes, and the microseconds from its first
+    /// byte to its end.
+    pub down_bytes: u64,
+    pub down_us: u64,
+    /// The AP's CPU while it received and while it sent.
+    pub cpu_down: CpuUse,
+    pub cpu_up: CpuUse,
+}
+
+/// The AP's CPU over one direction of a speed test, in thousandths.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CpuUse {
+    /// Of all its cores' time, the busy part (neither idle nor waiting for
+    /// I/O).
+    pub busy_permille: u16,
+    /// Of one core's time, the test's own thread's.
+    pub thread_permille: u16,
 }
 
 /// What came of a [`Command`].

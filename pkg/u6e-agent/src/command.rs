@@ -148,6 +148,7 @@ impl Commands {
             CommandKind::TxPower { radio, dbm } => self.radios.power(radio, dbm),
             // The link's session carries a sync out, with the shaper (`limits`).
             CommandKind::SyncLimits { .. } => Err("rate limits are the link's to sync".into()),
+            CommandKind::SpeedTest { .. } => Err("speed tests are the link's to run".into()),
             CommandKind::Steer {
                 mac,
                 target_bssid,

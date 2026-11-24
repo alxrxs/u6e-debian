@@ -270,6 +270,7 @@ pub fn action_name(kind: &CommandKind) -> &'static str {
         CommandKind::ChannelSwitch { .. } => "channel",
         CommandKind::TxPower { .. } => "power",
         CommandKind::SyncLimits { .. } => "limits",
+        CommandKind::SpeedTest { .. } => "speedtest",
     }
 }
 
