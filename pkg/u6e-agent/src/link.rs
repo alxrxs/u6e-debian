@@ -13,8 +13,9 @@
 //! the next (see `apply`), the client guards' mode and the leases they are
 //! seeded with, whose bindings, violations and mDNS table leave each tick
 //! (see `guards`), the rate limits, kept across sessions and synced with the AP
-//! each tick (see `limits`), and a client's capture, whose chunks leave as
-//! the controller acknowledges them (see `capture`); a silent or broken
+//! each tick (see `limits`), a client's capture, whose chunks leave as
+//! the controller acknowledges them (see `capture`), and a speed test, which
+//! runs over a connection of its own (see `speedtest`); a silent or broken
 //! connection is dropped, its scans and its capture with it, and dialed
 //! again. The wait before a redial
 //! doubles from 1 s to 30 s until a session is useful (the controller said
@@ -56,6 +57,7 @@ use crate::capture::Captures;
 use crate::guards::Guards;
 use crate::limits::{self, Limits};
 use crate::spectrum::{self, Spectrum};
+use crate::speedtest::{self, SpeedTests};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Longest the handshake or the controller's version frame may take, or a
@@ -133,11 +135,12 @@ impl Config {
     }
 }
 
-/// What the agent holds across sessions: the client guards' place and the
-/// rate limits the controller gave.
+/// What the agent holds across sessions: the client guards' place, the
+/// rate limits the controller gave and the speed test that may run.
 pub struct Held {
     pub guards: Guards,
     pub limits: Limits,
+    pub speedtests: SpeedTests,
 }
 
 /// What reads the flows: called with the seq of the message, the stations
@@ -198,6 +201,11 @@ fn run_with(
     let mut held = Held {
         guards: Guards::new(cfg.guards.clone(), cfg.guards_cursor.clone()),
         limits: Limits::new(cfg.shaper.clone(), cfg.net.clone()),
+        speedtests: SpeedTests::new(
+            cfg.controller.clone(),
+            Arc::clone(&client),
+            speedtest::PROC.into(),
+        ),
     };
     let mut ring = None;
     let mut backoff = *cfg.backoff.start();
@@ -755,6 +763,13 @@ impl Session {
                     self.send_msg(&m)?;
                 }
                 held.limits.wrote();
+            }
+            CtlMsg::Command(Command {
+                id,
+                kind: CommandKind::SpeedTest { secs, max_bytes },
+            }) => {
+                let result = held.speedtests.start(id, secs, max_bytes);
+                self.send_msg(&AgentMsg::Result(result))?;
             }
             CtlMsg::Command(c) => {
                 let result = command(&c, self.prev.as_ref());
@@ -1569,6 +1584,35 @@ mod tests {
         };
         assert_eq!(p.recv(), AgentMsg::Result(done));
         assert_eq!(p.recv(), AgentMsg::Pong(2));
+    }
+
+    /// A speed test is answered at once, its bounds held, and then dialed as
+    /// a connection of its own that opens with the test's id; the session
+    /// goes on meanwhile.
+    #[test]
+    fn a_speed_test_is_answered_at_once_and_dialed_apart() {
+        let fake = Fake::new();
+        let _agent = Agent::spawn(&fake, blank);
+        let mut p = fake.accept();
+        p.start();
+        p.send(CtlMsg::Command(Command {
+            id: 11,
+            kind: CommandKind::SpeedTest {
+                secs: 60,
+                max_bytes: u64::MAX,
+            },
+        }));
+        let started = CommandResult {
+            id: 11,
+            ok: true,
+            detail: "started: 10 s and 2048 MiB each way at most".into(),
+        };
+        assert_eq!(p.recv(), AgentMsg::Result(started));
+        let (mut test, _) = fake.accept_tls();
+        assert_eq!(test.agree(PROTOCOL), PROTOCOL);
+        assert_eq!(test.recv(), AgentMsg::SpeedTestOpen { id: 11 });
+        p.send(CtlMsg::Ping(3));
+        assert_eq!(p.recv(), AgentMsg::Pong(3));
     }
 
     /// A configuration is applied away from the link, which goes on (a ping

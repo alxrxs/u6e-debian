@@ -15,11 +15,12 @@
 //! With the three controller options it also streams telemetry to the
 //! controller, carries out its commands and forwards the spectrum scans it
 //! asks for, which u6e-spectral runs, puts its rate limits on the NSS
-//! through u6e-shaper and forwards the client captures it asks for, which
-//! u6e-capture runs (see `limits` and `capture`); with the public half of the
-//! controller's configuration key too, it applies the Wi-Fi configurations
-//! the controller signs with it (see `link`, `command`, `spectrum` and
-//! `apply`).
+//! through u6e-shaper, forwards the client captures it asks for, which
+//! u6e-capture runs (see `limits` and `capture`), and runs the speed tests
+//! it asks for over a connection of their own (see `speedtest`); with the
+//! public half of the controller's configuration key too, it applies the
+//! Wi-Fi configurations the controller signs with it (see `link`,
+//! `command`, `spectrum` and `apply`).
 //! `--print-flows` prints the flows the link would send now, and what
 //! reading them cost. `--config-helper` is the root helper that classifies
 //! and installs those configurations for the agent, one request on the
@@ -46,6 +47,7 @@ mod passed;
 mod rates;
 mod regdomain;
 mod spectrum;
+mod speedtest;
 mod stainfo;
 mod stats;
 #[cfg(test)]
