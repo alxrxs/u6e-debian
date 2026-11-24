@@ -40,7 +40,7 @@ use u6e_proto::msg::{
     AgentMsg, Band, Binding, Bss, ClientFlows, CommandKind, CommandResult, ConfigApplied, CtlMsg,
     Event, EventKind, FieldDelta, Flow, Flows, Guard, GuardConfig, Hello, MdnsDevice, MdnsOffer,
     MdnsQuery, Mechanism, Radio, RadioApplied, RadioConfig, RateMode, Services, SignedConfig,
-    Snapshot, SnapshotDelta, SpectrumFrame, Station, Temp, Violation,
+    Snapshot, SnapshotDelta, SpectrumFrame, Station, StationCaps, Temp, Violation,
 };
 use u6e_proto::tls::{self, Identity};
 use u6e_proto::{mac, version};
@@ -5103,4 +5103,113 @@ fn a_clients_destinations_are_named_once_a_page_shows_them() {
         traffic()["top"][0]["name"] == "one.example.org"
     });
     assert!(r.dns.asked.lock().unwrap().contains(&far));
+}
+
+/// A client's experience is in the state; its steer, roam and their
+/// outcome reach `/api/roaming` and the metrics, every kind and answer of
+/// every AP exported.
+#[test]
+fn roams_steering_and_experience_reach_the_api_and_the_metrics() {
+    let r = controller(Timing::default());
+    let mut ap1 = Agent::hello(r.c.agents, KEY_AP1, "ap1");
+    let mut ap2 = Agent::hello(r.c.agents, KEY_AP2, "ap2");
+    let he = StationCaps {
+        mode: RateMode::He,
+        nss: 2,
+        mcs: 11,
+        width_mhz: 160,
+    };
+    let now = || {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    };
+    let mut s = snapshot(1, vec![bss("wlan5", "Guest")], vec![station(MAC, 0, -74)]);
+    s.caps = vec![(MAC, he)];
+    ap1.send(&AgentMsg::Key(s.clone())).unwrap();
+    // A tick on: frames sent, the radio busier.
+    s.seq = 2;
+    s.stations[0].tx_packets += 2000;
+    s.stations[0].tx_rate_kbps = 648_500;
+    let radio = &mut s.radios[0];
+    (radio.active_ms, radio.busy_ms, radio.tx_ms) = (12_000, 2600, 550);
+    ap1.send(&AgentMsg::Key(s)).unwrap();
+    wait_for("the second snapshot", || seq_of(&r, "ap1") == Some(2));
+    let clients = json_get(r.c.http, "/api/clients");
+    let e = &clients["02:00:00:00:00:01"]["experience"];
+    assert_eq!(e["parts"]["signal"], json!({"score": 30.0, "value": -74.0}));
+    assert_eq!(e["parts"]["contention"]["value"], 2.5);
+    assert_eq!(e["parts"]["rate"]["score"], 72.0);
+    assert_eq!(e["score"], 70);
+    let aps = json_get(r.c.http, "/api/aps");
+    assert_eq!(aps["ap1"]["experience"]["clients"], 1);
+    assert_eq!(aps["ap1"]["experience"]["score"], 70);
+
+    // ap2's BSSs name its events.
+    ap2.send(&AgentMsg::Key(snapshot(
+        1,
+        vec![bss("wlan5", "Guest")],
+        vec![],
+    )))
+    .unwrap();
+    wait_for("ap2's snapshot", || seq_of(&r, "ap2") == Some(1));
+    let target = [0x02, 0, 0, 0, 0x10, 0x02];
+    let answer = EventKind::BtmResponse {
+        mac: MAC,
+        bss: 0,
+        status: 0,
+        target: Some(target),
+    };
+    ap1.send(&AgentMsg::Event(Event {
+        at_ms: now(),
+        kind: answer,
+    }))
+    .unwrap();
+    let roaming = || json_get(r.c.http, "/api/roaming");
+    let listed = |v: Value, key: &str| v[key].as_array().is_some_and(|l| !l.is_empty());
+    wait_for("the steer", || listed(roaming(), "steering"));
+    ap2.send(&AgentMsg::Event(Event {
+        at_ms: now(),
+        kind: EventKind::Assoc { mac: MAC, bss: 0 },
+    }))
+    .unwrap();
+    wait_for("the roam", || listed(roaming(), "roams"));
+    let v = roaming();
+    let roam = &v["roams"][0];
+    assert_eq!(
+        (roam["from"]["ap"].as_str(), roam["to"]["ap"].as_str()),
+        (Some("ap1"), Some("ap2"))
+    );
+    assert_eq!(roam["before"], -74);
+    assert_eq!(roam["steered"]["origin"], "ap");
+    let steer = &v["steering"][0];
+    assert_eq!(
+        (steer["status"].as_u64(), steer["target"].as_str()),
+        (Some(0), Some("02:00:00:00:10:02"))
+    );
+    assert_eq!(steer["outcome"]["moved"]["ap"], "ap2");
+    assert_eq!(v["aps"]["ap2"]["roams"], 1);
+    assert_eq!(v["settings"]["sticky_dbm"], -72);
+    let mine = json_get(r.c.http, "/api/roaming?client=02:00:00:00:00:01");
+    assert_eq!(mine["client"]["roams"], 1);
+    let (head, _) = http_request(r.c.http, "/api/roaming?client=nope", "");
+    assert!(head.starts_with("http/1.1 400"), "{head}");
+
+    let body = http_get(r.c.metrics, "/metrics");
+    for line in [
+        "wifi_steering_total{ap=\"ap1\",answer=\"accepted\"} 1",
+        "wifi_steering_total{ap=\"ap2\",answer=\"none\"} 0",
+        "wifi_steering_moved_total{ap=\"ap1\"} 1",
+        "wifi_roams_total{ap=\"ap2\",kind=\"unknown\"} 0",
+        "wifi_roams_total{ap=\"ap1\",kind=\"ft\"} 0",
+        "wifi_clients_sticky{ap=\"ap2\"} 0",
+        "wifi_sticky_seconds_total{ap=\"ap1\"} 0",
+        "wifi_roam_failures_total{ap=\"ap2\"} 0",
+    ] {
+        assert!(body.lines().any(|l| l == line), "missing {line}\n{body}");
+    }
+    // A client without a name has no series of its own.
+    assert!(!body.contains("wifi_client_experience{"), "{body}");
+    assert!(promtool_accepts(&body));
 }

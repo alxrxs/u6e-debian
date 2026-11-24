@@ -25,9 +25,17 @@
 //! AP's client guards read of mDNS is counted per AP alone (its devices,
 //! offers, offers not answering, messages read, unreadable, evicted and
 //! dropped past the guards' rate), never per device or service, and the
-//! clients whose traffic is kept are counted.
+//! clients whose traffic is kept are counted. The roams are counted per AP
+//! roamed to and kind, every kind always exported, failed roams, sticky
+//! time and the clients sticky now per AP, steering per AP and answer, every
+//! answer always exported, and the moves after it per AP. The experience
+//! score is per AP with clients, with each part's mean, and per client for
+//! at most [`EXPERIENCE_CLIENTS`] associated clients that have a name (the
+//! DHCP server's device, a lease's host name or a DNS name; the first by
+//! name), labelled by MAC and name: one series per named device, not per
+//! MAC ever seen.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -40,7 +48,9 @@ use u6e_proto::PROTOCOL;
 use u6e_proto::mac;
 use u6e_proto::msg::{LimitStatus, Radio, Snapshot, Station};
 
+use crate::experience::{self, PARTS};
 use crate::limits::status_name;
+use crate::roaming::{Answer, Kind};
 use crate::services::Table;
 use crate::sessions::Totals;
 use crate::sessions::unix_ms;
@@ -67,6 +77,9 @@ const LIMIT_STATUSES: [LimitStatus; 4] = [
     LimitStatus::Refused,
     LimitStatus::NotEnforced,
 ];
+
+/// The most clients with an experience series of their own.
+pub const EXPERIENCE_CLIENTS: usize = 64;
 
 const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
@@ -463,6 +476,8 @@ pub fn render(state: &State) -> String {
     leases(&mut m, state);
     guards(&mut m, &aps);
     services(&mut m, state);
+    roaming(&mut m, state, &aps);
+    experience(&mut m, state);
     m.family(
         "wifi_traffic_clients",
         GAUGE,
@@ -640,6 +655,128 @@ fn services(m: &mut Text, state: &State) {
     );
 }
 
+/// A per-AP figure, by the AP's name.
+type ApValue<'a> = &'a dyn Fn(&str) -> f64;
+
+/// The roams, failed roams, sticky time and steering, per configured AP.
+fn roaming(m: &mut Text, state: &State, aps: &[(&str, &Ap)]) {
+    let r = &state.roaming;
+    let c = &r.counts;
+    let kinds = Kind::ALL.map(Some).into_iter().chain([None]);
+    m.family(
+        "wifi_roams_total",
+        COUNTER,
+        "Roams into the AP, by how the client authenticated there (unknown: it never was authorized).",
+    );
+    for &(ap, _) in aps {
+        for kind in kinds.clone() {
+            let n = c.roams.get(&(ap.to_owned(), kind)).copied().unwrap_or(0);
+            let name = kind.map_or("unknown", Kind::name);
+            m.sample(&[("ap", ap), ("kind", name)], n as f64);
+        }
+    }
+    let now = unix_ms(SystemTime::now());
+    let sticky = r.sticky(now);
+    let per_ap: [(&str, &str, &str, ApValue); 4] = [
+        (
+            "wifi_roam_failures_total",
+            COUNTER,
+            "Failed roams to the AP: a sign-in that failed there, or a session that ended within 30 s.",
+            &|ap| c.failures.get(ap).copied().unwrap_or(0) as f64,
+        ),
+        (
+            "wifi_sticky_seconds_total",
+            COUNTER,
+            "Time clients spent sticky on the AP: below the threshold while another AP heard them 8 dB better.",
+            &|ap| c.sticky_ms.get(ap).copied().unwrap_or(0) as f64 / 1000.0,
+        ),
+        (
+            "wifi_clients_sticky",
+            GAUGE,
+            "Clients sticky on the AP now.",
+            &|ap| sticky.iter().filter(|(_, s)| s.ap == ap).count() as f64,
+        ),
+        (
+            "wifi_steering_moved_total",
+            COUNTER,
+            "Steering requests of the AP a client moved within 10 s of.",
+            &|ap| c.moved.get(ap).copied().unwrap_or(0) as f64,
+        ),
+    ];
+    for (name, kind, help, value) in per_ap {
+        m.family(name, kind, help);
+        for &(ap, _) in aps {
+            m.sample(&[("ap", ap)], value(ap));
+        }
+    }
+    m.family(
+        "wifi_steering_total",
+        COUNTER,
+        "Steering requests of the AP (an admin's, its answer to a query, its own), by the client's answer.",
+    );
+    for &(ap, _) in aps {
+        for a in Answer::ALL {
+            let n = c.answers.get(&(ap.to_owned(), a)).copied().unwrap_or(0);
+            m.sample(&[("ap", ap), ("answer", a.name())], n as f64);
+        }
+    }
+}
+
+/// The experience score per AP with clients and its parts, and per named
+/// client, at most [`EXPERIENCE_CLIENTS`].
+fn experience(m: &mut Text, state: &State) {
+    let site = experience::site(state, unix_ms(SystemTime::now()));
+    m.family(
+        "wifi_ap_experience",
+        GAUGE,
+        "The mean Wi-Fi experience score (0 to 100) of the AP's clients.",
+    );
+    for (ap, e) in &site.aps {
+        if let Some(s) = e.score {
+            m.sample(&[("ap", ap)], f64::from(s));
+        }
+    }
+    m.family(
+        "wifi_ap_experience_part",
+        GAUGE,
+        "The mean of each part (0 to 100) of the experience score of the AP's clients.",
+    );
+    for (ap, e) in &site.aps {
+        for (part, v) in PARTS.iter().zip(e.parts) {
+            if let Some(v) = v {
+                m.sample(&[("ap", ap), ("part", part)], v);
+            }
+        }
+    }
+    let named = named(&site.clients, |mac| {
+        state.identity(mac).name().map(str::to_owned)
+    });
+    m.family(
+        "wifi_client_experience",
+        GAUGE,
+        "The Wi-Fi experience score (0 to 100) of an associated client that has a name.",
+    );
+    for (name, mac, score) in named {
+        let mac = mac::format(mac);
+        m.sample(&[("mac", &mac), ("name", &name)], f64::from(score));
+    }
+}
+
+/// The clients of `clients` with a score that have a name (`name`), by
+/// name, at most [`EXPERIENCE_CLIENTS`]: name, MAC and score.
+fn named(
+    clients: &BTreeMap<[u8; 6], experience::Experience>,
+    name: impl Fn(&[u8; 6]) -> Option<String>,
+) -> Vec<(String, [u8; 6], u8)> {
+    let mut named: Vec<_> = clients
+        .iter()
+        .filter_map(|(mac, e)| Some((name(mac)?, *mac, e.score?)))
+        .collect();
+    named.sort();
+    named.truncate(EXPERIENCE_CLIENTS);
+    named
+}
+
 /// Each identity's sessions, bytes, clients and client certificate.
 fn identities(m: &mut Text, state: &State) {
     let ids = state.sessions.identities();
@@ -806,6 +943,26 @@ fn rollouts(m: &mut Text, state: &State) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Of 65 named clients 64 have a series, the first by name; an unnamed
+    /// one, or one without a score, has none.
+    #[test]
+    fn the_named_clients_series_are_bounded() {
+        let scored = experience::Experience {
+            score: Some(80),
+            ..Default::default()
+        };
+        let mut clients = BTreeMap::new();
+        for i in 0..=EXPERIENCE_CLIENTS as u8 + 1 {
+            clients.insert([2, 0, 0, 0, 0, i], scored.clone());
+        }
+        clients.insert([2, 0, 0, 0, 1, 0], experience::Experience::default());
+        let name = |m: &[u8; 6]| (m[5] != 0 || m[4] == 1).then(|| format!("device {:03}", m[5]));
+        let got = named(&clients, name);
+        assert_eq!(got.len(), EXPERIENCE_CLIENTS);
+        assert_eq!(got[0], ("device 001".to_owned(), [2, 0, 0, 0, 0, 1], 80));
+        assert_eq!(got.last().unwrap().0, "device 064");
+    }
 
     #[test]
     fn label_values_are_escaped() {

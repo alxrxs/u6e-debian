@@ -18,6 +18,8 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
+use serde_json::{Map, Value, json};
+use u6e_proto::mac;
 use u6e_proto::msg::{AuthKind, Band, Event, EventKind, Snapshot, StationAuth};
 
 use crate::sessions::{self, Roamed, Sessions, unix_ms};
@@ -52,6 +54,9 @@ const ADMIN_MS: u64 = 10_000;
 const EAP_NEAR_MS: u64 = 60_000;
 /// The same power, within a dB (mBm).
 const SAME_POWER_MBM: i32 = 100;
+/// The roams and steering records `/api/roaming` shows of the site.
+pub const ROAMS_SHOWN: usize = 200;
+pub const STEERS_SHOWN: usize = 100;
 /// Sticky time is kept in 5-minute buckets over the last day.
 const BUCKET_MS: u64 = 300_000;
 const DAY_MS: u64 = 24 * 3600 * 1000;
@@ -861,6 +866,218 @@ impl Roaming {
         out.sort_by_key(|(m, s)| (s.since_ms, *m));
         out
     }
+}
+
+impl Roaming {
+    /// What `/api/roaming` serves at `now_ms`, of `client` alone when given:
+    /// the thresholds (`settings`); per AP (`aps`) the roams into it over
+    /// the last day by kind and those that failed, the clients sticky on it
+    /// now, and its steering records kept by who asked, by answer and by
+    /// what the client did; the roams, newest first (`roams`, the site's
+    /// newest [`ROAMS_SHOWN`]), the clients sticky now (`sticky`) and the
+    /// steering records, newest first (`steering`, the site's newest
+    /// [`STEERS_SHOWN`]); for a client, what `facts` says of it too. Each
+    /// client is named by `name` when it has one.
+    pub fn view(
+        &self,
+        client: Option<[u8; 6]>,
+        now_ms: u64,
+        name: impl Fn(&[u8; 6]) -> Option<String>,
+    ) -> Value {
+        let mine = |m: &[u8; 6]| client.is_none_or(|c| c == *m);
+        let who = |m: &[u8; 6]| {
+            let mut o = Map::new();
+            o.insert("mac".into(), mac::format(*m).into());
+            if let Some(n) = name(m) {
+                o.insert("name".into(), n.into());
+            }
+            o
+        };
+        let shown = |n| if client.is_some() { usize::MAX } else { n };
+        let roams: Vec<Value> = (self.roams.iter().rev())
+            .filter(|r| mine(&r.mac))
+            .take(shown(ROAMS_SHOWN))
+            .map(|r| self.roam_json(r, who(&r.mac)))
+            .collect();
+        let sticky_now = self.sticky(now_ms);
+        let sticky: Vec<Value> = (sticky_now.iter())
+            .filter(|(m, _)| mine(m))
+            .map(|(m, s)| {
+                let mut o = who(m);
+                o.extend(sticky_json(s));
+                Value::Object(o)
+            })
+            .collect();
+        let steering: Vec<Value> = (self.steers.iter().rev())
+            .filter(|s| mine(&s.mac))
+            .take(shown(STEERS_SHOWN))
+            .map(|s| {
+                let mut o = who(&s.mac);
+                o.extend(steer_json(s));
+                Value::Object(o)
+            })
+            .collect();
+        let mut v = json!({
+            "settings": {
+                "sticky_dbm": self.sticky_dbm,
+                "better_db": BETTER_DB,
+                "moved_db": MOVED_DB,
+                "view_ms": VIEW_MS,
+                "move_ms": MOVE_MS,
+                "failed_ms": FAILED_MS,
+            },
+            "roams": roams,
+            "sticky": sticky,
+            "steering": steering,
+        });
+        match client {
+            Some(m) => {
+                let f = self.facts(&m, now_ms);
+                v["client"] = json!({
+                    "roams": f.roams,
+                    "failed": f.failed,
+                    "sticky_ms": f.sticky_ms,
+                    "sticky_share": (f.sticky_share * 1000.0).round() / 1000.0,
+                    "failed_hour": f.failed_hour,
+                    "view": f.view.as_ref().map(view_json),
+                });
+            }
+            None => v["aps"] = self.aps_json(&sticky_now, now_ms),
+        }
+        v
+    }
+
+    /// Each AP's summary, as [`Roaming::view`] says.
+    fn aps_json(&self, sticky: &[([u8; 6], StickyNow)], now_ms: u64) -> Value {
+        let day = now_ms.saturating_sub(DAY_MS);
+        let mut aps: BTreeMap<&str, Value> = BTreeMap::new();
+        let blank = || {
+            json!({
+                "roams": 0, "kinds": {}, "failed": 0, "sticky": 0,
+                "steering": { "asked": {}, "answers": {}, "rejected": {}, "outcomes": {} },
+            })
+        };
+        let add = |v: &mut Value, path: &[&str]| {
+            let mut at = v;
+            for p in path {
+                at = &mut at[*p];
+            }
+            *at = (at.as_u64().unwrap_or(0) + 1).into();
+        };
+        for r in self.roams.iter().rev().take_while(|r| r.at_ms >= day) {
+            let a = aps.entry(&r.to.ap).or_insert_with(blank);
+            if r.session != 0 {
+                add(a, &["roams"]);
+                add(a, &["kinds", r.kind.map_or("unknown", Kind::name)]);
+            }
+            if r.failure.is_some() {
+                add(a, &["failed"]);
+            }
+        }
+        for (_, s) in sticky {
+            add(aps.entry(&s.ap).or_insert_with(blank), &["sticky"]);
+        }
+        for s in &self.steers {
+            let a = &mut aps.entry(&s.ap).or_insert_with(blank)["steering"];
+            add(a, &["asked", origin_name(&s.origin)]);
+            add(a, &["answers", s.answer().name()]);
+            if let Some(code) = s.status.filter(|&c| c != 0) {
+                add(a, &["rejected", &code.to_string()]);
+            }
+            let outcome = match &s.outcome {
+                Some(Outcome::Moved { .. }) => "moved",
+                Some(Outcome::Stayed) => "stayed",
+                Some(Outcome::Left) => "left",
+                None => "pending",
+            };
+            add(a, &["outcomes", outcome]);
+        }
+        let aps = aps.into_iter().map(|(k, v)| (k.to_owned(), v));
+        Value::Object(aps.collect())
+    }
+
+    fn roam_json(&self, r: &Roam, mut o: Map<String, Value>) -> Value {
+        o.insert("at".into(), r.at_ms.into());
+        o.insert("from".into(), Value::Object(crate::view::place(&r.from)));
+        o.insert("to".into(), Value::Object(crate::view::place(&r.to)));
+        let mut put = |k: &str, v: Option<Value>| {
+            if let Some(v) = v {
+                o.insert(k.into(), v);
+            }
+        };
+        put("gap_ms", r.gap_ms.map(Into::into));
+        put("gap_min_ms", r.gap_ms.map(|_| r.gap_min_ms.into()));
+        put("before", r.before.map(Into::into));
+        put("after", r.after.map(Into::into));
+        put("kind", r.kind.map(|k| k.name().into()));
+        put("failure", r.failure.map(|f| f.name().into()));
+        let steer = r.steer.and_then(|id| self.steer(id));
+        put(
+            "steered",
+            steer.map(|s| Value::Object(origin_json(&s.origin))),
+        );
+        Value::Object(o)
+    }
+}
+
+fn origin_name(o: &Origin) -> &'static str {
+    match o {
+        Origin::Admin(_) => "admin",
+        Origin::Query => "query",
+        Origin::Ap => "ap",
+    }
+}
+
+/// Who asked: `origin`, and the admin's name (`by`).
+fn origin_json(o: &Origin) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("origin".into(), origin_name(o).into());
+    if let Origin::Admin(Some(by)) = o {
+        m.insert("by".into(), by.clone().into());
+    }
+    m
+}
+
+fn view_json(v: &View) -> Value {
+    json!({ "ap": v.ap, "signal": v.signal, "at": v.at_ms })
+}
+
+fn sticky_json(s: &StickyNow) -> Map<String, Value> {
+    let v = json!({
+        "ap": s.ap,
+        "band": crate::view::band(s.band),
+        "signal": s.signal,
+        "since": s.since_ms,
+        "view": view_json(&s.view),
+    });
+    match v {
+        Value::Object(o) => o,
+        _ => Map::new(),
+    }
+}
+
+fn steer_json(s: &Steer) -> Map<String, Value> {
+    let mut o = origin_json(&s.origin);
+    o.insert("at".into(), s.at_ms.into());
+    o.insert("ap".into(), s.ap.clone().into());
+    let mut put = |k: &str, v: Option<Value>| {
+        if let Some(v) = v {
+            o.insert(k.into(), v);
+        }
+    };
+    put("reason", s.reason.map(Into::into));
+    put("status", s.status.map(Into::into));
+    put("target", s.target.map(|t| mac::format(t).into()));
+    put("answered", s.answered_ms.map(Into::into));
+    let outcome = s.outcome.as_ref().map(|o| match o {
+        Outcome::Moved { to, after_ms } => {
+            json!({ "moved": crate::view::place(to), "after_ms": after_ms })
+        }
+        Outcome::Stayed => "stayed".into(),
+        Outcome::Left => "left".into(),
+    });
+    put("outcome", outcome);
+    o
 }
 
 /// Counts a steer whose outcome is settled.

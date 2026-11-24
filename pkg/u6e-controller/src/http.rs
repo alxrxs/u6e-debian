@@ -39,7 +39,9 @@
 //! view, one AP's table, or one device and those it relates to), `GET
 //! /api/services/see?from=&to=` whether one device's queries for what
 //! another offers are answered (`services`); a service's change is an
-//! event of kind `service`.
+//! event of kind `service`. `GET /api/roaming?client=` is the roams, the
+//! clients sticky now and the steering, of the site or of one client
+//! (`roaming`).
 //!
 //! The listener is reached only through the reverse proxy that signs users
 //! in, which names the user in `X-Forwarded-Preferred-Username` and their
@@ -176,6 +178,7 @@ pub fn router(state: Shared, access: Access) -> Router {
         .route("/api/auth-problems", get(api_auth_problems))
         .route("/api/services", get(api_services))
         .route("/api/services/see", get(api_services_see))
+        .route("/api/roaming", get(api_roaming))
         .route("/api/clients/{mac}/kick", post(actions::kick))
         .route("/api/clients/{mac}/block", post(actions::block))
         .route("/api/clients/{mac}/unblock", post(actions::unblock))
@@ -347,6 +350,23 @@ async fn api_services(Ext(state): Ext<Shared>, Query(q): Query<ServicesQuery>) -
         &*s,
         now,
     ))
+}
+
+#[derive(Deserialize)]
+struct RoamingQuery {
+    client: Option<String>,
+}
+
+async fn api_roaming(Ext(state): Ext<Shared>, Query(q): Query<RoamingQuery>) -> Response {
+    let client = match q.client.as_deref().map(mac::parse) {
+        None => None,
+        Some(Some(m)) => Some(m),
+        Some(None) => return error(StatusCode::BAD_REQUEST, "not a MAC"),
+    };
+    let now = sessions::unix_ms(std::time::SystemTime::now());
+    let s = state.read();
+    let name = |m: &[u8; 6]| s.identity(m).name().map(str::to_owned);
+    json_response(&s.roaming.view(client, now, name))
 }
 
 #[derive(Deserialize)]

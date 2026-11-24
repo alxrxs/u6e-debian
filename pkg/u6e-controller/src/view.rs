@@ -12,7 +12,12 @@
 //! `guard` (its `guard`, `detail`, whether its frame was `dropped`, and the
 //! `repeats` since the last one reported), a change of a service a device
 //! offers over mDNS one of kind `service` (`services::event_json`), on the
-//! timeline too when the device is a client. An associated client carries how
+//! timeline too when the device is a client; a client's query for BSS
+//! transition candidates is an event of kind `btm-query` (its `reason`), its
+//! answer to a request one of kind `btm-response` (its `status`, and the
+//! `target` it named). Each client and each AP with clients carries its
+//! Wi-Fi experience (`experience`: its score and parts). An associated
+//! client carries how
 //! it authenticated (`auth`: the method, its EAP identity and the expiry of
 //! the client certificate RADIUS last accepted for it, whether it came by a
 //! fast transition); its sessions and timeline are `history`, the clients
@@ -40,6 +45,7 @@ use u6e_proto::msg::{
     StationAuth, Violation,
 };
 
+use crate::experience;
 use crate::names;
 use crate::policy::{ConfigId, Phase};
 use crate::services;
@@ -296,23 +302,32 @@ pub fn action(a: &Action, admin: bool) -> Value {
 
 /// Every wanted AP by name.
 pub fn aps(state: &State, wanted: impl Fn(&str) -> bool) -> Value {
+    let site = experience::site(state, unix_ms(SystemTime::now()));
     let aps = state
         .aps()
         .filter(|(name, _)| wanted(name))
-        .map(|(name, ap)| (name.to_owned(), ap_view(ap)))
-        .collect();
-    Value::Object(aps)
+        .map(|(name, ap)| {
+            let mut v = ap_view(ap);
+            if let Some(e) = site.aps.get(name) {
+                v["experience"] = experience::ap_json(e);
+            }
+            (name.to_owned(), v)
+        });
+    Value::Object(aps.collect())
 }
 
 /// Every client of a wanted AP by MAC.
 pub fn clients(state: &State, wanted: impl Fn(&str) -> bool) -> Value {
-    let clients = state
-        .clients()
-        .iter()
-        .filter(|c| wanted(&c.ap))
-        .map(|c| (mac::format(c.station.mac), client_view(state, c)))
-        .collect();
-    Value::Object(clients)
+    let site = experience::site(state, unix_ms(SystemTime::now()));
+    let clients = state.clients();
+    let clients = clients.iter().filter(|c| wanted(&c.ap)).map(|c| {
+        let mut v = client_view(state, c);
+        if let Some(e) = site.clients.get(&c.station.mac) {
+            v["experience"] = experience::json(e);
+        }
+        (mac::format(c.station.mac), v)
+    });
+    Value::Object(clients.collect())
 }
 
 /// The events of `ap`, or of every AP, oldest first; the operator's actions
@@ -364,6 +379,22 @@ pub fn event(ap_name: &str, ap: &Ap, ev: &Event) -> Option<Value> {
         EventKind::GuardViolation(v) => {
             o.extend(violation(v));
             return Some(Value::Object(o));
+        }
+        EventKind::BtmQuery { mac, bss, reason } => {
+            o.insert("reason".into(), (*reason).into());
+            ("btm-query", Ok((mac, *bss)))
+        }
+        EventKind::BtmResponse {
+            mac,
+            bss,
+            status,
+            target,
+        } => {
+            o.insert("status".into(), (*status).into());
+            if let Some(t) = target {
+                o.insert("target".into(), mac::format(*t).into());
+            }
+            ("btm-response", Ok((mac, *bss)))
         }
         _ => return None,
     };
@@ -823,7 +854,7 @@ pub fn history(state: &State, mac: &[u8; 6], admin: bool) -> Value {
     o
 }
 
-fn place(p: &Place) -> Map<String, Value> {
+pub(crate) fn place(p: &Place) -> Map<String, Value> {
     let mut o = Map::new();
     o.insert("ap".into(), p.ap.clone().into());
     o.insert("bss".into(), p.bss.clone().into());
