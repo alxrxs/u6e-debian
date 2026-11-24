@@ -55,6 +55,8 @@ const SLACK_MS: u64 = 1000;
 /// steer the answer to it (the admin's result comes after the answer).
 const ANSWER_MS: u64 = 5_000;
 const ADMIN_MS: u64 = 10_000;
+/// The admins' steers remembered for their answers, at most.
+const ADMIN_STEERS: usize = 64;
 /// An EAP start this near a new association is that association's.
 const EAP_NEAR_MS: u64 = 60_000;
 /// The same power, within a dB (mBm).
@@ -417,6 +419,8 @@ pub struct Roaming {
     roams: VecDeque<Roam>,
     steers: VecDeque<Steer>,
     next_steer: u64,
+    /// The admins' latest steers, worked or not: client, AP, who and when.
+    admin_steers: VecDeque<([u8; 6], String, Option<String>, u64)>,
     pub counts: Counts,
 }
 
@@ -439,6 +443,7 @@ impl Roaming {
             roams: VecDeque::new(),
             steers: VecDeque::new(),
             next_steer: 0,
+            admin_steers: VecDeque::new(),
             counts: Counts::default(),
         }
     }
@@ -604,8 +609,10 @@ impl Roaming {
     }
 
     /// A client's answer to a steering request: the request it answers (a
-    /// query's within [`ANSWER_MS`], an admin's steer), or one of the AP's
-    /// own.
+    /// query's within [`ANSWER_MS`], an admin's steer), else a new one, an
+    /// admin's when one of theirs of the client on the AP came within
+    /// [`ADMIN_MS`], worked or not (the agent answers a steer after the
+    /// client, so a failed one recorded no request), else the AP's own.
     fn answered(&mut self, ap: &str, mac: [u8; 6], status: u8, target: Option<[u8; 6]>, at: u64) {
         let open = self.steers.iter_mut().rev().find(|s| {
             s.mac == mac
@@ -623,26 +630,32 @@ impl Roaming {
                 s.target = target;
                 s.answered_ms = Some(at);
             }
-            None => self.push_steer(Steer {
-                id: 0,
-                at_ms: at,
-                ap: ap.to_owned(),
-                mac,
-                origin: Origin::Ap,
-                reason: None,
-                status: Some(status),
-                target,
-                answered_ms: Some(at),
-                outcome: None,
-            }),
+            None => {
+                let admin = self
+                    .admin_steers
+                    .iter()
+                    .rev()
+                    .find(|(m, a, _, t)| *m == mac && a == ap && t.abs_diff(at) <= ADMIN_MS);
+                let origin = admin.map_or(Origin::Ap, |(.., by, _)| Origin::Admin(by.clone()));
+                self.push_steer(Steer {
+                    id: 0,
+                    at_ms: at,
+                    ap: ap.to_owned(),
+                    mac,
+                    origin,
+                    reason: None,
+                    status: Some(status),
+                    target,
+                    answered_ms: Some(at),
+                    outcome: None,
+                });
+            }
         }
     }
 
-    /// An admin's steer: the answer it drew, when that came first (the agent
-    /// waits for it before it answers), or a request of its own when the AP
-    /// sent it: the steer worked, or failed as the client declined (the
-    /// agent's word for a request sent and refused; one it never sent says
-    /// why it was not).
+    /// An admin's steer, remembered for an answer to come: the answer it
+    /// drew, when that came first (the agent waits for it before it
+    /// answers), or a request of its own when it worked (the AP sent it).
     pub fn action(&mut self, a: &Action) {
         let (Some(mac), Some(ap)) = (a.mac, a.ap.as_deref()) else {
             return;
@@ -651,13 +664,18 @@ impl Roaming {
             return;
         }
         let at = unix_ms(a.at);
+        if self.admin_steers.len() == ADMIN_STEERS {
+            self.admin_steers.pop_front();
+        }
+        self.admin_steers
+            .push_back((mac, ap.to_owned(), a.user.clone(), at));
         let by = Origin::Admin(a.user.clone());
         let answer = self.steers.iter_mut().rev().find(|s| {
             s.mac == mac && s.ap == ap && s.origin == Origin::Ap && s.at_ms.abs_diff(at) <= ADMIN_MS
         });
         if let Some(s) = answer {
             s.origin = by;
-        } else if a.ok || a.detail.contains("declined") {
+        } else if a.ok {
             self.push_steer(Steer {
                 id: 0,
                 at_ms: at,
@@ -1713,33 +1731,58 @@ mod tests {
         assert_eq!(site.r.counts.moved.get("ap1"), None);
     }
 
-    /// An admin's steer the client declined, its result here before the
-    /// client's answer: one request, the admin's, answered.
+    /// An admin's steer the client declined is one request, the admin's,
+    /// answered, whichever word comes first and whatever the agent's result
+    /// says; an answer more than 10 s from any admin's steer of the client
+    /// on that AP, or of another AP, is the AP's own.
     #[test]
     fn a_declined_steer_is_the_admins_whichever_word_comes_first() {
-        let mut site = Site::new();
-        on_ap1(&mut site, 1, -70);
-        site.r.action(&Action {
-            at: UNIX_EPOCH + Duration::from_millis(T0 + 3 * S),
-            user: Some("admin".into()),
-            action: "steer",
-            mac: Some(mac(1)),
-            ap: Some("ap1".into()),
-            ok: false,
-            detail: "wlan5: declined: no suitable candidates".into(),
-        });
-        let answer = EventKind::BtmResponse {
-            mac: mac(1),
+        let failed = |site: &mut Site, last, ap: &str, at| {
+            site.r.action(&Action {
+                at: UNIX_EPOCH + Duration::from_millis(at),
+                user: Some("admin".into()),
+                action: "steer",
+                mac: Some(mac(last)),
+                ap: Some(ap.into()),
+                ok: false,
+                detail: "any words of the agent's".into(),
+            });
+        };
+        let answer = |last| EventKind::BtmResponse {
+            mac: mac(last),
             bss: 0,
             status: 7,
             target: None,
         };
-        site.event("ap1", T0 + 3200, answer);
-        assert_eq!(site.r.steers().count(), 1);
-        let s = site.steer(1);
+        let mut site = Site::new();
+        for last in 1..=4 {
+            on_ap1(&mut site, last, -70);
+        }
+        // The result first, then the answer; the answer first, then the
+        // result.
+        failed(&mut site, 1, "ap1", T0 + 3 * S);
+        site.event("ap1", T0 + 3200, answer(1));
+        site.event("ap1", T0 + 3 * S, answer(2));
+        failed(&mut site, 2, "ap1", T0 + 3500);
+        // Too late, and of another AP.
+        failed(&mut site, 3, "ap1", T0 + 3 * S);
+        site.event("ap1", T0 + 14 * S, answer(3));
+        failed(&mut site, 4, "ap2", T0 + 3 * S);
+        site.event("ap1", T0 + 3200, answer(4));
+        let admin = Origin::Admin(Some("admin".into()));
+        let origins: Vec<(u8, Origin, Option<u8>)> = site
+            .r
+            .steers()
+            .map(|s| (s.mac[5], s.origin.clone(), s.status))
+            .collect();
         assert_eq!(
-            (s.origin.clone(), s.status),
-            (Origin::Admin(Some("admin".into())), Some(7))
+            origins,
+            [
+                (1, admin.clone(), Some(7)),
+                (2, admin, Some(7)),
+                (3, Origin::Ap, Some(7)),
+                (4, Origin::Ap, Some(7)),
+            ]
         );
     }
 
