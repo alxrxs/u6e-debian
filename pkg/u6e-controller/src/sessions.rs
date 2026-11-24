@@ -218,6 +218,7 @@ pub struct Roamed {
     pub session: u64,
     pub began: u64,
     pub to: Place,
+    pub from_session: u64,
     pub from: Place,
     pub from_start_ms: u64,
     pub heard_ms: u64,
@@ -460,7 +461,13 @@ impl Sessions {
                     gap_ms: None,
                     steered_by: steered_by.clone(),
                 });
-                left = Some((open.place.clone(), open.start_ms, open.last_ms, None));
+                left = Some((
+                    open.id,
+                    open.place.clone(),
+                    open.start_ms,
+                    open.last_ms,
+                    None,
+                ));
                 self.close_roamed(mac, began, &place.ap);
             }
         } else if let Some((id, ap, band, end)) = self.just_left(&mac, &place, began) {
@@ -473,7 +480,7 @@ impl Sessions {
             if let Some(s) = self.closed.iter_mut().rev().find(|s| s.id == id) {
                 prior = Some(carry(s));
                 let gone = (end <= began).then_some(end);
-                left = Some((s.place.clone(), s.start_ms, s.last_ms, gone));
+                left = Some((s.id, s.place.clone(), s.start_ms, s.last_ms, gone));
                 s.end = Some(End::Roamed {
                     to: place.ap.clone(),
                 });
@@ -500,7 +507,7 @@ impl Sessions {
             inactive_ms: 0,
         };
         self.open.insert(mac, session);
-        if let Some((from, from_start_ms, heard_ms, gone_ms)) = left {
+        if let Some((from_session, from, from_start_ms, heard_ms, gone_ms)) = left {
             if self.roamed.len() == ROAMED_MAX {
                 self.roamed.pop_front();
             }
@@ -509,6 +516,7 @@ impl Sessions {
                 session: self.next_id,
                 began,
                 to: place.clone(),
+                from_session,
                 from,
                 from_start_ms,
                 heard_ms,

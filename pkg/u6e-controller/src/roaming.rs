@@ -8,10 +8,13 @@
 //!
 //! No AP can say how it hears a client associated elsewhere (no probe
 //! request reaches hostapd on these radios), so another AP's view of a
-//! client is its last reading of it while it was associated there, taken for
-//! as long as it can still hold: [`VIEW_MS`] at most, that AP's radio on the
+//! client is its last reading of it in the session its current one replaced
+//! (the session it roamed from, or one that ended unobserved, or as its
+//! AP's radio on the band went down, before it joined here), taken for as
+//! long as it can still hold: [`VIEW_MS`] at most, that AP's radio on the
 //! band up at the same power, and the client not moved since (its signal
-//! within [`MOVED_DB`] of its first on its current AP).
+//! within [`MOVED_DB`] of its first on its current AP). A reading of an
+//! unrelated earlier session says nothing of where the client is now.
 //!
 //! All of it is in RAM and bounded ([`ROAMS_MAX`], [`STEERS_MAX`],
 //! [`CLIENTS_MAX`], [`KEEP_MS`]); the history of its counts is Prometheus'.
@@ -22,7 +25,7 @@ use serde_json::{Map, Value, json};
 use u6e_proto::mac;
 use u6e_proto::msg::{AuthKind, Band, Event, EventKind, Snapshot, StationAuth};
 
-use crate::sessions::{self, Roamed, Sessions, unix_ms};
+use crate::sessions::{self, Roamed, Session, Sessions, unix_ms};
 use crate::state::{Action, Naming};
 use crate::timeline::{End, Place};
 
@@ -168,7 +171,9 @@ pub struct Roam {
     /// The steering record it followed.
     pub steer: Option<u64>,
     pub failure: Option<Failure>,
+    /// The session it began (0 for an attempt) and the one it left.
     session: u64,
+    from_session: u64,
     settled: bool,
 }
 
@@ -276,14 +281,17 @@ struct Reading {
     signal: i8,
     at_ms: u64,
     power_mbm: i32,
+    session: u64,
 }
 
 #[derive(Debug, Default)]
 struct Client {
     readings: Vec<Reading>,
-    /// The session its last reading belongs to, its first signal in it, and
-    /// its last reading's AP, band, signal and time.
+    /// The session its last reading belongs to, the session that one
+    /// replaced (whose readings alone are other APs' views of it), its first
+    /// signal in it, and its last reading's AP, band, signal and time.
     session: u64,
+    replaced: Option<u64>,
     arrived: i8,
     at: Option<(String, Band, i8, u64)>,
     sticky_since: Option<u64>,
@@ -315,14 +323,20 @@ impl Client {
             .find(|r| r.ap == ap && Some(r.band) == band)
     }
 
-    /// Takes its reading `now` in its open session `session`: whether
-    /// another AP's view of it holds and it is sticky, the sticky step this
-    /// reading ends (counted in its buckets), and the reading kept as its
-    /// AP's view of it on the band. Another AP's readings all come from the
-    /// client's sessions there, so none is of its current session.
-    fn read(&mut self, now: Reading, session: u64, sticky_dbm: i8, radio: RadioOf) -> Option<u64> {
-        if self.session != session {
-            self.session = session;
+    /// Takes its reading `now` in its open session `now.session`, which
+    /// replaced `replaced`: whether another AP's view of it holds and it is
+    /// sticky, the sticky step this reading ends (counted in its buckets),
+    /// and the reading kept as its AP's view of it on the band.
+    fn read(
+        &mut self,
+        now: Reading,
+        replaced: Option<u64>,
+        sticky_dbm: i8,
+        radio: RadioOf,
+    ) -> Option<u64> {
+        if self.session != now.session {
+            self.session = now.session;
+            self.replaced = replaced;
             self.arrived = now.signal;
             self.at = None;
             self.sticky_since = None;
@@ -330,6 +344,7 @@ impl Client {
         let still = (i16::from(now.signal) - i16::from(self.arrived)).abs() <= MOVED_DB;
         let holds = |r: &&Reading| {
             r.ap != now.ap
+                && Some(r.session) == self.replaced
                 && r.band == now.band
                 && now.at_ms.saturating_sub(r.at_ms) <= VIEW_MS
                 && radio(&r.ap, r.band)
@@ -395,6 +410,8 @@ pub struct Counts {
 pub struct Roaming {
     sticky_dbm: i8,
     clients: HashMap<[u8; 6], Client>,
+    /// When each AP's radio on a band last went down.
+    downs: HashMap<(String, Band), u64>,
     roams: VecDeque<Roam>,
     steers: VecDeque<Steer>,
     next_steer: u64,
@@ -416,6 +433,7 @@ impl Roaming {
         Roaming {
             sticky_dbm,
             clients: HashMap::new(),
+            downs: HashMap::new(),
             roams: VecDeque::new(),
             steers: VecDeque::new(),
             next_steer: 0,
@@ -507,8 +525,32 @@ impl Roaming {
             steer,
             failure: None,
             session: r.session,
+            from_session: r.from_session,
             settled: false,
         });
+    }
+
+    /// The session the open session `s` of `mac` replaced: the one it
+    /// roamed from, else the client's one before if that ended unobserved,
+    /// or by the client leaving within the roam window of its AP's radio on
+    /// the band going down, and before `s` began.
+    fn replaced(&self, mac: &[u8; 6], s: &Session, sessions: &Sessions) -> Option<u64> {
+        if let Some(r) = self.roams.iter().rev().find(|r| r.session == s.id) {
+            return Some(r.from_session);
+        }
+        let before = sessions.of(mac).find(|p| p.id != s.id)?;
+        let end = before.end_ms.filter(|&e| e <= s.start_ms)?;
+        let radio_went = || {
+            let band = before.place.band?;
+            let down = self.downs.get(&(before.place.ap.clone(), band))?;
+            Some(down.abs_diff(end) <= sessions::ROAM_WINDOW_MS)
+        };
+        let gone = match before.end {
+            Some(End::Unobserved) => true,
+            Some(End::Left | End::Inactive) => radio_went().unwrap_or(false),
+            _ => false,
+        };
+        gone.then_some(before.id)
     }
 
     /// Takes an event of `ap` that happened at `at` (`sessions::event_ms`).
@@ -521,6 +563,13 @@ impl Roaming {
             EventKind::EapFail { mac, bss } => Some((*mac, *bss, Failure::EapFailed)),
             EventKind::EapTimeout { mac, bss, .. } => Some((*mac, *bss, Failure::EapTimedOut)),
             EventKind::PskMismatch { mac, bss } => Some((*mac, *bss, Failure::Passphrase)),
+            EventKind::RadioDown { phy } => {
+                let band = naming.bands.iter().find(|(p, _)| p == phy);
+                if let Some((_, band)) = band {
+                    self.downs.insert((ap.to_owned(), *band), at);
+                }
+                None
+            }
             EventKind::BtmQuery { mac, reason, .. } => {
                 self.push_steer(Steer {
                     id: 0,
@@ -685,6 +734,7 @@ impl Roaming {
             steer: None,
             failure: Some(why),
             session: 0,
+            from_session: 0,
             settled: true,
         });
     }
@@ -728,8 +778,10 @@ impl Roaming {
                 signal,
                 at_ms,
                 power_mbm: radio(ap, band).map_or(0, |(_, p)| p),
+                session: s.id,
             };
-            if let Some(ms) = self.client(st.mac).read(now, s.id, sticky_dbm, radio) {
+            let replaced = self.replaced(&st.mac, s, sessions);
+            if let Some(ms) = self.client(st.mac).read(now, replaced, sticky_dbm, radio) {
                 *self.counts.sticky_ms.entry(ap.to_owned()).or_default() += ms;
             }
         }
@@ -1203,6 +1255,15 @@ mod tests {
         }
 
         fn snap(&mut self, ap: &str, at: u64, stations: &[Sta]) {
+            self.snap_of(ap, at, stations, false);
+        }
+
+        /// The first snapshot of the AP's link after it was away.
+        fn back(&mut self, ap: &str, at: u64, stations: &[Sta]) {
+            self.snap_of(ap, at, stations, true);
+        }
+
+        fn snap_of(&mut self, ap: &str, at: u64, stations: &[Sta], fresh: bool) {
             let mut list: Vec<&Sta> = stations.iter().collect();
             list.sort_by_key(|s| s.0);
             let auth = list
@@ -1237,7 +1298,7 @@ mod tests {
                 caps: Vec::new(),
                 offload_held: false,
             };
-            self.s.snapshot(ap, &snap, &naming(), at, false);
+            self.s.snapshot(ap, &snap, &naming(), at, fresh);
             for x in self.s.take_roams() {
                 self.r.roamed(x);
             }
@@ -1469,6 +1530,46 @@ mod tests {
         assert!((site.r.facts(&mac(1), at(280)).sticky_share - 60.0 / 3600.0).abs() < 1e-9);
     }
 
+    /// A laptop read at -45 dBm on ap1 that left, and woke three hours later
+    /// on ap2 at -78: ap1's reading is of a session its new one did not
+    /// replace, so it is no view of where the laptop is.
+    #[test]
+    fn a_reading_of_an_unrelated_session_is_no_view() {
+        let mut site = Site::new();
+        site.snap("ap1", T0, &[Sta(1, 0, -45, 600, Some(EAP))]);
+        site.event("ap1", T0 + 10 * S, disassoc(1, 0));
+        let later = T0 + 3 * 3600 * S;
+        site.snap("ap2", later, &[Sta(1, 0, -78, 5, Some(EAP))]);
+        site.snap("ap2", later + 15 * S, &[Sta(1, 0, -78, 20, Some(EAP))]);
+        site.snap("ap2", later + 30 * S, &[Sta(1, 0, -78, 35, Some(EAP))]);
+        let f = site.r.facts(&mac(1), later + 30 * S);
+        assert_eq!((f.sticky, f.view, f.sticky_ms), (None, None, 0));
+    }
+
+    /// A client the APs lost track of, not one that left: its session ended
+    /// unobserved (its AP's link came back without it), or as its AP's radio
+    /// on the band went down; the session it joins after replaced it.
+    #[test]
+    fn a_session_lost_with_its_ap_or_radio_was_replaced() {
+        let stuck = |site: &mut Site, at: u64| {
+            site.snap("ap2", at, &[Sta(1, 0, -78, 5, Some(EAP))]);
+            site.snap("ap2", at + 15 * S, &[Sta(1, 0, -78, 20, Some(EAP))]);
+            site.snap("ap2", at + 30 * S, &[Sta(1, 0, -78, 35, Some(EAP))]);
+            site.r.facts(&mac(1), at + 30 * S).sticky_ms
+        };
+        let mut site = Site::new();
+        site.snap("ap1", T0, &[Sta(1, 0, -45, 600, Some(EAP))]);
+        site.back("ap1", T0 + 100 * S, &[]);
+        assert_eq!(stuck(&mut site, T0 + 200 * S), 30 * S, "unobserved");
+
+        let mut site = Site::new();
+        site.snap("ap1", T0, &[Sta(1, 0, -45, 600, Some(EAP))]);
+        let down = EventKind::RadioDown { phy: "phy1".into() };
+        site.event("ap1", T0 + 10 * S, down);
+        site.event("ap1", T0 + 10_500, disassoc(1, 0));
+        assert_eq!(stuck(&mut site, T0 + 60 * S), 30 * S, "radio down");
+    }
+
     /// The view of the other AP holds only while it can: not once that AP's
     /// radio runs at another power, not for another band, not for a client
     /// above the threshold or one the other AP heard less than 8 dB better.
@@ -1647,6 +1748,7 @@ mod tests {
                 steer: None,
                 failure: None,
                 session: 0,
+                from_session: 0,
                 settled: true,
             });
         }
