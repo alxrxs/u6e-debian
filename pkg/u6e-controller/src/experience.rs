@@ -5,21 +5,25 @@
 //! nothing:
 //!
 //! - signal: its average signal, −60 dBm and better 100, −80 and worse 0;
-//! - retries: the share of the frames sent to it that were retries, 0 % 100,
-//!   40 % and more 0, when at least [`FRAMES_MIN`] were sent;
+//! - retries: its retries as a share of every transmission to it (the frames
+//!   sent and their retries), 0 % 100, 40 % and more 0, when at least
+//!   [`FRAMES_MIN`] frames were sent;
 //! - contention: the share of its radio's time busy with anything but the
 //!   radio's own transmissions, 20 % and less 100, 70 % and more 0;
 //! - rate: the AP's last transmit rate to it over the best its capabilities
 //!   allow on its radio ([`best_rate_kbps`]), three quarters and more 100,
-//!   when at least [`FRAMES_MIN`] were sent;
-//! - roaming: 100, less its share of the last hour spent sticky, less 25 for
-//!   each roam of it that failed in the last hour.
+//!   when at least [`FRAMES_MIN`] were sent and its capabilities have a best
+//!   rate;
+//! - roaming: 100, less its share of the last hour spent sticky (its last
+//!   twelve 5-minute buckets, so up to 5 minutes more), less 25 for each roam
+//!   of it that failed in the last hour.
 //!
 //! The score is the mean of the parts it has, weighted ([`WEIGHTS`]), but
 //! never more than [`ABOVE_WORST`] above its worst part, so that one bad part
 //! does not hide behind good ones. A part without its figure (an idle client
 //! sends no frames) is left out, not counted as 0. An AP's score is the mean
-//! of its clients' scores, each of its parts the mean of theirs.
+//! of its clients' scores, each of its parts the mean of theirs; an AP
+//! without clients has none.
 //!
 //! Under the NSS offload an AP's retry counter seldom moves (measured: 7 of
 //! 674 readings of 17 clients over 10 minutes above 0 %, at most 3.9 %), so
@@ -89,7 +93,7 @@ pub fn parts(i: &Inputs) -> Parts {
     let signal = f64::from(i.signal);
     let busy = i.sent >= FRAMES_MIN;
     let retries = busy.then(|| i.retries as f64 * 100.0 / (i.sent + i.retries) as f64);
-    let best = i.caps.map(|c| best_rate_kbps(c, i.radio_width_mhz));
+    let best = i.caps.and_then(|c| best_rate_kbps(c, i.radio_width_mhz));
     let share = best
         .filter(|&b| busy && b > 0 && i.tx_rate_kbps > 0)
         .map(|b| f64::from(i.tx_rate_kbps) * 100.0 / f64::from(b));
@@ -165,19 +169,16 @@ fn modulation(mcs: u8) -> Option<(u32, u32, u32)> {
 /// The best rate, kbit/s, a client of `caps` gets on a radio of
 /// `radio_width_mhz`: its mode, streams and highest MCS on the narrower of
 /// its and the radio's widths, with the short guard interval; 54 Mbit/s for
-/// a legacy client, or a width or MCS no table holds.
-pub fn best_rate_kbps(caps: StationCaps, radio_width_mhz: u16) -> u32 {
-    const LEGACY: u32 = 54_000;
+/// a legacy client; none for a width or MCS no table holds.
+pub fn best_rate_kbps(caps: StationCaps, radio_width_mhz: u16) -> Option<u32> {
     if caps.mode == RateMode::Legacy {
-        return LEGACY;
+        return Some(54_000);
     }
     let width = caps.width_mhz.min(radio_width_mhz);
-    let (Some((sd, ns)), Some((bits, num, den))) = (ofdm(caps.mode, width), modulation(caps.mcs))
-    else {
-        return LEGACY;
-    };
+    let (sd, ns) = ofdm(caps.mode, width)?;
+    let (bits, num, den) = modulation(caps.mcs)?;
     let bits = u64::from(sd * bits * num) * u64::from(caps.nss.max(1));
-    (bits * 1_000_000 / u64::from(den * ns)) as u32
+    Some((bits * 1_000_000 / u64::from(den * ns)) as u32)
 }
 
 /// A client's parts and score, and its failed roams in the last hour, which
@@ -367,17 +368,30 @@ mod tests {
     #[test]
     fn the_best_rate_is_the_standards_rate_at_the_narrower_width() {
         let best = |c: Option<StationCaps>, w| best_rate_kbps(c.unwrap(), w);
-        assert_eq!(best(caps(RateMode::Ht, 1, 7, 40), 20), 72_222);
-        assert_eq!(best(caps(RateMode::Ht, 1, 7, 40), 40), 150_000);
-        assert_eq!(best(caps(RateMode::Vht, 2, 9, 80), 80), 866_666);
-        assert_eq!(best(caps(RateMode::Vht, 1, 9, 160), 80), 433_333);
-        assert_eq!(best(caps(RateMode::He, 2, 9, 160), 160), 1_921_568);
-        assert_eq!(best(caps(RateMode::He, 2, 11, 160), 160), 2_401_960);
-        assert_eq!(best(caps(RateMode::He, 2, 11, 160), 80), 1_200_980);
-        assert_eq!(best(caps(RateMode::Legacy, 1, 0, 20), 20), 54_000);
-        // Nothing a table holds: a width no radio has, an MCS past 11.
-        assert_eq!(best(caps(RateMode::He, 2, 11, 160), 10), 54_000);
-        assert_eq!(best(caps(RateMode::He, 2, 12, 80), 80), 54_000);
+        assert_eq!(best(caps(RateMode::Ht, 1, 7, 40), 20), Some(72_222));
+        assert_eq!(best(caps(RateMode::Ht, 1, 7, 40), 40), Some(150_000));
+        assert_eq!(best(caps(RateMode::Vht, 2, 9, 80), 80), Some(866_666));
+        assert_eq!(best(caps(RateMode::Vht, 1, 9, 160), 80), Some(433_333));
+        assert_eq!(best(caps(RateMode::He, 2, 9, 160), 160), Some(1_921_568));
+        assert_eq!(best(caps(RateMode::He, 2, 11, 160), 160), Some(2_401_960));
+        assert_eq!(best(caps(RateMode::He, 2, 11, 160), 80), Some(1_200_980));
+        assert_eq!(best(caps(RateMode::Legacy, 1, 0, 20), 20), Some(54_000));
+        // Nothing a table holds: a width no radio has, an MCS past 11; such
+        // a client has no rate part.
+        assert_eq!(best(caps(RateMode::He, 2, 11, 160), 10), None);
+        assert_eq!(best(caps(RateMode::He, 2, 12, 80), 80), None);
+        let odd = Inputs {
+            signal: -60,
+            sent: 100,
+            retries: 0,
+            tx_rate_kbps: 6000,
+            caps: caps(RateMode::He, 2, 12, 80),
+            radio_width_mhz: 80,
+            contention: None,
+            sticky: 0.0,
+            failed_roams: 0,
+        };
+        assert_eq!(parts(&odd).0[3], None);
     }
 
     #[test]

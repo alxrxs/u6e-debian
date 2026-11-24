@@ -9,9 +9,9 @@ import { h, pct, scoreQuality } from '../util.js';
  * client may have none. */
 const PARTS = [
   ['signal', 'Signal', (v) => `${v} dBm on average`, ''],
-  ['retries', 'Retries', (v) => `${pct(v)} of the frames sent it were resent`, 'too few frames sent it to tell'],
+  ['retries', 'Retries', (v) => `${pct(v)} of the transmissions to it were retries`, 'too few frames sent it to tell'],
   ['contention', 'Air contention', (v) => `${pct(v)} of the air busy with others`, 'its radio has reported once only'],
-  ['rate', 'Rate', (v) => `${pct(v)} of the best rate it can get here`, 'too few frames sent it, or what it supports is unknown'],
+  ['rate', 'Rate', (v) => `${pct(v)} of the best rate it can get here`, 'too few frames sent it, or what it supports has no best rate'],
   ['roaming', 'Roaming', (v) => (v ? `sticky ${pct(v)} of the last hour` : 'not sticky in the last hour'), ''],
 ];
 
