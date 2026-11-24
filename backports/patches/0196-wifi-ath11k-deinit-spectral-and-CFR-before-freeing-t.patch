@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Tue, 24 Nov 2026 05:26:17 +0200
+Subject: [PATCH] wifi: ath11k: deinit spectral and CFR before freeing the
+ pdev's DP
+
+ath11k_dp_pdev_free() calls ath11k_debugfs_unregister(), which removes
+the pdev's debugfs directory recursively, and with it the spectral and
+CFR files and relay buffers inside it. ath11k_core_reconfigure_on_crash()
+deinitialized spectral and CFR only after that, so their
+debugfs_remove() and relay_close() ran on dentries that were already
+removed and freed. Every firmware crash recovery of a radio with
+spectral scan enabled could oops there:
+
+  Unable to handle kernel NULL pointer dereference at virtual address 0000000000000098
+  pc : down_write+0x70/0xa0
+  lr : __simple_recursive_removal+0x5c/0x1fc
+  Call trace:
+   down_write+0x70/0xa0 (P)
+   __simple_recursive_removal+0x5c/0x1fc
+   simple_recursive_removal+0x14/0x20
+   debugfs_remove+0x58/0x7c
+   ath11k_spectral_deinit+0x9c/0x120 [ath11k]
+   ath11k_core_restart+0x98/0x208 [ath11k]
+
+Deinit them first, in the order ath11k_core_pdev_destroy() already
+uses.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/wireless/ath/ath11k/core.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/wireless/ath/ath11k/core.c b/drivers/net/wireless/ath/ath11k/core.c
+index b7cac0b..c0c079e 100644
+--- a/drivers/net/wireless/ath/ath11k/core.c
++++ b/drivers/net/wireless/ath/ath11k/core.c
+@@ -2446,9 +2446,10 @@ static int ath11k_core_reconfigure_on_crash(struct ath11k_base *ab)
+ 		ath11k_hif_ce_irq_disable(ab);
+ 	}
+ 
+-	ath11k_dp_pdev_free(ab);
++	/* Before ath11k_dp_pdev_free(), which removes the debugfs they live in */
+ 	ath11k_cfr_deinit(ab);
+ 	ath11k_spectral_deinit(ab);
++	ath11k_dp_pdev_free(ab);
+ 	ath11k_ce_cleanup_pipes(ab);
+ 	ath11k_wmi_detach(ab);
+ 	ath11k_dp_pdev_reo_cleanup(ab);
