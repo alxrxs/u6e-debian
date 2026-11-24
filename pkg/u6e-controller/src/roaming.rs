@@ -33,6 +33,9 @@ use crate::timeline::{End, Place};
 pub const KEEP_MS: u64 = 7 * 24 * 3600 * 1000;
 pub const ROAMS_MAX: usize = 2000;
 pub const STEERS_MAX: usize = 1000;
+/// The steering records kept of one client: one sending query after query
+/// cannot push the others' out.
+pub const STEERS_PER_CLIENT: usize = 50;
 /// The clients whose readings are kept, the least recently heard dropped.
 pub const CLIENTS_MAX: usize = 512;
 /// The sticky threshold unless the configuration sets another.
@@ -492,6 +495,12 @@ impl Roaming {
     }
 
     fn push_steer(&mut self, mut s: Steer) {
+        let mine = self.steers.iter().filter(|x| x.mac == s.mac).count();
+        if mine >= STEERS_PER_CLIENT
+            && let Some(i) = self.steers.iter().position(|x| x.mac == s.mac)
+        {
+            self.steers.remove(i);
+        }
         self.next_steer += 1;
         s.id = self.next_steer;
         self.steers.push_back(s);
@@ -1891,6 +1900,26 @@ mod tests {
         }
         assert_eq!(r.roams().count(), ROAMS_MAX);
         assert_eq!(r.roams().next().unwrap().at_ms, T0 + 1);
+        // A client that sends query after query keeps its newest 50, and
+        // pushes no other client's out.
+        let query = |last, reason| EventKind::BtmQuery {
+            mac: mac(last),
+            bss: 0,
+            reason,
+        };
+        let mut site = Site::new();
+        site.event("ap1", T0, query(2, 1));
+        for i in 0..60 {
+            site.event("ap1", T0 + 1 + i, query(1, i as u8));
+        }
+        let mine: Vec<u8> = site
+            .r
+            .steers()
+            .filter(|s| s.mac == mac(1))
+            .filter_map(|s| s.reason)
+            .collect();
+        assert_eq!(mine, (10..60).collect::<Vec<u8>>());
+        assert_eq!(site.r.steers().filter(|s| s.mac == mac(2)).count(), 1);
         r.settle(T0 + KEEP_MS + 1000, &Sessions::default());
         assert_eq!(r.roams().count(), ROAMS_MAX - 1000 + 1);
         for i in 0..=CLIENTS_MAX as u64 {
