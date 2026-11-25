@@ -1,9 +1,9 @@
-// Devices: each AP with what it runs and how it is doing, its clients'
-// Wi-Fi experience, its speed tests to the controller, and its radios with
-// channel, power, noise, clients and how busy the air is; a radio's name
-// leads to its spectrum.
+// Devices: one bar per AP, its state, clients and channels; opened, what it
+// runs and how it is doing, its clients' Wi-Fi experience, its speed tests
+// to the controller, and its radios with channel, power, noise, clients and
+// how busy the air is; a radio's name leads to its spectrum.
 
-import { h, ago, bandName, clientName, duration, palette, pct } from '../util.js';
+import { h, ago, bandName, bar, clientName, duration, palette, pct, place } from '../util.js';
 import { sparkline, stack } from '../charts.js';
 import { apExperience } from './experience.js';
 import { apSpeedBox } from './speedtest.js';
@@ -64,32 +64,35 @@ function radioPanel(store, name, phy, r, tempC) {
       tempC === undefined ? fact('Temp', h('span', { class: 'muted', title: 'This image reports no radio temperature' }, 'n/a')) : fact('Temp', temp(tempC))));
 }
 
-/** The AP's connection state and what it says, as [class, label, detail]. */
+/** The AP's connection state, as [class, words]. */
 function connection(ap) {
-  const m = ap.mismatch;
-  if (ap.up) return ['ok', 'Connected', `for ${duration((Date.now() - ap.since) / 1000)}`];
-  if (m) return ['bad', 'Protocol mismatch', `AP runs protocol ${m.ap}, controller runs ${m.controller}`];
-  return ['bad', 'Offline', ap.seen ? `last seen ${ago(ap.seen)}` : 'has not connected since the controller started'];
+  if (ap.up) return ['ok', `Connected for ${duration((Date.now() - ap.since) / 1000)}`];
+  if (ap.mismatch) return ['bad', 'Protocol mismatch'];
+  return ['bad', ap.seen ? `Offline, last seen ${ago(ap.seen)}` : 'Offline'];
 }
 
-function apPanel(store, name, ap) {
-  const open = (store.ui.manifests ||= new Set());
-  const [cls, label, detail] = connection(ap);
-  const top = h('div', { class: 'ap-top' },
-    h('h2', {}, name),
-    h('span', { class: `state ${cls}` }, label),
-    h('span', { class: 'since' }, detail));
+/** An AP bar's head: its state, clients and channels. */
+function apHead(name, ap) {
+  const [cls, state] = connection(ap);
+  const radios = Object.values(ap.up ? ap.radios || {} : {}).sort((a, b) => Number(a.band) - Number(b.band));
+  const clients = radios.reduce((n, r) => n + r.clients, 0);
+  return [h('span', { class: `sdot ${cls}`, 'aria-hidden': 'true' }),
+    h('span', { class: 'xbar-name' }, h('b', {}, name), h('small', {}, state)),
+    h('span', { class: 'xbar-count' }, radios.length ? h('span', { class: 'ap-chans' },
+      `${clients} client${clients === 1 ? '' : 's'}`,
+      radios.map((r) => h('span', { class: `chip${r.up ? '' : ' bad'}`, 'data-band': r.up ? r.band : null },
+        r.up ? `${bandName(r.band)} · ${r.channel}` : `${bandName(r.band)} down`))) : null)];
+}
 
+/** An AP bar's body: what it runs, its experience, speed test, radios. */
+function apBody(store, name, ap) {
+  const open = (store.ui.manifests ||= new Set());
   const m = ap.mismatch;
   if (m) {
     const fix = m.ap < m.controller ? `an image of ${name} built with this controller` : 'a controller as new as its agent';
-    return h('section', { class: 'panel ap' }, top,
-      h('p', { class: 'offline' }, `${name}’s agent dials in, but the controller turns it away: they speak different versions of the link. Wi-Fi on it keeps working; its figures return with ${fix}.`));
+    return h('p', { class: 'offline' }, `The controller turns ${name}’s agent away: they speak different versions of the link. Wi-Fi keeps working; its figures return with ${fix}.`);
   }
-  if (!ap.agent) {
-    return h('section', { class: 'panel ap' }, top,
-      h('p', { class: 'offline' }, `${name} is configured, but its agent has not dialled in yet. Its image, versions and radios appear here once it does.`));
-  }
+  if (!ap.agent) return h('p', { class: 'offline' }, `${name}’s agent has not dialled in yet.`);
 
   // Up but not yet reported: the first snapshot is on its way.
   const live = ap.up && ap.uptime !== undefined;
@@ -115,10 +118,10 @@ function apPanel(store, name, ap) {
   const body = live
     ? h('div', { class: 'radios' }, Object.entries(radios).map(([phy, r]) => radioPanel(store, name, phy, r, temps[phy])))
     : h('p', { class: 'offline' }, ap.up
-      ? `${name} has connected; its radios appear with its first report.`
-      : `No live data while ${name} is offline. Wi-Fi on it keeps working without the controller; the figures return when its agent reconnects.`);
+      ? 'Its radios show with its first report.'
+      : 'No live figures while it is offline. Wi-Fi on it keeps working.');
   const xp = live ? apExperience(ap.experience, (m) => clientName(store, m)) : null;
-  return h('section', { class: 'panel ap' }, top, facts,
+  return h('div', { class: 'ap-body' }, facts,
     crashes.length ? h('p', { class: 'note' }, crashes.map(([phy, n]) => `${phy} firmware crashed ${n} time${n === 1 ? '' : 's'} since the controller started. `)) : null,
     xp ? h('div', { class: 'ap-xp-box' }, h('h3', {}, 'Experience'), xp) : null,
     apSpeedBox(store, name, ap),
@@ -134,28 +137,37 @@ function nssMeter(v) {
 export default {
   mount(root, store) {
     const sub = h('p');
-    const list = h('div');
-    root.append(h('div', { class: 'head' }, h('h1', {}, 'Devices'), sub), list);
-    return {
+    const list = h('div', { class: 'xbars' });
+    const note = h('div');
+    const open = (store.ui.apsOpen ||= new Set());
+    const bars = new Map();
+    root.append(h('div', { class: 'head' }, h('h1', {}, 'Devices'), sub), note, list);
+    const view = {
       update() {
         const aps = Object.entries(store.state.aps).sort(([a], [b]) => a.localeCompare(b));
         const up = aps.filter(([, a]) => a.up).length;
         sub.textContent = aps.length ? `${up} of ${aps.length} access points connected` : '';
         draws.length = 0;
-        if (!store.keyed) {
-          const [title, text] = store.waiting();
-          list.replaceChildren(h('div', { class: 'panel empty' }, h('strong', {}, title), h('p', {}, text)));
+        if (!store.keyed || !aps.length) {
+          const [title, text] = store.keyed
+            ? ['No access points are configured', 'Each one shows here once its agent dials in.']
+            : store.waiting();
+          note.replaceChildren(h('div', { class: 'panel empty' }, h('strong', {}, title), h('p', {}, text)));
+          list.replaceChildren();
           return;
         }
-        if (!aps.length) {
-          list.replaceChildren(h('div', { class: 'panel empty' },
-            h('strong', {}, 'No access points are configured'),
-            h('p', {}, 'Each AP is listed in the controller’s configuration with its public key, and appears here once its agent dials in.')));
-          return;
-        }
-        list.replaceChildren(...aps.map(([name, ap]) => apPanel(store, name, ap)));
+        note.replaceChildren();
+        place(list, aps.map(([name, ap]) => {
+          if (!bars.has(name)) bars.set(name, bar(open, name, () => view.update()));
+          const b = bars.get(name);
+          b.head(apHead(name, ap));
+          b.el.classList.toggle('xbar-bad', !ap.up);
+          b.body.replaceChildren(...(b.open ? [apBody(store, name, ap)] : []));
+          return b.el;
+        }));
         for (const d of draws) d();
       },
     };
+    return view;
   },
 };

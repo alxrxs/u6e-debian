@@ -19,7 +19,7 @@ import { lineChart } from '../charts.js';
 import { clientFlows, flowTable, offload, redraw, sampled, tick, topRows } from './flows.js';
 import { certificate, sessionsTable, timelineItems } from './history.js';
 import { capturePanel, limitPanel } from './tools.js';
-import { byMac, deviceCard } from './services.js';
+import { byMac, deviceDetail } from './services.js';
 import { trafficPanel } from './traffic.js';
 import { vlanPanel } from './vlans.js';
 import { clientExperience } from './experience.js';
@@ -312,7 +312,7 @@ export default {
       svcDrawn = stamp;
       const macs = byMac(svc);
       const d = macs.get(mac);
-      svcBox.replaceChildren(d ? deviceCard(d, macs, { link: false }) : h('div', { class: 'panel empty' }, h('p', {},
+      svcBox.replaceChildren(d ? h('div', { class: 'panel svc-own' }, deviceDetail(d, svc, { link: false })) : h('div', { class: 'panel empty' }, h('p', {},
         !svc ? 'Loading what it offers over mDNS.'
           : svc.error !== undefined ? 'The controller cannot be reached; this page tries again.'
             : 'No access point has heard it speak mDNS (Bonjour, AirPlay, HomeKit) lately.')));

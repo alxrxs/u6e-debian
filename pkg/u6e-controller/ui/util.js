@@ -56,6 +56,48 @@ export function ask(root, { title, text, choices, confirm, danger, pick }) {
   });
 }
 
+let bars = 0;
+
+/** An expandable bar (the WAI-ARIA disclosure pattern): a heading whose
+ * button shows or hides the body below it. `open` holds the keys open this
+ * session; `toggled` runs after each click, to fill a body just opened. */
+export function bar(open, key, toggled) {
+  const id = `xbar-${++bars}`;
+  const btn = h('button', { type: 'button', class: 'xbar-btn', 'aria-controls': id });
+  const body = h('div', { class: 'xbar-body', id });
+  const el = h('section', { class: 'panel xbar' }, h('h3', { class: 'xbar-h' }, btn), body);
+  const b = {
+    el,
+    body,
+    btn,
+    get open() { return open.has(key); },
+    /** Sets what the bar says, closed. */
+    head(...kids) {
+      btn.replaceChildren(...kids.flat(Infinity).filter(Boolean), h('span', { class: 'xbar-chev', 'aria-hidden': 'true' }));
+    },
+    set(on) {
+      if (on) open.add(key);
+      else open.delete(key);
+      btn.setAttribute('aria-expanded', String(on));
+      body.hidden = !on;
+    },
+  };
+  btn.addEventListener('click', () => {
+    b.set(!b.open);
+    toggled?.(b);
+  });
+  b.set(b.open);
+  return b;
+}
+
+/** Puts `els` in `parent` in order, touching nothing when they are already
+ * so: a focused bar keeps its focus. */
+export function place(parent, els) {
+  const now = parent.children;
+  if (now.length === els.length && els.every((e, i) => now[i] === e)) return;
+  parent.replaceChildren(...els);
+}
+
 export const BANDS = ['2.4', '5', '6'];
 
 export function bandName(b) {
@@ -233,9 +275,6 @@ export function serviceName(type) {
 export function offerLabel(label) {
   return (label || '').replace(/^[0-9a-f]{12}@/i, '');
 }
-
-/** DNS record types, as mDNS questions ask for them. */
-export const QTYPES = { 1: 'A', 12: 'PTR', 16: 'TXT', 28: 'AAAA', 33: 'SRV', 255: 'ANY' };
 
 /** What a service change says, as the feed and a client's timeline show it
  * (`who` names the device that asked). */

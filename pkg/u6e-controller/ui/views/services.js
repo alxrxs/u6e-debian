@@ -1,13 +1,10 @@
-// Services: what the access points read of mDNS (Bonjour): every device
-// that speaks it, the services it offers and whether it answers the queries
-// for them, what it asks for and who answers; the AirPlay groups (a stereo
-// pair) and a "can one device see another" check. Site-wide, each device as
-// the access point it is on hears it, or one AP's own reading. Fetched every
-// 5 s while shown; a service's changes come with the events. The client
-// page shows its own device the same way.
+// Services: what the access points read of mDNS (Bonjour). One bar per
+// AirPlay group and per device, closed by default: what it offers, how
+// that answers, who asks for it and what it looks for. Site-wide, or one
+// AP's own reading; fetched every 5 s while shown. The client page shows
+// its own device's detail the same way.
 
-import { h, ago, bandName, hm, offerLabel, QTYPES, serviceName } from '../util.js';
-import { when } from './history.js';
+import { h, ago, bandName, bar, hm, offerLabel, place, serviceName } from '../util.js';
 
 const REFRESH_MS = 5000;
 
@@ -23,260 +20,216 @@ export function byMac(data) {
   return new Map((data?.devices || []).map((d) => [d.mac, d]));
 }
 
-/** A device's name as a link to its page. */
 function deviceLink(macs, mac) {
   return h('a', { href: `#/client/${mac}` }, deviceName(macs.get(mac)) || mac);
 }
 
-/** A list of devices' links, joined in words. */
-function names(macs, list) {
-  return list.flatMap((m, i) => [i ? (i === list.length - 1 ? ' and ' : ', ') : null, deviceLink(macs, m)]);
+/** A list in words: "a, b and c". */
+function inWords(items) {
+  return items.flatMap((x, i) => [i ? (i === items.length - 1 ? ' and ' : ', ') : null, x]);
 }
 
 const STATUS = {
   answering: ['ok', 'Answering'],
-  missing: ['warn', 'Missed the last'],
+  missing: ['warn', 'No answer yet'],
   silent: ['bad', 'Not answering'],
-  unconfirmed: ['', 'Unconfirmed'],
+  unconfirmed: ['', 'Quiet'],
   gone: ['', 'Gone'],
 };
 
-/** How an offer stands, in words beside its chip. */
-function offerDetail(o, macs) {
-  if (o.status === 'gone') {
-    return o.withdrawn === 'goodbye' ? `said goodbye ${ago(o.announced)}`
-      : 'did not answer a query after its announcement ran out';
-  }
-  if (o.status === 'unconfirmed') {
-    return `its announcement ran out ${ago(o.announced + o.ttl * 1000)}; nobody has asked for it since`;
-  }
-  const parts = [];
-  if (o.answered) parts.push(`answered ${o.answered}`);
-  if (o.missed_in_row) {
-    parts.push([`missed ${o.missed_in_row} in a row since ${when(o.missed_at)}`,
-      o.missed_by ? [', last asked by ', deviceLink(macs, o.missed_by)] : null]);
-  } else if (o.missed) {
-    parts.push(`missed ${o.missed} in all`);
-  }
-  if (!parts.length) parts.push(`announced ${ago(o.announced)}`);
-  return parts.flatMap((p, i) => (i ? [' · ', p] : [p]));
+/** Whether an offer stands badly: silent, or missing its last queries. */
+const poor = (o) => o.status === 'silent' || o.status === 'missing' || (o.status === 'answering' && o.missed_in_row > 0);
+
+/** A device's tone: bad when a service does not answer, warn when one
+ * misses or a query of its own goes unanswered. */
+function tone(d) {
+  if (d.offers.some((o) => o.status === 'silent')) return 'bad';
+  if (d.offers.some(poor) || d.queries.some((q) => q.missed_by.length)) return 'warn';
+  return d.offers.length ? 'ok' : '';
 }
 
-function offerRow(o, macs) {
-  const [tone, label] = STATUS[o.status] || ['', o.status];
-  const txt = Object.entries(o.txt || {}).filter(([k]) => k === 'model' || k === 'md').map(([, v]) => v)[0];
+/** How an offer stands, in a few words. */
+function offerWhen(o) {
+  switch (o.status) {
+    case 'silent': return o.answered_at ? `last answered ${ago(o.answered_at)}` : 'never answered';
+    case 'missing': return `missed ${o.missed}`;
+    case 'unconfirmed': return 'nobody asked lately';
+    case 'gone': return o.withdrawn === 'goodbye' ? `said goodbye ${ago(o.announced)}` : 'stopped answering';
+    default:
+      if (o.missed_in_row) return h('span', { class: 'q-fair' }, o.missed_in_row === 1 ? 'missed the last query' : `missed the last ${o.missed_in_row} queries`);
+      return o.answered_at ? `answered ${ago(o.answered_at)}` : `announced ${ago(o.announced)}`;
+  }
+}
+
+function offerRow(o) {
+  const [t, label] = STATUS[o.status] || ['', o.status];
+  const kind = o.service.replace(/\.local$/i, '');
   return h('li', { class: 'svc-row' },
     h('div', { class: 'svc-what' }, h('b', {}, serviceName(o.service)), h('span', {}, offerLabel(o.label)),
-      h('small', {}, [o.target, o.port ? `:${o.port}` : '', txt ? ` · ${txt}` : ''].join(''))),
-    h('div', { class: 'svc-how' }, h('span', { class: `chip ${tone}`.trim() }, label), h('small', {}, offerDetail(o, macs))));
+      h('small', { class: 'mono' }, kind)),
+    h('div', { class: 'svc-how' }, h('span', { class: `chip ${t}`.trim() }, label), h('small', {}, offerWhen(o))));
 }
 
-/** What a query asks, in words. */
-function asking(q) {
-  const first = q.name.split('.')[0];
-  if (first.startsWith('_') && q.qtype === 12) return `Browses for ${serviceName(q.name)}`;
-  if (/\._(tcp|udp)\.local$/i.test(q.name)) {
-    const label = q.name.replace(/\\./g, '\u0000').split('.')[0].replace(/\u0000/g, '.');
-    return `Resolves ${label} (${serviceName(q.name.slice(q.name.indexOf('._') + 1))})`;
+/** Who asked for `d`'s services, and whether it answered each: per asker,
+ * a miss outweighs an answer. */
+function askers(d, list) {
+  const names = new Set(d.offers.flatMap((o) => [o.service.toLowerCase(), o.instance.toLowerCase()]));
+  const out = new Map();
+  for (const x of list) {
+    if (x.mac === d.mac) continue;
+    for (const q of x.queries) {
+      if (!names.has(q.name.toLowerCase())) continue;
+      if (q.missed_by.includes(d.mac)) out.set(x.mac, false);
+      else if ((q.answered_by.includes(d.mac) || q.known.includes(d.mac)) && !out.has(x.mac)) out.set(x.mac, true);
+    }
   }
-  return `Asks for ${q.name} (${QTYPES[q.qtype] || q.qtype})`;
+  return [...out].sort(([, a], [, b]) => Number(a) - Number(b));
 }
 
-function queryRow(q, macs) {
-  const how = [];
-  if (q.answered_by.length) how.push(['answered by ', names(macs, q.answered_by)]);
-  if (q.missed_by.length) how.push([h('span', { class: 'q-poor' }, 'not by '), names(macs, q.missed_by)]);
-  if (q.known.length) how.push(['already holds ', names(macs, q.known)]);
-  if (q.unlisted) how.push(`and ${q.unlisted} more the AP does not list`);
-  if (q.unicast) how.push('asked for a unicast answer, which the AP may not see');
-  if (q.unanswered) how.push(h('span', { class: 'q-poor' }, `${q.unanswered} asked from scratch got no answer`));
-  const tone = q.missed_by.length || q.unanswered ? 'warn' : '';
-  return h('li', { class: 'svc-row' },
-    h('div', { class: 'svc-what' }, h('b', {}, asking(q)),
-      h('small', {}, `${q.count} time${q.count === 1 ? '' : 's'}, last ${ago(q.last)}`)),
-    h('div', { class: 'svc-how' }, tone ? h('span', { class: `chip ${tone}` }, q.missed_by.length ? 'Not all answer' : 'Unanswered') : null,
-      how.length ? h('small', {}, how.flatMap((x, i) => (i ? [' · ', x] : [x]))) : null));
+/** A device's detail: its services, who asks for them, what it looks for. */
+export function deviceDetail(d, data, { link = true } = {}) {
+  const list = data?.devices || [];
+  const macs = byMac(data);
+  const asked = askers(d, list);
+  const looks = [...new Set(d.queries.filter((q) => q.qtype === 12 && q.name.startsWith('_')).map((q) => serviceName(q.name)))];
+  const unanswering = [...new Set(d.queries.flatMap((q) => q.missed_by))];
+  return h('div', { class: 'svc-detail' },
+    d.offers.length
+      ? h('ul', { class: 'svc-list' }, d.offers.map(offerRow))
+      : h('p', { class: 'muted svc-none' }, 'Offers no services.'),
+    h('dl', { class: 'svc-rel' },
+      asked.length ? h('div', {}, h('dt', {}, 'Asked for by'), h('dd', {}, asked.map(([m, ok]) =>
+        h('span', { class: `who-chip ${ok ? 'ok' : 'bad'}` }, deviceLink(macs, m), ok ? ' answered' : ' no answer')))) : null,
+      looks.length ? h('div', {}, h('dt', {}, 'Looks for'), h('dd', {}, looks.join(', '),
+        unanswering.length ? h('span', { class: 'q-poor' }, `. No answer from `, inWords(unanswering.map((m) => deviceLink(macs, m)))) : null)) : null),
+    h('p', { class: 'muted svc-foot' }, h('span', { class: 'mono' }, d.mac), d.host ? ` · ${d.host}` : '', ` · heard ${ago(d.last)}`,
+      link ? [' · ', h('a', { href: `#/client/${d.mac}` }, 'Device page')] : null));
 }
 
-/** A device's card: who and where it is, what it offers, what it asks. */
-export function deviceCard(d, macs, { link = true } = {}) {
-  const name = deviceName(d);
-  const head = h('div', { class: 'svc-head' },
-    h('div', { class: 'who', 'data-band': d.band },
-      h('div', { class: 'id' },
-        link ? h('a', { href: `#/client/${d.mac}` }, name) : h('b', {}, name),
-        h('small', {}, [h('span', { class: 'mono' }, d.mac), d.host ? ` · ${d.host}` : ''].filter(Boolean)))),
-    h('div', { class: 'svc-where' },
-      d.band ? h('span', { class: 'chip', 'data-band': d.band }, bandName(d.band)) : h('span', { class: 'chip' }, d.wifi ? 'Wi-Fi' : 'Wired'),
-      h('span', { class: 'muted' }, `${d.ap} · ${d.port}`)));
-  const offers = d.offers.length
-    ? h('ul', { class: 'svc-list' }, d.offers.map((o) => offerRow(o, macs)))
-    : h('p', { class: 'muted svc-none' }, 'Offers nothing.');
-  const queries = d.queries.length
-    ? h('ul', { class: 'svc-list' }, d.queries.map((q) => queryRow(q, macs)))
-    : h('p', { class: 'muted svc-none' }, 'Asked for nothing lately.');
-  const silent = d.offers.some((o) => o.status === 'silent');
-  return h('article', { class: `panel svc-card${silent ? ' svc-bad' : ''}` }, head,
-    h('h3', {}, 'Offers'), offers, h('h3', {}, 'Asks for'), queries,
-    h('p', { class: 'muted foot' }, `Heard ${ago(d.last)} · ${d.queries_sent} queries and ${d.responses_sent} responses sent`));
+function dot(t) {
+  return h('span', { class: `sdot ${t}`.trim(), 'aria-hidden': 'true' });
 }
 
-/** A group's card: its members and how each answers. */
-function groupCard(g, macs, offers) {
-  return h('article', { class: 'panel svc-group' },
-    h('div', { class: 'svc-head' }, h('b', {}, g.name || 'AirPlay group'), h('span', { class: 'muted' }, `AirPlay group of ${g.members.length}`)),
-    h('ul', { class: 'svc-list' }, g.members.map((m) => {
-      const o = offers.get(`${m.mac}|${m.instance}`);
-      const [tone, label] = STATUS[o?.status] || ['', '–'];
-      return h('li', { class: 'svc-row' },
-        h('div', { class: 'svc-what' }, deviceLink(macs, m.mac), m.leader ? h('span', { class: 'chip wait' }, 'Leader') : null,
-          h('small', {}, offerLabel(m.label))),
-        h('div', { class: 'svc-how' }, h('span', { class: `chip ${tone}`.trim() }, label), o ? h('small', {}, offerDetail(o, macs)) : null));
-    })));
+/** A device bar's head: name, where, and a count of its services. */
+function deviceHead(d, macs) {
+  const silent = d.offers.filter((o) => o.status === 'silent').length;
+  const missing = d.offers.filter((o) => o.status !== 'silent' && poor(o)).length;
+  const gone = d.offers.filter((o) => o.status === 'gone').length;
+  const unanswered = [...new Set(d.queries.flatMap((q) => q.missed_by))];
+  const n = d.offers.length;
+  const where = d.band ? `${d.ap} · ${bandName(d.band)}` : `${d.ap} · ${d.wifi ? 'Wi-Fi' : 'wired'}`;
+  return [dot(tone(d)),
+    h('span', { class: 'xbar-name' }, h('b', {}, deviceName(d)), h('small', {}, where)),
+    h('span', { class: 'xbar-count' }, n ? `${n} service${n === 1 ? '' : 's'}` : 'No services',
+      silent ? h('span', { class: 'q-poor' }, ` · ${silent} not answering`) : null,
+      missing ? h('span', { class: 'q-fair' }, ` · ${missing} missed queries`) : null,
+      gone ? ` · ${gone} gone` : null,
+      unanswered.length ? h('span', { class: 'q-fair' }, ` · no answer from ${unanswered.length === 1
+        ? deviceName(macs.get(unanswered[0])) || unanswered[0] : `${unanswered.length} devices`}`) : null)];
 }
 
-/** The words of a verdict of `/api/services/see`: its tone and text. */
-export function verdict(v, from, to) {
-  const asked = v.query ? `its last ${v.query.qtype === 12 ? 'browse' : 'query'} (${ago(v.query.last)})` : '';
-  switch (v.outcome) {
-    case 'answered': return ['ok', [to, ` answered ${asked}.`]];
-    case 'known': return ['ok', [from, ' already holds it: ', asked, ' listed it as a known answer, so ', to, ' rightly kept quiet.']];
-    case 'missed': return ['bad', [to, ` did not answer ${asked}.`]];
-    case 'unlisted': return ['', [from, `’s last query had more answers and misses than the access point lists (${v.query.unlisted} more): whether `, to, ' was among them cannot be told.']];
-    case 'unclear': return ['', v.offer.status === 'gone'
-      ? [to, ' had withdrawn it when ', from, ' last asked.']
-      : [from, ' asked for a unicast answer, which the access point cannot always see.']];
-    default: return ['', [from, ' has not asked for it since the access points heard it.']];
-  }
+/** How a group member stands, in a few words. */
+function memberState(m) {
+  if (m.status === 'silent') return `not answering${m.since ? ` since ${hm(m.since)}` : ''}`;
+  if (m.status === 'gone') return 'gone';
+  if (m.status === 'unconfirmed') return 'quiet';
+  return 'answering';
 }
 
-/** The "can one see another" panel: two pickers, then a verdict per
- * service the second offers. */
-function seePanel(store) {
-  const pick = (store.ui.see ||= { from: '', to: '' });
-  const from = h('select', { 'aria-label': 'The device that asks' });
-  const to = h('select', { 'aria-label': 'The device that offers' });
-  const out = h('div', { class: 'see-out' });
-  let result = null;
-  let asked = '';
-  async function ask() {
-    const key = `${pick.from}|${pick.to}`;
-    if (!pick.from || !pick.to) return;
-    asked = key;
-    const r = await store.getJson(`/api/services/see?from=${encodeURIComponent(pick.from)}&to=${encodeURIComponent(pick.to)}`);
-    if (asked === key) result = r.status === 200 ? r : { error: r.status };
-  }
-  from.addEventListener('change', () => {
-    pick.from = from.value;
-    pick.to = '';
-    result = null;
-    panel.update(true);
-  });
-  to.addEventListener('change', () => {
-    pick.to = to.value;
-    result = null;
-    panel.update(true);
-  });
-  const el = h('section', { class: 'panel see' },
-    h('div', { class: 'see-head' }, h('h2', {}, 'Can one device see another?'),
-      h('div', { class: 'see-pick' }, from, h('span', { class: 'muted' }, 'sees'), to)), out);
-  const panel = {
-    el,
-    data: null,
-    async update(fresh) {
-      const data = this.data;
-      const macs = byMac(data);
-      // Unpicked, an asker some device did not answer, and that device.
-      const askers = (data?.devices || []).filter((d) => d.queries.length);
-      if (!macs.has(pick.from)) {
-        pick.from = (askers.find((d) => d.queries.some((q) => q.missed_by.length)) || askers[0])?.mac || '';
-      }
-      const queries = macs.get(pick.from)?.queries || [];
-      const missed = new Set(queries.flatMap((q) => q.missed_by));
-      const wanted = new Set(queries.map((q) => q.name.toLowerCase()));
-      const rank = (d) => 2 * Number(missed.has(d.mac)) + Number(d.offers.some((o) => wanted.has(o.service.toLowerCase())));
-      const offering = (data?.devices || []).filter((d) => d.offers.length && d.mac !== pick.from);
-      offering.sort((a, b) => rank(b) - rank(a) || deviceName(a).localeCompare(deviceName(b)));
-      if (!offering.some((d) => d.mac === pick.to)) pick.to = offering[0]?.mac || '';
-      const opts = (list, value) => list.map((d) => h('option', { value: d.mac, selected: d.mac === value }, `${deviceName(d)} (${d.mac})`));
-      from.replaceChildren(...opts(askers, pick.from));
-      to.replaceChildren(...opts(offering, pick.to));
-      if (fresh || !result) await ask();
-      if (!pick.from || !pick.to) {
-        out.replaceChildren(h('p', { class: 'muted' }, 'No device has asked for anything yet.'));
-        return;
-      }
-      if (!result || result.error !== undefined) {
-        out.replaceChildren(h('p', { class: 'muted' }, result ? 'The controller cannot be reached.' : 'Asking the controller.'));
-        return;
-      }
-      const a = deviceLink(macs, pick.from);
-      const b = deviceLink(macs, pick.to);
-      const lines = result.verdicts.map((v) => {
-        const [tone, words] = verdict(v, a.cloneNode(true), b.cloneNode(true));
-        return h('li', { class: tone || null },
-          h('span', { class: 'dot', 'aria-hidden': 'true' }),
-          h('span', {}, h('b', {}, serviceName(v.offer.service)), h('span', { class: 'muted' }, ` · ${offerLabel(v.offer.label)}`), h('br'), words,
-            v.offer.missed_in_row ? h('small', {}, ` It has missed ${v.offer.missed_in_row} queries in a row since ${hm(v.offer.missed_at)}.`) : null));
-      });
-      const bad = result.verdicts.some((v) => v.outcome === 'missed');
-      const good = result.verdicts.some((v) => v.outcome === 'answered' || v.outcome === 'known');
-      const summary = bad
-        ? h('p', { class: 'see-sum bad' }, a, ' cannot see all of ', b, ': some of its queries go unanswered.')
-        : good ? h('p', { class: 'see-sum ok' }, a, ' sees ', b, '.')
-          : h('p', { class: 'see-sum' }, 'Nothing tells yet whether ', a, ' sees ', b, '.');
-      out.replaceChildren(summary, h('ul', { class: 'see-list' }, lines));
-    },
-  };
-  return panel;
+function groupHead(g, macs) {
+  const name = (m) => deviceName(macs.get(m.mac)) || offerLabel(m.label);
+  const bad = g.members.filter((m) => m.status !== 'answering' && m.status !== 'missing');
+  const t = bad.some((m) => m.status === 'silent') ? 'bad' : bad.length ? 'warn' : 'ok';
+  return [dot(t),
+    h('span', { class: 'xbar-name' }, h('b', {}, g.name || 'AirPlay group'),
+      h('small', {}, g.members.length === 2 ? 'AirPlay pair' : `AirPlay group of ${g.members.length}`)),
+    h('span', { class: 'xbar-count' }, bad.length
+      ? bad.map((m, i) => h('span', { class: m.status === 'silent' ? 'q-poor' : null }, i ? ' · ' : '', `${name(m)}: ${memberState(m)}`))
+      : `${g.members.length} answering`)];
+}
+
+function groupDetail(g, macs) {
+  return h('ul', { class: 'svc-list' }, g.members.map((m) => {
+    const [t, label] = STATUS[m.status] || ['', m.status];
+    return h('li', { class: 'svc-row' },
+      h('div', { class: 'svc-what' }, macs.has(m.mac) ? deviceLink(macs, m.mac) : h('b', {}, offerLabel(m.label)),
+        m.leader ? h('span', { class: 'chip wait' }, 'Leader') : null, h('small', {}, offerLabel(m.label))),
+      h('div', { class: 'svc-how' }, h('span', { class: `chip ${t}`.trim() }, label),
+        m.status === 'silent' && m.since ? h('small', {}, `since ${hm(m.since)}`) : null));
+  }));
 }
 
 export default {
   /** `ap` (`#/services/<ap>`) shows that AP's own reading. */
   mount(root, store, ap) {
     const f = (store.ui.services ||= { ap: '', q: '', problems: false });
+    const open = (store.ui.servicesOpen ||= new Set());
     if (ap !== undefined) f.ap = ap;
     let data = null;
     let fetched = 0;
     let loading = false;
     let drawn = '';
-    const sub = h('p');
+    const sub = h('p', { class: 'svc-sum' });
     const scope = h('div', { class: 'seg', role: 'group', 'aria-label': 'Scope' });
-    const search = h('input', { type: 'search', placeholder: 'Filter by device, MAC or service', 'aria-label': 'Filter devices', value: f.q });
+    const search = h('input', { type: 'search', placeholder: 'Filter by device or service', 'aria-label': 'Filter devices', value: f.q });
     search.addEventListener('input', () => {
       f.q = search.value;
-      drawn = '';
-      view.update();
+      redraw();
     });
     const problems = h('button', { type: 'button' }, 'Not answering');
     const all = h('button', { type: 'button' }, 'All');
     for (const [b, on] of [[all, false], [problems, true]]) {
       b.addEventListener('click', () => {
         f.problems = on;
-        drawn = '';
-        view.update();
+        redraw();
       });
     }
-    const see = seePanel(store);
-    const groups = h('div', { class: 'svc-grid' });
+    const expand = h('button', { type: 'button', class: 'btn quiet' });
+    const bars = new Map();
+    let shownBars = [];
+    expand.addEventListener('click', () => {
+      const on = shownBars.some((b) => !b.open);
+      for (const b of shownBars) b.set(on);
+      redraw();
+    });
+    const groups = h('div', { class: 'xbars' });
     const groupsEl = h('section', {}, h('h2', { class: 'section-title' }, 'Groups'), groups);
-    const cards = h('div', { class: 'svc-grid' });
+    const devices = h('div', { class: 'xbars' });
+    const devicesEl = h('section', {}, h('h2', { class: 'section-title' }, 'Devices'), devices);
     const empty = h('div', { class: 'panel empty' });
     root.append(
       h('div', { class: 'head' }, h('h1', {}, 'Services'), sub),
-      h('div', { class: 'tools' }, scope, h('div', { class: 'grow' }, search), h('div', { class: 'seg', role: 'group', 'aria-label': 'Show' }, all, problems)),
-      see.el, groupsEl, h('h2', { class: 'section-title' }, 'Devices'), cards, empty);
+      h('div', { class: 'tools' }, scope, h('div', { class: 'grow' }, search),
+        h('div', { class: 'seg', role: 'group', 'aria-label': 'Show' }, all, problems), expand),
+      groupsEl, devicesEl, empty);
+
+    function redraw() {
+      drawn = '';
+      view.update();
+    }
+
+    /** The bar of `key`, made once and kept, so it keeps its focus. */
+    function barOf(key) {
+      if (!bars.has(key)) bars.set(key, bar(open, key, redraw));
+      return bars.get(key);
+    }
+
+    /** Opens a device's bar and takes the reader to it. */
+    function reveal(mac) {
+      const b = barOf(mac);
+      b.set(true);
+      redraw();
+      b.el.scrollIntoView({ block: 'nearest' });
+      b.btn.focus();
+    }
 
     async function load() {
       loading = true;
       const r = await store.getJson(`/api/services${f.ap ? `?ap=${encodeURIComponent(f.ap)}` : ''}`);
       loading = false;
       fetched = Date.now();
-      data = r.status === 200 ? r : { error: r.status, devices: data?.devices || [] };
-      drawn = '';
-      see.data = r.status === 200 ? r : see.data;
-      view.update();
-      see.update(true);
+      data = r.status === 200 ? r : { error: r.status, devices: data?.devices || [], groups: data?.groups || [] };
+      redraw();
     }
 
     const view = {
@@ -290,7 +243,7 @@ export default {
               f.ap = ap;
               data = null;
               load();
-              view.update();
+              redraw();
             });
             return b;
           }));
@@ -303,29 +256,51 @@ export default {
         drawn = stamp;
         const list = data?.devices || [];
         const macs = byMac(data);
-        const offers = new Map(list.flatMap((d) => d.offers.map((o) => [`${o.mac}|${o.instance}`, o])));
-        const silent = list.filter((d) => d.offers.some((o) => o.status === 'silent')).length;
-        const types = data?.services?.filter((s) => s.offered_by.length).length || 0;
-        sub.textContent = data && !data.error
-          ? `${list.length} devices · ${types} services offered${silent ? ` · ${silent} not answering` : ''}`
-          : '';
+        const silent = list.filter((d) => d.offers.some((o) => o.status === 'silent'));
+        const types = new Set(list.flatMap((d) => d.offers.map((o) => o.service.toLowerCase()))).size;
+        sub.replaceChildren(...(data && !data.error ? [
+          `${list.length} device${list.length === 1 ? '' : 's'} · ${types} service${types === 1 ? '' : 's'}`,
+          silent.length ? [' · ', h('span', { class: 'q-poor' }, `${silent.length} not answering: `),
+            inWords(silent.map((d) => {
+              const b = h('button', { type: 'button', class: 'linkish' }, deviceName(d));
+              b.addEventListener('click', () => reveal(d.mac));
+              return b;
+            }))] : ' · all answering',
+        ].flat(Infinity).filter((x) => x !== null) : []));
+
         const q = f.q.trim().toLowerCase();
-        const shown = list.filter((d) => (!f.problems || d.offers.some((o) => o.status === 'silent') || d.queries.some((x) => x.missed_by.length || x.unanswered))
-          && (!q || [d.mac, deviceName(d), d.host, ...d.offers.flatMap((o) => [o.label, o.service, serviceName(o.service)])]
-            .some((v) => v && v.toLowerCase().includes(q))));
-        // The ones not answering first, then by name.
-        shown.sort((a, b) => Number(b.offers.some((o) => o.status === 'silent')) - Number(a.offers.some((o) => o.status === 'silent'))
-          || deviceName(a).localeCompare(deviceName(b)));
-        groupsEl.hidden = !data?.groups?.length;
-        groups.replaceChildren(...(data?.groups || []).map((g) => groupCard(g, macs, offers)));
-        cards.replaceChildren(...shown.map((d) => deviceCard(d, macs)));
+        const matches = (...vals) => !q || vals.some((v) => v && v.toLowerCase().includes(q));
+        const shown = list.filter((d) => (!f.problems || tone(d) === 'bad' || tone(d) === 'warn')
+          && matches(d.mac, deviceName(d), d.host, ...d.offers.flatMap((o) => [o.label, o.service, serviceName(o.service)])));
+        const rank = { bad: 0, warn: 1, ok: 2, '': 3 };
+        shown.sort((a, b) => rank[tone(a)] - rank[tone(b)] || deviceName(a).localeCompare(deviceName(b)));
+        const gShown = (data?.groups || []).filter((g) => (!f.problems || g.members.some((m) => m.status !== 'answering'))
+          && matches(g.name, ...g.members.flatMap((m) => [m.label, deviceName(macs.get(m.mac))])));
+
+        const fill = (key, head, detail) => {
+          const b = barOf(key);
+          b.head(head);
+          b.el.classList.toggle('xbar-bad', head[0].classList.contains('bad'));
+          if (b.open) b.body.replaceChildren(detail());
+          else b.body.replaceChildren();
+          return b;
+        };
+        const gBars = gShown.map((g) => fill(`g:${g.gid || g.tsid}`, groupHead(g, macs), () => groupDetail(g, macs)));
+        const dBars = shown.map((d) => fill(d.mac, deviceHead(d, macs), () => deviceDetail(d, data)));
+        place(groups, gBars.map((b) => b.el));
+        place(devices, dBars.map((b) => b.el));
+        shownBars = [...gBars, ...dBars];
+        groupsEl.hidden = !gBars.length;
+        devicesEl.hidden = !dBars.length;
+        expand.hidden = !shownBars.length;
+        expand.textContent = shownBars.some((b) => !b.open) ? 'Expand all' : 'Collapse all';
+
         empty.hidden = !!shown.length;
         empty.replaceChildren(
           h('strong', {}, !data ? 'Loading' : data.error !== undefined ? 'The controller cannot be reached'
-            : list.length ? 'No device matches these filters' : 'No mDNS heard yet'),
-          h('p', {}, !data || data.error !== undefined ? 'This page tries again every few seconds.'
-            : list.length ? 'Change the filters to see more.'
-              : 'Devices appear here as the access points hear them announce, answer or ask for services over mDNS (AirPlay, HomeKit, printers…).'));
+            : list.length ? 'No device matches' : 'No mDNS heard yet'),
+          h('p', {}, !data || data.error !== undefined ? 'Trying again every few seconds.'
+            : list.length ? 'Change the filters to see more.' : 'Devices show up here when they announce or ask for services.'));
       },
     };
     load();

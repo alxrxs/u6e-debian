@@ -281,7 +281,6 @@ select {
 
 /* Devices */
 
-.ap { padding: 18px 20px 20px; margin-bottom: 18px; }
 .ap-top { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
 .ap-top h2 { font-size: 20px; }
 .ap-top .since { color: var(--ink-3); font-size: 13px; }
@@ -358,7 +357,7 @@ details.manifest pre {
 .radio-stats dd { margin: 0; font-weight: 600; }
 
 .note { margin: 4px 0 2px; color: var(--bad); font-weight: 600; }
-.ap > .note { margin-top: 12px; }
+.ap-body > .note { margin-top: 12px; }
 
 .offline { margin-top: 16px; padding: 14px 16px; border: 1px dashed var(--rule); border-radius: 9px; color: var(--ink-2); }
 
@@ -708,7 +707,6 @@ table.conns { font-size: 12.5px; }
   .user { max-width: 12ch; }
   .banner { padding: 9px 16px; }
   main { padding: 16px 16px 40px; }
-  .ap { padding: 14px 14px 16px; }
   .facts { gap: 8px 20px; }
   .radios { grid-template-columns: 1fr; }
   .charts { grid-template-columns: 1fr; }
@@ -838,45 +836,66 @@ main > .tool { margin-bottom: 18px; }
 .kept code.newest { font-weight: 650; }
 .rollout .manifest { margin-top: 8px; }
 
-/* Services: each device that speaks mDNS as a card, what it offers and
-   asks; the groups; whether one device sees another. */
-.svc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 14px; align-items: start; }
-.svc-card, .svc-group { padding: 14px 18px 12px; min-width: 0; }
-.svc-card.svc-bad { border-color: color-mix(in srgb, var(--bad) 45%, var(--rule)); }
-.svc-card h3 { margin: 14px 0 4px; font-size: 12px; color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.04em; }
-.svc-head { display: flex; align-items: center; justify-content: space-between; gap: 8px 14px; flex-wrap: wrap; }
-.svc-head .id { min-width: 0; }
-.svc-head .id a, .svc-head .id b { font-weight: 600; font-size: 15px; }
-.svc-head .id small { display: block; max-width: none; color: var(--ink-3); font-size: 12px; white-space: normal; overflow-wrap: anywhere; }
-.svc-where { display: flex; align-items: center; gap: 8px; font-size: 12.5px; }
-.svc-list { list-style: none; margin: 0; padding: 0; }
-.svc-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); gap: 4px 14px; padding: 8px 0; border-top: 1px solid var(--rule-2); font-size: 13px; }
-.svc-row:first-child { border-top: 0; }
-.svc-what { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; min-width: 0; }
-.svc-what > span { color: var(--ink-2); overflow-wrap: anywhere; }
-.svc-what small, .svc-how small { flex-basis: 100%; color: var(--ink-3); font-size: 12px; overflow-wrap: anywhere; }
-.svc-how { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; min-width: 0; }
-.svc-none { margin: 2px 0; font-size: 13px; }
-.svc-card .foot { margin: 10px 0 0; font-size: 12px; }
-.svc-group .svc-head { margin-bottom: 6px; }
-.svc-group .svc-head b { font-size: 15px; }
-.client-services .svc-card { max-width: 980px; }
+/* Expandable bars: one per device, AP or group; the head says how it
+   stands, the body opens below. A bar with a problem carries a red edge. */
+.xbars { display: grid; gap: 8px; }
+.xbar { position: relative; overflow: hidden; }
+.xbar-bad::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--bad); }
+.xbar-h { margin: 0; font: inherit; color: inherit; }
+.xbar-btn {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 4px 12px;
+  width: 100%;
+  padding: 11px 16px;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.xbar-btn:hover { background: var(--sunken); }
+.xbar-btn:focus-visible { outline-offset: -2px; border-radius: 10px; }
+.xbar-name { display: flex; align-items: baseline; flex-wrap: wrap; gap: 0 10px; min-width: 0; }
+.xbar-name b { font-weight: 600; font-size: 15px; overflow-wrap: anywhere; }
+.xbar-name small { color: var(--ink-3); font-size: 12.5px; }
+.xbar-count { color: var(--ink-2); font-size: 13px; text-align: right; }
+.xbar-chev { width: 8px; height: 8px; margin: 0 2px 3px 4px; border: solid var(--ink-3); border-width: 0 1.5px 1.5px 0; transform: rotate(45deg); transition: transform 0.15s; }
+.xbar-btn[aria-expanded="true"] .xbar-chev { transform: rotate(-135deg); margin-bottom: -3px; }
+.xbar-body { padding: 4px 16px 14px; border-top: 1px solid var(--rule-2); }
+.sdot { width: 9px; height: 9px; border-radius: 50%; background: var(--other); }
+.sdot.ok { background: var(--ok); }
+.sdot.warn { background: var(--warn); }
+.sdot.bad { background: var(--bad); box-shadow: 0 0 0 3px color-mix(in srgb, var(--bad) 22%, transparent); }
+@media (prefers-reduced-motion: reduce) { .xbar-chev { transition: none; } }
 
-.see { padding: 16px 20px; margin-bottom: 4px; }
-.see-head { display: flex; align-items: center; justify-content: space-between; gap: 10px 18px; flex-wrap: wrap; }
-.see-head h2 { font-size: 16px; }
-.see-pick { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.see-pick select { max-width: 32ch; }
-.see-out { margin-top: 12px; }
-.see-sum { margin: 0 0 8px; font-weight: 600; }
-.see-sum.bad { color: var(--bad); }
-.see-sum.ok { color: var(--ok); }
-.see-list { list-style: none; margin: 0; padding: 0; }
-.see-list li { display: grid; grid-template-columns: 14px 1fr; gap: 10px; align-items: baseline; padding: 8px 0; border-top: 1px solid var(--rule-2); font-size: 13px; }
-.see-list .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink-3); align-self: center; }
-.see-list li.ok .dot { background: var(--ok); }
-.see-list li.bad .dot { background: var(--bad); }
-.see-list small { color: var(--ink-3); font-size: 12px; }
+/* Services: a device's services, who asks for them, what it looks for. */
+.svc-sum .linkish { padding: 0; border: 0; background: none; color: var(--accent); font: inherit; cursor: pointer; }
+.svc-sum .linkish:hover { text-decoration: underline; }
+.svc-list { list-style: none; margin: 0; padding: 0; }
+.svc-row { display: grid; grid-template-columns: minmax(0, 24rem) minmax(0, 1fr); gap: 4px 14px; padding: 8px 0; border-top: 1px solid var(--rule-2); font-size: 13px; }
+.svc-row:first-child { border-top: 0; }
+.svc-what, .svc-how { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; min-width: 0; }
+.svc-what > span { color: var(--ink-2); overflow-wrap: anywhere; }
+.svc-what small, .svc-how small { color: var(--ink-3); font-size: 12px; overflow-wrap: anywhere; }
+.svc-what small { flex-basis: 100%; }
+.svc-none { margin: 6px 0; font-size: 13px; }
+.svc-rel { margin: 6px 0 0; padding-top: 8px; border-top: 1px solid var(--rule-2); font-size: 13px; }
+.svc-rel div { display: grid; grid-template-columns: 12ch minmax(0, 1fr); gap: 8px; padding: 3px 0; }
+.svc-rel dt { color: var(--ink-3); }
+.svc-rel dd { margin: 0; display: flex; flex-wrap: wrap; gap: 4px 6px; align-items: baseline; }
+.who-chip { padding: 0 8px; border-radius: 999px; font-size: 12.5px; line-height: 20px; color: var(--ink-2); background: var(--sunken); border: 1px solid var(--rule-2); }
+.who-chip.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 30%, transparent); }
+.who-chip.bad { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 35%, transparent); background: color-mix(in srgb, var(--bad) 8%, transparent); }
+.svc-rel:empty { display: none; }
+.svc-foot { margin: 10px 0 0; font-size: 12px; overflow-wrap: anywhere; }
+.svc-own { padding: 6px 18px 12px; max-width: 980px; }
+
+/* Devices: an AP bar's channels. */
+.ap-chans { display: inline-flex; flex-wrap: wrap; gap: 4px 6px; justify-content: flex-end; }
+.ap-body > .facts { margin-top: 10px; }
 
 /* A client's traffic over the week. */
 .traffic .chart-head { padding: 14px 16px 0; }
@@ -891,11 +910,13 @@ table.dests td.wrap { min-width: 24ch; }
 .share span { width: 3.4em; text-align: right; color: var(--ink-2); }
 
 @media (max-width: 720px) {
-  .svc-grid { grid-template-columns: 1fr; }
-  .svc-card, .svc-group { padding: 12px 14px 10px; }
   .svc-row { grid-template-columns: 1fr; }
-  .see { padding: 14px 16px; }
-  .see-pick select { max-width: 100%; flex: 1 1 100%; }
+  .svc-rel div { grid-template-columns: 1fr; gap: 2px; }
+  .xbar-btn { grid-template-columns: auto minmax(0, 1fr) auto; padding: 11px 14px; }
+  .xbar-count { grid-column: 2; grid-row: 2; text-align: left; }
+  .xbar-chev { grid-column: 3; grid-row: 1; }
+  .xbar-body { padding: 4px 14px 12px; }
+  .ap-chans { justify-content: flex-start; }
   .traffic .chart canvas { height: 150px; }
 }
 
