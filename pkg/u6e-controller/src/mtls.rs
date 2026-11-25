@@ -1,9 +1,9 @@
 //! Mutual TLS 1.3 with the host's monitoring certificate
 //! (`[monitoring_tls]`): the chain it presents (leaf first), its key, and
 //! the CA bundle every peer is verified against. The controller serves
-//! `/metrics` over it to the scrapers it names, when it names any, and
-//! reads RADIUS's log over it when switched to it (`radius`, through
-//! [`get`]). The files are read at every connection, so a renewed
+//! `/metrics` over it to the scrapers it names, and reads RADIUS's log
+//! (`radius`) and the DHCP nodes' leases (`leases`) over it, each when
+//! switched on. The files are read at every connection, so a renewed
 //! certificate (new files) counts from the next one with no restart, and a
 //! missing, unreadable or mismatched one fails that connection alone:
 //! counted and logged, never served or read in plain HTTP instead. rustls

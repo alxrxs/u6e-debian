@@ -9,17 +9,18 @@
 //! rollouts (`rollout`), each off without its section; in `[rf]`, the RF
 //! planner's (`rf::config`), without which it is off; in `[leases]`, the
 //! DHCP nodes' node exporters the clients' leases are read from (`leases`),
-//! none without it; in `[radius]`, the Lokis the RADIUS servers' log is
-//! read from (`radius`, one, or several taken in turn when one fails), over
-//! mutual TLS with `tls = true`, RADIUS's side of the clients' timelines
-//! missing without it; in `[monitoring_tls]`, the host's monitoring
-//! certificate (`mtls`), which `[radius]` presents with `tls = true`:
-//! the chain (leaf first), its key and the CA bundle every peer is verified
-//! against, and the DNS names of the scrapers `/metrics` is then served to
-//! over mutual TLS alone (`metrics_clients`, plain HTTP while none is
-//! listed); where the clients' sessions and timelines are kept
-//! (`history_path`, `sessions`), and their traffic (`traffic_path`, `traffic`); the signal
-//! below which a client another AP heard better is sticky (`sticky_dbm`,
+//! over mutual TLS with `tls = true`, none without it; in `[radius]`, the
+//! Lokis the RADIUS servers' log is read from (`radius`, one, or several
+//! taken in turn when one fails), over mutual TLS with `tls = true`,
+//! RADIUS's side of the clients' timelines missing without it; in
+//! `[monitoring_tls]`, the host's monitoring certificate those two present
+//! (`mtls`): the chain (leaf first), its key and the CA bundle every peer
+//! is verified against, and the DNS names of the scrapers `/metrics` is
+//! then served to over mutual TLS alone (`metrics_clients`, plain HTTP
+//! while none is listed); where the clients' sessions and timelines are
+//! kept (`history_path`, `sessions`), and their traffic (`traffic_path`,
+//! `traffic`); the signal below which a client another AP heard better is
+//! sticky (`sticky_dbm`,
 //! `roaming`, −72 dBm unless set); where the client captures' files are kept
 //! (`captures_path`, `captures`); in `[limits]`, the site's per-SSID rate
 //! limits, which an
@@ -72,6 +73,7 @@
 //!
 //! [leases]
 //! exporters = ["dhcp1.example.org:9100", "[2001:db8::53]:9100"]
+//! tls = true
 //!
 //! [radius]
 //! loki = ["logs1.example.org:3100", "logs2.example.org:3100"]
@@ -115,7 +117,7 @@ use serde::Deserialize;
 use u6e_proto::mac;
 use u6e_proto::msg::{Binding, GuardConfig, Limit, LimitTarget, Rate, check_limits};
 
-use crate::{configs, macauth, mtls, presence, radius, rf, roaming, rollout};
+use crate::{configs, leases, macauth, mtls, presence, radius, rf, roaming, rollout};
 
 /// The parsed, checked configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,8 +161,8 @@ pub struct Config {
     pub rollouts: Option<rollout::Settings>,
     /// The RF planner's settings, if it is on.
     pub rf: Option<rf::config::Settings>,
-    /// The node exporters (`host:port`) that publish the DHCP leases.
-    pub leases: Vec<String>,
+    /// The node exporters that publish the DHCP leases.
+    pub leases: leases::Settings,
     /// Where RADIUS's log is read, if it is.
     pub radius: Option<radius::Settings>,
     /// How the APs' client guards run.
@@ -181,9 +183,11 @@ impl Config {
             .as_ref()
             .is_some_and(|t| !t.metrics_clients.is_empty());
         let loki = self.radius.as_ref().is_some_and(|r| r.tls.is_some());
+        let leases = self.leases.tls.is_some();
         [
             (metrics, mtls::Endpoint::Metrics),
             (loki, mtls::Endpoint::Loki),
+            (leases, mtls::Endpoint::Leases),
         ]
         .into_iter()
         .filter_map(|(on, e)| on.then_some(e))
@@ -332,6 +336,8 @@ struct StaticFile {
 #[serde(deny_unknown_fields)]
 struct LeasesFile {
     exporters: Vec<String>,
+    #[serde(default)]
+    tls: bool,
 }
 
 #[derive(Deserialize)]
@@ -531,8 +537,14 @@ impl Config {
                 "{what}.tls needs [monitoring_tls]"
             ))),
         };
-        let leases = file.leases.map_or_else(Vec::new, |l| l.exporters);
-        if let Some(bad) = leases.iter().find(|e| !is_host_port(e)) {
+        let leases = match file.leases {
+            Some(l) => leases::Settings {
+                tls: tls(l.tls, "leases")?,
+                exporters: l.exporters,
+            },
+            None => leases::Settings::default(),
+        };
+        if let Some(bad) = leases.exporters.iter().find(|e| !is_host_port(e)) {
             return Err(ConfigError::BadExporter(bad.clone()));
         }
         let radius = file
@@ -1038,8 +1050,10 @@ mod tests {
             |list: &str| Config::parse(&format!("{ORIGIN}[leases]\nexporters = [{list}]\n"));
         let c = leases("\"dhcp1.example.org:9100\", \"192.0.2.53:9100\", \"[2001:db8::53]:9100\"")
             .unwrap();
-        assert_eq!(c.leases.len(), 3);
-        assert!(Config::parse(ORIGIN).unwrap().leases.is_empty());
+        assert_eq!(c.leases.exporters.len(), 3);
+        assert_eq!(c.leases.tls, None);
+        let none = Config::parse(ORIGIN).unwrap();
+        assert_eq!(none.leases, leases::Settings::default());
         for bad in [
             "dhcp1.example.org",
             "2001:db8::53:9100",
@@ -1254,30 +1268,41 @@ mod tests {
     fn each_monitoring_endpoint_is_switched_to_mutual_tls_on_its_own() {
         const TLS: &str =
             "[monitoring_tls]\ncert = \"/c.pem\"\nkey = \"/k.pem\"\nca = \"/ca.pem\"\n";
+        const LEASES: &str = "[leases]\nexporters = [\"dhcp1.example.org:9100\"]\n";
+        const RADIUS: &str =
+            "[radius]\nloki = \"logs1.example.org:3100\"\nselector = '{job=\"x\"}'\n";
         let files = mtls::Files {
             cert: "/c.pem".into(),
             key: "/k.pem".into(),
             ca: "/ca.pem".into(),
         };
-        const RADIUS: &str =
-            "[radius]\nloki = \"logs1.example.org:3100\"\nselector = '{job=\"x\"}'\n";
         let parse = |s: String| Config::parse(&format!("{ORIGIN}{s}"));
         // The section alone switches nothing.
-        let c = parse(format!("{TLS}{RADIUS}")).unwrap();
+        let c = parse(format!("{TLS}{LEASES}{RADIUS}")).unwrap();
         let t = c.monitoring_tls.clone().unwrap();
         assert_eq!((t.files, t.metrics_clients.len()), (files.clone(), 0));
         assert_eq!(c.tls_endpoints(), []);
-        assert_eq!(c.radius.unwrap().tls, None);
+        assert_eq!((c.leases.tls, c.radius.unwrap().tls), (None, None));
         // Each switch, alone.
         let clients = "metrics_clients = [\"status1.example.org\", \"status2.example.org\"]\n";
-        let c = parse(format!("{TLS}{clients}{RADIUS}")).unwrap();
+        let c = parse(format!("{TLS}{clients}{LEASES}{RADIUS}")).unwrap();
         assert_eq!(c.tls_endpoints(), [mtls::Endpoint::Metrics]);
-        let c = parse(format!("{TLS}{RADIUS}tls = true\n")).unwrap();
+        let c = parse(format!("{TLS}{LEASES}tls = true\n{RADIUS}")).unwrap();
+        assert_eq!(c.tls_endpoints(), [mtls::Endpoint::Leases]);
+        assert_eq!(c.leases.tls, Some(files.clone()));
+        let c = parse(format!("{TLS}{LEASES}{RADIUS}tls = true\n")).unwrap();
         assert_eq!(c.tls_endpoints(), [mtls::Endpoint::Loki]);
         assert_eq!(c.radius.unwrap().tls, Some(files));
         // A switch with no certificate to present.
-        let alone = parse(format!("{RADIUS}tls = true\n"));
-        assert!(matches!(alone, Err(ConfigError::MonitoringTls(_))));
+        for s in [
+            format!("{LEASES}tls = true\n"),
+            format!("{RADIUS}tls = true\n"),
+        ] {
+            assert!(
+                matches!(parse(s.clone()), Err(ConfigError::MonitoringTls(_))),
+                "{s}"
+            );
+        }
         // Scrapers are DNS names, each once; the files are required.
         for bad in [
             "[\"192.0.2.1\"]",

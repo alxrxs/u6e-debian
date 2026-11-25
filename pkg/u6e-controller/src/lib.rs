@@ -26,8 +26,8 @@
 //! lists are announced to Home Assistant as they join and leave the Wi-Fi
 //! (`presence`). Admins set the VLAN RADIUS's MAC authentication puts a
 //! device in, in the mapping every RADIUS server reads from OpenBao
-//! (`macauth`). The metrics and RADIUS's log each speak mutual TLS with the
-//! host's monitoring certificate when switched to it (`mtls`).
+//! (`macauth`). The metrics, RADIUS's log and the leases each speak mutual
+//! TLS with the host's monitoring certificate when switched to it (`mtls`).
 
 pub mod actions;
 pub mod agents;
@@ -159,7 +159,7 @@ pub async fn start(
         .rf
         .as_ref()
         .map_or(rf::history::WINDOW, |rf| rf.rules.window_hours);
-    if !config.guards.enforce.is_empty() && config.leases.is_empty() {
+    if !config.guards.enforce.is_empty() && config.leases.exporters.is_empty() {
         eprintln!(
             "u6e-controller: [guards] enforce needs [leases]: the APs' client guards only report"
         );
@@ -190,7 +190,7 @@ pub async fn start(
         .with_spectrum(timing.spectrum)
         .with_speedtests(timing.speedtest)
         .with_history(window)
-        .with_leases(&config.leases)
+        .with_leases(&config.leases.exporters)
         .with_tls(config.tls_endpoints())
         .with_guards(config.guards.clone())
         .with_site_limits(config.limits.clone())
@@ -284,7 +284,7 @@ pub async fn start(
     };
     tokio::spawn(agents::serve(agents, listener));
     tokio::spawn(expire(state.clone(), timing));
-    if !config.leases.is_empty() {
+    if !config.leases.exporters.is_empty() {
         tokio::spawn(leases::supervise(state.clone(), config.leases.clone()));
     }
     if let Some(settings) = &config.radius {

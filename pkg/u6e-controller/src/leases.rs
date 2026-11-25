@@ -4,23 +4,34 @@
 //! subnet_id}` sample per active lease, its value the lease's expiry. The
 //! controller never speaks to the DHCP servers themselves.
 //!
-//! Every [`EVERY`] each exporter is read over plain HTTP/1.0 (`fetch`) and
-//! its leases replace the ones it gave last; one that does not answer keeps
-//! its last ones until they expire. A client's addresses are the union over
-//! the exporters, each address with its newest expiry, and its host name and
-//! device those of its lease that expires last. The APs' client guards are
+//! Every [`EVERY`] each exporter is read over HTTP/1.0, plain (`fetch`) or,
+//! with `[leases] tls`, over mutual TLS by the name it is listed with
+//! (`mtls`), and its leases replace the ones it gave last; one that does
+//! not answer keeps its last ones until they expire. A client's addresses
+//! are the union over the exporters, each address with its newest expiry,
+//! and its host name and device those of its lease that expires last. The APs' client guards are
 //! seeded from them (`state`), never before a read has worked; the clients'
 //! timelines (`sessions`) take a lease new or renewed since the last read.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::time::interval;
 use u6e_proto::mac;
 
+use crate::mtls::{self, Endpoint};
+use crate::names;
 use crate::state::Shared;
-use crate::{fetch, names};
+
+/// The exporters, and the certificate they are read with over mutual TLS.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Settings {
+    /// Each `host:port`.
+    pub exporters: Vec<String>,
+    pub tls: Option<mtls::Files>,
+}
 
 /// The family that carries the leases.
 pub const FAMILY: &str = "kea_lease_expiry_timestamp_seconds";
@@ -243,15 +254,20 @@ fn union<'a>(leases: impl Iterator<Item = &'a Lease>) -> HashMap<[u8; 6], Leased
 
 /// Reads every exporter each [`EVERY`] for the life of the process, one
 /// task per read so a slow exporter holds up no other; a change of an
-/// exporter's state is logged once.
-pub async fn supervise(state: Shared, exporters: Vec<String>) {
+/// exporter's state is logged once, a failure of mutual TLS counted.
+pub async fn supervise(state: Shared, settings: Settings) {
     let mut every = interval(EVERY);
+    let tls = settings.tls.map(Arc::new);
     loop {
         every.tick().await;
-        for exporter in &exporters {
-            let (state, exporter) = (state.clone(), exporter.clone());
+        for exporter in &settings.exporters {
+            let (state, exporter, tls) = (state.clone(), exporter.clone(), tls.clone());
             tokio::spawn(async move {
-                let read = read(&exporter).await.map(|text| parse(&text));
+                let read = read(&exporter, tls.as_deref()).await;
+                if let Err(f) = &read {
+                    state.write().tls_failures.count(Endpoint::Leases, f);
+                }
+                let read = read.map(|text| parse(&text)).map_err(|f| f.to_string());
                 let was = state
                     .read()
                     .leases
@@ -274,9 +290,10 @@ pub async fn supervise(state: Shared, exporters: Vec<String>) {
     }
 }
 
-/// The exposition of the exporter at `address` (`host:port`).
-pub async fn read(address: &str) -> Result<String, String> {
-    fetch::get(address, "/metrics", "text/plain", BODY_MAX, TIMEOUT).await
+/// The exposition of the exporter at `address` (`host:port`), over mutual
+/// TLS with `tls`.
+pub async fn read(address: &str, tls: Option<&mtls::Files>) -> Result<String, mtls::Failure> {
+    mtls::get(tls, address, "/metrics", "text/plain", BODY_MAX, TIMEOUT).await
 }
 
 #[cfg(test)]
@@ -415,14 +432,55 @@ kea_subnet_addresses{family="ipv4",kind="assigned",subnet="192.0.2.0/24",subnet_
             }
         };
         let ok = format!("HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\n{EXPOSITION}");
-        let (text, ()) = tokio::join!(read(&addr), serve(Box::leak(ok.into_boxed_str())));
+        let (text, ()) = tokio::join!(read(&addr, None), serve(Box::leak(ok.into_boxed_str())));
         assert_eq!(parse(&text.unwrap()).len(), 3);
-        let (r, ()) = tokio::join!(read(&addr), serve("HTTP/1.0 503 Busy\r\n\r\n"));
-        assert!(r.unwrap_err().contains("503"));
+        let (r, ()) = tokio::join!(read(&addr, None), serve("HTTP/1.0 503 Busy\r\n\r\n"));
+        assert!(r.unwrap_err().to_string().contains("503"));
         let gz = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n\r\nxx";
-        let (r, ()) = tokio::join!(read(&addr), serve(gz));
-        assert_eq!(r.unwrap_err(), "the body is encoded");
+        let (r, ()) = tokio::join!(read(&addr, None), serve(gz));
+        assert_eq!(r.unwrap_err().to_string(), "the body is encoded");
         drop(listener);
-        assert!(read(&addr).await.is_err());
+        assert!(read(&addr, None).await.is_err());
+    }
+
+    /// With `tls` an exporter is read over mutual TLS by the name it is
+    /// listed with, the controller's certificate presented; the
+    /// certificate missing fails the read, counted as such.
+    #[tokio::test]
+    async fn an_exporter_is_read_over_mutual_tls() {
+        use crate::mtls::testing::{files, leaf, server};
+        use crate::state::State;
+        let me = files("controller");
+        let admitted = ["controller.example.org"];
+        let (addr, seen) = server("127.0.0.1", "server1", &admitted, EXPOSITION).await;
+        let port = addr.rsplit_once(':').unwrap().1;
+        let by_name = format!("localhost:{port}");
+        assert_eq!(parse(&read(&by_name, Some(&me)).await.unwrap()).len(), 3);
+        assert_eq!(seen.lock().unwrap()[0], Ok(leaf("controller")));
+        let missing = mtls::Files {
+            cert: "/nonexistent/cert.pem".into(),
+            ..me
+        };
+        let e = read(&addr, Some(&missing)).await.unwrap_err();
+        assert!(matches!(e, mtls::Failure::Certificate(_)), "{e}");
+        let state = Shared::new(State::new([]).with_tls([Endpoint::Leases]));
+        let settings = Settings {
+            exporters: vec![addr],
+            tls: Some(missing),
+        };
+        tokio::spawn(supervise(state.clone(), settings));
+        let counted = (Endpoint::Leases, mtls::Reason::Certificate);
+        for _ in 0..100 {
+            if state.read().tls_failures.counts.get(&counted) == Some(&1) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(state.read().tls_failures.counts.get(&counted), Some(&1));
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "nothing reached the exporter"
+        );
     }
 }
