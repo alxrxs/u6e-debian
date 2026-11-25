@@ -11,8 +11,12 @@
 //! DHCP nodes' node exporters the clients' leases are read from (`leases`),
 //! none without it; in `[radius]`, the Loki the RADIUS servers' log is read
 //! from (`radius`), RADIUS's side of the clients' timelines missing without
-//! it; where the clients' sessions and timelines are kept (`history_path`,
-//! `sessions`), and their traffic (`traffic_path`, `traffic`); the signal
+//! it; in `[monitoring_tls]`, the host's monitoring certificate (`mtls`):
+//! the chain (leaf first), its key and the CA bundle every peer is verified
+//! against, and the DNS names of the scrapers `/metrics` is then served to
+//! over mutual TLS alone (`metrics_clients`, plain HTTP while none is
+//! listed); where the clients' sessions and timelines are kept
+//! (`history_path`, `sessions`), and their traffic (`traffic_path`, `traffic`); the signal
 //! below which a client another AP heard better is sticky (`sticky_dbm`,
 //! `roaming`, −72 dBm unless set); where the client captures' files are kept
 //! (`captures_path`, `captures`); in `[limits]`, the site's per-SSID rate
@@ -71,6 +75,12 @@
 //! loki = "logs.example.org:3100"
 //! selector = '{job="radius-auth"}'
 //!
+//! [monitoring_tls]
+//! cert = "/etc/ssl/monitoring/fullchain.pem"
+//! key = "/etc/ssl/monitoring/key.pem"
+//! ca = "/etc/ssl/monitoring/chain.pem"
+//! metrics_clients = ["prometheus1.example.org", "prometheus2.example.org"]
+//!
 //! [limits]
 //! ssids = [{ ssid = "guest", down_kbit = 50000, up_kbit = 10000 }]
 //!
@@ -102,7 +112,7 @@ use serde::Deserialize;
 use u6e_proto::mac;
 use u6e_proto::msg::{Binding, GuardConfig, Limit, LimitTarget, Rate, check_limits};
 
-use crate::{configs, macauth, presence, radius, rf, roaming, rollout};
+use crate::{configs, macauth, mtls, presence, radius, rf, roaming, rollout};
 
 /// The parsed, checked configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +166,22 @@ pub struct Config {
     pub presence: Option<presence::Settings>,
     /// RADIUS's MAC authentication mapping, if admins edit it.
     pub mac_auth: Option<macauth::Settings>,
+    /// The host's monitoring certificate, if anything speaks mutual TLS.
+    pub monitoring_tls: Option<mtls::Settings>,
+}
+
+impl Config {
+    /// The endpoints switched to mutual TLS.
+    pub fn tls_endpoints(&self) -> Vec<mtls::Endpoint> {
+        let metrics = self
+            .monitoring_tls
+            .as_ref()
+            .is_some_and(|t| !t.metrics_clients.is_empty());
+        [(metrics, mtls::Endpoint::Metrics)]
+            .into_iter()
+            .filter_map(|(on, e)| on.then_some(e))
+            .collect()
+    }
 }
 
 #[derive(Deserialize)]
@@ -195,6 +221,17 @@ struct File {
     limits: Option<LimitsFile>,
     presence: Option<PresenceFile>,
     mac_auth: Option<MacAuthFile>,
+    monitoring_tls: Option<MonitoringTlsFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MonitoringTlsFile {
+    cert: PathBuf,
+    key: PathBuf,
+    ca: PathBuf,
+    #[serde(default)]
+    metrics_clients: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -388,6 +425,8 @@ pub enum ConfigError {
     Presence(String),
     /// `[mac_auth]` is not one: why.
     MacAuth(String),
+    /// `[monitoring_tls]` is not one: why.
+    MonitoringTls(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -412,6 +451,7 @@ impl fmt::Display for ConfigError {
             Self::BadSticky => f.write_str("sticky_dbm is not between -90 and -50"),
             Self::Presence(e) => write!(f, "presence: {e}"),
             Self::MacAuth(e) => write!(f, "mac_auth: {e}"),
+            Self::MonitoringTls(e) => write!(f, "monitoring_tls: {e}"),
         }
     }
 }
@@ -462,6 +502,10 @@ impl Config {
             .map(rf::config::File::check)
             .transpose()
             .map_err(ConfigError::Rf)?;
+        let monitoring_tls = file
+            .monitoring_tls
+            .map(monitoring_tls_settings)
+            .transpose()?;
         let leases = file.leases.map_or_else(Vec::new, |l| l.exporters);
         if let Some(bad) = leases.iter().find(|e| !is_host_port(e)) {
             return Err(ConfigError::BadExporter(bad.clone()));
@@ -501,8 +545,35 @@ impl Config {
             guards,
             presence,
             mac_auth,
+            monitoring_tls,
         })
     }
+}
+
+/// The monitoring certificate's section, checked: 0 to 16 scrapers, each
+/// a DNS name (what their certificates carry), each once.
+fn monitoring_tls_settings(file: MonitoringTlsFile) -> Result<mtls::Settings, ConfigError> {
+    let bad = |e: String| ConfigError::MonitoringTls(e);
+    let clients = file.metrics_clients;
+    if clients.len() > 16 {
+        return Err(bad("metrics_clients: at most 16 are listed".into()));
+    }
+    for (i, c) in clients.iter().enumerate() {
+        let name = c.parse::<std::net::IpAddr>().is_err() && is_address(c) && !c.contains(':');
+        if !name || clients[..i].contains(c) {
+            return Err(bad(format!(
+                "metrics_clients: {c:?} is not a DNS name, or is listed twice"
+            )));
+        }
+    }
+    Ok(mtls::Settings {
+        files: mtls::Files {
+            cert: file.cert,
+            key: file.key,
+            ca: file.ca,
+        },
+        metrics_clients: clients,
+    })
 }
 
 /// The presence section, checked: an `https://host[:port]` with nothing
@@ -1118,6 +1189,46 @@ mod tests {
                 "{loki} {selector}"
             );
         }
+    }
+
+    #[test]
+    fn each_monitoring_endpoint_is_switched_to_mutual_tls_on_its_own() {
+        const TLS: &str =
+            "[monitoring_tls]\ncert = \"/c.pem\"\nkey = \"/k.pem\"\nca = \"/ca.pem\"\n";
+        let files = mtls::Files {
+            cert: "/c.pem".into(),
+            key: "/k.pem".into(),
+            ca: "/ca.pem".into(),
+        };
+        let parse = |s: String| Config::parse(&format!("{ORIGIN}{s}"));
+        // The section alone switches nothing.
+        let c = parse(TLS.into()).unwrap();
+        let t = c.monitoring_tls.clone().unwrap();
+        assert_eq!((t.files, t.metrics_clients.len()), (files.clone(), 0));
+        assert_eq!(c.tls_endpoints(), []);
+        // Each switch, alone.
+        let clients = "metrics_clients = [\"status1.example.org\", \"status2.example.org\"]\n";
+        let c = parse(format!("{TLS}{clients}")).unwrap();
+        assert_eq!(c.tls_endpoints(), [mtls::Endpoint::Metrics]);
+        // Scrapers are DNS names, each once; the files are required.
+        for bad in [
+            "[\"192.0.2.1\"]",
+            "[\"2001:db8::1\"]",
+            "[\"a b\"]",
+            "[\"-x.example.org\"]",
+            "[\"a.example.org\", \"a.example.org\"]",
+        ] {
+            let text = format!("{TLS}metrics_clients = {bad}\n");
+            assert!(
+                matches!(parse(text), Err(ConfigError::MonitoringTls(_))),
+                "{bad}"
+            );
+        }
+        let seventeen: Vec<String> = (0..17).map(|i| format!("\"s{i}.example.org\"")).collect();
+        let text = format!("{TLS}metrics_clients = [{}]\n", seventeen.join(", "));
+        assert!(matches!(parse(text), Err(ConfigError::MonitoringTls(_))));
+        let no_ca = "[monitoring_tls]\ncert = \"/c.pem\"\nkey = \"/k.pem\"\n";
+        assert!(matches!(parse(no_ca.into()), Err(ConfigError::Syntax(_))));
     }
 
     #[test]

@@ -28,7 +28,7 @@
 //! scans of the APs' radios are kept here too, watched as `spectrum` says,
 //! and so are the speed tests (`speedtest`), the listed devices'
 //! presence (`presence`) and RADIUS's MAC authentication mapping
-//! (`macauth`).
+//! (`macauth`), and the connections over mutual TLS that failed (`mtls`).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::net::IpAddr;
@@ -52,6 +52,7 @@ use crate::identity::Identity;
 use crate::leases::{Lease, Leases};
 use crate::limits::{self, RateLimits};
 use crate::macauth::{self, MacAuth};
+use crate::mtls;
 use crate::names::{self, Names};
 use crate::oui;
 use crate::policy::{ApImages, Blocked, ConfigId, Hold, Phase, Policy, SavedRollout};
@@ -648,6 +649,8 @@ pub struct State {
     pub presence: Option<Presence>,
     /// RADIUS's MAC authentication mapping, when admins edit it.
     pub mac_auth: Option<MacAuth>,
+    /// The connections over mutual TLS not made.
+    pub tls_failures: mtls::Failures,
 }
 
 impl State {
@@ -691,6 +694,7 @@ impl State {
             speedtests: SpeedTests::default(),
             presence: None,
             mac_auth: None,
+            tls_failures: mtls::Failures::default(),
         }
     }
 
@@ -765,6 +769,14 @@ impl State {
         };
         State {
             radius: Some(health),
+            ..self
+        }
+    }
+
+    /// The state counting the failures of the endpoints `on` mutual TLS.
+    pub fn with_tls(self, on: impl IntoIterator<Item = mtls::Endpoint>) -> Self {
+        State {
+            tls_failures: mtls::Failures::new(on),
             ..self
         }
     }

@@ -40,7 +40,9 @@
 //! listed device (at most `presence::DEVICES_MAX`) its state, and counted
 //! by result. The MAC authentication mapping's exist only when admins edit
 //! it: whether its last read worked and when one last did, its entries and
-//! version, and the changes by result, every result always exported.
+//! version, and the changes by result, every result always exported. The
+//! connections over mutual TLS not made are counted per endpoint switched
+//! to it and why, every pair always exported.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
@@ -57,6 +59,7 @@ use u6e_proto::msg::{LimitStatus, Radio, Snapshot, Station};
 
 use crate::experience::{self, PARTS};
 use crate::limits::status_name;
+use crate::mtls;
 use crate::roaming::{Answer, Kind};
 use crate::services::Table;
 use crate::sessions::Totals;
@@ -501,6 +504,7 @@ pub fn render(state: &State) -> String {
     m.sample(&[], state.traffic.clients() as f64);
     identities(&mut m, state);
     radius_log(&mut m, state);
+    tls_failures(&mut m, &state.tls_failures);
     m.family(
         "wifi_blocked_clients",
         GAUGE,
@@ -1033,6 +1037,25 @@ fn radius_log(m: &mut Text, state: &State) {
     );
     if let Some(ms) = h.newest_ms {
         m.sample(&[], ms as f64 / 1000.0);
+    }
+}
+
+/// The connections over mutual TLS not made, when any endpoint speaks it.
+fn tls_failures(m: &mut Text, f: &mtls::Failures) {
+    if f.on.is_empty() {
+        return;
+    }
+    m.family(
+        "wifi_monitoring_tls_failures_total",
+        COUNTER,
+        "Connections over mutual TLS not made, by endpoint and why: the host's certificate \
+         could not be read or used, or the handshake failed or was refused.",
+    );
+    for &e in &f.on {
+        for r in mtls::Reason::ALL {
+            let n = f.counts.get(&(e, r)).copied().unwrap_or(0);
+            m.sample(&[("endpoint", e.name()), ("reason", r.name())], n as f64);
+        }
     }
 }
 

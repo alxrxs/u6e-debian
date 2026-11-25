@@ -3,6 +3,9 @@
 //! store): no chunking, the body ends with the connection, an answer past
 //! its cap or its time refused. Plain HTTP on the estate's own network: what
 //! is read is published there already, and nothing is sent but the request.
+//! The same GET over TLS by a configuration of the caller's ([`get_tls`])
+//! reads them over mutual TLS once they require it (`mtls`), a failure of
+//! TLS itself told apart from any other.
 //!
 //! And one HTTPS request ([`request_tls`]) carrying a secret in one header
 //! and, for a write, a JSON body: Home Assistant's events (`presence`, a
@@ -14,6 +17,8 @@
 //! once sent. The secret is read from its file at each request
 //! ([`read_token`]) and wiped when dropped.
 
+use std::fmt;
+use std::io;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,7 +30,7 @@ use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
-use tokio_rustls::rustls::{ClientConfig, RootCertStore, crypto, version};
+use tokio_rustls::rustls::{self, ClientConfig, RootCertStore, crypto, version};
 use u6e_proto::frame::zeroize;
 
 /// The most of an HTTPS answer's status line and headers read.
@@ -83,11 +88,10 @@ async fn fetch(address: &str, target: &str, accept: &str, max: usize) -> Result<
     Ok(body.to_owned())
 }
 
-/// A TLS 1.3 client that trusts the certificates of the PEM bundle `ca` as
-/// anchors, on aws-lc-rs (which verifies every curve the estate's CAs use);
-/// none of them parsable is an error.
-pub fn tls_client(ca: &Path) -> Result<Arc<ClientConfig>, String> {
-    let at = |e: &dyn std::fmt::Display| format!("{}: {e}", ca.display());
+/// The certificates of the PEM bundle `ca` as trust anchors; none of them
+/// parsable is an error.
+pub fn roots(ca: &Path) -> Result<RootCertStore, String> {
+    let at = |e: &dyn fmt::Display| format!("{}: {e}", ca.display());
     let certs: Vec<CertificateDer> = CertificateDer::pem_file_iter(ca)
         .map_err(|e| at(&e))?
         .collect::<Result<_, _>>()
@@ -97,13 +101,46 @@ pub fn tls_client(ca: &Path) -> Result<Arc<ClientConfig>, String> {
     if added == 0 {
         return Err(at(&"no certificate to trust"));
     }
+    Ok(roots)
+}
+
+/// A TLS 1.3 client that trusts the certificates of the PEM bundle `ca` as
+/// anchors, on aws-lc-rs (which verifies every curve the estate's CAs use).
+pub fn tls_client(ca: &Path) -> Result<Arc<ClientConfig>, String> {
+    let roots = roots(ca)?;
     let provider = Arc::new(crypto::aws_lc_rs::default_provider());
     let config = ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&version::TLS13])
-        .map_err(|e| at(&e))?
+        .map_err(|e| format!("{}: {e}", ca.display()))?
         .with_root_certificates(roots)
         .with_no_client_auth();
     Ok(Arc::new(config))
+}
+
+/// Why a request over TLS failed: TLS itself (the peer's certificate or
+/// ours refused, or a peer that speaks no TLS), or anything else
+/// (connecting, the time, the HTTP answer).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Failed {
+    Tls(String),
+    Other(String),
+}
+
+impl fmt::Display for Failed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Tls(e) => write!(f, "TLS: {e}"),
+            Self::Other(e) => f.write_str(e),
+        }
+    }
+}
+
+/// An I/O error of a TLS stream: TLS's own when rustls raised it.
+fn failed(e: io::Error) -> Failed {
+    match e.get_ref() {
+        Some(inner) if inner.is::<rustls::Error>() => Failed::Tls(e.to_string()),
+        _ => Failed::Other(e.to_string()),
+    }
 }
 
 /// An answer to [`request_tls`]: its status and its body.
@@ -127,40 +164,81 @@ pub async fn request_tls(
     wait: Duration,
 ) -> Result<Answer, String> {
     let config = tls_client(ca)?;
-    let ask = async {
-        let name = ServerName::try_from(host.to_owned()).map_err(|e| e.to_string())?;
-        let sock = TcpStream::connect((host, port))
-            .await
-            .map_err(|e| e.to_string())?;
-        let mut tls = TlsConnector::from(config)
-            .connect(name, sock)
-            .await
-            .map_err(|e| format!("TLS: {e}"))?;
-        let json = body.map_or_else(String::new, |b| {
-            format!(
-                "Content-Type: application/json\r\nContent-Length: {}\r\n",
-                b.len()
-            )
-        });
-        let head =
-            format!("{method} {target} HTTP/1.0\r\nHost: {host}\r\n{header}{secret}\r\n{json}\r\n");
-        let mut out = head.into_bytes();
-        out.extend_from_slice(body.unwrap_or_default().as_bytes());
-        let sent = tls.write_all(&out).await;
-        zeroize(&mut out);
-        sent.map_err(|e| e.to_string())?;
-        let mut answer = Vec::new();
-        let cap = (HEAD_MAX + max + 4) as u64;
-        let read = (&mut tls).take(cap).read_to_end(&mut answer).await;
-        // A server that ends without its close_notify still said what it said.
-        if answer.is_empty() {
-            read.map_err(|e| e.to_string())?;
-        }
-        parse_answer(&answer, max)
-    };
-    timeout(wait, ask)
+    let json = body.map_or_else(String::new, |b| {
+        format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n",
+            b.len()
+        )
+    });
+    let head =
+        format!("{method} {target} HTTP/1.0\r\nHost: {host}\r\n{header}{secret}\r\n{json}\r\n");
+    let mut request = head.into_bytes();
+    request.extend_from_slice(body.unwrap_or_default().as_bytes());
+    timeout(wait, exchange_tls((host, port), config, request, max))
         .await
         .map_err(|_| format!("no answer in {} s", wait.as_secs()))?
+        .map_err(|e| e.to_string())
+}
+
+/// The body `host`:`port` answers a GET of `target` with over TLS by
+/// `config` (the host's name verified), of at most `max` bytes, within
+/// `wait`, connecting included; why not, otherwise.
+pub async fn get_tls(
+    (host, port): (&str, u16),
+    config: Arc<ClientConfig>,
+    target: &str,
+    accept: &str,
+    max: usize,
+    wait: Duration,
+) -> Result<String, Failed> {
+    let authority = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    };
+    let ask = format!("GET {target} HTTP/1.0\r\nHost: {authority}\r\nAccept: {accept}\r\n\r\n");
+    let answer = timeout(
+        wait,
+        exchange_tls((host, port), config, ask.into_bytes(), max),
+    )
+    .await
+    .map_err(|_| Failed::Other(format!("no answer in {} s", wait.as_secs())))??;
+    if answer.status != 200 {
+        return Err(Failed::Other(format!("answered {}", answer.status)));
+    }
+    Ok(answer.body)
+}
+
+/// The answer to `request` (wiped once sent) from `host`:`port` over TLS by
+/// `config`, whose name it verifies, its body at most `max` bytes.
+async fn exchange_tls(
+    (host, port): (&str, u16),
+    config: Arc<ClientConfig>,
+    mut request: Vec<u8>,
+    max: usize,
+) -> Result<Answer, Failed> {
+    let other = |e: &dyn fmt::Display| Failed::Other(e.to_string());
+    let name = ServerName::try_from(host.to_owned()).map_err(|e| other(&e))?;
+    let sock = TcpStream::connect((host, port))
+        .await
+        .map_err(|e| other(&e))?;
+    let mut tls = TlsConnector::from(config)
+        .connect(name, sock)
+        .await
+        .map_err(failed)?;
+    let sent = tls.write_all(&request).await;
+    zeroize(&mut request);
+    sent.map_err(failed)?;
+    let mut answer = Vec::new();
+    let cap = (HEAD_MAX + max + 4) as u64;
+    let read = (&mut tls).take(cap).read_to_end(&mut answer).await;
+    // A server that ends without its close_notify still said what it said;
+    // one that refused our certificate (TLS 1.3 tells the client after its
+    // side of the handshake) says so here.
+    if answer.is_empty() {
+        read.map_err(failed)?;
+    }
+    parse_answer(&answer, max).map_err(Failed::Other)
 }
 
 /// The status and the body of an HTTP/1.0 answer, its body at most `max`

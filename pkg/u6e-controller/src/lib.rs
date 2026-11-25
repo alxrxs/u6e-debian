@@ -26,7 +26,8 @@
 //! lists are announced to Home Assistant as they join and leave the Wi-Fi
 //! (`presence`). Admins set the VLAN RADIUS's MAC authentication puts a
 //! device in, in the mapping every RADIUS server reads from OpenBao
-//! (`macauth`).
+//! (`macauth`). The metrics are served over mutual TLS with the host's
+//! monitoring certificate when switched to it (`mtls`).
 
 pub mod actions;
 pub mod agents;
@@ -45,6 +46,7 @@ pub mod limits;
 pub mod local;
 pub mod macauth;
 pub mod metrics;
+pub mod mtls;
 pub mod names;
 pub mod oui;
 pub mod policy;
@@ -189,6 +191,7 @@ pub async fn start(
         .with_speedtests(timing.speedtest)
         .with_history(window)
         .with_leases(&config.leases)
+        .with_tls(config.tls_endpoints())
         .with_guards(config.guards.clone())
         .with_site_limits(config.limits.clone())
         .with_captures(Captures::open(&config.captures_path).map_err(|e| {
@@ -320,7 +323,20 @@ pub async fn start(
         }
     });
     tokio::spawn(spectrum::supervise(state.clone()));
-    tokio::spawn(serve_http("metrics", metrics, metrics::router(state)));
+    let scraped = metrics::router(state.clone());
+    match config
+        .monitoring_tls
+        .clone()
+        .filter(|t| !t.metrics_clients.is_empty())
+    {
+        Some(tls) => {
+            let listener = mtls::listen(metrics, tls, state)?;
+            tokio::spawn(serve_http("metrics", listener, scraped));
+        }
+        None => {
+            tokio::spawn(serve_http("metrics", metrics, scraped));
+        }
+    }
     Ok(controller)
 }
 
@@ -355,7 +371,11 @@ async fn expire(state_of: Shared, timing: Timing) {
     }
 }
 
-async fn serve_http(what: &str, listener: TcpListener, router: Router) {
+async fn serve_http<L>(what: &str, listener: L, router: Router)
+where
+    L: axum::serve::Listener,
+    L::Addr: std::fmt::Debug,
+{
     // axum::serve retries failed accepts itself, so this returns only if the
     // listener is gone.
     if let Err(e) = axum::serve(listener, router).await {
