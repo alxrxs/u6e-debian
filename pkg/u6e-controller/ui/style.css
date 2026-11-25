@@ -891,7 +891,7 @@ main > .tool { margin-bottom: 18px; }
 .who-chip.bad { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 35%, transparent); background: color-mix(in srgb, var(--bad) 8%, transparent); }
 .svc-rel:empty { display: none; }
 .svc-foot { margin: 10px 0 0; font-size: 12px; overflow-wrap: anywhere; }
-.svc-own { padding: 6px 18px 12px; max-width: 980px; }
+.svc-own { padding: 6px 18px 12px; }
 
 /* Devices: an AP bar's channels. */
 .ap-chans { display: inline-flex; flex-wrap: wrap; gap: 4px 6px; justify-content: flex-end; }
