@@ -62,6 +62,7 @@ use crate::rf::history::{self, History};
 use crate::roaming::Roaming;
 use crate::services::{self, Services};
 use crate::sessions::{self, Sessions};
+use crate::sleep_proxy;
 use crate::spectrum::{self, Limits, Scan, Stopped};
 use crate::speedtest::SpeedTests;
 use crate::traffic::{self, Traffic};
@@ -103,7 +104,7 @@ pub enum Change {
     Up(String),
     Down(String),
     Snapshot(String),
-    Event(String, Event),
+    Event(String, Logged),
     Flows(String),
     /// What names a client (its lease, a DNS name) or a flow's far end
     /// came or changed.
@@ -323,6 +324,14 @@ struct Addresses {
     at: SystemTime,
 }
 
+/// An AP's event as the controller took it: a client guard's report that is
+/// a sleep proxy's names the device it answers for (`sleep_proxy`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Logged {
+    pub ev: Event,
+    pub sleep_proxy_for: Option<[u8; 6]>,
+}
+
 /// What names an AP's events: its BSSs and its radios' bands, as its last
 /// snapshot had them.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -364,16 +373,18 @@ pub struct Ap {
     pub connected_since: Option<SystemTime>,
     /// When the agent last sent anything.
     pub last_seen: Option<SystemTime>,
-    pub events: VecDeque<Event>,
+    pub events: VecDeque<Logged>,
     /// Firmware crashes per phy since the controller started.
     pub crashes: BTreeMap<String, u64>,
     /// Its clients' latest flows and when they came, only while connected.
     pub flows: Option<(Flows, SystemTime)>,
     /// Its client guards' bindings, only while connected.
     pub bindings: Vec<Binding>,
-    /// Its client guards' violations by guard and VLAN, repeats included,
-    /// since the controller started.
+    /// Its client guards' violations by guard and VLAN, and the reports
+    /// that were a sleep proxy's instead, repeats included, since the
+    /// controller started.
     pub violations: BTreeMap<(Guard, u16), u64>,
+    pub sleep_proxied: u64,
     /// The frames its client guards dropped, by guard, since they started.
     pub guard_drops: Vec<(Guard, u64)>,
     /// How each rate limit stands on it, only while connected.
@@ -425,6 +436,7 @@ impl Ap {
             flows: None,
             bindings: Vec::new(),
             violations: BTreeMap::new(),
+            sleep_proxied: 0,
             guard_drops: Vec::new(),
             limit_states: Vec::new(),
             rx_bytes: Arc::new(AtomicU64::new(0)),
@@ -477,7 +489,7 @@ impl Ap {
         self.rx_bytes.load(Ordering::Relaxed)
     }
 
-    fn push_event(&mut self, ev: Event) {
+    fn push_event(&mut self, ev: Logged) {
         if self.events.len() == EVENTS_CAP {
             self.events.pop_front();
         }
@@ -641,6 +653,8 @@ pub struct State {
     pub captures: Captures,
     /// What the APs read of mDNS.
     pub services: Services,
+    /// Which clients answer for which address as a sleep proxy.
+    pub sleep_proxies: sleep_proxy::Pairs,
     /// Each client's volumes and destinations.
     pub traffic: Traffic,
     /// The speed tests.
@@ -690,6 +704,7 @@ impl State {
             site_limits: BTreeMap::new(),
             captures: Captures::default(),
             services: Services::default(),
+            sleep_proxies: sleep_proxy::Pairs::default(),
             traffic: Traffic::default(),
             speedtests: SpeedTests::default(),
             presence: None,
@@ -1122,9 +1137,16 @@ impl State {
                 Some(Change::Snapshot(ap.to_owned()))
             }
             AgentMsg::Event(ev) => {
+                let sleep_proxy_for = self.sleep_proxy(ap, &ev, sessions::unix_ms(now));
+                let Some(entry) = self.live(ap, id) else {
+                    return Ok(());
+                };
                 match &ev.kind {
                     EventKind::FwCrash { phy } => {
                         *entry.crashes.entry(phy.clone()).or_default() += 1
+                    }
+                    EventKind::GuardViolation(v) if sleep_proxy_for.is_some() => {
+                        entry.sleep_proxied += 1 + u64::from(v.repeats);
                     }
                     EventKind::GuardViolation(v) => {
                         let n = entry.violations.entry((v.guard, v.vlan)).or_default();
@@ -1132,8 +1154,12 @@ impl State {
                     }
                     _ => {}
                 }
-                entry.push_event(ev.clone());
-                Some(Change::Event(ap.to_owned(), ev))
+                let logged = Logged {
+                    ev,
+                    sleep_proxy_for,
+                };
+                entry.push_event(logged.clone());
+                Some(Change::Event(ap.to_owned(), logged))
             }
             AgentMsg::Flows(f) => {
                 entry.full.retain(|w| !w.is_closed());
@@ -1220,8 +1246,18 @@ impl State {
         let now_ms = sessions::unix_ms(now);
         if let Some(a) = self.aps.get(ap) {
             match &change {
-                Some(Change::Event(_, ev)) => {
-                    self.sessions.event(ap, &a.naming, ev, now_ms);
+                Some(Change::Event(
+                    _,
+                    Logged {
+                        ev,
+                        sleep_proxy_for,
+                    },
+                )) => {
+                    // A sleep proxy's report is on the timelines as the
+                    // change it made, if any.
+                    if sleep_proxy_for.is_none() {
+                        self.sessions.event(ap, &a.naming, ev, now_ms);
+                    }
                     for r in self.sessions.take_roams() {
                         self.roaming.roamed(r);
                     }
@@ -2064,6 +2100,23 @@ impl State {
         self.service_events(changed);
     }
 
+    /// The device whose address the client of guard report `ev` on `ap`
+    /// answers for as its sleep proxy, at `now_ms`; each change of that on
+    /// the proxy's and the owner's timelines.
+    fn sleep_proxy(&mut self, ap: &str, ev: &Event, now_ms: u64) -> Option<[u8; 6]> {
+        let EventKind::GuardViolation(v) = &ev.kind else {
+            return None;
+        };
+        let ip = sleep_proxy::address(v)?;
+        let bindings = &self.aps.get(ap)?.bindings;
+        let owner = sleep_proxy::owner(v, bindings, &self.services.site(), now_ms);
+        let at = sessions::event_ms(ev, now_ms);
+        if let Some(turn) = self.sleep_proxies.report(v.mac, ip, owner, at) {
+            self.sessions.sleep_proxy(ap, &turn, at);
+        }
+        owner
+    }
+
     /// Tells the UI of each change of a service, and the timeline of a
     /// client's.
     fn service_events(&mut self, changed: Vec<services::Event>) {
@@ -2388,7 +2441,7 @@ mod tests {
         }
         let ap = s.ap("ap1").unwrap();
         assert_eq!(ap.events.len(), EVENTS_CAP);
-        assert_eq!(ap.events.front().unwrap().at_ms, 5);
+        assert_eq!(ap.events.front().unwrap().ev.at_ms, 5);
         assert_eq!(ap.crashes["phy1"], 1005);
     }
 
@@ -2720,5 +2773,145 @@ mod tests {
         // The session's end takes the AP's table; a new one starts afresh.
         s.disconnect("ap1", id);
         assert!(s.services.ap("ap1").is_none());
+    }
+
+    /// A sleep proxy's reports are no violations, its turns are on both
+    /// devices' timelines once, and the owner announcing its address again
+    /// makes the next report a violation.
+    #[test]
+    fn a_sleep_proxys_reports_are_shown_as_such_and_counted_apart() {
+        use crate::timeline::What;
+        use u6e_proto::msg::{MdnsAddr, MdnsDevice, MdnsOffer, Services as Read, Violation};
+        let (proxy, owner) = ([2, 0, 0, 0, 0, 0x0e], [2, 0, 0, 0, 0, 0x01]);
+        let ip: std::net::Ipv4Addr = "192.0.2.10".parse().unwrap();
+        let mut s = state(&["ap1"]);
+        let id = s.connect("ap1", hello("ap1")).unwrap().id;
+        let bound = Binding {
+            mac: owner,
+            ip,
+            expires_ms: None,
+        };
+        s.apply("ap1", id, AgentMsg::Bindings(vec![bound])).unwrap();
+        // The AP's boot clock reads 1 000 000 now: the proxy answered for
+        // the address 10 s ago, the owner last announced it 1000 s ago.
+        let device = |mac, at_ms| MdnsDevice {
+            mac,
+            port: "wlan5.42".into(),
+            vlan: 42,
+            wifi: true,
+            host: String::new(),
+            addrs: vec![MdnsAddr {
+                ip: ip.into(),
+                ttl_s: 120,
+                at_ms,
+            }],
+            first_ms: 0,
+            last_ms: at_ms,
+            queries: 0,
+            responses: 1,
+        };
+        let offer = MdnsOffer {
+            mac: proxy,
+            instance: "70-35-60-63.1 Speaker._sleep-proxy._udp.local".into(),
+            service: "_sleep-proxy._udp.local".into(),
+            target: "Speaker.local".into(),
+            port: 61_000,
+            txt: Vec::new(),
+            first_ms: 0,
+            ttl_s: 4500,
+            announced_ms: 990_000,
+            withdrawn: None,
+            answered: 0,
+            missed: 0,
+            missed_in_row: 0,
+            answered_ms: None,
+            missed_ms: None,
+            missed_by: None,
+        };
+        let read = Read {
+            full: true,
+            now_ms: 1_000_000,
+            devices: vec![device(proxy, 990_000), device(owner, 0)],
+            offers: vec![offer],
+            ..Read::default()
+        };
+        s.apply("ap1", id, AgentMsg::Services(read)).unwrap();
+        let report = |s: &mut State| {
+            let v = Violation {
+                guard: Guard::Arp,
+                mac: proxy,
+                ifname: "wlan5.42".into(),
+                vlan: 42,
+                ip: Some(ip.into()),
+                detail: "claims 192.0.2.10, bound to 02:00:00:00:00:01".into(),
+                dropped: false,
+                repeats: 2,
+            };
+            let at_ms = sessions::unix_ms(SystemTime::now());
+            let kind = EventKind::GuardViolation(v);
+            s.apply("ap1", id, AgentMsg::Event(Event { at_ms, kind }))
+                .unwrap();
+        };
+        let turns = |s: &State, mac| -> Vec<Option<bool>> {
+            let entries = s.sessions.timeline.of(&mac);
+            entries
+                .map(|e| match e.what {
+                    What::SleepProxy { answering, .. } => Some(answering),
+                    _ => None,
+                })
+                .collect()
+        };
+        let metric = |s: &State, name: &str| -> Vec<String> {
+            let text = crate::metrics::render(s);
+            let lines = text.lines().filter(|l| l.starts_with(name));
+            lines.map(str::to_owned).collect()
+        };
+        report(&mut s);
+        report(&mut s);
+        let ap = s.ap("ap1").unwrap();
+        assert!(ap.violations.is_empty());
+        assert_eq!(ap.sleep_proxied, 6);
+        assert_eq!(turns(&s, proxy), [Some(true)]);
+        assert_eq!(turns(&s, owner), [Some(true)]);
+        let events = crate::view::events(&s, None, false);
+        let e = events.last().unwrap();
+        assert_eq!(
+            (&e["kind"], &e["guard"], &e["sleep_proxy_for"]),
+            (&"guard".into(), &"arp".into(), &"02:00:00:00:00:01".into())
+        );
+        let history = crate::view::history(&s, &proxy, false);
+        assert_eq!(
+            history["timeline"][0],
+            serde_json::json!({
+                "at": history["timeline"][0]["at"], "kind": "sleep-proxy", "ap": "ap1",
+                "proxy": "02:00:00:00:00:0e", "owner": "02:00:00:00:00:01",
+                "ip": "192.0.2.10", "answering": true,
+            })
+        );
+        assert!(metric(&s, "wifi_guard_violations_total{").is_empty());
+        assert_eq!(
+            metric(&s, "wifi_guard_sleep_proxy_total{"),
+            ["wifi_guard_sleep_proxy_total{ap=\"ap1\"} 6"]
+        );
+        // The owner wakes and announces its address: the next report is a
+        // violation, the turn on both timelines, the report on the proxy's.
+        let back = Read {
+            now_ms: 1_000_000,
+            devices: vec![device(owner, 999_000)],
+            ..Read::default()
+        };
+        s.apply("ap1", id, AgentMsg::Services(back)).unwrap();
+        report(&mut s);
+        let ap = s.ap("ap1").unwrap();
+        assert_eq!(ap.violations[&(Guard::Arp, 42)], 3);
+        assert_eq!(ap.sleep_proxied, 6);
+        assert_eq!(turns(&s, proxy), [Some(true), Some(false), None]);
+        assert_eq!(turns(&s, owner), [Some(true), Some(false)]);
+        let events = crate::view::events(&s, None, false);
+        assert!(events.last().unwrap().get("sleep_proxy_for").is_none());
+        assert_eq!(
+            metric(&s, "wifi_guard_violations_total{"),
+            ["wifi_guard_violations_total{ap=\"ap1\",guard=\"arp\",vlan=\"42\"} 3"]
+        );
     }
 }

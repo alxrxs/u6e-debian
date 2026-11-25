@@ -2,9 +2,10 @@
 //! Wi-Fi (associations and roams, EAP's steps, a passphrase that did not
 //! match, disconnects), what RADIUS answered for it, its DHCP leases being
 //! granted and renewed, its first traffic, the operators' actions on it,
-//! the client guards' reports and the changes of the services it offers
-//! over mDNS. Every entry is whole on its own (where, who,
-//! how long), so it reads the same once the session it belongs to is gone.
+//! the client guards' reports, a sleep proxy answering for it or it for
+//! another, and the changes of the services it offers over mDNS. Every
+//! entry is whole on its own (where, who, how long), so it reads the same
+//! once the session it belongs to is gone.
 //!
 //! Bounded: a client's entries are kept for [`KEEP`], at most [`PER_CLIENT`]
 //! of them, and [`TOTAL`] over every client, the oldest going first.
@@ -173,6 +174,16 @@ pub enum What {
         by: Option<[u8; 6]>,
         misses: u16,
         silent_ms: Option<u64>,
+    },
+    /// `proxy` began answering for `owner`'s address `ip` as its sleep
+    /// proxy (`sleep_proxy`), or stopped: its next report on `ap` was a
+    /// violation again. On both devices' timelines.
+    SleepProxy {
+        ap: String,
+        proxy: [u8; 6],
+        owner: [u8; 6],
+        ip: IpAddr,
+        answering: bool,
     },
 }
 

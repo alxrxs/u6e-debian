@@ -1,7 +1,8 @@
 // A client's history as the controller keeps it: its timeline (associations
 // and roams, EAP's steps and RADIUS's verdicts, its leases, its first
-// traffic, the operators' actions, the client guards' reports, the changes
-// of the services it offers over mDNS, disconnects)
+// traffic, the operators' actions, the client guards' reports, a sleep
+// proxy answering for it or it for another, the changes of the services it
+// offers over mDNS, disconnects)
 // in the feed's shape, and its sessions as a table. The client page and the
 // Auth problems page share the words.
 
@@ -101,6 +102,13 @@ function words(e) {
     case 'service': {
       const w = serviceWords(e);
       return { tone: w.tone, text: [`${w.text[0].toUpperCase()}${w.text.slice(1)}`] };
+    }
+    case 'sleep-proxy': {
+      const proxy = e.proxy_name || e.proxy;
+      const owner = e.owner_name || e.owner;
+      return e.answering
+        ? { tone: '', text: [`${proxy} answers for ${owner} while it sleeps`, h('span', { class: 'muted' }, ` · sleep proxy for ${e.ip}, not a guard violation`)] }
+        : { tone: 'warn', text: [`${proxy} no longer answers for ${owner} as its sleep proxy`, h('span', { class: 'muted' }, ` · its use of ${e.ip} is a guard violation again`)] };
     }
     default:
       return { tone: '', text: [e.kind] };

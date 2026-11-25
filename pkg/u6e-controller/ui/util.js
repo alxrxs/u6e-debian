@@ -351,6 +351,10 @@ export function describe(ev) {
     case 'guard': {
       const more = ev.repeats ? `, ${ev.repeats} more times since the last report` : '';
       const fate = ev.dropped ? ' Dropped.' : '';
+      if (ev.sleep_proxy_for) {
+        const owner = ev.sleep_proxy_for_name || ev.sleep_proxy_for;
+        return { text: `answers for ${owner} as its sleep proxy while it sleeps, which the ${GUARDS[ev.guard] || ev.guard} reports: ${ev.detail}${more}.${fate}`, tone: '', group: 'guard' };
+      }
       return { text: `broke the ${GUARDS[ev.guard] || ev.guard}: ${ev.detail}${more}.${fate}`, tone: 'bad', group: 'guard' };
     }
     case 'service': return { ...serviceWords(ev), group: 'service' };

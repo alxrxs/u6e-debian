@@ -46,8 +46,8 @@ use serde_json::{Map, Value, json};
 use u6e_proto::PROTOCOL;
 use u6e_proto::mac;
 use u6e_proto::msg::{
-    AuthKind, Band, Event, EventKind, Flow, Flows, Guard, Radio, RateMode, Snapshot, Station,
-    StationAuth, Violation,
+    AuthKind, Band, EventKind, Flow, Flows, Guard, Radio, RateMode, Snapshot, Station, StationAuth,
+    Violation,
 };
 
 use crate::experience;
@@ -55,7 +55,7 @@ use crate::names;
 use crate::policy::{ConfigId, Phase};
 use crate::services;
 use crate::sessions::Session;
-use crate::state::{Action, Ap, ClientView, Rollout, State, mechanism_name, outcome_name};
+use crate::state::{Action, Ap, ClientView, Logged, Rollout, State, mechanism_name, outcome_name};
 use crate::timeline::{EapStep, End, Entry, Place, What};
 
 /// The APs and clients of the APs `wanted` says yes to, and the clients
@@ -369,7 +369,7 @@ pub fn events(state: &State, ap: Option<&str>, admin: bool) -> Vec<Value> {
         let at = a
             .events
             .iter()
-            .filter_map(|ev| Some((ev.at_ms, event(name, a, ev)?)));
+            .filter_map(|l| Some((l.ev.at_ms, event(state, name, a, l)?)));
         out.extend(at);
     }
     let actions = state
@@ -387,8 +387,10 @@ pub fn events(state: &State, ap: Option<&str>, admin: bool) -> Vec<Value> {
 }
 
 /// One event as the UI shows it, its BSS or radio named as the AP last
-/// reported them; `None` for a kind this controller does not know.
-pub fn event(ap_name: &str, ap: &Ap, ev: &Event) -> Option<Value> {
+/// reported them, a sleep proxy's guard report with the device it answers
+/// for (`sleep_proxy_for`); `None` for a kind this controller does not know.
+pub fn event(state: &State, ap_name: &str, ap: &Ap, l: &Logged) -> Option<Value> {
+    let ev = &l.ev;
     let mut o = Map::new();
     o.insert("ap".into(), ap_name.into());
     o.insert("at".into(), ev.at_ms.into());
@@ -408,6 +410,9 @@ pub fn event(ap_name: &str, ap: &Ap, ev: &Event) -> Option<Value> {
         EventKind::FwCrash { phy } => ("fw-crash", Err(phy)),
         EventKind::GuardViolation(v) => {
             o.extend(violation(v));
+            if let Some(owner) = l.sleep_proxy_for {
+                o.extend(device(state, "sleep_proxy_for", owner));
+            }
             return Some(Value::Object(o));
         }
         EventKind::BtmQuery { mac, bss, reason } => {
@@ -508,6 +513,16 @@ pub fn guard_name(g: Guard) -> &'static str {
         Guard::Source => "source",
         Guard::Tag => "tag",
     }
+}
+
+/// Device `mac` as `key`, and its name as `<key>_name` when it has one.
+fn device(state: &State, key: &str, mac: [u8; 6]) -> Map<String, Value> {
+    let mut o = Map::new();
+    o.insert(key.into(), mac::format(mac).into());
+    if let Some(name) = state.identity(&mac).name() {
+        o.insert(format!("{key}_name"), name.into());
+    }
+    o
 }
 
 /// A violation's fields in an event.
@@ -864,7 +879,7 @@ pub fn history(state: &State, mac: &[u8; 6], admin: bool) -> Value {
         .of(mac)
         .rev()
         .take(HISTORY_ENTRIES)
-        .map(|e| entry(e, admin))
+        .map(|e| entry(state, e, admin))
         .collect();
     let kept = timeline.of(mac).count();
     let mut o = json!({
@@ -950,7 +965,7 @@ fn session(state: &State, s: &Session) -> Value {
 /// join's `authorized`: whether its AP authorized it in that session, until
 /// when its `identity` is only claimed), as an `admin` or any other viewer
 /// reads it.
-fn entry(e: &Entry, admin: bool) -> Value {
+fn entry(state: &State, e: &Entry, admin: bool) -> Value {
     let mut o = Map::new();
     o.insert("at".into(), e.at_ms.into());
     let mut put = |k: &str, v: Value| {
@@ -1120,6 +1135,24 @@ fn entry(e: &Entry, admin: bool) -> Value {
                 put("silent_for", (*ms).into());
             }
             "service"
+        }
+        What::SleepProxy {
+            ap,
+            proxy,
+            owner,
+            ip,
+            answering,
+        } => {
+            put("ap", ap.clone().into());
+            for (k, v) in device(state, "proxy", *proxy) {
+                put(&k, v);
+            }
+            for (k, v) in device(state, "owner", *owner) {
+                put(&k, v);
+            }
+            put("ip", ip.to_string().into());
+            put("answering", (*answering).into());
+            "sleep-proxy"
         }
     };
     o.insert("kind".into(), kind.into());

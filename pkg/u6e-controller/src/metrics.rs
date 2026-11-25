@@ -11,9 +11,9 @@
 //! naming another AP are counted per AP, and a radio not as the site file
 //! plans it is timed from when it was found so. The lease exporters' series
 //! exist only when the leases are read. The client guards' violations are
-//! counted per AP, guard and VLAN from the first of each, repeats included,
-//! and the frames their filters dropped per AP and guard as the AP counts
-//! them. Per identity (an EAP identity, or the MAC of a MAC-authenticated
+//! counted per AP, guard and VLAN from the first of each, repeats included
+//! (a sleep proxy's reports apart, per AP alone: `sleep_proxy`), and the
+//! frames their filters dropped per AP and guard as the AP counts them. Per identity (an EAP identity, or the MAC of a MAC-authenticated
 //! client), the only label of its series, so their number is bounded by
 //! the identities the sessions keep (`sessions::IDENTITIES_MAX`): its ended
 //! sessions and its bytes (those of its open sessions counted in), its
@@ -748,8 +748,8 @@ fn leases(m: &mut Text, state: &State) {
     m.sample(&[], state.leases.all(SystemTime::now()).count() as f64);
 }
 
-/// The client guards: each AP's bindings while connected, and its
-/// violations.
+/// The client guards: each AP's bindings while connected, its violations,
+/// and the reports that were a sleep proxy's.
 fn guards(m: &mut Text, aps: &[(&str, &Ap)]) {
     m.family(
         "wifi_guard_bindings",
@@ -786,6 +786,14 @@ fn guards(m: &mut Text, aps: &[(&str, &Ap)]) {
             ];
             m.sample(&labels, *n as f64);
         }
+    }
+    m.family(
+        "wifi_guard_sleep_proxy_total",
+        COUNTER,
+        "Reports of the AP's client guards (arp, source) that were a sleep proxy answering for a sleeping device, not violations.",
+    );
+    for &(ap, a) in aps {
+        m.sample(&[("ap", ap)], a.sleep_proxied as f64);
     }
 }
 

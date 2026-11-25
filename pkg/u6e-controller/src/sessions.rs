@@ -4,7 +4,8 @@
 //! snapshots (who is associated, how each authenticated, their bytes), the
 //! flows (first traffic), the leases (grants and renewals, seen at the next
 //! read of the leases), RADIUS's verdicts (`radius`), the operators' actions,
-//! the client guards' reports and the changes of the services a client
+//! the client guards' reports, a sleep proxy beginning and ceasing to answer
+//! for a client (`sleep_proxy`) and the changes of the services a client
 //! offers over mDNS (`services`).
 //!
 //! A session ends with a reason. An association with another BSS while one
@@ -46,6 +47,7 @@ use u6e_proto::msg::{AuthKind, Band, Event, EventKind, Flows, Snapshot, StationA
 
 use crate::leases::Leases;
 use crate::radius::Line;
+use crate::sleep_proxy::Turn;
 use crate::state::{Action, Naming, Shared};
 use crate::store;
 use crate::timeline::{EapStep, End, Entry, Place, Roam, Timeline, What};
@@ -751,6 +753,20 @@ impl Sessions {
         self.push(e.mac, e.at_ms, what);
     }
 
+    /// Takes a change of a sleep proxy answering for a device, on both
+    /// devices' timelines.
+    pub fn sleep_proxy(&mut self, ap: &str, t: &Turn, at_ms: u64) {
+        let what = What::SleepProxy {
+            ap: ap.to_owned(),
+            proxy: t.proxy,
+            owner: t.owner,
+            ip: t.ip.into(),
+            answering: t.answering,
+        };
+        self.push(t.owner, at_ms, what.clone());
+        self.push(t.proxy, at_ms, what);
+    }
+
     /// Takes a read of the leases at `now_ms`: a lease new since the last
     /// read, or with a later expiry, is granted or renewed then, for the
     /// clients the Wi-Fi knows. The first read only sets what is known.
@@ -1157,6 +1173,7 @@ mod tests {
             What::Action { .. } => "action",
             What::Guard { .. } => "guard",
             What::Service { .. } => "service",
+            What::SleepProxy { .. } => "sleep-proxy",
         };
         s.timeline.of(&MAC).map(|e| kind(&e.what)).collect()
     }

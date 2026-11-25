@@ -736,7 +736,7 @@ async fn live(
         let (relevant, out) = match change {
             Ok(Change::Event(ap, ev)) if wanted(&ap) => {
                 let s = state.read();
-                let ev = s.ap(&ap).and_then(|a| view::event(&ap, a, &ev));
+                let ev = s.ap(&ap).and_then(|a| view::event(&s, &ap, a, &ev));
                 (true, ev.map(|e| json!({ "events": [e] })))
             }
             Ok(Change::Up(ap) | Change::Down(ap) | Change::Snapshot(ap) | Change::Bindings(ap)) => {

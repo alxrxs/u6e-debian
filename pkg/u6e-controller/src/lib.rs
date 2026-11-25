@@ -19,8 +19,10 @@
 //! client's sessions and timeline (`sessions`, `timeline`) come from all of
 //! that and from RADIUS's verdicts, read from its log (`radius`). What the
 //! APs read of mDNS shows which device offers which service and whether it
-//! answers for it (`services`); the flows and the station counters each
-//! client's volumes and where they went (`traffic`). An admin measures an
+//! answers for it (`services`), and which client answers for a sleeping
+//! one as its sleep proxy rather than breaking a client guard
+//! (`sleep_proxy`); the flows and the station counters each client's
+//! volumes and where they went (`traffic`). An admin measures an
 //! AP's throughput to the controller, and a signed-in viewer their own
 //! device's through the UI (`speedtest`). The devices the configuration
 //! lists are announced to Home Assistant as they join and leave the Wi-Fi
@@ -58,6 +60,7 @@ pub mod rollout;
 pub mod script;
 pub mod services;
 pub mod sessions;
+pub mod sleep_proxy;
 pub mod spectrum;
 pub mod speedtest;
 pub mod stage;

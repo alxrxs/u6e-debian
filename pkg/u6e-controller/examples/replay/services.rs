@@ -1,9 +1,11 @@
 //! The mDNS the replay's APs read, made up: an iPhone (`03`) browsing for
-//! AirPlay, AirPlay audio and its companion link every ten seconds, and for
-//! a sleep proxy nobody answers; a HomePod stereo pair (`0e` the left, the
-//! group's leader, `0f` the right) whose right speaker stops answering
-//! anything from second 20 to 100 of each cycle, and whose left one says
-//! goodbye to its AirPlay audio from 105 to 115; a TV (`04`) offering
+//! AirPlay, AirPlay audio, its companion link and a sleep proxy every ten
+//! seconds; a HomePod stereo pair (`0e` the left, the group's leader, `0f`
+//! the right) whose right speaker stops answering anything from second 20
+//! to 100 of each cycle, and whose left one says goodbye to its AirPlay
+//! audio from 105 to 115 and is a sleep proxy, answering for the laptop's
+//! address (`02`) while it sleeps, from 40 to 75, after which the laptop
+//! announces its address itself again; a TV (`04`) offering
 //! AirPlay and browsing for HomeKit, a printer (`07`), and a wired HomeKit
 //! bridge both APs hear over their uplinks. Each AP hears everything on the
 //! shared VLAN, its own clients on their BSS; it sends its whole table at a
@@ -11,10 +13,13 @@
 
 use std::collections::BTreeMap;
 
-use u6e_proto::msg::{MdnsDevice, MdnsKey, MdnsOffer, MdnsQuery, Services, Withdrawn};
+use std::net::{IpAddr, Ipv4Addr};
+
+use u6e_proto::msg::{MdnsAddr, MdnsDevice, MdnsKey, MdnsOffer, MdnsQuery, Services, Withdrawn};
 
 use super::{BSSS, CYCLE, World};
 
+pub const LAPTOP: u8 = 2;
 pub const PHONE: u8 = 3;
 const TV: u8 = 4;
 const PRINTER: u8 = 7;
@@ -31,6 +36,11 @@ const EVERY: f64 = 10.0;
 /// left one's AirPlay audio is gone in.
 const SILENT: (f64, f64) = (20.0, 100.0);
 const AWAY: (f64, f64) = (105.0, 115.0);
+/// The part of each cycle the laptop sleeps in, the left speaker answering
+/// for its address as its sleep proxy; it announces the address itself as
+/// it wakes.
+pub const SLEEP: (f64, f64) = (40.0, 75.0);
+const SLEEP_PROXY: &str = "_sleep-proxy._udp.local";
 const PTR: u16 = 12;
 
 fn within(t: f64, (from, to): (f64, f64)) -> bool {
@@ -40,6 +50,31 @@ fn within(t: f64, (from, to): (f64, f64)) -> bool {
 /// The times of the browses every `every` seconds up to `t`.
 fn browses(t: f64, every: f64) -> impl Iterator<Item = f64> {
     (0..=(t / every) as u64).map(move |k| k as f64 * every)
+}
+
+/// The address of the client `last` leases (`leases` in `main`).
+pub fn leased(last: u8) -> Ipv4Addr {
+    Ipv4Addr::new(192, 0, 2, 10 + last)
+}
+
+/// An address record of `last`'s address, of TTL 120, sent at `at_ms`.
+fn record(last: u8, at_ms: u64) -> MdnsAddr {
+    MdnsAddr {
+        ip: IpAddr::V4(leased(last)),
+        ttl_s: 120,
+        at_ms,
+    }
+}
+
+/// When the laptop last woke, up to `t`: at the end of each cycle's
+/// [`SLEEP`], and at the start.
+fn woke(t: f64) -> f64 {
+    let cycle = t - t % CYCLE;
+    if t % CYCLE >= SLEEP.1 {
+        cycle + SLEEP.1
+    } else {
+        (cycle - CYCLE + SLEEP.1).max(0.0)
+    }
 }
 
 /// What the right speaker did with the phone's browses up to `t`: answered,
@@ -81,24 +116,25 @@ pub fn table(
     let ms = |s: f64| boot_ms.saturating_sub(((t - s).max(0.0) * 1000.0) as u64);
     let mac = World::mac;
     let mut devices = Vec::new();
-    let mut device = |m: [u8; 6], at: Option<(usize, usize)>, host: &str, queries: u32| {
-        let (port, vlan, wifi) = match at {
-            Some((x, bss)) if x == ap => (BSSS[bss].0.to_owned(), BSSS[bss].3, true),
-            _ => ("vlan10".to_owned(), 10, false),
+    let mut device =
+        |m: [u8; 6], at: Option<(usize, usize)>, host: &str, queries: u32, addrs: Vec<MdnsAddr>| {
+            let (port, vlan, wifi) = match at {
+                Some((x, bss)) if x == ap => (BSSS[bss].0.to_owned(), BSSS[bss].3, true),
+                _ => ("vlan10".to_owned(), 10, false),
+            };
+            devices.push(MdnsDevice {
+                mac: m,
+                port,
+                vlan,
+                wifi,
+                host: host.into(),
+                addrs,
+                first_ms: 0,
+                last_ms: ms(t - 0.5),
+                queries,
+                responses: (t / EVERY) as u32,
+            });
         };
-        devices.push(MdnsDevice {
-            mac: m,
-            port,
-            vlan,
-            wifi,
-            host: host.into(),
-            addrs: Vec::new(),
-            first_ms: 0,
-            last_ms: ms(t - 0.5),
-            queries,
-            responses: (t / EVERY) as u32,
-        });
-    };
     let phone_at = on(PHONE);
     let n = (t / EVERY) as u32 + 1;
     let last_browse = (t / EVERY).floor() * EVERY;
@@ -142,7 +178,16 @@ pub fn table(
     ] {
         let Some(at) = on(last) else { continue };
         let host = format!("Living-Room-{side}");
-        device(mac(last), Some(at), &format!("{host}.local"), 0);
+        // The left one answers for the sleeping laptop's address after
+        // each browse while it sleeps.
+        let answered = browses(t, EVERY).filter(|b| within(*b, SLEEP)).last();
+        let proxied = answered.filter(|_| last == LEFT);
+        let addrs = [
+            Some(record(last, ms(t - 0.5))),
+            proxied.map(|b| record(LAPTOP, ms(b + 0.1))),
+        ];
+        let addrs = addrs.into_iter().flatten().collect();
+        device(mac(last), Some(at), &format!("{host}.local"), 0, addrs);
         let txt = [
             ("model", "AudioAccessory5,1"),
             ("gid", GROUP),
@@ -162,6 +207,10 @@ pub fn table(
             ),
             offer(mac(last), &name, companion, &host, 49_152, &[]),
         ];
+        if last == LEFT {
+            let instance = format!("70-35-60-63.1 {name}");
+            own.push(offer(mac(last), &instance, SLEEP_PROXY, &host, 61_000, &[]));
+        }
         if last == RIGHT {
             for o in &mut own {
                 (o.answered, o.missed, o.missed_in_row) = (r.answered, r.missed, r.in_row);
@@ -183,6 +232,7 @@ pub fn table(
             Some(at),
             "Living-Room-TV.local",
             (t / (3.0 * EVERY)) as u32 + 1,
+            Vec::new(),
         );
         let txt = [("model", "AppleTV14,1")];
         offers.push(offer(
@@ -216,7 +266,13 @@ pub fn table(
         });
     }
     if let Some(at) = on(PRINTER) {
-        device(mac(PRINTER), Some(at), "Office-Printer.local", 0);
+        device(
+            mac(PRINTER),
+            Some(at),
+            "Office-Printer.local",
+            0,
+            Vec::new(),
+        );
         offers.push(offer(
             mac(PRINTER),
             "Office Printer",
@@ -234,7 +290,9 @@ pub fn table(
             &[],
         ));
     }
-    device(BRIDGE, None, "Home-Bridge.local", 0);
+    device(BRIDGE, None, "Home-Bridge.local", 0, Vec::new());
+    let laptop = vec![record(LAPTOP, ms(woke(t)))];
+    device(mac(LAPTOP), on(LAPTOP), "MacBook-Air.local", 0, laptop);
     offers.push(offer(
         BRIDGE,
         "Home Bridge 5F2A",
@@ -244,7 +302,7 @@ pub fn table(
         &[("md", "Home Bridge")],
     ));
     if let Some(at) = phone_at {
-        device(mac(PHONE), Some(at), "iPhone.local", 4 * n);
+        device(mac(PHONE), Some(at), "iPhone.local", 4 * n, Vec::new());
         offers.push(offer(
             mac(PHONE),
             "iPhone",
@@ -289,10 +347,7 @@ pub fn table(
             [left, heard].into_iter().flatten().collect(),
             missed.into_iter().collect(),
         ));
-        queries.push(MdnsQuery {
-            unanswered: n,
-            ..browse("_sleep-proxy._udp.local", Vec::new(), Vec::new())
-        });
+        queries.push(browse(SLEEP_PROXY, left.into_iter().collect(), Vec::new()));
     }
     Services {
         full: true,

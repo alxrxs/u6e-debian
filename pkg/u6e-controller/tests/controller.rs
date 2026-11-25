@@ -38,9 +38,10 @@ use u6e_proto::config::{self, config_sha256};
 use u6e_proto::frame::{decode_frame, frame_body, write_frame};
 use u6e_proto::msg::{
     AgentMsg, Band, Binding, Bss, ClientFlows, CommandKind, CommandResult, ConfigApplied, CtlMsg,
-    Event, EventKind, FieldDelta, Flow, Flows, Guard, GuardConfig, Hello, MdnsDevice, MdnsOffer,
-    MdnsQuery, Mechanism, Radio, RadioApplied, RadioConfig, RateMode, Services, SignedConfig,
-    Snapshot, SnapshotDelta, SpectrumFrame, SpeedTestReport, Station, StationCaps, Temp, Violation,
+    Event, EventKind, FieldDelta, Flow, Flows, Guard, GuardConfig, Hello, MdnsAddr, MdnsDevice,
+    MdnsOffer, MdnsQuery, Mechanism, Radio, RadioApplied, RadioConfig, RateMode, Services,
+    SignedConfig, Snapshot, SnapshotDelta, SpectrumFrame, SpeedTestReport, Station, StationCaps,
+    Temp, Violation,
 };
 use u6e_proto::speedtest::{CHUNK, Chunks};
 use u6e_proto::tls::{self, Identity};
@@ -4665,6 +4666,118 @@ fn violations_are_events_and_counted() {
         metrics_of(&r, "wifi_guard_bindings{"),
         ["wifi_guard_bindings{ap=\"ap1\"} 1"]
     );
+    assert_eq!(
+        metrics_of(&r, "wifi_guard_sleep_proxy_total{"),
+        [
+            "wifi_guard_sleep_proxy_total{ap=\"ap1\"} 0",
+            "wifi_guard_sleep_proxy_total{ap=\"ap2\"} 0"
+        ]
+    );
+    assert!(promtool_accepts(&http_get(r.c.metrics, "/metrics")));
+}
+
+/// The live case: a speaker offering a sleep proxy answers for a laptop's
+/// address while the laptop sleeps, still associated, and claims it in ARP.
+/// The report is the proxy's, on the Events page and both timelines, and
+/// counted apart from the violations.
+#[test]
+fn a_sleep_proxys_report_is_no_violation() {
+    const SPEAKER: [u8; 6] = [0x02, 0, 0, 0, 0, 0x0e];
+    let r = controller(Timing::default());
+    let mut a = ap_with_client(&r, KEY_AP1, "ap1", &[]);
+    let bound = Binding {
+        mac: MAC,
+        ip: "192.0.2.10".parse().unwrap(),
+        expires_ms: None,
+    };
+    a.send(&AgentMsg::Bindings(vec![bound])).unwrap();
+    let speaker = MdnsDevice {
+        mac: SPEAKER,
+        port: "wlan5.42".into(),
+        vlan: 42,
+        wifi: true,
+        host: "Laptop.local".into(),
+        addrs: vec![MdnsAddr {
+            ip: "192.0.2.10".parse().unwrap(),
+            ttl_s: 120,
+            at_ms: 990_000,
+        }],
+        first_ms: 0,
+        last_ms: 990_000,
+        queries: 0,
+        responses: 3,
+    };
+    let offer = MdnsOffer {
+        mac: SPEAKER,
+        instance: "70-35-60-63.1 Speaker._sleep-proxy._udp.local".into(),
+        service: "_sleep-proxy._udp.local".into(),
+        target: "Speaker.local".into(),
+        port: 61_000,
+        txt: Vec::new(),
+        first_ms: 0,
+        ttl_s: 4500,
+        announced_ms: 900_000,
+        withdrawn: None,
+        answered: 1,
+        missed: 0,
+        missed_in_row: 0,
+        answered_ms: Some(990_000),
+        missed_ms: None,
+        missed_by: None,
+    };
+    a.send(&AgentMsg::Services(Services {
+        full: true,
+        now_ms: 1_000_000,
+        devices: vec![speaker],
+        offers: vec![offer],
+        ..Services::default()
+    }))
+    .unwrap();
+    let v = Violation {
+        guard: Guard::Arp,
+        mac: SPEAKER,
+        ifname: "wlan5".into(),
+        vlan: 42,
+        ip: Some("192.0.2.10".parse().unwrap()),
+        detail: "claims 192.0.2.10, bound to 02:00:00:00:00:01".into(),
+        dropped: false,
+        repeats: 1,
+    };
+    let at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let ev = Event {
+        at_ms,
+        kind: EventKind::GuardViolation(v),
+    };
+    a.send(&AgentMsg::Event(ev)).unwrap();
+    let guard = || {
+        let events = json_get(r.c.http, "/api/events");
+        let mut events = events.as_array().unwrap().iter();
+        events.rfind(|e| e["kind"] == "guard").cloned()
+    };
+    wait_for("the report", || guard().is_some());
+    let e = guard().unwrap();
+    assert_eq!(
+        (&e["mac"], &e["sleep_proxy_for"]),
+        (&json!("02:00:00:00:00:0e"), &json!("02:00:00:00:00:01"))
+    );
+    assert!(metrics_of(&r, "wifi_guard_violations_total{").is_empty());
+    assert_eq!(
+        metrics_of(&r, "wifi_guard_sleep_proxy_total{"),
+        [
+            "wifi_guard_sleep_proxy_total{ap=\"ap1\"} 2",
+            "wifi_guard_sleep_proxy_total{ap=\"ap2\"} 0"
+        ]
+    );
+    let timeline = &json_get(r.c.http, &format!("{CLIENT}/history"))["timeline"];
+    let turn = timeline
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "sleep-proxy");
+    assert_eq!(turn.unwrap()["proxy"], "02:00:00:00:00:0e");
     assert!(promtool_accepts(&http_get(r.c.metrics, "/metrics")));
 }
 

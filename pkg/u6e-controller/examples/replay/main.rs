@@ -25,7 +25,9 @@
 //! the leases the controller seeds them with, and three times a cycle a
 //! client breaks a guard's rule (an ARP for another client's address, a
 //! router advertisement, VLAN-tagged frames, which the AP drops as one
-//! enforcing on that VLAN does).
+//! enforcing on that VLAN does); the left HomePod claims the laptop's
+//! address twice a cycle, as its sleep proxy while the laptop sleeps and
+//! once more after it woke, a violation then.
 //! A radio asked to scan sends eight spectra a second until it is told to stop
 //! or goes down (`spectrum`: Wi-Fi bursts, a narrowband sender on 5 GHz, a
 //! microwave oven and Bluetooth on 2.4 GHz, a quiet 6 GHz channel).
@@ -318,6 +320,9 @@ enum Act {
     LinkDown(usize, f64),
     /// A client on an AP breaks a client guard's rule.
     Violation(u8, usize, Guard),
+    /// The first client claims the second's address in ARP, on its own AP:
+    /// a sleep proxy answering for it while it sleeps, or not.
+    Claim(u8, u8),
     /// The AP reboots, its link down for so many seconds: its clients go to
     /// the other AP, and all but the sticky speakers come back after.
     ApReboot(usize, f64),
@@ -331,7 +336,7 @@ enum Act {
 /// The script, by second of the cycle and in that order; clients by the last
 /// byte of their MAC, APs and BSSs by index. A join of a client already
 /// somewhere is a roam.
-const SCRIPT: [(f64, Act); 24] = [
+const SCRIPT: [(f64, Act); 26] = [
     (3.0, Act::ApReboot(0, 15.0)),
     (20.0, Act::Join(3, 1, 1, -58.0)),
     (25.0, Act::Query(5)),
@@ -346,10 +351,12 @@ const SCRIPT: [(f64, Act); 24] = [
     (65.0, Act::Unknown(1)),
     (61.0, Act::Join(8, 1, 1, -61.0)),
     (70.0, Act::Violation(2, 0, Guard::Ra)),
+    (72.0, Act::Claim(services::LEFT, services::LAPTOP)),
     (75.0, Act::Join(7, 1, 0, -74.0)),
     (80.0, Act::RadioUp(1, 2)),
     (86.0, Act::Join(8, 1, 3, -56.0)),
     (90.0, Act::Violation(9, 0, Guard::Tag)),
+    (93.0, Act::Claim(services::LEFT, services::LAPTOP)),
     (95.0, Act::Join(3, 0, 1, -63.0)),
     (96.0, Act::HomeBy(services::LEFT, 0, 1, -60.0)),
     (97.0, Act::HomeBy(services::RIGHT, 0, 1, -64.0)),
@@ -743,6 +750,24 @@ impl World {
                     detail,
                     dropped,
                     repeats: 2,
+                };
+                self.event(ap, EventKind::GuardViolation(v));
+            }
+            Act::Claim(proxy, owner) => {
+                let Some((ap, bss)) = find(self, proxy).and_then(|i| self.clients[i].at) else {
+                    return;
+                };
+                let (ifname, _, _, vlan) = BSSS[bss];
+                let ip = services::leased(owner);
+                let v = Violation {
+                    guard: Guard::Arp,
+                    mac: World::mac(proxy),
+                    ifname: ifname.into(),
+                    vlan,
+                    ip: Some(ip.into()),
+                    detail: format!("claims {ip}, bound to {}", mac::format(World::mac(owner))),
+                    dropped: false,
+                    repeats: 1,
                 };
                 self.event(ap, EventKind::GuardViolation(v));
             }
