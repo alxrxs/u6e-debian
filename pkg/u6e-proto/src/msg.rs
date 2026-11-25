@@ -1003,9 +1003,10 @@ pub const MDNS_DEVICES: usize = 96;
 pub const MDNS_OFFERS: usize = 256;
 pub const MDNS_QUERIES: usize = 256;
 /// The most devices each of a query's lists names (the rest counted), and
-/// the most addresses kept of a device.
+/// the most address records kept of a device: a sleep proxy's own and
+/// those of a device or two it answers for.
 pub const MDNS_LISTED: usize = 16;
-pub const MDNS_ADDRS: usize = 4;
+pub const MDNS_ADDRS: usize = 16;
 
 /// What the AP's client guards read of the mDNS its bridges carry: the
 /// devices heard, the services they offer and the queries they send, each
@@ -1044,15 +1045,27 @@ pub struct MdnsDevice {
     pub port: String,
     pub vlan: u16,
     pub wifi: bool,
-    /// The host name its address records name, and the addresses they give
-    /// (the newest [`MDNS_ADDRS`]).
+    /// The host name its newest address record names, and its address
+    /// records by address, the newest [`MDNS_ADDRS`] first.
     pub host: String,
-    pub addrs: Vec<IpAddr>,
+    pub addrs: Vec<MdnsAddr>,
     pub first_ms: u64,
     pub last_ms: u64,
     /// The queries and the responses it sent, each copy (IPv4, IPv6) one.
     pub queries: u32,
     pub responses: u32,
+}
+
+/// An address record (A or AAAA) a device sent, announcing or answering:
+/// the address it gives, its TTL (0, a goodbye) and when it last came. A
+/// sleep proxy sends those of the devices it answers for.
+///
+/// On the wire: a change to it bumps [`crate::PROTOCOL`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MdnsAddr {
+    pub ip: IpAddr,
+    pub ttl_s: u32,
+    pub at_ms: u64,
 }
 
 /// A service instance a device advertises.

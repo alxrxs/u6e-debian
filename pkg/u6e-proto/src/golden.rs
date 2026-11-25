@@ -27,10 +27,10 @@ use crate::msg::{
     AgentMsg, Band, Binding, Bss, CaptureChunk, CaptureFilter, CaptureMechanism, CaptureRequest,
     CaptureState, ClientFlows, Command, CommandKind, CommandResult, ConfigApplied, CpuUse, CtlMsg,
     Event, EventKind, FieldDelta, FilterProto, Flow, Flows, Guard, GuardConfig, Hello, Limit,
-    LimitState, LimitStatus, LimitTarget, MdnsDevice, MdnsKey, MdnsOffer, MdnsQuery, Mechanism,
-    PowerLimit, Radio, RadioApplied, RadioConfig, Rate, RateMode, RecDelta, Services, SignedConfig,
-    Snapshot, SnapshotDelta, SpectrumFrame, SpeedTestReport, Station, StationAuth, StationCaps,
-    Temp, Violation, Withdrawn,
+    LimitState, LimitStatus, LimitTarget, MdnsAddr, MdnsDevice, MdnsKey, MdnsOffer, MdnsQuery,
+    Mechanism, PowerLimit, Radio, RadioApplied, RadioConfig, Rate, RateMode, RecDelta, Services,
+    SignedConfig, Snapshot, SnapshotDelta, SpectrumFrame, SpeedTestReport, Station, StationAuth,
+    StationCaps, Temp, Violation, Withdrawn,
 };
 
 const HOW: &str = "bump u6e_proto::PROTOCOL (pkg/u6e-proto/src/version.rs) and write the \
@@ -626,8 +626,16 @@ fn services() -> Services {
             wifi: true,
             host: "Device-1.local".into(),
             addrs: vec![
-                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 200)),
-                IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0xc1)),
+                MdnsAddr {
+                    ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 200)),
+                    ttl_s: 70_026,
+                    at_ms: (1 << 33) + 7,
+                },
+                MdnsAddr {
+                    ip: IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0xc1)),
+                    ttl_s: 0,
+                    at_ms: (1 << 33) + 8,
+                },
             ],
             first_ms: 1 << 33,
             last_ms: (1 << 33) + 1,

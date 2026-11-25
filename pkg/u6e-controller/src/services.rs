@@ -156,6 +156,7 @@ fn retime(s: &mut Read, at_ms: u64) {
     for d in &mut s.devices {
         t(&mut d.first_ms);
         t(&mut d.last_ms);
+        d.addrs.iter_mut().for_each(|a| t(&mut a.at_ms));
     }
     for o in &mut s.offers {
         t(&mut o.first_ms);
@@ -570,7 +571,7 @@ pub fn view(
                 "vlan": d.vlan,
                 "wifi": d.wifi,
                 "host": d.host,
-                "addrs": d.addrs.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "addrs": d.addrs.iter().map(|a| a.ip.to_string()).collect::<Vec<_>>(),
                 "first": d.first_ms,
                 "last": d.last_ms,
                 "queries_sent": d.queries,
@@ -728,6 +729,7 @@ pub fn event_json(e: &Event) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use u6e_proto::msg::MdnsAddr;
 
     const PHONE: [u8; 6] = [2, 0, 0, 0, 0, 1];
     const LEFT: [u8; 6] = [2, 0, 0, 0, 0, 2];
@@ -830,12 +832,20 @@ mod tests {
             T0
         );
         // A delta 10 s later: the right is gone from the AP, the phone
-        // asked again 2 s before the read.
+        // asked again 2 s before the read and answered for its address 1 s
+        // before.
         let mut q = browse(PHONE);
         q.last_ms = BOOT + 8000;
+        let mut phone = device(PHONE, true, BOOT + 9000);
+        phone.addrs = vec![MdnsAddr {
+            ip: "192.0.2.3".parse().unwrap(),
+            ttl_s: 120,
+            at_ms: BOOT + 9000,
+        }];
         let delta = Read {
             full: false,
             now_ms: BOOT + 10_000,
+            devices: vec![phone],
             queries: vec![q],
             gone: vec![MdnsKey::Offer(RIGHT, format!("Right.{AIRPLAY}"))],
             ..Read::default()
@@ -844,6 +854,7 @@ mod tests {
         let t = s.ap("ap1").unwrap();
         assert_eq!(t.offers.len(), 1);
         assert_eq!(t.queries[&(PHONE, AIRPLAY.into(), 12)].last_ms, T0 + 8000);
+        assert_eq!(t.devices[&PHONE].addrs[0].at_ms, T0 + 9000);
         // A full read replaces it all.
         s.apply("ap1", full(vec![], vec![], vec![]), T0 + 20_000);
         assert!(s.ap("ap1").unwrap().devices.is_empty());

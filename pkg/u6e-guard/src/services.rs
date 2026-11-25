@@ -1,6 +1,7 @@
 //! What the guards read of the mDNS the bridges carry (`mdns`), as one
-//! bounded table: the devices heard (by source MAC: the port and VLAN, the
-//! host name and addresses their address records give), the services they
+//! bounded table: the devices heard (by source MAC: the port and VLAN, and
+//! the address records they send, each with its host, TTL and time: a sleep
+//! proxy's tell whose addresses it answers for), the services they
 //! offer (from their PTR, SRV and TXT records, each extending the offer's
 //! life; a PTR, or an SRV naming its target, of TTL 0 is a goodbye) and the
 //! queries they send. Nothing of a message is kept but those names,
@@ -36,10 +37,11 @@
 //! a log of the last [`GONE`], or the whole table when it is further behind.
 
 use std::collections::{HashMap, VecDeque};
+use std::net::IpAddr;
 
 use u6e_proto::msg::{
-    MDNS_ADDRS, MDNS_DEVICES, MDNS_LISTED, MDNS_OFFERS, MDNS_QUERIES, MdnsDevice, MdnsKey,
-    MdnsOffer, MdnsQuery, Services, Withdrawn,
+    MDNS_ADDRS, MDNS_DEVICES, MDNS_LISTED, MDNS_OFFERS, MDNS_QUERIES, MdnsAddr, MdnsDevice,
+    MdnsKey, MdnsOffer, MdnsQuery, Services, Withdrawn,
 };
 
 use crate::mdns::{self, Data, Kind, Message, Section};
@@ -378,8 +380,8 @@ impl Table {
                         }
                     }
                 }
-                Data::A(a) => self.address(src, &r.name, msg, (*a).into()),
-                Data::Aaaa(a) => self.address(src, &r.name, msg, (*a).into()),
+                Data::A(a) => self.address(src, &r.name, msg, (*a).into(), r.ttl, now),
+                Data::Aaaa(a) => self.address(src, &r.name, msg, (*a).into(), r.ttl, now),
                 _ => {}
             }
             // What answers each window: its own name, and an instance of
@@ -399,8 +401,18 @@ impl Table {
         }
     }
 
-    /// `src`'s address record of `host` (of message `msg`) for `ip`.
-    fn address(&mut self, src: [u8; 6], host: &mdns::Name, msg: &[u8], ip: std::net::IpAddr) {
+    /// `src`'s address record of `host` (of message `msg`) for `ip`, of TTL
+    /// `ttl` (0, a goodbye), at `now`: the newest first, the least recently
+    /// sent dropped for room.
+    fn address(
+        &mut self,
+        src: [u8; 6],
+        host: &mdns::Name,
+        msg: &[u8],
+        ip: IpAddr,
+        ttl: u32,
+        now: u64,
+    ) {
         if host.kind != Kind::Other || !host.local {
             return;
         }
@@ -413,11 +425,14 @@ impl Table {
         if w.host != text {
             w.host = text;
         }
-        if w.addrs.first() != Some(&ip) {
-            w.addrs.retain(|a| *a != ip);
-            w.addrs.insert(0, ip);
-            w.addrs.truncate(MDNS_ADDRS);
-        }
+        w.addrs.retain(|a| a.ip != ip);
+        let a = MdnsAddr {
+            ip,
+            ttl_s: ttl,
+            at_ms: now,
+        };
+        w.addrs.insert(0, a);
+        w.addrs.truncate(MDNS_ADDRS);
         d.changed = g;
     }
 
@@ -940,7 +955,14 @@ pub mod tests {
             vlan: u16::MAX,
             wifi: true,
             host: name(),
-            addrs: vec![IpAddr::V6(Ipv6Addr::from([0xff; 16])); MDNS_ADDRS],
+            addrs: vec![
+                MdnsAddr {
+                    ip: IpAddr::V6(Ipv6Addr::from([0xff; 16])),
+                    ttl_s: u32::MAX,
+                    at_ms: u64::MAX,
+                };
+                MDNS_ADDRS
+            ],
             first_ms: u64::MAX,
             last_ms: u64::MAX,
             queries: u32::MAX,
@@ -1178,17 +1200,35 @@ pub mod tests {
         }
         assert_eq!((s.windows.len(), s.evicted), (WINDOWS, 1));
         assert_eq!(s.queries.len(), WINDOWS + 1);
-        // Addresses: the newest four.
+        // Address records: the newest sixteen, each with its TTL and time;
+        // one sent again moves to the front, and a goodbye stays as TTL 0.
         let mut s = Table::default();
         let mut b = Builder::new(true);
-        for i in 0..6 {
+        for i in 0..18 {
             b.record(1, "h.local", A, 120, Rd::A([192, 0, 2, i]));
         }
         b.record(1, "h.local", TXT, 120, Rd::Txt(&[]));
         s.take(&wifi(), LEFT, &b.bytes(), false, 0);
-        let (_, r) = s.read(None, 0);
-        let addrs: Vec<String> = r.devices[0].addrs.iter().map(|a| a.to_string()).collect();
-        assert_eq!(addrs, ["192.0.2.5", "192.0.2.4", "192.0.2.3", "192.0.2.2"]);
+        let mut b = Builder::new(true);
+        b.record(1, "h.local", A, 4500, Rd::A([192, 0, 2, 9]));
+        b.record(1, "h.local", A, 0, Rd::A([192, 0, 2, 4]));
+        s.take(&wifi(), LEFT, &b.bytes(), false, 5);
+        let (_, r) = s.read(None, 5);
+        let d = &r.devices[0];
+        let addrs: Vec<(String, u32, u64)> = (d.addrs.iter())
+            .map(|a| (a.ip.to_string(), a.ttl_s, a.at_ms))
+            .collect();
+        assert_eq!(addrs.len(), MDNS_ADDRS);
+        assert_eq!(
+            addrs[..3],
+            [
+                ("192.0.2.4".into(), 0, 5),
+                ("192.0.2.9".into(), 4500, 5),
+                ("192.0.2.17".into(), 120, 0),
+            ]
+        );
+        assert_eq!(addrs[15].0, "192.0.2.2");
+        assert_eq!(d.host, "h.local");
     }
 
     /// The frames of a pcap file (Ethernet, microseconds) and their times.
