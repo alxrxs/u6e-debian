@@ -10,13 +10,14 @@ use std::net::IpAddr;
 
 use serde_json::{Map, Value};
 
+use crate::names::Name;
 use crate::oui::Vendor;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Identity {
     pub device: Option<String>,
     pub hostname: Option<String>,
-    pub dns: Option<String>,
+    pub dns: Option<Name>,
     pub vendor: Option<Vendor>,
     pub addresses: Vec<IpAddr>,
     /// When its last lease expires, in Unix seconds.
@@ -26,8 +27,11 @@ pub struct Identity {
 impl Identity {
     /// The name it goes by.
     pub fn name(&self) -> Option<&str> {
-        let names = [&self.device, &self.hostname, &self.dns];
-        names.into_iter().find_map(Option::as_deref)
+        let dns = self.dns.as_ref().map(|n| n.name.as_str());
+        [self.device.as_deref(), self.hostname.as_deref(), dns]
+            .into_iter()
+            .flatten()
+            .next()
     }
 
     /// The fields of a client's view: `name` and each source of it,
@@ -44,7 +48,11 @@ impl Identity {
         put("name", self.name().map(Into::into));
         put("device", self.device.clone().map(Into::into));
         put("hostname", self.hostname.clone().map(Into::into));
-        put("dns", self.dns.clone().map(Into::into));
+        put("dns", self.dns.as_ref().map(|n| n.name.clone().into()));
+        put(
+            "dns_confirmed",
+            self.dns.as_ref().map(|n| n.confirmed.into()),
+        );
         put(
             "vendor",
             self.vendor.map(|v| match v {
@@ -77,10 +85,14 @@ mod tests {
     #[test]
     fn the_device_names_it_then_the_host_name_then_dns() {
         let mut i = Identity {
-            dns: Some("tab.example.org".into()),
+            dns: Some(Name {
+                name: "tab.example.org".into(),
+                confirmed: false,
+            }),
             ..Identity::default()
         };
         assert_eq!(i.name(), Some("tab.example.org"));
+        assert_eq!(i.fields()["dns_confirmed"], false);
         i.hostname = Some("tablet".into());
         assert_eq!(i.name(), Some("tablet"));
         i.device = Some("Kitchen tablet".into());

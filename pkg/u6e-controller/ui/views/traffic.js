@@ -5,7 +5,7 @@
 // or by the client it is when it is one. Fetched when shown, again a few seconds later (the
 // names it asked for have come by then) and every minute after.
 
-import { h, bytes, dayOf, palette } from '../util.js';
+import { h, bytes, dayOf, dnsTag, palette } from '../util.js';
 import { barChart } from '../charts.js';
 
 const REFRESH_MS = 60000;
@@ -24,7 +24,7 @@ function endCell(d) {
     ? h('a', { href: `#/client/${d.client}` }, d.client_name || d.client)
     : null;
   return h('td', { class: 'wrap' },
-    client || h('span', { class: d.name ? null : 'mono' }, d.name || d.ip),
+    client || h('span', { class: d.name ? null : 'mono' }, d.name || d.ip, d.name ? [' ', dnsTag(d.name_confirmed)] : null),
     h('small', { class: 'mono' }, client ? `${where} · a client here` : where));
 }
 

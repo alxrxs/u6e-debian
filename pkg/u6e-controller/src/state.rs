@@ -53,7 +53,7 @@ use crate::leases::{Lease, Leases};
 use crate::limits::{self, RateLimits};
 use crate::macauth::{self, MacAuth};
 use crate::mtls;
-use crate::names::{self, Names};
+use crate::names::{self, Name, Names};
 use crate::oui;
 use crate::policy::{ApImages, Blocked, ConfigId, Hold, Phase, Policy, SavedRollout};
 use crate::presence::{self, Presence};
@@ -1286,7 +1286,7 @@ impl State {
                         self.sessions.flows(ap, f, now_ms);
                         let names = &self.names;
                         self.traffic
-                            .flows(ap, f, now_ms, |ip| names.get(ip).map(str::to_owned));
+                            .flows(ap, f, now_ms, |ip| names.get(ip).map(|n| n.name.clone()));
                     }
                 }
                 _ => {}
@@ -2053,7 +2053,7 @@ impl State {
     }
 
     /// Takes the answer of a lookup of `ip`.
-    pub fn named(&mut self, ip: IpAddr, name: Option<String>, now: Instant) {
+    pub fn named(&mut self, ip: IpAddr, name: Option<Name>, now: Instant) {
         if self.names.answer(ip, name, now) {
             self.notify(Change::Names);
         }
@@ -2136,7 +2136,7 @@ impl State {
     }
 
     /// The DNS name of `ip`, as last looked up.
-    pub fn dns_name(&self, ip: &IpAddr) -> Option<&str> {
+    pub fn dns_name(&self, ip: &IpAddr) -> Option<&Name> {
         self.names.get(ip)
     }
 
@@ -2151,10 +2151,7 @@ impl State {
                 .collect::<Vec<_>>(),
         );
         Identity {
-            dns: seen
-                .iter()
-                .find_map(|ip| self.names.get(ip))
-                .map(str::to_owned),
+            dns: seen.iter().find_map(|ip| self.names.get(ip)).cloned(),
             vendor: oui::vendor(mac),
             lease_expires: leased.expires(),
             device: leased.device,
@@ -2199,8 +2196,8 @@ impl State {
 /// A far end is named by its reverse DNS, and a client's own address by
 /// that client.
 impl traffic::Look for State {
-    fn dns_name(&self, ip: &IpAddr) -> Option<String> {
-        self.names.get(ip).map(str::to_owned)
+    fn dns_name(&self, ip: &IpAddr) -> Option<Name> {
+        self.names.get(ip).cloned()
     }
 
     fn client_at(&self, ip: &IpAddr) -> Option<([u8; 6], Option<String>)> {

@@ -191,6 +191,16 @@ impl Resolve for FakeDns {
         self.asked.lock().unwrap().push(ip);
         self.names.lock().unwrap().get(&ip).cloned()
     }
+
+    /// Every name it gives resolves back.
+    fn forward(&self, name: &str) -> Vec<IpAddr> {
+        let names = self.names.lock().unwrap();
+        names
+            .iter()
+            .filter(|(_, n)| *n == name)
+            .map(|(ip, _)| *ip)
+            .collect()
+    }
 }
 
 /// A controller in this process, alive as long as the runtime, its files
@@ -4433,6 +4443,7 @@ fn clients_are_named_by_their_leases() {
         "device",
         "hostname",
         "dns",
+        "dns_confirmed",
         "vendor",
         "addresses",
         "lease_expires",
@@ -4448,6 +4459,7 @@ fn clients_are_named_by_their_leases() {
             "device": "Kitchen tablet",
             "hostname": "tablet",
             "dns": "tab.lan.example",
+            "dns_confirmed": true,
             // A locally administered MAC, as the tests' are.
             "vendor": "Private address",
             // The leased address first, then what only the flows show.

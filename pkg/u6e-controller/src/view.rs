@@ -175,8 +175,9 @@ fn flow(state: &State, f: &Flow) -> Value {
         "client_is_src": f.client_is_src,
         "opened": opener(f),
     });
-    if let Some(name) = state.dns_name(&names::remote(f)) {
-        o["remote_name"] = name.into();
+    if let Some(n) = state.dns_name(&names::remote(f)) {
+        o["remote_name"] = n.name.clone().into();
+        o["remote_confirmed"] = n.confirmed.into();
     }
     o
 }

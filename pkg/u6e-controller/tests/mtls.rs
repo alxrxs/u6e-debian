@@ -45,6 +45,10 @@ impl Resolve for NoNames {
     fn reverse(&self, _: std::net::IpAddr) -> Option<String> {
         None
     }
+
+    fn forward(&self, _: &str) -> Vec<std::net::IpAddr> {
+        Vec::new()
+    }
 }
 
 /// A controller with its files in `dir`, presenting `dir`'s cert.pem and

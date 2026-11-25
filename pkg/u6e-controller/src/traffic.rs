@@ -40,7 +40,7 @@ use tokio::time::interval;
 use u6e_proto::mac;
 use u6e_proto::msg::{Flows, Snapshot};
 
-use crate::names;
+use crate::names::{self, Name};
 use crate::sessions::unix_ms;
 use crate::state::Shared;
 use crate::store;
@@ -427,7 +427,7 @@ pub async fn keep(state: Shared, path: PathBuf) {
 /// What names a far end: its reverse DNS, as last looked up, and the
 /// client whose own address it is.
 pub trait Look {
-    fn dns_name(&self, ip: &IpAddr) -> Option<String>;
+    fn dns_name(&self, ip: &IpAddr) -> Option<Name>;
     fn client_at(&self, ip: &IpAddr) -> Option<([u8; 6], Option<String>)>;
 }
 
@@ -439,8 +439,12 @@ fn dest_json(end: End, name: Option<&str>, bytes: Bytes, look: &dyn Look) -> Val
         "up": bytes.up,
         "down": bytes.down,
     });
-    if let Some(n) = name.map(str::to_owned).or_else(|| look.dns_name(&end.ip)) {
+    // The name it was seen by first; confirmed while its lookup now says so.
+    let live = look.dns_name(&end.ip);
+    if let Some(n) = name.or(live.as_ref().map(|l| l.name.as_str())) {
+        let confirmed = live.as_ref().is_some_and(|l| l.confirmed && l.name == n);
         o["name"] = n.into();
+        o["name_confirmed"] = confirmed.into();
     }
     if let Some((m, n)) = look.client_at(&end.ip) {
         o["client"] = mac::format(m).into();
@@ -896,8 +900,11 @@ mod tests {
     struct Lan;
 
     impl Look for Lan {
-        fn dns_name(&self, ip: &IpAddr) -> Option<String> {
-            (*ip == far(3)).then(|| "three.example.org".into())
+        fn dns_name(&self, ip: &IpAddr) -> Option<Name> {
+            (*ip == far(3)).then(|| Name {
+                name: "three.example.org".into(),
+                confirmed: true,
+            })
         }
 
         fn client_at(&self, ip: &IpAddr) -> Option<([u8; 6], Option<String>)> {

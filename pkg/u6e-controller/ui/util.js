@@ -98,6 +98,14 @@ export function place(parent, els) {
   parent.replaceChildren(...els);
 }
 
+/** A reverse DNS name's tag: green when it resolves back to the address
+ * (FCrDNS), amber when it does not, since anyone may set their own PTR. */
+export function dnsTag(confirmed) {
+  return h('span', { class: `dns-tag ${confirmed ? 'ok' : 'warn'}`,
+    title: confirmed ? 'Resolves back to this address' : 'Does not resolve back to this address' },
+  confirmed ? 'FCrDNS' : 'rDNS');
+}
+
 export const BANDS = ['2.4', '5', '6'];
 
 export function bandName(b) {

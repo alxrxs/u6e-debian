@@ -14,7 +14,7 @@
 // when the controller edits RADIUS's MAC authentication mapping, its entry
 // there and an admin's change of it (`vlans`).
 
-import { h, icon, ago, ask, bandName, bits, bytes, dayOf, DID, duration, hm, mbps, palette, pct, phy, quality, time } from '../util.js';
+import { h, icon, ago, ask, bandName, bits, bytes, dayOf, DID, dnsTag, duration, hm, mbps, palette, pct, phy, quality, time } from '../util.js';
 import { lineChart } from '../charts.js';
 import { clientFlows, flowTable, offload, redraw, sampled, tick, topRows } from './flows.js';
 import { certificate, sessionsTable, timelineItems } from './history.js';
@@ -78,7 +78,7 @@ function identityFacts(c) {
   return [
     c.device ? fact('Device', c.device, 'DHCP') : null,
     c.hostname ? fact('Host name', c.hostname, 'DHCP') : null,
-    c.dns ? fact('DNS name', c.dns, 'rDNS') : null,
+    c.dns ? fact('DNS name', c.dns, dnsTag(c.dns_confirmed)) : null,
     c.addresses?.length ? fact('Addresses', c.addresses.map((a) => h('span', { class: 'mono addr' }, a))) : null,
     c.bound?.length ? fact('Guards bind', c.bound.map((b) => h('span', { class: 'mono addr' }, b.ip)), `on ${c.ap}`) : null,
     c.lease_expires ? fact('Lease', c.lease_expires > Date.now() ? `expires in ${duration((c.lease_expires - Date.now()) / 1000)}` : 'expired', until(c.lease_expires)) : null,

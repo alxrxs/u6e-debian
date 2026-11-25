@@ -1027,3 +1027,8 @@ table.vlans tbody tr:hover td { background: none; }
   .v-now { grid-area: now; }
   .v-act { grid-area: act; align-self: start; }
 }
+
+/* A reverse DNS name's tag: forward-confirmed or not. */
+.dns-tag { display: inline-block; padding: 0 5px; border-radius: 4px; font-size: 10.5px; font-weight: 600; line-height: 16px; vertical-align: 1px; }
+.dns-tag.ok { color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, transparent); }
+.dns-tag.warn { color: var(--warn); background: color-mix(in srgb, var(--warn) 16%, transparent); }

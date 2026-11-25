@@ -206,6 +206,34 @@ impl Resolve for Names {
         let (name, _) = PROFILES.get(usize::from(last).checked_sub(1)?)?;
         name.map(str::to_owned)
     }
+
+    /// The clients' names, the resolver's and the even edges' resolve back;
+    /// the odd edges' and the v6 hosts' do not.
+    fn forward(&self, name: &str) -> Vec<IpAddr> {
+        if name == "resolver.example.net" {
+            return vec![IpAddr::from([198, 51, 100, 53])];
+        }
+        if let Some(edge) = name
+            .strip_prefix("edge-")
+            .and_then(|n| n.strip_suffix(".cdn.example.com"))
+        {
+            let Some((c, d)) = edge.split_once('-') else {
+                return Vec::new();
+            };
+            let (Ok(c), Ok(d)) = (c.parse::<u8>(), d.parse::<u8>()) else {
+                return Vec::new();
+            };
+            let net = if c == 100 { [198, 51] } else { [203, 0] };
+            return if d % 2 == 0 {
+                vec![IpAddr::from([net[0], net[1], c, d])]
+            } else {
+                Vec::new()
+            };
+        }
+        let at = PROFILES.iter().position(|(n, _)| *n == Some(name));
+        at.map(|i| vec![IpAddr::from([192, 0, 2, 11 + i as u8])])
+            .unwrap_or_default()
+    }
 }
 
 /// The DHCP leases, as a DHCP node's exporter publishes them: each client

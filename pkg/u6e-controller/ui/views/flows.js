@@ -5,7 +5,7 @@
 // with its DNS name in grey beneath once the controller has looked it up. A
 // client's page shows its own with the table built here.
 
-import { h, icon, bits, bytes, duration, time } from '../util.js';
+import { h, icon, bits, bytes, dnsTag, duration, time } from '../util.js';
 
 const PROTOS = { 1: 'ICMP', 6: 'TCP', 17: 'UDP', 47: 'GRE', 50: 'ESP', 58: 'ICMPv6', 132: 'SCTP' };
 /** Protocols whose connections have ports. */
@@ -48,7 +48,7 @@ export function flowTable(rows, { of } = {}) {
         of ? h('td', { class: 'c-client' }, of(mac)) : null,
         h('td', { class: 'c-proto' }, protoName(f.proto)),
         h('td', { class: 'c-remote' }, h('span', { class: 'mono' }, endpoint(rip, rport, f.proto)),
-          f.remote_name ? h('small', { class: 'rname' }, f.remote_name) : null,
+          f.remote_name ? h('small', { class: 'rname' }, f.remote_name, ' ', dnsTag(f.remote_confirmed)) : null,
           opened ? h('small', {}, opened) : null),
         h('td', { class: 'c-port mono', 'data-label': 'port' }, PORTS.has(f.proto) ? String(lport) : '–'),
         h('td', { class: 'c-down num', 'data-label': '↓' }, bytes(f.rx_bytes)),

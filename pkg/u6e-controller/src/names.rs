@@ -3,7 +3,8 @@
 //! server's device nor the client's own host name does (a static client's
 //! PTR, typically); and the far ends of the flows a UI watches, shown under
 //! each address, and of the destinations a client's traffic page shows
-//! (`traffic`).
+//! (`traffic`). A name is confirmed (FCrDNS) when its own forward lookup
+//! gives the address back; a client may set its PTR to anything.
 //!
 //! Each address is looked up at most once at a time, [`LOOKUPS`] at most at
 //! once. A name found is kept for [`FOUND_TTL`], the lack of one for
@@ -15,7 +16,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::CStr;
-use std::net::IpAddr;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -33,9 +34,18 @@ pub const CAPACITY: usize = 4096;
 /// The longest a DNS name is.
 const NAME_MAX: usize = 253;
 
-/// A reverse lookup; it blocks, and is run off the async workers.
+/// Lookups that block, run off the async workers.
 pub trait Resolve: Send + Sync + 'static {
     fn reverse(&self, ip: IpAddr) -> Option<String>;
+    /// The addresses `name` resolves to.
+    fn forward(&self, name: &str) -> Vec<IpAddr>;
+}
+
+/// An address's reverse name, and whether it is forward-confirmed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Name {
+    pub name: String,
+    pub confirmed: bool,
 }
 
 /// The C library's resolver (`getnameinfo`): `/etc/hosts`, then the DNS
@@ -97,6 +107,14 @@ impl Resolve for System {
         let name = unsafe { CStr::from_ptr(host.as_ptr()) };
         clean(name.to_str().ok()?)
     }
+
+    fn forward(&self, name: &str) -> Vec<IpAddr> {
+        // getaddrinfo, through the same hosts file and servers.
+        (name, 0)
+            .to_socket_addrs()
+            .map(|a| a.map(|a| a.ip()).collect())
+            .unwrap_or_default()
+    }
 }
 
 /// `name` without its root dot, if it is a host name. A client may register
@@ -110,7 +128,7 @@ pub(crate) fn clean(name: &str) -> Option<String> {
 /// What is known of one address.
 struct Entry {
     /// The name last found; kept while a newer lookup is out.
-    name: Option<String>,
+    name: Option<Name>,
     /// When the answer is stale.
     until: Instant,
     pending: bool,
@@ -146,7 +164,7 @@ impl Names {
     }
 
     /// Takes the answer of a lookup of `ip`; true when its name changed.
-    pub fn answer(&mut self, ip: IpAddr, name: Option<String>, now: Instant) -> bool {
+    pub fn answer(&mut self, ip: IpAddr, name: Option<Name>, now: Instant) -> bool {
         let ttl = if name.is_some() {
             FOUND_TTL
         } else {
@@ -175,8 +193,8 @@ impl Names {
         true
     }
 
-    pub fn get(&self, ip: &IpAddr) -> Option<&str> {
-        self.entries.get(ip)?.name.as_deref()
+    pub fn get(&self, ip: &IpAddr) -> Option<&Name> {
+        self.entries.get(ip)?.name.as_ref()
     }
 
     /// Forgets the addresses no flow has shown for a while.
@@ -201,14 +219,19 @@ impl Lookups {
         }
     }
 
-    /// The name of `ip`, looked up on a blocking thread when a permit is free.
-    pub async fn reverse(&self, ip: IpAddr) -> Option<String> {
+    /// The name of `ip` and whether it resolves back to `ip`, looked up on
+    /// a blocking thread when a permit is free.
+    pub async fn reverse(&self, ip: IpAddr) -> Option<Name> {
         let _permit = self.permits.acquire().await.ok()?;
         let resolver = Arc::clone(&self.resolver);
-        tokio::task::spawn_blocking(move || resolver.reverse(ip))
-            .await
-            .ok()
-            .flatten()
+        tokio::task::spawn_blocking(move || {
+            let name = resolver.reverse(ip)?;
+            let confirmed = resolver.forward(&name).contains(&ip);
+            Some(Name { name, confirmed })
+        })
+        .await
+        .ok()
+        .flatten()
     }
 }
 
@@ -285,6 +308,17 @@ mod tests {
         assert_eq!(addresses(&[]), Vec::<IpAddr>::new());
     }
 
+    fn nm(name: &str, confirmed: bool) -> Name {
+        Name {
+            name: name.into(),
+            confirmed,
+        }
+    }
+
+    fn name(n: &Names, ip: IpAddr) -> Option<&str> {
+        n.get(&ip).map(|x| x.name.as_str())
+    }
+
     #[test]
     fn lookups_are_one_at_a_time_and_cached() {
         let mut n = Names::default();
@@ -293,9 +327,9 @@ mod tests {
         assert_eq!(n.due([a, b], t0), [a, b]);
         // In flight: not asked again.
         assert!(n.due([a, b], t0).is_empty());
-        assert!(n.answer(a, Some("host-a.example".into()), t0));
+        assert!(n.answer(a, Some(nm("host-a.example", true)), t0));
         assert!(!n.answer(b, None, t0));
-        assert_eq!((n.get(&a), n.get(&b)), (Some("host-a.example"), None));
+        assert_eq!((name(&n, a), name(&n, b)), (Some("host-a.example"), None));
         // The missing name is asked again after ten minutes, the found one
         // after an hour, and stays shown meanwhile.
         let later = |s| t0 + Duration::from_secs(s);
@@ -303,9 +337,11 @@ mod tests {
         assert_eq!(n.due([a, b], later(600)), [b]);
         assert!(n.due([a, b], later(3599)).is_empty());
         assert_eq!(n.due([a, b], later(3600)), [a]);
-        assert_eq!(n.get(&a), Some("host-a.example"));
-        assert!(!n.answer(a, Some("host-a.example".into()), later(3600)));
-        assert!(n.answer(a, Some("renamed.example".into()), later(3600)));
+        assert_eq!(name(&n, a), Some("host-a.example"));
+        assert!(!n.answer(a, Some(nm("host-a.example", true)), later(3600)));
+        // A name that stops resolving back is a change too.
+        assert!(n.answer(a, Some(nm("host-a.example", false)), later(3600)));
+        assert!(n.answer(a, Some(nm("renamed.example", true)), later(3600)));
         // Not seen for a while: forgotten, unless a lookup is out (b's
         // since 600 s, c's).
         let c = ip("192.0.2.3");
@@ -356,5 +392,32 @@ mod tests {
         // Every system names its loopback address in /etc/hosts.
         let name = System.reverse(ip("127.0.0.1"));
         assert!(name.is_some_and(|n| !n.is_empty()));
+        assert!(System.forward("localhost").contains(&ip("127.0.0.1")));
+    }
+
+    /// Names 192.0.2.1 and .2; only .1's name resolves back to it.
+    struct Ptr;
+
+    impl Resolve for Ptr {
+        fn reverse(&self, ip: IpAddr) -> Option<String> {
+            Some(format!("host-{ip}.example"))
+        }
+
+        fn forward(&self, name: &str) -> Vec<IpAddr> {
+            match name {
+                "host-192.0.2.1.example" => vec![ip("192.0.2.1")],
+                "host-192.0.2.2.example" => vec![ip("192.0.2.9")],
+                _ => Vec::new(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_name_is_confirmed_when_it_resolves_back() {
+        let l = Lookups::new(Arc::new(Ptr));
+        let one = l.reverse(ip("192.0.2.1")).await.unwrap();
+        let two = l.reverse(ip("192.0.2.2")).await.unwrap();
+        assert_eq!((one.confirmed, two.confirmed), (true, false));
+        assert_eq!(two.name, "host-192.0.2.2.example");
     }
 }
