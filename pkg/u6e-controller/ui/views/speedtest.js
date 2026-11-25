@@ -47,7 +47,7 @@ function figures(down, up, notes = {}) {
 function cpuText(cpu) {
   if (!cpu) return '';
   const pc = (c) => `${Math.round(c.busy)} %`;
-  return `AP CPU ${pc(cpu.down)} down, ${pc(cpu.up)} up (all cores); the test’s own ${Math.round(cpu.down.thread)} % and ${Math.round(cpu.up.thread)} % of a core`;
+  return `CPU ${pc(cpu.down)}/${pc(cpu.up)}, test thread ${Math.round(cpu.down.thread)}/${Math.round(cpu.up.thread)} %`;
 }
 
 /** The speed test box of AP `name` on its Devices panel. */
@@ -56,7 +56,7 @@ export function apSpeedBox(store, name, ap) {
   const mine = all.filter((t) => t.ap === name);
   const running = all.find((t) => t.status === 'running');
   const ui = (store.ui.speedtest ||= {});
-  const result = h('p', { class: 'result', role: 'status', hidden: true });
+  const result = h('span', { class: 'result', role: 'status', hidden: true });
   if (ui.result?.ap === name) resultLine(result, ui.result.tone, ui.result.text);
   const admin = !!store.me?.admin;
   const why = !ap.up ? `${name} is not connected`
@@ -77,22 +77,14 @@ export function apSpeedBox(store, name, ap) {
     resultLine(result, ui.result.tone, text);
   });
   const last = mine.find((t) => t.status !== 'running');
-  const now = running?.ap === name
-    ? h('p', { class: 'note' }, `Running since ${time(running.at)}${running.user ? `, asked by ${running.user}` : ''}: 10 s down, then 10 s up.`)
-    : null;
-  const lastEl = !last ? h('p', { class: 'muted' }, 'No test of this AP since the controller started.')
-    : last.status === 'failed'
-      ? h('p', { class: 'note warn' }, `The last test, ${ago(last.at)}, failed: ${last.detail}.`)
-      : h('div', {},
-        figures(last.down.bits_per_second, last.up.bits_per_second, { down: 'as the AP received it', up: 'as the controller received it' }),
-        h('p', { class: 'muted st-foot' }, `${ago(last.at)}${last.user ? ` by ${last.user}` : ''}. ${cpuText(last.cpu)}.`));
-  const earlier = mine.filter((t) => t.status === 'done' && t !== last).slice(0, 4);
-  return h('div', { class: 'ap-st-box' },
-    h('div', { class: 'st-head' }, h('h3', {}, 'Speed test to the controller'), admin ? run : null),
-    now, lastEl,
-    earlier.length ? h('p', { class: 'muted st-foot' }, 'Before: ', earlier.map((t) => `${hm(t.at)} ${mbit(t.down.bits_per_second)} down, ${mbit(t.up.bits_per_second)} up`).join(' · ')) : null,
-    h('p', { class: 'muted st-foot' }, 'Wired, AP to controller. Test thread near 100 % means the AP’s CPU is the limit.'),
-    admin ? null : h('p', { class: 'lock' }, `Running one needs membership of ${ADMIN_GROUP}.`),
+  const status = running?.ap === name ? `Running since ${time(running.at)}: 10 s down, then 10 s up`
+    : !last ? 'No test yet'
+      : last.status === 'failed' ? `Failed ${ago(last.at)}: ${last.detail}`
+        : `${mbit(last.down.bits_per_second)} down · ${mbit(last.up.bits_per_second)} up · ${ago(last.at)}${last.user ? ` by ${last.user}` : ''} · ${cpuText(last.cpu)}`;
+  return h('div', { class: 'ap-st-box st-line', title: 'Wired, AP to controller. Test thread near 100 % means the AP’s CPU is the limit.' },
+    h('h3', {}, 'Speed test'),
+    h('span', { class: `st-status${last?.status === 'failed' ? ' bad' : ''}` }, status),
+    admin ? run : h('span', { class: 'lock' }, `Needs ${ADMIN_GROUP}`),
     result);
 }
 

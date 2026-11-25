@@ -158,6 +158,9 @@ export default {
         }
         note.replaceChildren();
         place(list, aps.map(([name, ap]) => {
+          // An AP opens the first time it is seen; closing it sticks.
+          const seen = (store.ui.apsSeen ||= new Set());
+          if (!seen.has(name)) { seen.add(name); open.add(name); }
           if (!bars.has(name)) bars.set(name, bar(open, name, () => view.update()));
           const b = bars.get(name);
           b.head(apHead(name, ap));

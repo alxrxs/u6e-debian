@@ -162,7 +162,7 @@ h3 { font-size: 13px; color: var(--ink-2); font-weight: 600; }
   font-size: 13px;
 }
 
-main { padding: 22px 24px 48px; max-width: 1560px; }
+main { padding: 22px 24px 48px; }
 
 .head { display: flex; align-items: baseline; gap: 14px; margin-bottom: 16px; flex-wrap: wrap; }
 .head p { margin: 0; color: var(--ink-3); }
@@ -942,7 +942,13 @@ table.dests td.wrap { min-width: 24ch; }
 .ap-xp-box { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--rule-2); }
 .ap-xp-box h3 { margin: 0 0 8px; font-size: 12px; color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.04em; }
 .ap-xp .xp-score > b { font-size: 34px; }
-.ap-xp .xp-parts li { grid-template-columns: 13ch minmax(60px, 200px) 3ch; }
+.ap-xp .xp-parts { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 4px 24px; }
+.ap-xp .xp-parts li { grid-template-columns: minmax(0, 1fr) auto; gap: 6px 8px; }
+.ap-xp .xp-parts li .xp-bar { grid-column: 1 / -1; grid-row: 2; }
+.st-line { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
+.st-line .st-status { flex: 1; min-width: 0; color: var(--ink-2); font-size: 13px; font-variant-numeric: tabular-nums; }
+.st-line .st-status.bad { color: var(--bad); }
+.st-line .result { flex-basis: 100%; margin: 0; }
 .xp-weakest { grid-column: 1 / -1; margin: 2px 0 0; font-size: 13px; color: var(--ink-2); }
 
 /* Roaming: each AP's summary, the sticky clients, the roams and steering. */
@@ -959,6 +965,9 @@ table.roams td:nth-child(n+2) small, table.steering td small { display: block; }
   .roam-aps { grid-template-columns: 1fr; }
   .xp { grid-template-columns: 1fr; }
   .xp-parts li { grid-template-columns: 13ch minmax(50px, 1fr) 3ch; }
+  .ap-xp .xp-parts { display: block; }
+  .ap-xp .xp-parts li { grid-template-columns: 13ch minmax(50px, 1fr) 3ch; }
+  .ap-xp .xp-parts li .xp-bar { grid-column: auto; grid-row: auto; }
   .xp-parts li small { grid-column: 1 / -1; }
   .client-xp > .panel { padding: 14px 16px; }
 }
