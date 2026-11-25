@@ -38,6 +38,13 @@
 //! once the whole poll worked, so a poll that fails part way hands its lines
 //! over at the next. Each answer is at most [`BODY_MAX`] bytes within
 //! [`TIMEOUT`].
+//!
+//! Several Lokis that each receive the whole log (`[radius] loki`, a list)
+//! are taken in turn: each page is asked of the one that answered last, and
+//! of the next only when it fails, the change logged once. The cursor and
+//! what was delivered are the lines', whichever Loki gave them, so a poll
+//! read partly from each is the same poll. With `[radius] tls` every Loki
+//! is read over mutual TLS (`mtls`), its failures counted.
 
 use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
@@ -49,6 +56,7 @@ use tokio::time::interval;
 use u6e_proto::{mac, text};
 
 use crate::fetch;
+use crate::mtls::{self, Endpoint, Failure};
 use crate::state::Shared;
 
 /// How often Loki is read.
@@ -72,10 +80,12 @@ const FIELD_MAX: usize = 253;
 /// Where the log is read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
-    /// Loki's `host:port`.
-    pub loki: String,
+    /// Each Loki's `host:port`, in the order they are tried.
+    pub loki: Vec<String>,
     /// The LogQL stream selector of the log, `{job="..."}`.
     pub selector: String,
+    /// The certificate the Lokis are read with over mutual TLS.
+    pub tls: Option<mtls::Files>,
 }
 
 /// How the reads of the log go, for the metrics.
@@ -284,6 +294,10 @@ struct Cursor {
     skipped: HashSet<u64>,
     /// How many instants were stepped past since the start.
     skips: u64,
+    /// The Loki that answered last, which the next page is asked of first.
+    at: usize,
+    /// The failures of the reads since they were last counted.
+    failures: Vec<Failure>,
 }
 
 /// What one read of a window found: whether it reached the window's end,
@@ -321,6 +335,8 @@ impl Cursor {
             rescan_at: now + RESCAN_EVERY,
             skipped: HashSet::new(),
             skips: 0,
+            at: 0,
+            failures: Vec::new(),
         }
     }
 
@@ -385,7 +401,7 @@ impl Cursor {
     /// of one instant (Loki pages by time alone, so the rest of it cannot be
     /// asked for) goes on a nanosecond past it.
     async fn read(
-        &self,
+        &mut self,
         s: &Settings,
         mut start: u64,
         end: u64,
@@ -399,9 +415,7 @@ impl Cursor {
             let target = format!(
                 "/loki/api/v1/query_range?query={q}&start={start}&end={end}&limit={PAGE}&direction=forward"
             );
-            let answer =
-                fetch::get(&s.loki, &target, "application/json", BODY_MAX, TIMEOUT).await?;
-            let page = lines(&answer).ok_or("Loki's answer is not a list of lines")?;
+            let page = self.ask(s, &target).await?;
             for (ns, l) in page.verdicts {
                 let k = key(ns, &l);
                 if !self.taken.contains(&k) && new.insert(k) {
@@ -431,30 +445,64 @@ impl Cursor {
             stepped,
         })
     }
+
+    /// The page `target` asks for: from the Loki that answered last, else
+    /// from each next one in turn; why none gave it, otherwise.
+    async fn ask(&mut self, s: &Settings, target: &str) -> Result<Page, String> {
+        let mut why = Vec::new();
+        for i in 0..s.loki.len() {
+            let at = (self.at + i) % s.loki.len();
+            let loki = &s.loki[at];
+            let tls = s.tls.as_ref();
+            let answer = mtls::get(tls, loki, target, "application/json", BODY_MAX, TIMEOUT).await;
+            let page = match answer {
+                Ok(a) => lines(&a).ok_or_else(|| "its answer is not a list of lines".to_owned()),
+                Err(f) => {
+                    let e = f.to_string();
+                    self.failures.push(f);
+                    Err(e)
+                }
+            };
+            match page {
+                Ok(page) => {
+                    if at != self.at {
+                        let why = why.join("; ");
+                        eprintln!("u6e-controller: RADIUS log read from {loki} ({why})");
+                        self.at = at;
+                    }
+                    return Ok(page);
+                }
+                Err(e) => why.push(format!("{loki}: {e}")),
+            }
+        }
+        Err(why.join("; "))
+    }
 }
 
 /// Reads the log every [`EVERY`] for the life of the process, into the
-/// state; a change of whether it can be read is logged once.
+/// state; a change of whether it can be read is logged once, a failure of
+/// mutual TLS counted.
 pub async fn supervise(state: Shared, settings: Settings) {
     let mut every = interval(EVERY);
     let resume = state.read().sessions.radius_newest();
     let mut cursor = Cursor::new(SystemTime::now(), resume);
+    let lokis = settings.loki.join(", ");
     loop {
         every.tick().await;
         let now = SystemTime::now();
         let read = cursor.poll(&settings, now).await;
-        let was = state.read().radius.as_ref().and_then(|h| h.up);
+        let mut st = state.write();
+        for f in cursor.failures.drain(..) {
+            st.tls_failures.count(Endpoint::Loki, &f);
+        }
+        let was = st.radius.as_ref().and_then(|h| h.up);
         if was != Some(read.is_ok()) {
             match &read {
-                Ok(l) => eprintln!(
-                    "u6e-controller: RADIUS log from {}: {} lines",
-                    settings.loki,
-                    l.len()
-                ),
-                Err(e) => eprintln!("u6e-controller: RADIUS log from {}: {e}", settings.loki),
+                Ok(l) => eprintln!("u6e-controller: RADIUS log from {lokis}: {} lines", l.len()),
+                Err(e) => eprintln!("u6e-controller: RADIUS log from {lokis}: {e}"),
             }
         }
-        state.write().take_radius(read.map_err(|_| ()), now);
+        st.take_radius(read.map_err(|_| ()), now);
     }
 }
 
@@ -462,8 +510,12 @@ pub async fn supervise(state: Shared, settings: Settings) {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use tokio_rustls::TlsAcceptor;
+
+    use crate::mtls::Reason;
+    use crate::mtls::testing::{acceptor, files};
 
     const MAC: [u8; 6] = [2, 0, 0, 0, 0, 0x21];
     const OLD: &str =
@@ -639,48 +691,76 @@ mod tests {
         asked: Arc<Mutex<Vec<String>>>,
         fail: &'static [usize],
     ) -> String {
-        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        loki_at("127.0.0.1", None, log, asked, fail).await
+    }
+
+    /// The same on `ip`, over mutual TLS with `tls`.
+    async fn loki_at(
+        ip: &str,
+        tls: Option<TlsAcceptor>,
+        log: Arc<Mutex<Vec<(u64, String)>>>,
+        asked: Arc<Mutex<Vec<String>>>,
+        fail: &'static [usize],
+    ) -> String {
+        let l = TcpListener::bind((ip, 0)).await.unwrap();
         let addr = l.local_addr().unwrap().to_string();
         tokio::spawn(async move {
             loop {
-                let (mut s, _) = l.accept().await.unwrap();
-                let mut buf = vec![0; 8192];
-                let n = s.read(&mut buf).await.unwrap();
-                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
-                let param = |k: &str| -> u64 {
-                    let q = req
-                        .split_whitespace()
-                        .nth(1)
-                        .unwrap()
-                        .split_once('?')
-                        .unwrap()
-                        .1;
-                    let v = q
-                        .split('&')
-                        .find_map(|kv| kv.strip_prefix(k)?.strip_prefix('='));
-                    v.unwrap().parse().unwrap()
-                };
-                let (start, end, limit) = (param("start"), param("end"), param("limit"));
-                asked.lock().unwrap().push(req.clone());
-                if fail.contains(&asked.lock().unwrap().len()) {
-                    let _ = s.write_all(b"HTTP/1.0 200 OK\r\n\r\n<html>").await;
-                    continue;
+                let (s, _) = l.accept().await.unwrap();
+                match &tls {
+                    Some(t) => {
+                        if let Ok(s) = t.accept(s).await {
+                            answer(s, &log, &asked, fail).await;
+                        }
+                    }
+                    None => answer(s, &log, &asked, fail).await,
                 }
-                let values: Vec<Value> = log
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .filter(|(ns, _)| (start..=end).contains(ns))
-                    .take(limit as usize)
-                    .map(|(ns, l)| serde_json::json!([ns.to_string(), l]))
-                    .collect();
-                let stream = serde_json::json!({"stream": {"host": "r1"}, "values": values});
-                let body = serde_json::json!({"status": "success", "data": {"result": [stream]}});
-                let head = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n";
-                let _ = s.write_all(format!("{head}{body}").as_bytes()).await;
             }
         });
         addr
+    }
+
+    async fn answer(
+        mut s: impl AsyncRead + AsyncWrite + Unpin,
+        log: &Mutex<Vec<(u64, String)>>,
+        asked: &Mutex<Vec<String>>,
+        fail: &[usize],
+    ) {
+        let mut buf = vec![0; 8192];
+        let n = s.read(&mut buf).await.unwrap();
+        let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+        let param = |k: &str| -> u64 {
+            let q = req
+                .split_whitespace()
+                .nth(1)
+                .unwrap()
+                .split_once('?')
+                .unwrap()
+                .1;
+            let v = q
+                .split('&')
+                .find_map(|kv| kv.strip_prefix(k)?.strip_prefix('='));
+            v.unwrap().parse().unwrap()
+        };
+        let (start, end, limit) = (param("start"), param("end"), param("limit"));
+        asked.lock().unwrap().push(req.clone());
+        let answer = if fail.contains(&asked.lock().unwrap().len()) {
+            "HTTP/1.0 200 OK\r\n\r\n<html>".to_owned()
+        } else {
+            let values: Vec<Value> = log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(ns, _)| (start..=end).contains(ns))
+                .take(limit as usize)
+                .map(|(ns, l)| serde_json::json!([ns.to_string(), l]))
+                .collect();
+            let stream = serde_json::json!({"stream": {"host": "r1"}, "values": values});
+            let body = serde_json::json!({"status": "success", "data": {"result": [stream]}});
+            format!("HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{body}")
+        };
+        let _ = s.write_all(answer.as_bytes()).await;
+        let _ = s.shutdown().await;
     }
 
     async fn loki(log: Arc<Mutex<Vec<(u64, String)>>>, asked: Arc<Mutex<Vec<String>>>) -> String {
@@ -689,8 +769,9 @@ mod tests {
 
     fn settings(loki: String) -> Settings {
         Settings {
-            loki,
+            loki: vec![loki],
             selector: r#"{job="radius"}"#.into(),
+            tls: None,
         }
     }
 
@@ -886,6 +967,141 @@ mod tests {
         });
         assert!(cursor.poll(&settings(addr), now).await.is_err());
         assert_eq!(cursor.from_ns, from);
+    }
+
+    fn lokis(loki: Vec<String>, tls: Option<mtls::Files>) -> Settings {
+        Settings {
+            loki,
+            tls,
+            ..settings(String::new())
+        }
+    }
+
+    /// An address nothing listens on.
+    async fn refusing() -> String {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap().to_string()
+    }
+
+    fn reasons(c: &Cursor) -> Vec<Option<Reason>> {
+        c.failures.iter().map(Failure::reason).collect()
+    }
+
+    /// A Loki that refuses hands the page to the next, which is asked
+    /// first from then on.
+    #[tokio::test]
+    async fn a_failing_loki_hands_over_to_the_next_which_stays_first() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let log = Arc::new(Mutex::new(vec![(nanos(now) - 1_000_000_000, verdict(1))]));
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let good = loki(log, Arc::clone(&asked)).await;
+        let s = lokis(vec![refusing().await, good], None);
+        let mut cursor = Cursor::new(now, None);
+        assert_eq!(cursor.poll(&s, now).await.unwrap().len(), 1);
+        assert_eq!((cursor.at, reasons(&cursor)), (1, vec![None]));
+        let later = now + Duration::from_secs(60);
+        assert!(cursor.poll(&s, later).await.unwrap().is_empty());
+        assert_eq!(
+            cursor.failures.len(),
+            1,
+            "the refusing one is not asked first"
+        );
+        assert_eq!(asked.lock().unwrap().len(), 2);
+    }
+
+    /// A poll whose second page one Loki fails to give (an answer that is
+    /// no list of lines) reads it from the other: the poll is one, each
+    /// line delivered once.
+    #[tokio::test]
+    async fn a_poll_read_partly_from_each_loki_delivers_each_line_once() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let ns = nanos(now);
+        let log: Vec<(u64, String)> = (0..1500u64)
+            .map(|i| (ns - 120_000_000_000 + i * 1_000_000, verdict(i)))
+            .collect();
+        let log = Arc::new(Mutex::new(log));
+        let (first, second) = (
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let a = loki_failing(Arc::clone(&log), Arc::clone(&first), &[2]).await;
+        let b = loki(log, Arc::clone(&second)).await;
+        let s = lokis(vec![a, b], None);
+        let mut cursor = Cursor::new(now, None);
+        let got = cursor.poll(&s, now).await.unwrap();
+        let users: HashSet<&str> = got.iter().map(|l| l.user.as_str()).collect();
+        assert_eq!((got.len(), users.len()), (1500, 1500));
+        assert_eq!(
+            (first.lock().unwrap().len(), second.lock().unwrap().len()),
+            (2, 1)
+        );
+        assert!(cursor.poll(&s, now).await.unwrap().is_empty());
+    }
+
+    /// A Loki that takes the connection and never answers is given up
+    /// after its timeout, and the page read from the next.
+    #[tokio::test]
+    async fn a_hanging_loki_is_given_up_in_time() {
+        let now = SystemTime::now();
+        let hung = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hung_at = hung.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = hung.accept().await {
+                held.push(s);
+            }
+        });
+        let log = Arc::new(Mutex::new(vec![(nanos(now) - 1_000_000_000, verdict(1))]));
+        let good = loki(log, Arc::new(Mutex::new(Vec::new()))).await;
+        let s = lokis(vec![hung_at, good], None);
+        let mut cursor = Cursor::new(now, None);
+        let t = std::time::Instant::now();
+        assert_eq!(cursor.poll(&s, now).await.unwrap().len(), 1);
+        assert!(t.elapsed() >= TIMEOUT && t.elapsed() < TIMEOUT + Duration::from_secs(5));
+    }
+
+    /// Over mutual TLS each Loki is verified by the address dialled and
+    /// shown the controller's certificate; one of another name is refused
+    /// and the next one read; the certificate missing fails every one, each
+    /// failure kept for the count.
+    #[tokio::test]
+    async fn the_lokis_are_read_over_mutual_tls() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let log = Arc::new(Mutex::new(vec![(nanos(now) - 1_000_000_000, verdict(1))]));
+        let me = ["controller.example.org"];
+        let serve = |ip: &'static str, cert: &str| {
+            let tls = Some(acceptor(cert, &me));
+            loki_at(
+                ip,
+                tls,
+                Arc::clone(&log),
+                Arc::new(Mutex::new(Vec::new())),
+                &[],
+            )
+        };
+        let (one, two) = (
+            serve("127.0.0.1", "server1").await,
+            serve("127.0.0.2", "server2").await,
+        );
+        let misnamed = serve("127.0.0.1", "server2").await;
+        let tls = Some(files("controller"));
+        let mut cursor = Cursor::new(now, None);
+        let s = lokis(vec![one.clone(), two.clone()], tls.clone());
+        assert_eq!(cursor.poll(&s, now).await.unwrap().len(), 1);
+        let mut cursor = Cursor::new(now, None);
+        let s = lokis(vec![misnamed, two], tls);
+        assert_eq!(cursor.poll(&s, now).await.unwrap().len(), 1);
+        assert_eq!(reasons(&cursor), [Some(Reason::Handshake)]);
+        let mut cursor = Cursor::new(now, None);
+        let missing = mtls::Files {
+            key: "/nonexistent/key.pem".into(),
+            ..files("controller")
+        };
+        let s = lokis(vec![one, s.loki[1].clone()], Some(missing));
+        let e = cursor.poll(&s, now).await.unwrap_err();
+        assert!(e.contains("the monitoring certificate"), "{e}");
+        let certificate = Some(Reason::Certificate);
+        assert_eq!(reasons(&cursor), [certificate, certificate]);
     }
 
     /// A restarted controller reads on from what its history holds, never

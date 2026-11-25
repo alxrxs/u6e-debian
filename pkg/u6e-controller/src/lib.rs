@@ -26,8 +26,8 @@
 //! lists are announced to Home Assistant as they join and leave the Wi-Fi
 //! (`presence`). Admins set the VLAN RADIUS's MAC authentication puts a
 //! device in, in the mapping every RADIUS server reads from OpenBao
-//! (`macauth`). The metrics are served over mutual TLS with the host's
-//! monitoring certificate when switched to it (`mtls`).
+//! (`macauth`). The metrics and RADIUS's log each speak mutual TLS with the
+//! host's monitoring certificate when switched to it (`mtls`).
 
 pub mod actions;
 pub mod agents;

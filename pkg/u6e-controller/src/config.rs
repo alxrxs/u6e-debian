@@ -9,9 +9,11 @@
 //! rollouts (`rollout`), each off without its section; in `[rf]`, the RF
 //! planner's (`rf::config`), without which it is off; in `[leases]`, the
 //! DHCP nodes' node exporters the clients' leases are read from (`leases`),
-//! none without it; in `[radius]`, the Loki the RADIUS servers' log is read
-//! from (`radius`), RADIUS's side of the clients' timelines missing without
-//! it; in `[monitoring_tls]`, the host's monitoring certificate (`mtls`):
+//! none without it; in `[radius]`, the Lokis the RADIUS servers' log is
+//! read from (`radius`, one, or several taken in turn when one fails), over
+//! mutual TLS with `tls = true`, RADIUS's side of the clients' timelines
+//! missing without it; in `[monitoring_tls]`, the host's monitoring
+//! certificate (`mtls`), which `[radius]` presents with `tls = true`:
 //! the chain (leaf first), its key and the CA bundle every peer is verified
 //! against, and the DNS names of the scrapers `/metrics` is then served to
 //! over mutual TLS alone (`metrics_clients`, plain HTTP while none is
@@ -72,8 +74,9 @@
 //! exporters = ["dhcp1.example.org:9100", "[2001:db8::53]:9100"]
 //!
 //! [radius]
-//! loki = "logs.example.org:3100"
+//! loki = ["logs1.example.org:3100", "logs2.example.org:3100"]
 //! selector = '{job="radius-auth"}'
+//! tls = true
 //!
 //! [monitoring_tls]
 //! cert = "/etc/ssl/monitoring/fullchain.pem"
@@ -177,10 +180,14 @@ impl Config {
             .monitoring_tls
             .as_ref()
             .is_some_and(|t| !t.metrics_clients.is_empty());
-        [(metrics, mtls::Endpoint::Metrics)]
-            .into_iter()
-            .filter_map(|(on, e)| on.then_some(e))
-            .collect()
+        let loki = self.radius.as_ref().is_some_and(|r| r.tls.is_some());
+        [
+            (metrics, mtls::Endpoint::Metrics),
+            (loki, mtls::Endpoint::Loki),
+        ]
+        .into_iter()
+        .filter_map(|(on, e)| on.then_some(e))
+        .collect()
     }
 }
 
@@ -287,8 +294,18 @@ struct SsidLimitFile {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RadiusFile {
-    loki: String,
+    loki: Addresses,
     selector: String,
+    #[serde(default)]
+    tls: bool,
+}
+
+/// One `host:port`, or several.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Addresses {
+    One(String),
+    Many(Vec<String>),
 }
 
 #[derive(Deserialize)]
@@ -425,7 +442,7 @@ pub enum ConfigError {
     Presence(String),
     /// `[mac_auth]` is not one: why.
     MacAuth(String),
-    /// `[monitoring_tls]` is not one: why.
+    /// `[monitoring_tls]` is not one, or a `tls = true` has none: why.
     MonitoringTls(String),
 }
 
@@ -506,11 +523,25 @@ impl Config {
             .monitoring_tls
             .map(monitoring_tls_settings)
             .transpose()?;
+        // A path switched to mutual TLS presents the host's certificate.
+        let tls = |on: bool, what: &str| match (on, &monitoring_tls) {
+            (false, _) => Ok(None),
+            (true, Some(t)) => Ok(Some(t.files.clone())),
+            (true, None) => Err(ConfigError::MonitoringTls(format!(
+                "{what}.tls needs [monitoring_tls]"
+            ))),
+        };
         let leases = file.leases.map_or_else(Vec::new, |l| l.exporters);
         if let Some(bad) = leases.iter().find(|e| !is_host_port(e)) {
             return Err(ConfigError::BadExporter(bad.clone()));
         }
-        let radius = file.radius.map(radius_settings).transpose()?;
+        let radius = file
+            .radius
+            .map(|r| {
+                let files = tls(r.tls, "radius")?;
+                radius_settings(r, files)
+            })
+            .transpose()?;
         let guards = file
             .guards
             .map_or_else(|| Ok(GuardConfig::default()), guards)?;
@@ -687,12 +718,25 @@ fn mac_auth_settings(file: MacAuthFile) -> Result<macauth::Settings, ConfigError
     })
 }
 
-/// The RADIUS log's section, checked: a `host:port`, and a stream selector
-/// (in braces, on one line: it goes into the query as it is).
-fn radius_settings(file: RadiusFile) -> Result<radius::Settings, ConfigError> {
-    if !is_host_port(&file.loki) {
-        let e = format!("loki: {:?} is not host:port", file.loki);
-        return Err(ConfigError::Radius(e));
+/// The RADIUS log's section, checked: 1 to 8 `host:port`, each once, and a
+/// stream selector (in braces, on one line: it goes into the query as it
+/// is); read over mutual TLS with `tls`.
+fn radius_settings(
+    file: RadiusFile,
+    tls: Option<mtls::Files>,
+) -> Result<radius::Settings, ConfigError> {
+    let loki = match file.loki {
+        Addresses::One(a) => vec![a],
+        Addresses::Many(a) => a,
+    };
+    if loki.is_empty() || loki.len() > 8 {
+        return Err(ConfigError::Radius("loki: 1 to 8 are listed".into()));
+    }
+    for (i, a) in loki.iter().enumerate() {
+        if !is_host_port(a) || loki[..i].contains(a) {
+            let e = format!("loki: {a:?} is not host:port, or is listed twice");
+            return Err(ConfigError::Radius(e));
+        }
     }
     let s = &file.selector;
     if !(s.starts_with('{') && s.ends_with('}') && !s.chars().any(char::is_control)) {
@@ -701,8 +745,9 @@ fn radius_settings(file: RadiusFile) -> Result<radius::Settings, ConfigError> {
         )));
     }
     Ok(radius::Settings {
-        loki: file.loki,
+        loki,
         selector: file.selector,
+        tls,
     })
 }
 
@@ -1174,11 +1219,25 @@ mod tests {
         assert_eq!(
             c.radius,
             Some(radius::Settings {
-                loki: "logs.example.org:3100".into(),
+                loki: vec!["logs.example.org:3100".into()],
                 selector: r#"{job="radius-auth"}"#.into(),
+                tls: None,
             })
         );
         assert_eq!(c.history_path, PathBuf::from("/h"));
+        // Several, taken in turn.
+        let several = "[radius]\nloki = [\"logs1.example.org:3100\", \"[2001:db8::3]:3100\"]\n\
+                       selector = '{job=\"x\"}'\n";
+        let c = Config::parse(&format!("{ORIGIN}{several}")).unwrap();
+        let loki = c.radius.unwrap().loki;
+        assert_eq!(loki, ["logs1.example.org:3100", "[2001:db8::3]:3100"]);
+        for list in ["[]", "[\"a:1\", \"a:1\"]", "[\"a:1\", \"b\"]"] {
+            let text = format!("{ORIGIN}[radius]\nloki = {list}\nselector = '{{job=\"x\"}}'\n");
+            assert!(
+                matches!(Config::parse(&text), Err(ConfigError::Radius(_))),
+                "{list}"
+            );
+        }
         for (loki, selector) in [
             ("logs.example.org", r#"{job="x"}"#),
             ("logs.example.org:3100", r#"job="x""#),
@@ -1200,16 +1259,25 @@ mod tests {
             key: "/k.pem".into(),
             ca: "/ca.pem".into(),
         };
+        const RADIUS: &str =
+            "[radius]\nloki = \"logs1.example.org:3100\"\nselector = '{job=\"x\"}'\n";
         let parse = |s: String| Config::parse(&format!("{ORIGIN}{s}"));
         // The section alone switches nothing.
-        let c = parse(TLS.into()).unwrap();
+        let c = parse(format!("{TLS}{RADIUS}")).unwrap();
         let t = c.monitoring_tls.clone().unwrap();
         assert_eq!((t.files, t.metrics_clients.len()), (files.clone(), 0));
         assert_eq!(c.tls_endpoints(), []);
+        assert_eq!(c.radius.unwrap().tls, None);
         // Each switch, alone.
         let clients = "metrics_clients = [\"status1.example.org\", \"status2.example.org\"]\n";
-        let c = parse(format!("{TLS}{clients}")).unwrap();
+        let c = parse(format!("{TLS}{clients}{RADIUS}")).unwrap();
         assert_eq!(c.tls_endpoints(), [mtls::Endpoint::Metrics]);
+        let c = parse(format!("{TLS}{RADIUS}tls = true\n")).unwrap();
+        assert_eq!(c.tls_endpoints(), [mtls::Endpoint::Loki]);
+        assert_eq!(c.radius.unwrap().tls, Some(files));
+        // A switch with no certificate to present.
+        let alone = parse(format!("{RADIUS}tls = true\n"));
+        assert!(matches!(alone, Err(ConfigError::MonitoringTls(_))));
         // Scrapers are DNS names, each once; the files are required.
         for bad in [
             "[\"192.0.2.1\"]",
