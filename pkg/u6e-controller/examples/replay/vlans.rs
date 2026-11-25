@@ -64,3 +64,15 @@ pub fn vlan_of(store: &Mutex<Store>, m: [u8; 6]) -> Option<u16> {
         listed.then(|| g.get("id")?.as_u64()?.try_into().ok())?
     })
 }
+
+/// Gives the mapping a group on a VLAN that is not the site's, which RADIUS
+/// refuses: the controller then takes no change until it is fixed.
+pub fn refuse(store: &Mutex<Store>) {
+    let mut store = store.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(secret) = store.secrets.get_mut("mac-auth") else {
+        return;
+    };
+    let mut mapping = secret.versions.last().cloned().unwrap_or_default();
+    mapping["vlans"]["guest"] = json!({ "id": 99, "devices": [] });
+    secret.versions.push(mapping);
+}

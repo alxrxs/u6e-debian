@@ -7,7 +7,9 @@
 // by its MAC, from one dialog that says what the change will do before it is
 // confirmed; the controller writes it to OpenBao, every RADIUS server takes
 // it within a minute, and a device moved while it is on one of those SSIDs
-// is disconnected once to join again on its new VLAN.
+// is disconnected once to join again on its new VLAN. While the mapping
+// holds anything RADIUS refuses, no change can be made: a banner says what
+// to fix in OpenBao.
 
 import { h, ago, ask, hm, icon } from '../util.js';
 
@@ -32,6 +34,17 @@ function ssidWords(ma) {
 /** They refuse a device with no entry: "ssid-b refuses it". */
 function refuse(ma) {
   return `${ssidWords(ma)} ${ma?.ssids?.length === 1 ? 'refuses' : 'refuse'} it`;
+}
+
+/** A client's name as a description, as the controller cleans it: no
+ * control or format character, 64 at most. */
+export function nameDescription(name) {
+  return [...(name || '').replace(/[\p{Cc}\p{Cf}]/gu, '').trim()].slice(0, 64).join('');
+}
+
+/** Whether RADIUS refuses the mapping as it is, which blocks every change. */
+export function blocked(ma) {
+  return !!ma?.unread?.length;
 }
 
 /** A MAC as the controller's API spells it, from any of RADIUS's; null
@@ -74,6 +87,7 @@ export function vlanOutcome(res, who) {
       : `${no}: the controller took the request for a cross-site one. Reload the page and try again.`];
     case 404: return ['bad', `${no}: the controller does not edit the mapping.`];
     case 409: return ['bad', `${no}: ${res.detail}. It shows here as it is now; look again before changing it.`];
+    case 422: return ['bad', `${no}: ${res.detail}. Fix the mapping in OpenBao first; RADIUS goes on with its last good one.`];
     case 502: return ['bad', `${no}: ${res.detail}. RADIUS goes on with the mapping as it was.`];
     default: break;
   }
@@ -90,7 +104,7 @@ function choices(ma, who, entry, client, name, ok) {
   const say = h('p', { class: 'vlan-effect', role: 'status' });
   const desc = h('input', {
     type: 'text', name: 'vlan-description', maxlength: '64', 'aria-label': 'Description',
-    placeholder: name || 'what the device is', value: entry?.description ?? (name || undefined),
+    placeholder: nameDescription(name) || 'what the device is', value: entry?.description ?? (nameDescription(name) || undefined),
   });
   const pickable = [...ma.vlans.map((v) => v.id), ...(entry ? [null] : [])];
   const list = pickable.map((id) => {
@@ -178,8 +192,8 @@ function readNote(ma) {
     const last = ma.read_at ? ` It was last read ${ago(ma.read_at)}; what shows is that.` : ' It has not been read since the controller started.';
     return h('p', { class: 'note warn' }, `The mapping cannot be read from OpenBao: ${ma.error}.${last} RADIUS goes on with the mapping it has.`);
   }
-  if (ma.unread?.length) {
-    return h('p', { class: 'note warn' }, `Not entries, kept as they are: ${ma.unread.join('; ')}.`);
+  if (blocked(ma)) {
+    return h('p', { class: 'note', role: 'alert' }, `RADIUS refuses this mapping and goes on with its last good one: ${ma.unread.join('; ')}. No change can be made here until it is fixed in OpenBao.`);
   }
   return null;
 }
@@ -227,7 +241,7 @@ export function vlanPanel(store, mac, root) {
     change.hidden = !admin;
     change.lastChild.textContent = busy ? 'Writing…' : entry ? 'Change…' : 'Add…';
     change.toggleAttribute('aria-busy', busy);
-    change.disabled = busy || ma.version === null;
+    change.disabled = busy || ma.version === null || blocked(ma);
     lock.replaceChildren(admin ? '' : lockNote(store));
   }
   return { el, update };
@@ -251,7 +265,7 @@ export default {
     let drawn = '';
 
     async function edit(mac, name) {
-      if (busy || !store.me?.admin) return;
+      if (busy || !store.me?.admin || blocked(store.state.mac_auth)) return;
       busy = true;
       const out = await editEntry(store, root, mac, name);
       busy = false;
@@ -282,7 +296,7 @@ export default {
         h('td', { class: 'v-who' }, h('a', { class: who ? null : 'mono', href: `#/client/${mac}` }, who || mac), who ? h('small', { class: 'mono' }, mac) : null),
         h('td', { class: 'v-desc' }, e.description || h('span', { class: 'muted' }, '–')),
         h('td', { class: 'v-now' }, nowWords(ma, e, c), ma.follows?.[mac] ? [' ', followWords(ma.follows[mac])] : null),
-        admin ? h('td', { class: 'v-act' }, h('button', { type: 'button', class: 'btn quiet', onclick: () => edit(mac, who) }, 'Change…')) : null);
+        admin ? h('td', { class: 'v-act' }, h('button', { type: 'button', class: 'btn quiet', disabled: blocked(ma), onclick: () => edit(mac, who) }, 'Change…')) : null);
     }
 
     const view = {
@@ -290,6 +304,7 @@ export default {
         const ma = store.state.mac_auth;
         const admin = !!store.me?.admin;
         addForm.hidden = !ma || !admin;
+        addBtn.disabled = blocked(ma);
         lock.replaceChildren(ma && !admin ? lockNote(store) : '');
         if (!ma) {
           sub.textContent = '';
@@ -306,7 +321,7 @@ export default {
         note.replaceChildren(readNote(ma) || '');
         // Drawn again when the mapping, the clients' places or the pending
         // kicks change, and every second while a kick counts down.
-        const stamp = JSON.stringify([ma.version, ma.entries, ma.follows, admin,
+        const stamp = JSON.stringify([ma.version, ma.entries, ma.follows, admin, ma.unread,
           entries.map(([m]) => { const c = store.state.clients[m]; return c && [c.name, c.ssid, c.ap, c.vlan]; }),
           Object.keys(ma.follows || {}).length ? Math.floor(Date.now() / 1000) : 0]);
         // Never read: no VLAN can be said to be empty.

@@ -57,13 +57,14 @@
 //! events waiting and dropped show. RADIUS's MAC authentication mapping of
 //! the clients on `ssid-b` is kept by an OpenBao of the replay's own
 //! (`vlans`), which puts each on its entry's VLAN as it joins; with
-//! `--bao-down` it answers every request 503, as a sealed one does.
+//! `--bao-down` it answers every request 503, as a sealed one does, and
+//! with `--mapping-refused` the mapping has a group RADIUS refuses.
 //! The web listener adds what the sign-in proxy in front of a controller
 //! would: a user, a member of the admin group unless `--viewer` is given,
 //! and, unless the request names one, the address of the laptop
 //! (`02:00:00:00:00:02`) as the one it came from, so the Test page tests it.
 //!
-//!   cargo run -p u6e-controller --example replay [-- [<web address>] [--viewer] [--ha-down] [--bao-down]]
+//!   cargo run -p u6e-controller --example replay [-- [<web address>] [--viewer] [--ha-down] [--bao-down] [--mapping-refused]]
 //!
 //! The web address defaults to 127.0.0.1:8080.
 
@@ -1518,6 +1519,7 @@ async fn main() -> io::Result<()> {
     let admin = !args.iter().any(|a| a == "--viewer");
     let ha_down = args.iter().any(|a| a == "--ha-down");
     let bao_down = args.iter().any(|a| a == "--bao-down");
+    let refused = args.iter().any(|a| a == "--mapping-refused");
     let web = args
         .iter()
         .find(|a| !a.starts_with("--"))
@@ -1539,6 +1541,9 @@ async fn main() -> io::Result<()> {
     let world = Arc::new(Mutex::new(World::new()));
     let mapping = Arc::clone(&world.lock().unwrap_or_else(|e| e.into_inner()).bao);
     mapping.lock().unwrap_or_else(|e| e.into_inner()).down = bao_down;
+    if refused {
+        vlans::refuse(&mapping);
+    }
     let stager: Arc<dyn Stage> = Arc::new(manage::SimStage(Arc::clone(&world)));
     // The controller's own web listener goes unused: the one below is its
     // router behind what the sign-in proxy adds. The planner's channel table

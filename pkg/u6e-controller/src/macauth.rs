@@ -16,8 +16,13 @@
 //! check-and-set on the version read, reading and editing again when
 //! another writer came first, three times at most; one change at a time.
 //! The VLAN must be one of `vlans`, the mapping hold at most `entries_max`
-//! entries; the MAC is written as RADIUS keys it, `aa-bb-cc-dd-ee-ff`.
-//! Each change is an action `vlan` on the client, with the admin's name.
+//! entries; the MAC is written as RADIUS keys it, `aa-bb-cc-dd-ee-ff`. A
+//! mapping holding anything RADIUS refuses (which makes it keep its last
+//! good one) takes no change until it is fixed in OpenBao. A write whose
+//! answer is lost is settled by reading the mapping again. The description
+//! is the admin's or the client's name, without control or format
+//! characters, 64 at most. Each change is an action `vlan` on the client,
+//! with the admin's name.
 //!
 //! A device moved onto a VLAN while it is on one of the MAC-authenticated
 //! `ssids` is then kicked once, 90 s after the write (by when every
@@ -57,6 +62,36 @@ const ANSWER_MAX: usize = 1 << 20;
 const WRITE_TRIES: usize = 3;
 /// The longest description an admin may give.
 pub const DESCRIPTION_MAX: usize = 64;
+
+/// Whether `c` is a format character (Unicode's Cf): invisible, it can
+/// reorder or hide what a description says.
+fn is_format(c: char) -> bool {
+    matches!(c as u32,
+        0xad | 0x600..=0x605 | 0x61c | 0x6dd | 0x70f | 0x890..=0x891 | 0x8e2 | 0x180e
+        | 0x200b..=0x200f | 0x202a..=0x202e | 0x2060..=0x2064 | 0x2066..=0x206f | 0xfeff
+        | 0xfff9..=0xfffb | 0x110bd | 0x110cd | 0x13430..=0x1343f | 0x1bca0..=0x1bca3
+        | 0x1d173..=0x1d17a | 0xe0001 | 0xe0020..=0xe007f)
+}
+
+/// An admin's description without its format characters; why it is
+/// refused.
+pub fn description(d: &str) -> Result<String, &'static str> {
+    let d: String = d.trim().chars().filter(|c| !is_format(*c)).collect();
+    if d.chars().count() > DESCRIPTION_MAX || d.chars().any(char::is_control) {
+        return Err("the description is over 64 characters or holds a control character");
+    }
+    Ok(d)
+}
+
+/// A client's name as a description: without control or format characters,
+/// 64 at most.
+pub fn name_description(name: &str) -> String {
+    let d: String = name
+        .chars()
+        .filter(|c| !is_format(*c) && !c.is_control())
+        .collect();
+    d.trim().chars().take(DESCRIPTION_MAX).collect()
+}
 
 /// `[mac_auth]`, checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,8 +145,8 @@ pub struct Entry {
 }
 
 /// The mapping as read: the tree, its KV version, its entries by MAC, and
-/// what of it is no entry (kept in the tree, never written by the
-/// controller).
+/// what of it RADIUS refuses (the mapping whole: it keeps its last good
+/// one), which blocks every change until it is fixed in OpenBao.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Mapping {
     pub version: u64,
@@ -195,9 +230,10 @@ pub fn parse_key(s: &str) -> Option<[u8; 6]> {
 
 impl Mapping {
     /// The mapping KV version `version` holds (`data`, `None` while there
-    /// is no secret); refused only when it has a `vlans` that is no object,
-    /// which the controller could not edit without losing what it holds.
-    pub fn from_kv(data: Option<Value>, version: u64) -> Result<Self, String> {
+    /// is no secret), `vlans` being the site's; refused only when it has a
+    /// `vlans` that is no object, which the controller could not edit
+    /// without losing what it holds.
+    pub fn from_kv(data: Option<Value>, version: u64, vlans: &[u16]) -> Result<Self, String> {
         let tree = data.unwrap_or_else(|| json!({}));
         if !tree.is_object() {
             return Err("the mapping is not a JSON object".into());
@@ -205,10 +241,11 @@ impl Mapping {
         let mut entries = BTreeMap::new();
         let mut unread = Vec::new();
         match tree.get("vlans") {
-            None => {}
+            None if version == 0 => {}
+            None => unread.push("the mapping has no vlans; RADIUS refuses it".into()),
             Some(Value::Object(groups)) => {
                 for (group, g) in groups {
-                    read_group(group, g, &mut entries, &mut unread);
+                    read_group(group, g, vlans, &mut entries, &mut unread);
                 }
             }
             Some(_) => return Err("the mapping's vlans is not an object".into()),
@@ -289,10 +326,11 @@ impl Mapping {
     }
 }
 
-/// The entries of one group, and what of it is none.
+/// The entries of one group, and what of it RADIUS refuses.
 fn read_group(
     group: &str,
     g: &Value,
+    vlans: &[u16],
     entries: &mut BTreeMap<[u8; 6], Entry>,
     unread: &mut Vec<String>,
 ) {
@@ -301,6 +339,12 @@ fn read_group(
         unread.push(format!("group {group}: no VLAN 1-4094"));
         return;
     };
+    // Its devices are still read: they show where they were meant to go.
+    if !vlans.contains(&(vlan as u16)) {
+        unread.push(format!(
+            "group {group}: VLAN {vlan} is not one of the site's"
+        ));
+    }
     let devices = match g.get("devices") {
         None | Some(Value::Null) => return,
         Some(Value::Array(d)) => d,
@@ -320,7 +364,7 @@ fn read_group(
         };
         if let Some(first) = entries.get(&m) {
             unread.push(format!(
-                "{} is in groups {} and {group}; RADIUS refuses the mapping",
+                "{} is in groups {} and {group}",
                 mac::format(m),
                 first.group
             ));
@@ -344,6 +388,8 @@ fn read_group(
 enum Failure {
     /// Another writer came first.
     Conflict,
+    /// No answer: OpenBao may have taken the write or not.
+    Lost(String),
     Other(String),
 }
 
@@ -362,13 +408,13 @@ async fn read(s: &Settings) -> Result<Mapping, String> {
     let a = fetch::request_tls(host, get, &s.ca, auth, None, ANSWER_MAX, REQUEST_WAIT).await?;
     match a.status {
         200 => {}
-        404 => return Mapping::from_kv(None, 0),
+        404 => return Mapping::from_kv(None, 0, &s.vlans),
         n => return Err(bao_error(n, &a.body)),
     }
     let v: Value = serde_json::from_str(&a.body).map_err(|_| "OpenBao's answer is not JSON")?;
     let version = v["data"]["metadata"]["version"].as_u64();
     let version = version.ok_or("OpenBao's answer is not a KV-v2 secret")?;
-    Mapping::from_kv(Some(v["data"]["data"].clone()), version)
+    Mapping::from_kv(Some(v["data"]["data"].clone()), version, &s.vlans)
 }
 
 /// Writes `tree` over version `cas`; the version written.
@@ -389,7 +435,7 @@ async fn write(s: &Settings, tree: &Value, cas: u64) -> Result<u64, Failure> {
         REQUEST_WAIT,
     )
     .await
-    .map_err(Failure::Other)?;
+    .map_err(Failure::Lost)?;
     if a.status == 400 && a.body.contains("check-and-set") {
         return Err(Failure::Conflict);
     }
@@ -546,6 +592,8 @@ enum Done {
     },
     Unchanged,
     Conflict(String),
+    /// The mapping holds what RADIUS refuses: nothing written.
+    Refused(String),
     Failed(String),
 }
 
@@ -585,13 +633,15 @@ pub async fn change(
     {
         return refuse("not a VLAN the site lets a device be put in");
     }
-    if let Some(d) = &a.description
-        && (d.chars().count() > DESCRIPTION_MAX || d.chars().any(char::is_control))
-    {
-        return refuse("the description is over 64 characters or holds a control character");
-    }
+    let a = match a.description.as_deref().map(description).transpose() {
+        Ok(d) => Ask {
+            description: d,
+            ..a
+        },
+        Err(why) => return refuse(why),
+    };
     let user = actions::user(&req);
-    let name = web.state.read().identity(&m).name().map(str::to_owned);
+    let name = web.state.read().identity(&m).name().map(name_description);
     let _one = writing.lock().await;
     let done = write_one(&settings, m, &a, name.as_deref()).await;
     finish(&web, m, &a, user, done)
@@ -604,6 +654,10 @@ async fn write_one(s: &Settings, m: [u8; 6], a: &Ask, name: Option<&str>) -> Don
             Ok(map) => map,
             Err(why) => return Done::Failed(why),
         };
+        if !mapping.unread.is_empty() {
+            let why = mapping.unread.join("; ");
+            return Done::Refused(format!("RADIUS refuses the mapping as it is ({why})"));
+        }
         let now = mapping.entries.get(&m);
         let from = now.map(|e| e.vlan);
         if from != a.expect {
@@ -630,14 +684,53 @@ async fn write_one(s: &Settings, m: [u8; 6], a: &Ask, name: Option<&str>) -> Don
         };
         match write(s, &tree, mapping.version).await {
             Ok(version) => {
-                let mapping = Mapping::from_kv(Some(tree), version).expect("edited from one");
+                let mapping =
+                    Mapping::from_kv(Some(tree), version, &s.vlans).expect("edited from one");
                 return Done::Written { mapping, from };
             }
             Err(Failure::Conflict) => continue,
+            Err(Failure::Lost(why)) => {
+                let to = a.vlan.map(|v| (v, description.as_str()));
+                return settle(s, m, mapping.version, to, from, why).await;
+            }
             Err(Failure::Other(why)) => return Done::Failed(why),
         }
     }
     Done::Failed(format!("{WRITE_TRIES} writes, each after another writer's"))
+}
+
+/// A write over version `cas` whose answer was lost, settled by reading
+/// the mapping again: written when a newer version has `m`'s entry as the
+/// change made it (`to`), not when the version is still `cas`.
+async fn settle(
+    s: &Settings,
+    m: [u8; 6],
+    cas: u64,
+    to: Option<(u16, &str)>,
+    from: Option<u16>,
+    why: String,
+) -> Done {
+    let mapping = match read(s).await {
+        Ok(map) => map,
+        Err(again) => {
+            return Done::Failed(format!(
+                "{why}; whether it was written is not known: {again}"
+            ));
+        }
+    };
+    let now = mapping
+        .entries
+        .get(&m)
+        .map(|e| (e.vlan, e.description.as_str()));
+    if mapping.version > cas && now == to {
+        return Done::Written { mapping, from };
+    }
+    if mapping.version == cas {
+        return Done::Failed(format!("{why}; not written"));
+    }
+    Done::Failed(format!(
+        "{why}; another writer changed the mapping meanwhile, not to this"
+    ))
 }
 
 fn count(state: &Shared, result: &'static str) {
@@ -665,6 +758,12 @@ fn finish(web: &Web, m: [u8; 6], a: &Ask, user: Option<String>, done: Done) -> R
         }
         Done::Unchanged => (StatusCode::OK, "unchanged", true, "unchanged".into()),
         Done::Conflict(why) => (StatusCode::CONFLICT, "conflict", false, why.clone()),
+        Done::Refused(why) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "refused",
+            false,
+            why.clone(),
+        ),
         Done::Failed(why) => (StatusCode::BAD_GATEWAY, "failed", false, why.clone()),
     };
     count(&web.state, result);
@@ -868,6 +967,8 @@ mod tests {
     const A: [u8; 6] = [2, 0, 0, 0, 0, 1];
     const B: [u8; 6] = [2, 0, 0, 0, 0, 2];
     const C: [u8; 6] = [2, 0, 0, 0, 0, 3];
+    /// The site's VLANs.
+    const SITE: &[u16] = &[42, 43, 44, 45, 46, 47];
 
     /// A mapping as a site keeps it: two groups, and keys and fields the
     /// controller does not know, which it must keep.
@@ -883,7 +984,7 @@ mod tests {
             },
             "owner": "netops",
         });
-        Mapping::from_kv(Some(tree), 7).unwrap()
+        Mapping::from_kv(Some(tree), 7, SITE).unwrap()
     }
 
     #[test]
@@ -936,14 +1037,50 @@ mod tests {
             "z": {"id": 46, "devices": "many"},
             "empty": {"id": 47, "devices": null},
         }});
-        let m = Mapping::from_kv(Some(odd), 1).unwrap();
+        let m = Mapping::from_kv(Some(odd), 1, SITE).unwrap();
         assert_eq!(m.entries.keys().copied().collect::<Vec<_>>(), vec![A]);
         assert_eq!(m.unread.len(), 6, "{:?}", m.unread);
         assert!(m.unread.iter().any(|u| u.contains("in groups x and y")));
         // No secret yet: no entry. A tree it could not edit: refused.
-        assert!(Mapping::from_kv(None, 0).unwrap().entries.is_empty());
-        assert!(Mapping::from_kv(Some(json!({"vlans": []})), 1).is_err());
-        assert!(Mapping::from_kv(Some(json!([1])), 1).is_err());
+        assert!(Mapping::from_kv(None, 0, SITE).unwrap().entries.is_empty());
+        assert!(Mapping::from_kv(Some(json!({"vlans": []})), 1, SITE).is_err());
+        assert!(Mapping::from_kv(Some(json!([1])), 1, SITE).is_err());
+    }
+
+    #[test]
+    fn what_radius_refuses_is_said_and_its_entries_still_read() {
+        // A group on a VLAN that is not the site's: RADIUS refuses the
+        // mapping, and its devices show where they were meant to go.
+        let m = Mapping::from_kv(Some(site().tree), 7, &[42]).unwrap();
+        assert_eq!(
+            m.unread,
+            vec!["group iot: VLAN 43 is not one of the site's".to_owned()]
+        );
+        assert_eq!(m.entries[&B].vlan, 43);
+        // A secret with no vlans: refused by RADIUS; none yet: nothing to say.
+        let m = Mapping::from_kv(Some(json!({"owner": "netops"})), 3, SITE).unwrap();
+        assert_eq!(
+            m.unread,
+            vec!["the mapping has no vlans; RADIUS refuses it".to_owned()]
+        );
+        assert!(Mapping::from_kv(None, 0, SITE).unwrap().unread.is_empty());
+    }
+
+    #[test]
+    fn a_description_has_no_control_or_format_character() {
+        // An admin's: format characters dropped, a control character or
+        // over 64 refused.
+        assert_eq!(description(" tv\u{200b}\u{202e} ").as_deref(), Ok("tv"));
+        assert_eq!(
+            description(&"\u{feff}x".repeat(64)).map(|d| d.len()),
+            Ok(64)
+        );
+        assert!(description("a\nb").is_err());
+        assert!(description("a\u{85}b").is_err());
+        assert!(description(&"x".repeat(65)).is_err());
+        // A client's name: cleaned and cut alike, never refused.
+        assert_eq!(name_description("Ana\u{202e}'s\tphone\n"), "Ana'sphone");
+        assert_eq!(name_description(&"é".repeat(80)).chars().count(), 64);
     }
 
     #[test]
@@ -959,7 +1096,7 @@ mod tests {
             json!([{"mac": "02:00:00:00:00:02", "description": "plug"},
                    {"mac": "02-00-00-00-00-01", "description": "laptop"}])
         );
-        let moved = Mapping::from_kv(Some(t), 8).unwrap();
+        let moved = Mapping::from_kv(Some(t), 8, SITE).unwrap();
         assert_eq!(moved.entries[&A].vlan, 43);
         assert_eq!(moved.entries[&B], m.entries[&B]);
         // Added onto a VLAN no group has yet: a group of its own.
@@ -975,7 +1112,7 @@ mod tests {
         assert!(e.contains("holds 2 entries"), "{e}");
         assert!(m.edit(A, Some((43, "")), 2).is_ok());
         // No secret yet: the tree is made.
-        let empty = Mapping::from_kv(None, 0).unwrap();
+        let empty = Mapping::from_kv(None, 0, SITE).unwrap();
         let t = empty.edit(A, Some((42, "laptop")), 512).unwrap();
         let made = json!({"vlans": {"vlan-42": {"id": 42, "devices": [
             {"mac": "02-00-00-00-00-01", "description": "laptop"},

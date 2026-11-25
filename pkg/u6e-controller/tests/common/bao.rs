@@ -2,8 +2,9 @@
 //! check-and-set write of the secrets under `/v1/secret/data/`, over TLS
 //! with the tests' certificate (`tests/fixtures/tls`, for 127.0.0.1), each
 //! request's token checked and every request kept; it answers 503 while
-//! `down`, and makes the next `races` writes find that another writer came
-//! first.
+//! `down`, makes the next `races` writes find that another writer came
+//! first, and closes the connection unanswered on the next `lost_writes`
+//! writes (not taken) and `lost_answers` (taken).
 
 use std::collections::BTreeMap;
 use std::io;
@@ -36,6 +37,8 @@ pub struct Store {
     pub requests: Vec<(String, Option<Value>)>,
     pub down: bool,
     pub races: u32,
+    pub lost_writes: u32,
+    pub lost_answers: u32,
 }
 
 /// Serves `store` until the process ends; its address.
@@ -66,7 +69,10 @@ pub async fn serve(store: Arc<Mutex<Store>>) -> io::Result<SocketAddr> {
                 let Some((head, body)) = request(&mut tls).await else {
                     return;
                 };
-                let (status, answer) = answer(&mut store.lock().unwrap(), &head, &body);
+                let Some((status, answer)) = answer(&mut store.lock().unwrap(), &head, &body)
+                else {
+                    return;
+                };
                 let body = answer.to_string();
                 let out = format!(
                     "HTTP/1.0 {status} X\r\nContent-Type: application/json\r\n\
@@ -106,14 +112,31 @@ async fn request<S: AsyncReadExt + Unpin>(tls: &mut S) -> Option<(String, String
     }
 }
 
-/// KV-v2's answer to one request.
-fn answer(store: &mut Store, head: &str, body: &str) -> (u16, Value) {
+/// KV-v2's answer to one request; none when it is lost.
+fn answer(store: &mut Store, head: &str, body: &str) -> Option<(u16, Value)> {
+    let mut words = head.split_whitespace();
+    let (method, path) = (words.next().unwrap_or(""), words.next().unwrap_or(""));
+    store
+        .requests
+        .push((format!("{method} {path}"), serde_json::from_str(body).ok()));
+    let post = method == "POST";
+    if post && store.lost_writes > 0 {
+        store.lost_writes -= 1;
+        return None;
+    }
+    let answer = kv(store, head, body);
+    if post && store.lost_answers > 0 {
+        store.lost_answers -= 1;
+        return None;
+    }
+    Some(answer)
+}
+
+/// KV-v2's answer to one request, taken.
+fn kv(store: &mut Store, head: &str, body: &str) -> (u16, Value) {
     let mut words = head.split_whitespace();
     let (method, path) = (words.next().unwrap_or(""), words.next().unwrap_or(""));
     let json: Option<Value> = serde_json::from_str(body).ok();
-    store
-        .requests
-        .push((format!("{method} {path}"), json.clone()));
     let errors = |e: &str| json!({ "errors": [e] });
     if store.down {
         return (503, errors("Vault is sealed"));

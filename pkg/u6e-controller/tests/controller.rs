@@ -6203,6 +6203,71 @@ fn a_newer_change_replaces_a_pending_kick() {
 }
 
 #[test]
+fn a_mapping_radius_refuses_takes_no_change_until_it_is_fixed() {
+    // VLAN 44 is not one the site lets a device be put in: every RADIUS
+    // server refuses the mapping, and keeps its last good one.
+    let mut m = site_mapping();
+    m["vlans"]["guest"] = json!({"id": 44, "devices": []});
+    let (r, store, _rt) = with_mapping(Some(m));
+    wait_for("the mapping read", || {
+        json_get(r.c.http, "/api/mac-auth")["version"] == 1
+    });
+    let v = json_get(r.c.http, "/api/mac-auth");
+    assert_eq!(
+        v["unread"],
+        json!(["group guest: VLAN 44 is not one of the site's"])
+    );
+    let h = format!("{SAME_SITE}{ADMIN}");
+    let (status, answer) = set_vlan(&r, &h, r#"{"vlan": 43, "expect": 42}"#);
+    assert_eq!(status, 422, "{answer}");
+    assert_eq!(
+        answer["detail"],
+        "RADIUS refuses the mapping as it is (group guest: VLAN 44 is not one of the site's)"
+    );
+    assert!(writes(&store).is_empty());
+    // Fixed in OpenBao: the change is made.
+    let mut fixed = site_mapping();
+    fixed["vlans"]["guest"] = json!({"id": 42, "devices": []});
+    store
+        .lock()
+        .unwrap()
+        .secrets
+        .get_mut("mac-auth")
+        .unwrap()
+        .versions
+        .push(fixed);
+    let (status, answer) = set_vlan(&r, &h, r#"{"vlan": 43, "expect": 42}"#);
+    assert_eq!(status, 200, "{answer}");
+    let m = metrics_of(&r, "wifi_mac_auth_changes_total");
+    assert!(m.iter().any(|l| l.ends_with("refused\"} 1")), "{m:?}");
+}
+
+#[test]
+fn a_write_whose_answer_is_lost_is_settled_by_reading_again() {
+    let (r, store, _rt) = with_mapping(Some(site_mapping()));
+    let mut a = ap_with_mab_client(&r, "iot");
+    let h = format!("{SAME_SITE}{ADMIN}");
+    // OpenBao took the write, and the answer never came: written, and
+    // the device kicked into its new VLAN.
+    store.lock().unwrap().lost_answers = 1;
+    let (status, answer) = set_vlan(&r, &h, r#"{"vlan": 43, "expect": 42}"#);
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer["detail"], "VLAN 42 → VLAN 43 (mapping version 2)");
+    assert_eq!(answer["kick"], "once, in 0 s, to join again on VLAN 43");
+    let id = a.expect_command(CommandKind::Kick { mac: MAC });
+    a.reply(id, true, "wlan2: OK");
+    // The write itself lost: not written, and said so.
+    store.lock().unwrap().lost_writes = 1;
+    let (status, answer) = set_vlan(&r, &h, r#"{"vlan": 42, "expect": 43}"#);
+    assert_eq!(status, 502, "{answer}");
+    let detail = answer["detail"].as_str().unwrap();
+    assert!(detail.ends_with("; not written"), "{detail}");
+    assert_eq!(writes(&store).len(), 2, "each write tried once");
+    let s = store.lock().unwrap();
+    assert_eq!(s.secrets["mac-auth"].versions.len(), 2);
+}
+
+#[test]
 fn openbao_away_changes_nothing_and_says_so() {
     let (r, store, _rt) = with_mapping(None);
     // No secret yet: the first entry makes it.
