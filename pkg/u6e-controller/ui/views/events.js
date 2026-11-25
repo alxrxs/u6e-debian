@@ -124,14 +124,14 @@ export default {
         const stamp = `${f.group}|${f.ap}|${q}|${store.events.length}|${shown[0]?.at}|${limit}|${dayOf(Date.now())}`;
         if (stamp === drawn) return;
         drawn = stamp;
-        sub.textContent = store.events.length ? `${all.length} of ${store.events.length} held by the controller` : '';
+        sub.textContent = store.events.length ? `${all.length} of ${store.events.length}` : '';
         list.hidden = !shown.length;
         empty.hidden = !!shown.length;
         more.hidden = all.length <= limit;
         if (!shown.length) {
           empty.replaceChildren(
             h('strong', {}, store.events.length ? 'No event matches these filters' : 'No events yet'),
-            h('p', {}, store.events.length ? 'Change the filters to see more.' : 'Joins, leaves, sign-ins, radio changes and actions on clients appear here the moment they happen.'));
+            h('p', {}, store.events.length ? 'Change the filters to see more.' : 'Joins, sign-ins, radio changes and actions show here live.'));
           return;
         }
         list.replaceChildren(...feed(shown, { seen, since }));

@@ -38,7 +38,7 @@ function radioPanel(store, name, phy, r, tempC) {
     // On a scale of at least 0–20 %, so that a quiet radio's noise stays flat.
     const busy = store.radio.get(`${name}/${phy}`) || [];
     const top = Math.max(20, Math.ceil(Math.max(0, ...busy.filter((v) => v !== null)) / 10) * 10);
-    trend.title = `Air busy over the last ${duration((busy.length * 2))}, 0 to ${top} %`;
+    trend.title = `Air busy, last ${duration((busy.length * 2))} (0–${top} %)`;
     sparkline(trend, busy, { color, min: 0, max: top });
   });
   return h('article', { class: `radio${r.up ? '' : ' down'}`, 'data-band': r.band },
@@ -47,7 +47,7 @@ function radioPanel(store, name, phy, r, tempC) {
       h('a', { class: 'phy', href: `#/spectrum/${name}/${phy}`, title: `The spectrum ${phy} hears` }, phy)),
     h('div', { class: 'chan', title: `Channel ${r.channel}, ${r.width} MHz wide` },
       h('span', { class: 'muted' }, 'Channel'), h('b', {}, String(r.channel)), h('span', {}, `${r.width} MHz`)),
-    r.up ? null : h('p', { class: 'note' }, 'Radio down: no clients can join it.'),
+    r.up ? null : h('p', { class: 'note' }, 'Radio down'),
     h('div', { class: 'util-head' },
       h('span', {}, 'Air busy'),
       h('b', {}, u && r.up ? pct(u.busy) : '–')),
@@ -61,7 +61,7 @@ function radioPanel(store, name, phy, r, tempC) {
       fact('Power', `${r.txpower} dBm`),
       fact('Noise', `${r.noise} dBm`),
       fact('Clients', String(r.clients)),
-      tempC === undefined ? fact('Temp', h('span', { class: 'muted', title: 'This image reports no radio temperature' }, 'n/a')) : fact('Temp', temp(tempC))));
+      tempC === undefined ? fact('Temp', h('span', { class: 'muted', title: 'Not reported by this image' }, 'n/a')) : fact('Temp', temp(tempC))));
 }
 
 /** The AP's connection state, as [class, words]. */
@@ -89,10 +89,10 @@ function apBody(store, name, ap) {
   const open = (store.ui.manifests ||= new Set());
   const m = ap.mismatch;
   if (m) {
-    const fix = m.ap < m.controller ? `an image of ${name} built with this controller` : 'a controller as new as its agent';
-    return h('p', { class: 'offline' }, `The controller turns ${name}’s agent away: they speak different versions of the link. Wi-Fi keeps working; its figures return with ${fix}.`);
+    const fix = m.ap < m.controller ? `rebuild ${name}’s image with this controller` : 'update the controller';
+    return h('p', { class: 'offline' }, `Agent version mismatch. Wi-Fi keeps working. Fix: ${fix}.`);
   }
-  if (!ap.agent) return h('p', { class: 'offline' }, `${name}’s agent has not dialled in yet.`);
+  if (!ap.agent) return h('p', { class: 'offline' }, 'Agent not connected yet');
 
   // Up but not yet reported: the first snapshot is on its way.
   const live = ap.up && ap.uptime !== undefined;
@@ -118,11 +118,11 @@ function apBody(store, name, ap) {
   const body = live
     ? h('div', { class: 'radios' }, Object.entries(radios).map(([phy, r]) => radioPanel(store, name, phy, r, temps[phy])))
     : h('p', { class: 'offline' }, ap.up
-      ? 'Its radios show with its first report.'
-      : 'No live figures while it is offline. Wi-Fi on it keeps working.');
+      ? 'Waiting for its first report…'
+      : 'Offline. Wi-Fi on it keeps working.');
   const xp = live ? apExperience(ap.experience, (m) => clientName(store, m)) : null;
   return h('div', { class: 'ap-body' }, facts,
-    crashes.length ? h('p', { class: 'note' }, crashes.map(([phy, n]) => `${phy} firmware crashed ${n} time${n === 1 ? '' : 's'} since the controller started. `)) : null,
+    crashes.length ? h('p', { class: 'note' }, crashes.map(([phy, n]) => `${phy} firmware crashed ${n}× `)) : null,
     xp ? h('div', { class: 'ap-xp-box' }, h('h3', {}, 'Experience'), xp) : null,
     apSpeedBox(store, name, ap),
     manifest, body);
@@ -146,13 +146,13 @@ export default {
       update() {
         const aps = Object.entries(store.state.aps).sort(([a], [b]) => a.localeCompare(b));
         const up = aps.filter(([, a]) => a.up).length;
-        sub.textContent = aps.length ? `${up} of ${aps.length} access points connected` : '';
+        sub.textContent = aps.length ? `${up} of ${aps.length} APs connected` : '';
         draws.length = 0;
         if (!store.keyed || !aps.length) {
           const [title, text] = store.keyed
-            ? ['No access points are configured', 'Each one shows here once its agent dials in.']
+            ? ['No APs yet', 'Each shows once its agent connects.']
             : store.waiting();
-          note.replaceChildren(h('div', { class: 'panel empty' }, h('strong', {}, title), h('p', {}, text)));
+          note.replaceChildren(h('div', { class: 'panel empty' }, h('strong', {}, title), text ? h('p', {}, text) : null));
           list.replaceChildren();
           return;
         }

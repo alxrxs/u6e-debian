@@ -360,7 +360,7 @@ export default {
     // The radio shown: the address's, else the one shown last.
     const ui = (store.ui.spectrum ||= {});
     if (arg) [ui.ap, ui.radio] = arg.split('/');
-    const sub = h('p', {}, 'What each radio hears on its own channel, Wi-Fi or not');
+    const sub = h('p', {}, 'Each radio’s own channel, Wi-Fi or not');
     const apPick = h('select', { 'aria-label': 'Access point' });
     const radioPick = h('div', { class: 'seg', role: 'group', 'aria-label': 'Radio' });
     const title = h('div', { class: 'rf-title' });
@@ -501,10 +501,10 @@ export default {
       const rate = span > 0 ? (arrivals.length - 1) / span : 0;
       clear.hidden = !frame;
       readings.replaceChildren(
-        reading('Noise floor', frame ? `${frame.noise} dBm` : '–', frame ? 'as the radio reports it' : null),
+        reading('Noise floor', frame ? `${frame.noise} dBm` : '–', frame ? 'radio-reported' : null),
         reading('Strongest now', now ? `${now.dbm} dBm` : '–', now ? `at ${now.mhz.toFixed(1)} MHz` : null),
-        reading('Strongest since the start', top ? `${top.dbm} dBm` : '–', top ? `at ${top.mhz.toFixed(1)} MHz` : null),
-        reading('Frames', frame && scanning() ? `${rate.toFixed(1)} a second` : '–',
+        reading('Strongest since start', top ? `${top.dbm} dBm` : '–', top ? `at ${top.mhz.toFixed(1)} MHz` : null),
+        reading('Frames', frame && scanning() ? `${rate.toFixed(1)}/s` : '–',
           s?.watchers ? `${s.watchers} ${s.watchers === 1 ? 'page' : 'pages'} watching` : null));
     }
 
@@ -513,22 +513,22 @@ export default {
     function sentence(ap, r) {
       const s = state();
       const minutes = Math.round((s?.limit ?? 600) / 60);
-      if (!ap?.up) return ['bad', `${ui.ap} is not connected to the controller, so its radios cannot scan. Wi-Fi on it keeps working.`];
-      if (!r) return ['bad', `${ui.ap} has not reported a ${ui.radio}.`];
-      if (!r.up) return ['bad', `${ui.radio} is down: it has no channel to scan.`];
+      if (!ap?.up) return ['bad', `${ui.ap} offline. Can’t scan. Wi-Fi keeps working.`];
+      if (!r) return ['bad', `${ui.ap} reports no ${ui.radio}.`];
+      if (!r.up) return ['bad', `${ui.radio} down. Nothing to scan.`];
       if (s?.error === 'not an admin' || (store.me && !store.me.admin)) return ['lock', ''];
-      if (s?.error) return ['bad', `The scan did not start: ${s.error}.`];
+      if (s?.error) return ['bad', `Scan failed: ${s.error}.`];
       if (s?.scanning) {
         if (!s.running) return ['wait', `Waiting for ${ui.ap} to start the scan…`];
         const left = s.since + s.limit * 1000 - Date.now();
-        return ['ok', `Scanning. It stops in ${clock(left)}, after ${minutes} minutes, or 4 s after the last page watching it closes.`];
+        return ['ok', `Scanning · stops in ${clock(left)} or when no page watches`];
       }
       if (asked) return ['wait', `Asking ${ui.ap} to scan…`];
       switch (s?.stopped) {
-        case 'limit': return ['', `Stopped after ${minutes} minutes, the longest a scan runs. Start it again to keep watching.`];
-        case 'link': return ['bad', `Stopped: ${ui.ap}’s link to the controller went down.`];
+        case 'limit': return ['', `Stopped at the ${minutes}-minute limit. Start again to keep watching.`];
+        case 'link': return ['bad', `Stopped: ${ui.ap} disconnected.`];
         case 'ap': return ['bad', `${ui.ap} is not scanning${s.detail ? `: ${s.detail}` : ''}.`];
-        default: return ['', `Not scanning. While it scans, the radio gives a little of its airtime to listening, ${minutes} minutes at most.`];
+        default: return ['', `Not scanning. A scan uses a little airtime, ${minutes} min max.`];
       }
     }
 
@@ -538,7 +538,7 @@ export default {
         plan.update();
         if (!store.keyed) {
           const [head, text] = store.waiting();
-          panel.replaceChildren(h('div', { class: 'empty' }, h('strong', {}, head), h('p', {}, text)));
+          panel.replaceChildren(h('div', { class: 'empty' }, h('strong', {}, head), text ? h('p', {}, text) : null));
           return;
         }
         if (panel.firstChild !== parts[0]) panel.replaceChildren(...parts);
@@ -579,7 +579,7 @@ export default {
         status.dataset.tone = tone;
         if (tone === 'lock') {
           status.replaceChildren(icon(LOCK), h('span', {},
-            store.me ? 'Viewing only: a scan takes airtime from the radio’s clients, so starting one needs membership of ' : 'Starting a scan needs membership of ',
+            store.me ? 'View only. Scans need ' : 'Scans need ',
             h('b', {}, ADMIN_GROUP), '.'));
         } else {
           status.replaceChildren(h('span', {}, text));

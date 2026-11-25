@@ -64,34 +64,34 @@ export function effect(ma, who, entry, client, to) {
   const ssids = ssidWords(ma);
   const onMab = client && ma.ssids.includes(client.ssid);
   if (to === null) {
-    return `${who} loses its entry, and ${refuse(ma)} from its next join on.${onMab ? ` It stays on ${client.ssid} until it leaves.` : ''}`;
+    return `${who} loses its entry. ${refuse(ma)} from its next join.${onMab ? ` Stays on ${client.ssid} until it leaves.` : ''}`;
   }
   if (from === undefined) {
-    return `${who} gets an entry on ${vlanName(ma, to)}: it can then join ${ssids} with the shared passphrase, and is put on VLAN ${to}. Every RADIUS server has it within a minute.`;
+    return `${who} can join ${ssids} on ${vlanName(ma, to)}. Live on RADIUS within a minute.`;
   }
-  if (from === to) return `${who} stays on ${vlanName(ma, to)}; only its description changes.`;
+  if (from === to) return `Only the description changes.`;
   const kick = onMab
-    ? ` ${who} is then disconnected once from ${client.ssid} on ${client.ap}, in about ${ma.settle_secs} s, to join again on VLAN ${to}.`
-    : ` It is not on ${ma.ssids.length === 1 ? ssids : `any of ${ssids}`} now, so nothing disconnects it: it is put on VLAN ${to} when it next joins.`;
-  return `${who} moves from ${vlanName(ma, from)} to ${vlanName(ma, to)}. Every RADIUS server has the change within a minute.${kick}`;
+    ? ` Kicked once from ${client.ssid} in ~${ma.settle_secs} s to rejoin.`
+    : ' Not connected now. Applies at its next join.';
+  return `${vlanName(ma, from)} → ${vlanName(ma, to)}, live on RADIUS within a minute.${kick}`;
 }
 
 /** What the controller answered, in words: [tone, text]. */
 export function vlanOutcome(res, who) {
   const no = `${who}'s entry not changed`;
   switch (res.status) {
-    case 0: return ['bad', `${no}: the controller could not be reached.`];
+    case 0: return ['bad', `${no}: controller unreachable.`];
     case 400: return ['bad', `${no}: ${res.error}.`];
     case 403: return ['bad', res.error === 'not an admin'
-      ? `${no}: your account is not in ${ADMIN_GROUP}.`
-      : `${no}: the controller took the request for a cross-site one. Reload the page and try again.`];
-    case 404: return ['bad', `${no}: the controller does not edit the mapping.`];
-    case 409: return ['bad', `${no}: ${res.detail}. It shows here as it is now; look again before changing it.`];
-    case 422: return ['bad', `${no}: ${res.detail}. Fix the mapping in OpenBao first; RADIUS goes on with its last good one.`];
-    case 502: return ['bad', `${no}: ${res.detail}. RADIUS goes on with the mapping as it was.`];
+      ? `${no}: needs ${ADMIN_GROUP}.`
+      : `${no}: seen as cross-site. Reload and retry.`];
+    case 404: return ['bad', `${no}: the controller doesn’t edit the mapping.`];
+    case 409: return ['bad', `${no}: ${res.detail}. Showing the current entry. Check before changing.`];
+    case 422: return ['bad', `${no}: ${res.detail}. Fix it in OpenBao first. RADIUS keeps its last good mapping.`];
+    case 502: return ['bad', `${no}: ${res.detail}. RADIUS keeps the old mapping.`];
     default: break;
   }
-  if (res.result === 'unchanged') return ['ok', `Nothing to change: ${who}'s entry is already so.`];
+  if (res.result === 'unchanged') return ['ok', `No change: ${who}'s entry already matches.`];
   if (!res.ok) return ['bad', `${no}: ${res.detail || 'no reason given'}.`];
   const kick = res.kick?.startsWith('once') ? ` It is disconnected ${res.kick}.` : '';
   return ['ok', `Written: ${res.detail}.${kick}`];
@@ -122,7 +122,7 @@ function choices(ma, who, entry, client, name, ok) {
     return h('label', { class: 'choice' }, input,
       h('span', { class: 'choice-main' },
         h('b', {}, id === null ? 'No entry' : `VLAN ${id}`),
-        h('small', {}, id === null ? refuse(ma) : group ? `group ${group}` : 'a group of its own is made')),
+        h('small', {}, id === null ? refuse(ma) : group ? `group ${group}` : 'new group')),
       id === (entry?.vlan ?? null) && entry ? h('span', { class: 'choice-side' }, 'now') : null);
   });
   if (!entry) {
@@ -144,7 +144,7 @@ export async function editEntry(store, root, mac, name) {
   const who = name || entry?.description || mac;
   const picked = await ask(root, {
     title: entry ? `The VLAN of ${who}` : `Add ${who}`,
-    text: `RADIUS's MAC authentication puts it on this VLAN when it joins ${ssidWords(ma)}.`,
+    text: `Its VLAN when it joins ${ssidWords(ma)} (MAC auth).`,
     choices: (ok) => choices(ma, who, entry, client, name, ok),
     confirm: 'Set',
     pick: (dlg) => {
@@ -166,7 +166,7 @@ function resultLine(el, [tone, text]) {
 }
 
 function lockNote(store) {
-  return h('p', { class: 'lock' }, icon(LOCK), h('span', {}, store.me ? 'Viewing only: changing it needs membership of ' : 'Changing it needs membership of ', h('b', {}, ADMIN_GROUP), '.'));
+  return h('p', { class: 'lock' }, icon(LOCK), h('span', {}, store.me ? 'View only. Changes need ' : 'Changes need ', h('b', {}, ADMIN_GROUP), '.'));
 }
 
 /** The kick pending for a device just moved, in words. */
@@ -174,26 +174,26 @@ function followWords(f) {
   if (!f) return null;
   if (f.kicked) return h('span', { class: 'chip wait' }, `Kicked at ${hm(f.kick_at)}, rejoining on VLAN ${f.to}`);
   const s = Math.max(0, Math.round((f.kick_at - Date.now()) / 1000));
-  return h('span', { class: 'chip wait' }, `Kicked in ${s} s, to rejoin on VLAN ${f.to}`);
+  return h('span', { class: 'chip wait' }, `Kick in ${s} s, rejoins on VLAN ${f.to}`);
 }
 
 /** Where the client is now, against its entry. */
 function nowWords(ma, entry, c) {
-  if (!c) return h('span', { class: 'muted' }, 'not on the Wi-Fi');
+  if (!c) return h('span', { class: 'muted' }, 'offline');
   const onMab = ma.ssids.includes(c.ssid);
   const off = onMab && entry && c.vlan !== entry.vlan;
   return [h('span', { class: `chip${off ? ' warn' : ''}` }, `VLAN ${c.vlan}`), ` ${c.ssid} on ${c.ap}`,
-    off ? h('small', {}, ` · on VLAN ${entry.vlan} from its next join`) : null];
+    off ? h('small', {}, ` · VLAN ${entry.vlan} at next join`) : null];
 }
 
 /** How reading the mapping goes, when not well: a note, else null. */
 function readNote(ma) {
   if (ma.error) {
-    const last = ma.read_at ? ` It was last read ${ago(ma.read_at)}; what shows is that.` : ' It has not been read since the controller started.';
-    return h('p', { class: 'note warn' }, `The mapping cannot be read from OpenBao: ${ma.error}.${last} RADIUS goes on with the mapping it has.`);
+    const last = ma.read_at ? ` Showing the copy read ${ago(ma.read_at)}.` : ' Never read yet.';
+    return h('p', { class: 'note warn', title: ma.error }, `Can’t read the mapping from OpenBao.${last} RADIUS keeps its own.`);
   }
   if (blocked(ma)) {
-    return h('p', { class: 'note', role: 'alert' }, `RADIUS refuses this mapping and goes on with its last good one: ${ma.unread.join('; ')}. No change can be made here until it is fixed in OpenBao.`);
+    return h('p', { class: 'note', role: 'alert' }, `RADIUS rejects this mapping (${ma.unread.join(', ')}) and keeps its last good one. Fix it in OpenBao to edit here.`);
   }
   return null;
 }
@@ -207,7 +207,7 @@ export function vlanPanel(store, mac, root) {
   const lock = h('div');
   const result = h('p', { class: 'result', role: 'status', hidden: true });
   const el = h('section', { class: 'panel tool' },
-    h('div', { class: 'tool-head' }, h('h2', {}, 'VLAN'), h('small', { class: 'muted' }, 'RADIUS’s MAC authentication')),
+    h('div', { class: 'tool-head' }, h('h2', {}, 'VLAN'), h('small', { class: 'muted' }, 'RADIUS MAC auth')),
     note, facts, h('div', { class: 'tool-buttons' }, change), lock, result);
   let busy = false;
   let name = '';
@@ -254,7 +254,7 @@ export default {
     const add = h('input', { type: 'text', placeholder: '02:00:00:00:00:01', 'aria-label': 'MAC of the device to add', spellcheck: 'false' });
     const addBtn = h('button', { type: 'button', class: 'btn primary' }, icon(TAG), h('span', {}, 'Add…'));
     const addForm = h('div', { class: 'panel tool vlan-add' },
-      h('div', { class: 'tool-head' }, h('h2', {}, 'Add a device'), h('small', { class: 'muted' }, 'by its MAC, as it sends it (its private Wi-Fi address, if it uses one)')),
+      h('div', { class: 'tool-head' }, h('h2', {}, 'Add a device'), h('small', { class: 'muted', title: 'Its private Wi-Fi address, if it uses one' }, 'by the MAC it sends')),
       h('div', { class: 'tool-form' }, h('label', { class: 'field' }, h('span', {}, 'MAC'), add), h('div', { class: 'tool-buttons' }, addBtn)));
     const lock = h('div');
     const result = h('p', { class: 'result', role: 'status', hidden: true });
@@ -277,12 +277,12 @@ export default {
     addBtn.addEventListener('click', () => {
       const mac = macOf(add.value);
       if (!mac) {
-        resultLine(result, ['bad', 'That is no device’s MAC: six pairs of hex digits, with colons, hyphens or nothing between them.']);
+        resultLine(result, ['bad', 'Not a valid MAC. Use 6 hex pairs, e.g. 02:00:00:00:00:01.']);
         return;
       }
       const ma = store.state.mac_auth;
       if (ma.entries[mac]) {
-        resultLine(result, ['bad', `${mac} has an entry already, on ${vlanName(ma, ma.entries[mac].vlan)}: change it below.`]);
+        resultLine(result, ['bad', `${mac} is already on ${vlanName(ma, ma.entries[mac].vlan)}. Change it below.`]);
         return;
       }
       edit(mac, store.state.clients[mac]?.name || '');
@@ -312,12 +312,12 @@ export default {
           groups.replaceChildren();
           empty.hidden = false;
           const [title, text] = !store.keyed ? store.waiting()
-            : ['The controller does not edit the mapping', 'It has no [mac_auth] section: which VLAN a MAC-authenticated device is put in is set where RADIUS reads it.'];
-          empty.replaceChildren(h('strong', {}, title), h('p', {}, text));
+            : ['VLAN editing off', 'No [mac_auth] section in the controller config.'];
+          empty.replaceChildren(h('strong', {}, title), text ? h('p', {}, text) : null);
           return;
         }
         const entries = Object.entries(ma.entries || {});
-        sub.textContent = `RADIUS puts each device below on its VLAN when it joins ${ssidWords(ma)} with the shared passphrase; a device that is not listed cannot join them.${ma.version ? ` Mapping version ${ma.version}${ma.read_at ? `, read ${ago(ma.read_at)}` : ''}.` : ''}`;
+        sub.textContent = `MAC auth for ${ssidWords(ma)} · unlisted devices can’t join${ma.version ? ` · v${ma.version}${ma.read_at ? `, read ${ago(ma.read_at)}` : ''}` : ''}`;
         note.replaceChildren(readNote(ma) || '');
         // Drawn again when the mapping, the clients' places or the pending
         // kicks change, and every second while a kick counts down.
@@ -328,8 +328,8 @@ export default {
         const unread = ma.version === null;
         empty.hidden = !!entries.length;
         if (!entries.length) {
-          empty.replaceChildren(h('strong', {}, unread ? (ma.error ? 'The mapping is not read yet' : 'Reading the mapping') : 'No device has an entry'),
-            h('p', {}, unread ? 'The controller reads it from OpenBao every minute.' : `No device can join ${ssidWords(ma)} until it has one.`));
+          empty.replaceChildren(h('strong', {}, unread ? (ma.error ? 'Mapping not read yet' : 'Reading the mapping…') : 'No entries'),
+            h('p', {}, unread ? 'Read from OpenBao every minute.' : `No device can join ${ssidWords(ma)} yet.`));
         }
         if (stamp === drawn) return;
         drawn = stamp;
@@ -345,12 +345,12 @@ export default {
           const head = ['Device', 'Description', 'Now', ...(admin ? [''] : [])];
           return h('section', { class: 'vlan-group' },
             h('h2', { class: 'section-title' }, vlanName(ma, id), h('span', { class: 'muted' }, ` · ${mine.length} device${mine.length === 1 ? '' : 's'}`),
-              allowed ? null : h('span', { class: 'chip warn' }, 'not one the site lets admins choose')),
+              allowed ? null : h('span', { class: 'chip warn' }, 'not selectable')),
             mine.length
               ? h('div', { class: 'panel table-wrap' }, h('table', { class: 'vlans' },
                 h('thead', {}, h('tr', {}, head.map((t) => h('th', {}, h('span', {}, t))))),
                 h('tbody', {}, mine.map(([m, e]) => row(ma, m, e)))))
-              : h('p', { class: 'muted' }, 'No device on it.'));
+              : h('p', { class: 'muted' }, 'No devices'));
         }));
       },
     };

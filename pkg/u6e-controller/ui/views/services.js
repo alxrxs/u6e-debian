@@ -299,8 +299,8 @@ export default {
         empty.replaceChildren(
           h('strong', {}, !data ? 'Loading' : data.error !== undefined ? 'The controller cannot be reached'
             : list.length ? 'No device matches' : 'No mDNS heard yet'),
-          h('p', {}, !data || data.error !== undefined ? 'Trying again every few seconds.'
-            : list.length ? 'Change the filters to see more.' : 'Devices show up here when they announce or ask for services.'));
+          h('p', {}, !data || data.error !== undefined ? 'Retrying.'
+            : list.length ? 'Change the filters to see more.' : 'Devices show once they announce or query mDNS.'));
       },
     };
     load();

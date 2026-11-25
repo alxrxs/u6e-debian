@@ -8,16 +8,16 @@ import { h, pct, scoreQuality } from '../util.js';
 /** Each part: its name, the figure it comes from in words, and why a
  * client may have none. */
 const PARTS = [
-  ['signal', 'Signal', (v) => `${v} dBm on average`, ''],
-  ['retries', 'Retries', (v) => `${pct(v)} of the transmissions to it were retries`, 'too few frames sent it to tell'],
-  ['contention', 'Air contention', (v) => `${pct(v)} of the air busy with others`, 'its radio has reported once only'],
-  ['rate', 'Rate', (v) => `${pct(v)} of the best rate it can get here`, 'too few frames sent it, or what it supports has no best rate'],
-  ['roaming', 'Roaming', (v) => (v ? `sticky ${pct(v)} of the last hour` : 'not sticky in the last hour'), ''],
+  ['signal', 'Signal', (v) => `${v} dBm avg`, ''],
+  ['retries', 'Retries', (v) => `${pct(v)} retried`, 'too few frames'],
+  ['contention', 'Air contention', (v) => `${pct(v)} busy with others`, 'one report so far'],
+  ['rate', 'Rate', (v) => `${pct(v)} of best possible`, 'too few frames'],
+  ['roaming', 'Roaming', (v) => (v ? `sticky ${pct(v)} of last hour` : 'not sticky (1 h)'), ''],
 ];
 
 /** Its failed roams in the last hour, after the roaming part's figure. */
 function failures(n) {
-  return n ? `, ${n} failed roam${n === 1 ? '' : 's'}` : '';
+  return n ? ` · ${n} failed` : '';
 }
 
 /** A score as a bar, coloured by how good it is. */
@@ -37,9 +37,9 @@ function head(score, note) {
  * none yet. */
 export function clientExperience(e) {
   if (e?.score === undefined || e.score === null) {
-    return h('p', { class: 'xp-none muted' }, 'No score yet: it comes with its access point’s next report.');
+    return h('p', { class: 'xp-none muted' }, 'No score yet. Due with the AP’s next report.');
   }
-  return h('div', { class: 'xp' }, head(e.score, 'the weakest part weighs most'),
+  return h('div', { class: 'xp' }, head(e.score, 'weakest part weighs most'),
     h('ul', { class: 'xp-parts' }, PARTS.map(([key, label, figure, none]) => {
       const p = e.parts?.[key];
       return h('li', { class: p ? null : 'off' },
@@ -54,7 +54,7 @@ export function clientExperience(e) {
  * score and parts, and its weakest clients, each named by `name`. */
 export function apExperience(a, name) {
   if (a?.score === undefined || a.score === null) return null;
-  const clients = `the mean of its ${a.clients} client${a.clients === 1 ? '' : 's'}`;
+  const clients = `mean of ${a.clients} client${a.clients === 1 ? '' : 's'}`;
   return h('div', { class: 'xp ap-xp' }, head(a.score, clients),
     h('ul', { class: 'xp-parts' }, PARTS.map(([key, label]) => {
       const p = a.parts?.[key];

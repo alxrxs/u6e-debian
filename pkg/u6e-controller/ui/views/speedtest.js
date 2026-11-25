@@ -69,19 +69,19 @@ export function apSpeedBox(store, name, ap) {
     if (why) return;
     run.setAttribute('aria-busy', '');
     const res = await store.apSpeedTest(name);
-    const text = res.status === 202 ? `Started: about 20 seconds, ${res.detail}.`
-      : res.status === 0 ? 'Not started: the controller could not be reached.'
-        : res.status === 403 && res.error === 'not an admin' ? `Not started: your account is not in ${ADMIN_GROUP}.`
+    const text = res.status === 202 ? `Started (~20 s), ${res.detail}.`
+      : res.status === 0 ? 'Not started: controller unreachable.'
+        : res.status === 403 && res.error === 'not an admin' ? `Not started: needs ${ADMIN_GROUP}.`
           : `Not started: ${res.error || `status ${res.status}`}.`;
     ui.result = { ap: name, tone: res.status === 202 ? 'ok' : 'bad', text };
     resultLine(result, ui.result.tone, text);
   });
   const last = mine.find((t) => t.status !== 'running');
-  const status = running?.ap === name ? `Running since ${time(running.at)}: 10 s down, then 10 s up`
+  const status = running?.ap === name ? `Running since ${time(running.at)} · 10 s down, 10 s up`
     : !last ? 'No test yet'
       : last.status === 'failed' ? `Failed ${ago(last.at)}: ${last.detail}`
         : `${mbit(last.down.bits_per_second)} down · ${mbit(last.up.bits_per_second)} up · ${ago(last.at)}${last.user ? ` by ${last.user}` : ''} · ${cpuText(last.cpu)}`;
-  return h('div', { class: 'ap-st-box st-line', title: 'Wired, AP to controller. Test thread near 100 % means the AP’s CPU is the limit.' },
+  return h('div', { class: 'ap-st-box st-line', title: 'Wired, AP to controller. Test thread near 100 % = AP CPU is the limit.' },
     h('h3', {}, 'Speed test'),
     h('span', { class: `st-status${last?.status === 'failed' ? ' bad' : ''}` }, status),
     admin ? run : h('span', { class: 'lock' }, `Needs ${ADMIN_GROUP}`),
@@ -104,7 +104,7 @@ function whereText(c) {
   if (!c) return null;
   return [
     h('b', {}, c.name || c.mac), ` on ${c.ap}, ${bandName(c.band)}, `, h('span', { class: 'mono' }, c.ssid),
-    `; signal ${c.signal} dBm, rates ${Math.round(c.tx_mbps)} and ${Math.round(c.rx_mbps)} Mbit/s`,
+    ` · ${c.signal} dBm · ${Math.round(c.tx_mbps)}/${Math.round(c.rx_mbps)} Mbit/s`,
   ];
 }
 
@@ -118,10 +118,11 @@ export default {
     const history = h('div', { class: 'panel table-wrap' });
     root.append(
       h('div', { class: 'head' }, h('h1', {}, 'Test my connection'),
-        h('p', {}, 'How fast this device reaches the Wi-Fi controller, both ways.')),
+        h('p', {}, 'This device to the Wi-Fi controller, both ways')),
       h('section', { class: 'panel tool st-run' },
         h('div', { class: 'st-head' }, start, phase), who, live, result,
-        h('p', { class: 'muted st-foot' }, 'The path is this device’s Wi-Fi to its access point, the access point’s network processor, the access router, the sign-in proxy (TLS, on whichever server answers) and the controller: a slow figure may be any of them. Each direction runs 10 seconds at most; you have one test at a time and six an hour.')),
+        h('p', { class: 'muted st-foot', title: 'Path: Wi-Fi, AP network processor, access router, sign-in proxy (TLS), controller. Any can be the bottleneck.' },
+          'Up to 10 s each way · one test at a time, 6 per hour')),
       h('h2', { class: 'section-title' }, 'Your recent tests'), history);
     let running = false;
     let figs = { down: undefined, up: undefined };
@@ -219,21 +220,21 @@ export default {
         phase.textContent = 'Starting…';
         const s = await store.startSpeedTest();
         if (s.status !== 200) {
-          const why = s.status === 0 ? 'the controller could not be reached' : s.error || `status ${s.status}`;
+          const why = s.status === 0 ? 'controller unreachable' : s.error || `status ${s.status}`;
           throw new Error(why);
         }
-        who.replaceChildren(...(s.client ? ['The controller sees this device as ', ...whereText(s.client), '.']
-          : ['The controller does not see this device on its Wi-Fi: the test measures its path all the same.']));
+        who.replaceChildren(...(s.client ? ['Seen as ', ...whereText(s.client)]
+          : ['Not seen on this Wi-Fi. Testing the path anyway.']));
         phase.textContent = 'Downloading…';
         const down = await download(s.id);
         phase.textContent = 'Uploading…';
         await upload(s.id, s.secs);
         phase.textContent = 'Finishing…';
         const { http, test: d } = await store.finishSpeedTest(s.id, down);
-        if (http !== 200) throw new Error(http ? d.error || `status ${http}` : 'the controller could not be reached');
+        if (http !== 200) throw new Error(http ? d.error || `status ${http}` : 'controller unreachable');
         figs = { down: d.down?.bits_per_second, up: d.up?.bits_per_second };
-        draw({ down: 'as this browser received it', up: 'as the controller received it' });
-        const moved = d.moved ? ` It moved to ${d.moved.ap}, ${bandName(d.moved.band)}, during the test.` : '';
+        draw({ down: 'at browser', up: 'at controller' });
+        const moved = d.moved ? ` Moved to ${d.moved.ap}, ${bandName(d.moved.band)} mid-test.` : '';
         resultLine(result, d.status === 'done' ? 'ok' : 'bad', d.status === 'done' ? `Done.${moved}` : `Failed: ${d.detail}.`);
         phase.textContent = '';
       } catch (e) {

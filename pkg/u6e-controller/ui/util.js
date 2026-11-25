@@ -282,9 +282,9 @@ export function serviceWords(e, who = (m) => m) {
   const what = `${offerLabel(e.label)} (${serviceName(e.service)})`;
   const after = e.silent_for ? ` after ${duration(e.silent_for / 1000)} of silence` : '';
   switch (e.change) {
-    case 'silent': return { text: `stopped answering for ${what}: missed ${e.misses} queries in a row${e.by ? `, the last from ${who(e.by)}` : ''}`, tone: 'bad' };
+    case 'silent': return { text: `stopped answering for ${what} (${e.misses} queries missed${e.by ? `, last from ${who(e.by)}` : ''})`, tone: 'bad' };
     case 'answering': return { text: `answers for ${what} again${after}`, tone: 'ok' };
-    case 'gone': return { text: `withdrew ${what}${e.goodbye ? ' (said goodbye)' : ': it did not answer a query after its announcement ran out'}`, tone: '' };
+    case 'gone': return { text: `withdrew ${what}${e.goodbye ? ' (said goodbye)' : ' (expired, no answer)'}`, tone: '' };
     case 'back': return { text: `offers ${what} again`, tone: 'ok' };
     default: return { text: `${e.change} ${what}`, tone: '' };
   }
@@ -382,23 +382,23 @@ export function describe(ev) {
     case 'eap-ok': return { text: `signed in to${on}`, tone: 'ok', group: 'auth' };
     case 'eap-fail': return { text: `was refused by RADIUS on${on}`, tone: 'bad', group: 'auth' };
     case 'eap-timeout': return { text: `timed out signing in to${on}: ${ev.server ? 'RADIUS did not answer' : 'the client stopped answering'}`, tone: 'bad', group: 'auth' };
-    case 'psk-mismatch': return { text: `gave a passphrase for${on} that does not match`, tone: 'bad', group: 'auth' };
+    case 'psk-mismatch': return { text: `wrong passphrase for${on}`, tone: 'bad', group: 'auth' };
     case 'radio-up': return { text: `${ev.phy} came up`, tone: 'ok', group: 'radio' };
     case 'radio-down': return { text: `${ev.phy} went down`, tone: 'bad', group: 'radio' };
     case 'fw-crash': return { text: `${ev.phy} firmware crashed`, tone: 'bad', group: 'radio' };
     case 'action': return { text: DID[ev.action] || ev.action, tone: ev.ok ? 'ok' : 'bad', group: 'action' };
     case 'guard': {
-      const more = ev.repeats ? `, ${ev.repeats} more times since the last report` : '';
+      const more = ev.repeats ? ` (+${ev.repeats} since last report)` : '';
       const fate = ev.dropped ? ' Dropped.' : '';
       if (ev.sleep_proxy_for) {
         const owner = ev.sleep_proxy_for_name || ev.sleep_proxy_for;
-        return { text: `answers for ${owner} as its sleep proxy while it sleeps, which the ${GUARDS[ev.guard] || ev.guard} reports: ${ev.detail}${more}.${fate}`, tone: '', group: 'guard' };
+        return { text: `sleep proxy for ${owner}, flagged by the ${GUARDS[ev.guard] || ev.guard}: ${ev.detail}${more}.${fate}`, tone: '', group: 'guard' };
       }
       return { text: `broke the ${GUARDS[ev.guard] || ev.guard}: ${ev.detail}${more}.${fate}`, tone: 'bad', group: 'guard' };
     }
     case 'service': return { ...serviceWords(ev), group: 'service' };
-    case 'btm-query': return { text: `asked${on}${band} for a better access point: ${btmReason(ev.reason)}`, tone: '', group: 'roam' };
-    case 'btm-response': return { text: `answered a request to move: ${btmAnswer(ev.status, ev.target)}`, tone: ev.status === 0 ? 'ok' : 'warn', group: 'roam' };
+    case 'btm-query': return { text: `asked${on}${band} for a better AP: ${btmReason(ev.reason)}`, tone: '', group: 'roam' };
+    case 'btm-response': return { text: `move request: ${btmAnswer(ev.status, ev.target)}`, tone: ev.status === 0 ? 'ok' : 'warn', group: 'roam' };
     default: return { text: ev.kind, tone: '', group: 'other' };
   }
 }

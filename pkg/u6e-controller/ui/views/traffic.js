@@ -98,9 +98,9 @@ export function trafficPanel(store, mac) {
       const days = data?.days || [];
       box.hidden = !days.length;
       empty.hidden = !!days.length;
-      empty.replaceChildren(h('p', {}, !data ? 'Loading its traffic.'
-        : data.error !== undefined ? 'The controller cannot be reached; this page tries again.'
-          : 'The controller holds no traffic of this client from the last 7 days.'));
+      empty.replaceChildren(h('p', {}, !data ? 'Loading traffic…'
+        : data.error !== undefined ? 'Controller unreachable. Retrying.'
+          : 'No traffic in the last 7 days.'));
       if (!days.length) return;
       const today = days[days.length - 1];
       const shown = pick.span === 'day' ? [today] : days;
@@ -112,11 +112,11 @@ export function trafficPanel(store, mac) {
       const hidden = data.destinations === false;
       sums.replaceChildren(
         reading('Down', bytes(down), pick.span === 'day' ? dayOf(today.day)
-          : `over ${days.length} day${days.length === 1 ? '' : 's'} kept`),
+          : `${days.length} day${days.length === 1 ? '' : 's'}`),
         reading('Up', bytes(up)),
-        hidden ? reading('Destinations', '–', 'shown to members of wifi-admins')
-          : reading('Destinations', String(dests.length), dests.length >= 20 ? 'the largest 20' : ''),
-        reading('Other', bytes(otherDown + otherUp), 'not in a listed connection'));
+        hidden ? reading('Destinations', '–', 'wifi-admins only')
+          : reading('Destinations', String(dests.length), dests.length >= 20 ? 'top 20' : ''),
+        reading('Other', bytes(otherDown + otherUp), 'unlisted connections'));
       // One bar an hour over the span, from midnight of its first day.
       const start = shown[0].day;
       const count = pick.span === 'day' ? 24 : Math.round((today.day - start) / 86400e3 + 1) * 24;
@@ -139,9 +139,10 @@ export function trafficPanel(store, mac) {
         start, step: HOUR, count, format: (v) => bytes(v),
         series: [{ label: 'Download', color, values: downs }, { label: 'Upload', color: p.ink3, values: ups }],
       }));
-      table.replaceChildren(hidden ? h('p', { class: 'muted' }, 'Where it went online is shown to members of wifi-admins, as its captures are.')
-        : dests.length ? destTable(dests, down + up) : h('p', { class: 'muted' }, 'No connection of it was listed.'));
-      note.textContent = 'Volumes from the radio’s byte counters; destinations from the connections its access point lists, its largest each time, so smaller ones count as other. Names from reverse DNS, looked up as this page shows them.';
+      table.replaceChildren(hidden ? h('p', { class: 'muted' }, 'Destinations: wifi-admins only.')
+        : dests.length ? destTable(dests, down + up) : h('p', { class: 'muted' }, 'No connections listed.'));
+      note.textContent = 'Sources: radio counters · AP’s top connections · rDNS';
+      note.title = 'Volumes from the radio’s byte counters. Destinations from the AP’s largest connections; smaller ones count as Other. Names from reverse DNS.';
     },
   };
   return panel;

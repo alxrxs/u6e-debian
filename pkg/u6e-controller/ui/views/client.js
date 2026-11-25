@@ -66,9 +66,9 @@ function signInFacts(id) {
       h('span', { class: 'chip warn' }, 'not authenticated'))];
   }
   return [
-    fact('Signed in', id.identity ? `${id.method} as ${id.identity}` : id.method, id.ft ? 'came by fast transition' : ''),
+    fact('Signed in', id.identity ? `${id.method} as ${id.identity}` : id.method, id.ft ? 'fast transition' : ''),
     cert ? fact('Certificate', cert.tone ? h('span', { class: `chip ${cert.tone}` }, cert.text) : cert.text,
-      `${id.cert_cn}, on ${new Date(id.cert_expires).toLocaleDateString()}`) : null,
+      `${id.cert_cn}, until ${new Date(id.cert_expires).toLocaleDateString()}`) : null,
   ];
 }
 
@@ -76,9 +76,9 @@ function signInFacts(id) {
 function identityFacts(c) {
   const until = (ms) => (dayOf(ms) === 'Today' ? `until ${hm(ms)}` : `until ${dayOf(ms)}, ${hm(ms)}`);
   return [
-    c.device ? fact('Device', c.device, 'as the DHCP server knows it') : null,
-    c.hostname ? fact('Host name', c.hostname, 'as it asked for its lease') : null,
-    c.dns ? fact('DNS name', c.dns) : null,
+    c.device ? fact('Device', c.device, 'DHCP') : null,
+    c.hostname ? fact('Host name', c.hostname, 'DHCP') : null,
+    c.dns ? fact('DNS name', c.dns, 'rDNS') : null,
     c.addresses?.length ? fact('Addresses', c.addresses.map((a) => h('span', { class: 'mono addr' }, a))) : null,
     c.bound?.length ? fact('Guards bind', c.bound.map((b) => h('span', { class: 'mono addr' }, b.ip)), `on ${c.ap}`) : null,
     c.lease_expires ? fact('Lease', c.lease_expires > Date.now() ? `expires in ${duration((c.lease_expires - Date.now()) / 1000)}` : 'expired', until(c.lease_expires)) : null,
@@ -95,15 +95,15 @@ function presenceFact(p, refused) {
       : h('span', { class: 'chip wait' }, 'Not known yet');
   const word = (home) => (home ? 'home' : 'not home');
   const told = p.pending
-    ? `Home Assistant is to be told “${word(p.pending.home)}”${p.pending.why ? `: ${p.pending.why}` : ''}${refused ? ' (it refuses the controller’s token)' : ''}`
-    : p.told ? `Home Assistant was told “${word(p.told.home)}” at ${hm(p.told.at)}` : 'Home Assistant has been told nothing since the controller started';
+    ? `HA: sending “${word(p.pending.home)}”${p.pending.why ? ` (${p.pending.why})` : ''}${refused ? ' · token refused' : ''}`
+    : p.told ? `HA told “${word(p.told.home)}” at ${hm(p.told.at)}` : 'HA not told yet';
   return fact('Presence', chip, `${p.name} · ${told}`);
 }
 
 /** A chart panel: its canvas is kept across updates, so a pointer on it stays. */
 function chartPanel(title) {
   const canvas = h('canvas', { role: 'img', 'aria-label': title });
-  const wait = h('div', { class: 'wait' }, 'Collecting samples: one every 2 seconds.');
+  const wait = h('div', { class: 'wait' }, 'Collecting samples (every 2 s)…');
   const legend = h('div', { class: 'legend' });
   const since = h('span', { class: 'muted' });
   const el = h('section', { class: 'panel chart' },
@@ -147,8 +147,8 @@ function steerChoices(list, c, ok) {
   const force = h('label', { class: 'choice' },
     h('input', { type: 'checkbox', name: 'steer-force' }),
     h('span', { class: 'choice-main' },
-      h('b', {}, 'Force (disconnects the client if it declines)'),
-      h('small', {}, 'A client that declines is disconnected about 10 s later and has to reconnect, briefly losing its connection.')));
+      h('b', {}, 'Force'),
+      h('small', {}, 'If it declines, it is disconnected after ~10 s.')));
   return h('div', {}, steerTargets(list, c, ok), force);
 }
 
@@ -176,38 +176,38 @@ function outcome(action, res, who, target) {
   const no = `Not ${DID[action]}`;
   const ap = res.ap || 'the AP';
   const why = (detail) => {
-    if (/not associated/i.test(detail)) return `${who} was no longer on ${ap} when the command arrived.`;
-    if (action === 'steer' && /unknown|neighbo|not in/i.test(detail)) return `${ap} does not know that BSS (its AP or radio may have gone down). Pick another.`;
+    if (/not associated/i.test(detail)) return `${who} had already left ${ap}.`;
+    if (action === 'steer' && /unknown|neighbo|not in/i.test(detail)) return `${ap} doesn’t know that BSS. Pick another.`;
     const declined = action === 'steer' && /declined: (.*)$/.exec(detail);
-    if (declined) return `${who} declined to move (${declined[1]}) and stays on ${ap}.`;
+    if (declined) return `${who} declined (${declined[1]}). Stays on ${ap}.`;
     return detail;
   };
   switch (res.status) {
-    case 0: return ['bad', `${no}: the controller could not be reached.`];
+    case 0: return ['bad', `${no}: controller unreachable.`];
     case 403: return ['bad', res.error === 'not an admin'
-      ? `${no}: your account is not in ${ADMIN_GROUP}.`
-      : `${no}: the controller took the request for a cross-site one. Reload the page and try again.`];
-    case 404: return ['bad', `${no}: ${who} is not associated with any access point.`];
-    case 504: return ['bad', `${no}: ${ap} did not answer within 5 s. It may still have acted; its events will show.`];
+      ? `${no}: needs ${ADMIN_GROUP}.`
+      : `${no}: seen as cross-site. Reload and retry.`];
+    case 404: return ['bad', `${no}: ${who} is not on any AP.`];
+    case 504: return ['bad', `${no}: ${ap} didn’t answer in 5 s. It may still act. Check Events.`];
     case 502: return ['bad', `${no}: ${ap} is not connected.`];
     default: break;
   }
   if (Array.isArray(res.results)) {
     const failed = res.results.filter((r) => !r.ok);
     const done = res.results.filter((r) => r.ok && r.ap).map((r) => r.ap);
-    if (!res.results.some((r) => r.ap)) return ['ok', `${DID[action][0].toUpperCase()}${DID[action].slice(1)} ${who}. No access point is connected; each is told as it connects.`];
+    if (!res.results.some((r) => r.ap)) return ['ok', `${DID[action][0].toUpperCase()}${DID[action].slice(1)} ${who}. No AP connected. Each gets it on connect.`];
     const lead = done.length ? `${DID[action][0].toUpperCase()}${DID[action].slice(1)} ${who} on ${done.join(' and ')}.` : `${no}.`;
-    const fails = failed.map((r) => (/no answer/i.test(r.detail) ? `${r.ap} did not answer in time` : `${r.ap || 'the controller'}: ${r.detail}`));
+    const fails = failed.map((r) => (/no answer/i.test(r.detail) ? `${r.ap} didn’t answer` : `${r.ap || 'the controller'}: ${r.detail}`));
     return [failed.length ? 'bad' : 'ok', fails.length ? `${lead} ${fails.join('; ')}.` : lead];
   }
   if (res.status !== 200 && res.error) return ['bad', `${no}: ${res.error}.`];
   if (!res.ok) return ['bad', `${no}: ${why(res.detail || 'no reason given')}`];
   switch (action) {
-    case 'kick': return ['ok', `Kicked ${who} off ${ap}. It may rejoin at once; block it to keep it off.`];
+    case 'kick': return ['ok', `Kicked ${who} off ${ap}. It may rejoin. Block to keep it off.`];
     case 'steer': {
       const forced = /declined: (.*); disassociated/.exec(res.detail || '');
-      if (forced) return ['ok', `${who} declined to move to ${target} (${forced[1]}), so ${ap} disconnects it in about 10 s; it reconnects where it can.`];
-      return ['ok', `Asked ${who} to move to ${target}. The client makes the move; this page shows it when it does.`];
+      if (forced) return ['ok', `${who} declined ${target} (${forced[1]}). ${ap} disconnects it in ~10 s.`];
+      return ['ok', `Asked ${who} to move to ${target}.`];
     }
     default: return ['ok', `${DID[action][0].toUpperCase()}${DID[action].slice(1)} ${who}.`];
   }
@@ -313,9 +313,9 @@ export default {
       const macs = byMac(svc);
       const d = macs.get(mac);
       svcBox.replaceChildren(d ? h('div', { class: 'panel svc-own' }, deviceDetail(d, svc, { link: false })) : h('div', { class: 'panel empty' }, h('p', {},
-        !svc ? 'Loading what it offers over mDNS.'
-          : svc.error !== undefined ? 'The controller cannot be reached; this page tries again.'
-            : 'No access point has heard it speak mDNS (Bonjour, AirPlay, HomeKit) lately.')));
+        !svc ? 'Loading mDNS services…'
+          : svc.error !== undefined ? 'Controller unreachable. Retrying.'
+            : 'No mDNS heard from it lately.')));
     }
 
     function updateRoams() {
@@ -325,7 +325,7 @@ export default {
       if (stamp === roamDrawn) return;
       roamDrawn = stamp;
       if (!d || d.error !== undefined) {
-        roamSum.replaceChildren(h('p', {}, !d ? 'Loading its roams.' : 'The controller cannot be reached; this page tries again.'));
+        roamSum.replaceChildren(h('p', {}, !d ? 'Loading roams…' : 'Controller unreachable. Retrying.'));
         roamBox.hidden = steerBox.hidden = true;
         return;
       }
@@ -334,9 +334,9 @@ export default {
       const heard = c.view && !sticky
         ? h('p', { class: 'muted' }, `${c.view.ap} last heard it at ${c.view.signal} dBm, ${ago(c.view.at)}.`) : null;
       fill(roamSum,
-        h('p', {}, `${c.roams} roam${c.roams === 1 ? '' : 's'} in the last day, `,
+        h('p', {}, `${c.roams} roam${c.roams === 1 ? '' : 's'} in 24 h · `,
           h('span', { class: c.failed ? 'q-poor' : null }, `${c.failed} failed`),
-          `, sticky ${duration(c.sticky_ms / 1000) || '0 s'} of it.`),
+          ` · sticky ${duration(c.sticky_ms / 1000) || '0 s'}`),
         sticky ? h('p', {}, stickyWords(sticky, d.settings)) : null,
         heard);
       roamBox.hidden = !d.roams.length;
@@ -353,11 +353,11 @@ export default {
 
     /** Why `action` cannot be taken now, or '' when it can. */
     function barred(action) {
-      if (!store.me?.admin) return `Needs membership of ${ADMIN_GROUP}`;
+      if (!store.me?.admin) return `Needs ${ADMIN_GROUP}`;
       if (busy) return `${DOING[busy]}…`;
       const c = store.state.clients[mac];
-      if ((action === 'kick' || action === 'steer') && !c) return 'Not associated with any access point';
-      if (action === 'steer' && !targets(store, c).length) return `No other BSS of ${c.ssid} to move to`;
+      if ((action === 'kick' || action === 'steer') && !c) return 'Not on any AP';
+      if (action === 'steer' && !targets(store, c).length) return `No other ${c.ssid} BSS`;
       return '';
     }
 
@@ -371,7 +371,7 @@ export default {
         const list = targets(store, c);
         const picked = await ask(root, {
           title: `Steer ${who}`,
-          text: `Asks it to move off ${c.ap}’s ${bandName(c.band)} BSS to the one picked here (802.11v). The client decides; one that does not support it stays, unless the move is forced.`,
+          text: `Asks it to leave ${c.ap} ${bandName(c.band)} for the BSS picked (802.11v). The client may decline unless forced.`,
           choices: (ok) => steerChoices(list, c, ok), confirm: 'Steer',
           pick: (dlg) => {
             const bssid = dlg.querySelector('input[name=steer-target]:checked')?.value;
@@ -384,9 +384,9 @@ export default {
         body = { target_bssid: picked.bssid, force: picked.force };
       } else {
         const text = {
-          kick: c ? `It is disconnected from ${c.ssid} on ${c.ap}. Most devices rejoin at once; to keep it off, block it.` : '',
-          block: 'It is disconnected and every access point refuses it until it is unblocked. The block outlasts restarts of the controller and of the APs.',
-          unblock: 'Every access point lets it join again.',
+          kick: c ? `Disconnects it from ${c.ssid} on ${c.ap}. Most devices rejoin at once.` : '',
+          block: 'Disconnects it. Every AP refuses it until unblocked, across restarts.',
+          unblock: 'Every AP lets it join again.',
         }[action];
         const yes = await ask(root, { title: `${LABELS[action]} ${who}?`, text, confirm: LABELS[action], danger: action === 'block' });
         if (!yes) return;
@@ -431,7 +431,7 @@ export default {
         b.lastChild.textContent = busy === a ? `${DOING[a]}…` : LABELS[a];
       }
       lock.hidden = !!store.me?.admin;
-      lock.lastChild.replaceChildren(store.me ? 'Viewing only: actions need membership of ' : 'Actions need membership of ',
+      lock.lastChild.replaceChildren(store.me ? 'View only. Actions need ' : 'Actions need ',
         h('b', {}, ADMIN_GROUP), '.');
       if (c) {
         fill(where,
@@ -445,15 +445,15 @@ export default {
           reading('Transmit rate', mbps(c.tx), phy(c.tx)),
           reading('Receive rate', mbps(c.rx), phy(c.rx)),
           reading('Download', c.down === undefined ? '–' : bits(c.down), c.up === undefined ? '' : `upload ${bits(c.up)}`),
-          reading('Retries', c.retries === undefined ? '–' : pct(c.retries), 'of frames sent to it'),
-          reading('Airtime', c.airtime === undefined ? '–' : pct(c.airtime), 'of the channel’s time'),
-          reading('Transferred', bytes(c.tx_bytes), `${bytes(c.rx_bytes)} sent by it`),
-          reading('Idle', `${c.idle} s`, 'since it was last heard'));
+          reading('Retries', c.retries === undefined ? '–' : pct(c.retries), 'of frames to it'),
+          reading('Airtime', c.airtime === undefined ? '–' : pct(c.airtime), 'of the channel'),
+          reading('Transferred', bytes(c.tx_bytes), `${bytes(c.rx_bytes)} up`),
+          reading('Idle', `${c.idle} s`, 'since last heard'));
       } else {
         where.replaceChildren();
         absent.textContent = !store.keyed ? store.waiting()[0]
-          : blocked ? 'Blocked: no access point lets it join. Its sessions and timeline are below.'
-            : 'This client is not associated with any AP right now. Its sessions and timeline are below.';
+          : blocked ? 'Blocked on every AP. History below.'
+            : 'Not connected. History below.';
       }
       readings.hidden = !c;
       absent.hidden = !!c;
@@ -471,22 +471,22 @@ export default {
       if (!x) {
         flowSub.replaceChildren();
         flowBox.replaceChildren(h('div', { class: 'panel empty' }, h('p', {},
-          !store.flowsKeyed ? 'Loading its connections.'
-            : 'It has no connection open, or its AP has not reported its connections yet: every AP does every 10 seconds while this page is open, one with many connections less often.')));
+          !store.flowsKeyed ? 'Loading connections…'
+            : 'No connections reported yet.', h('small', { class: 'muted' }, ' APs report every 10 s while this page is open.'))));
         return;
       }
       const { cf } = x;
       flowSub.replaceChildren(`through ${x.ap}, `, sampled(x.at));
       redraw(flowBox, () => [h('div', { class: 'panel' },
         h('dl', { class: 'readings flow-sum' },
-          reading('Connections', String(cf.conns), `${cf.offloaded} offloaded, ${cf.conns - cf.offloaded} through the CPU`),
-          reading('Offloaded', offload(cf.conns, cf.offloaded), 'forwarded by the NSS hardware'),
-          reading('Down', cf.down === undefined ? '–' : bits(cf.down), `${bytes(cf.rx_bytes)} over these connections`),
-          reading('Up', cf.up === undefined ? '–' : bits(cf.up), `${bytes(cf.tx_bytes)} over these connections`)),
+          reading('Connections', String(cf.conns), `${cf.offloaded} offloaded · ${cf.conns - cf.offloaded} CPU`),
+          reading('Offloaded', offload(cf.conns, cf.offloaded), 'NSS hardware'),
+          reading('Down', cf.down === undefined ? '–' : bits(cf.down), `${bytes(cf.rx_bytes)} total`),
+          reading('Up', cf.up === undefined ? '–' : bits(cf.up), `${bytes(cf.tx_bytes)} total`)),
         cf.top.length ? h('div', { class: 'table-wrap' }, flowTable(topRows(cf))) : null,
         h('p', { class: 'muted foot' }, cf.top.length < cf.conns
-          ? [`The largest ${cf.top.length} of its ${cf.conns} connections. `, h('a', { href: '#/flows' }, `Every connection of ${x.ap}`), ' is on the Flows page.']
-          : cf.conns ? `All its ${cf.conns} connections.` : 'No connection is open.'))]);
+          ? [`Top ${cf.top.length} of ${cf.conns}. `, h('a', { href: '#/flows' }, `All of ${x.ap} on Flows`)]
+          : cf.conns ? `All ${cf.conns} connections` : 'No open connections'))]);
     }
 
     function updateHistory() {
@@ -502,16 +502,16 @@ export default {
       timeline.hidden = !entries.length;
       if (entries.length) timeline.replaceChildren(...timelineItems(entries));
       const notes = [
-        hist?.more ? `The newest ${entries.length} entries; ${hist.more} older ones are kept.` : '',
-        hist?.radius === 'off' ? 'RADIUS’s log is not read, so its verdicts are not here.' : '',
-        hist?.radius === 'down' ? 'RADIUS’s log cannot be read right now; its verdicts come when it can.' : '',
+        hist?.more ? `Newest ${entries.length} · ${hist.more} older kept.` : '',
+        hist?.radius === 'off' ? 'RADIUS log not read.' : '',
+        hist?.radius === 'down' ? 'RADIUS log unreadable for now.' : '',
       ].filter(Boolean);
       timelineNote.hidden = !notes.length || !entries.length;
       timelineNote.textContent = notes.join(' ');
       noHistory.hidden = !!entries.length;
-      noHistory.replaceChildren(h('p', {}, !hist ? 'Loading its history.'
-        : hist.error !== undefined ? 'The controller cannot be reached; this page tries again.'
-          : 'The controller holds nothing of this client from the last 7 days.'));
+      noHistory.replaceChildren(h('p', {}, !hist ? 'Loading history…'
+        : hist.error !== undefined ? 'Controller unreachable. Retrying.'
+          : 'Nothing in the last 7 days.'));
     }
 
     const view = {

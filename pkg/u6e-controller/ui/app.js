@@ -45,8 +45,8 @@ const store = {
   /** Why there is no state yet, for the views' empty states. */
   waiting() {
     return this.live === 'down'
-      ? ['The controller cannot be reached', 'This page keeps trying, and shows the access points as soon as it gets through.']
-      : ['Connecting to the controller', 'The access points and their clients appear as soon as their state arrives.'];
+      ? ['Controller unreachable', 'Retrying.']
+      : ['Connecting…', ''];
   },
   /** Every event seen, oldest first. */
   events: [],
@@ -467,7 +467,7 @@ function render() {
   const user = document.getElementById('user');
   user.hidden = !name;
   user.textContent = name || '';
-  user.title = name ? `Signed in as ${name}${store.me?.admin ? ', a member of wifi-admins' : ''}` : '';
+  user.title = name ? `Signed in as ${name}${store.me?.admin ? ' (wifi-admins)' : ''}` : '';
   const n = Object.keys(store.state.clients).length;
   document.getElementById('tally').textContent = store.live === 'live' ? String(n) : '';
   const banner = document.getElementById('banner');
@@ -475,8 +475,8 @@ function render() {
   if (store.live === 'down') {
     const s = Math.max(1, Math.round((store.retryAt - Date.now()) / 1000));
     banner.textContent = store.keyed
-      ? `Live updates stopped: the controller cannot be reached. Trying again in ${s} s; the figures shown are the last received.`
-      : `The controller cannot be reached. Trying again in ${s} s.`;
+      ? `Controller unreachable. Showing last data. Retry in ${s} s.`
+      : `Controller unreachable. Retry in ${s} s.`;
   }
   const title = { devices: 'Devices', clients: 'Clients', client: 'Client', auth: 'Auth problems', vlans: 'VLANs', flows: 'Flows', roaming: 'Roaming', services: 'Services', spectrum: 'Spectrum', config: 'Config', events: 'Events', test: 'Test my connection' }[currentName];
   document.title = `${title} – Wi-Fi`;

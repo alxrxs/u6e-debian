@@ -75,7 +75,7 @@ export function clientFlows(store, mac) {
 
 /** A rate and the bytes it adds to, for a table cell. */
 function rateCell(bps, total, cls) {
-  return h('td', { class: `num ${cls}` }, bps === undefined ? h('span', { class: 'muted' }, '–') : bits(bps), h('small', {}, `${bytes(total)} in all`));
+  return h('td', { class: `num ${cls}` }, bps === undefined ? h('span', { class: 'muted' }, '–') : bits(bps), h('small', {}, `${bytes(total)} total`));
 }
 
 /** How long ago flows sampled at `at` were, in an element that `tick`
@@ -161,9 +161,9 @@ async function askFull(store, ap, view) {
   if (!full[ap]) return;
   full[ap] = r.status === 200 && r.clients
     ? { at: r.at ?? Date.now(), complete: r.complete ?? true, clients: r.clients }
-    : { error: r.status === 504 ? `${ap} did not send its table in time. Try again; a busy AP can take a few seconds.`
-      : r.status === 429 ? `${ap} was asked for its table moments ago; it is asked at most every 10 seconds. Try again shortly.`
-        : r.status === 0 ? 'The controller could not be reached.'
+    : { error: r.status === 504 ? `${ap} timed out. Try again.`
+      : r.status === 429 ? `${ap} was just asked (max every 10 s). Try again shortly.`
+        : r.status === 0 ? 'Controller unreachable.'
           : `${ap} could not send its table${r.error ? `: ${r.error}` : ''}.` };
   view.update();
 }
@@ -227,7 +227,7 @@ export default {
         if (!isOpen) return [row];
         const detail = cf.top.length
           ? h('div', { class: 'table-wrap' }, flowTable(topRows(cf)),
-            cf.top.length < cf.conns ? h('p', { class: 'muted foot' }, `The largest ${cf.top.length} of ${cf.conns}; the AP’s whole table has every one.`) : null)
+            cf.top.length < cf.conns ? h('p', { class: 'muted foot' }, `Top ${cf.top.length} of ${cf.conns}. The AP’s full table has all.`) : null)
           : h('p', { class: 'muted foot' }, 'No connection is open.');
         return [row, h('tr', { class: 'sub' }, h('td', { colspan: '5' }, detail))];
       });
@@ -251,14 +251,14 @@ export default {
       return h('section', { class: 'panel flows-ap' },
         h('div', { class: 'flows-top' },
           h('h2', {}, ap),
-          h('span', { class: 'muted' }, `${conns} connection${conns === 1 ? '' : 's'}, ${all.length} client${all.length === 1 ? '' : 's'}`),
+          h('span', { class: 'muted' }, `${conns} connection${conns === 1 ? '' : 's'} · ${all.length} client${all.length === 1 ? '' : 's'}`),
           conns ? h('span', { class: 'muted off-sum' }, offload(conns, off), 'offloaded') : null,
           sampled(fl.at),
           fullBtn),
-        fl.complete ? null : h('p', { class: 'note warn' }, `${ap} counted more connections than it reports at once; these figures cover those it read.`),
+        fl.complete ? null : h('p', { class: 'note warn' }, `Partial: ${ap} has more connections than it reports at once.`),
         cfs.length
           ? h('div', { class: 'table-wrap' }, h('table', { class: 'flow-clients' }, thead, h('tbody', {}, clientRows(ap, cfs))))
-          : h('p', { class: 'offline' }, all.length ? 'No client of this AP matches the filter.' : `No client of ${ap} has a connection open.`),
+          : h('p', { class: 'offline' }, all.length ? 'No match' : 'No open connections'),
         fullPanel(store, ap, view));
     }
 
@@ -274,7 +274,7 @@ export default {
         const all = Object.values(store.flows).flatMap((x) => Object.values(x.clients));
         const conns = all.reduce((n, c) => n + c.conns, 0);
         const off = all.reduce((n, c) => n + c.offloaded, 0);
-        sub.textContent = all.length ? `${conns} connections of ${all.length} clients, ${Math.floor((off / conns) * 100 || 0)} % offloaded` : '';
+        sub.textContent = all.length ? `${conns} connections · ${all.length} clients · ${Math.floor((off / conns) * 100 || 0)} % offloaded` : '';
         // The flows change every 10 s at most, the samples every 2 s: most
         // updates only move the "sampled" clocks.
         const full = Object.entries(store.ui.fullFlows || {}).map(([a, x]) => [a, x.loading, x.error, x.at, x.q, x.limit]);
@@ -287,10 +287,10 @@ export default {
         drawn = stamp;
         if (!shown.length) {
           const [title, text] = !store.keyed ? store.waiting()
-            : !store.flowsKeyed ? ['Loading the flows', 'Each AP sends its clients’ connections every 10 seconds while this page shows them, one with many connections less often.']
-              : Object.values(store.state.aps).some((a) => a.up) ? ['No flows yet', 'Each connected AP sends its clients’ connections within 10 seconds, one with many connections within a minute.']
-                : ['No access point is connected', 'Flows are listed once an AP’s agent reports them.'];
-          list.replaceChildren(h('div', { class: 'panel empty' }, h('strong', {}, title), h('p', {}, text)));
+            : !store.flowsKeyed ? ['Loading flows…', 'APs report every 10 s.']
+              : Object.values(store.state.aps).some((a) => a.up) ? ['No flows yet', 'APs report within 10 s (busy ones within a minute).']
+                : ['No AP connected', ''];
+          list.replaceChildren(h('div', { class: 'panel empty' }, h('strong', {}, title), text ? h('p', {}, text) : null));
           return;
         }
         redraw(list, () => shown.map(([ap, fl]) => apPanel(ap, fl)));

@@ -35,11 +35,11 @@ function configPanel(c) {
   const title = h('h3', {}, 'Wi-Fi configuration');
   if (!c.installed && !c.latest && !c.last) {
     return h('div', {}, h('div', { class: 'cfg-head' }, title),
-      h('p', { class: 'muted' }, 'No configuration was sent to it, and it reports none installed yet.'));
+      h('p', { class: 'muted' }, 'None sent or installed yet'));
   }
   const drift = c.drift === undefined || !c.installed ? null
     : c.drift
-      ? h('span', { class: 'chip bad', title: 'It is signed the latest again when it can be: when it comes back, its clock is synchronized or a rollout of it ends' }, 'Not on the latest')
+      ? h('span', { class: 'chip bad', title: 'Re-signed when it is back, its clock is synced or its rollout ends' }, 'Not on the latest')
       : h('span', { class: 'chip ok' }, 'On the latest');
   const facts = h('dl', { class: 'facts' },
     fact('Installed', c.installed ? hash(c.installed) : h('span', { class: 'muted' }, 'not reported')),
@@ -59,9 +59,9 @@ function configPanel(c) {
 function step(r) {
   const p = r.phase || {};
   switch (p.step) {
-    case 'checking': return 'Checking both images against their manifests';
-    case 'staging': return `Staging ${r.image}: the AP reboots into stock and back`;
-    case 'gate': return `Waiting for the health gate, until ${hm(p.deadline)}: back with the image, its radios up, its clients back`;
+    case 'checking': return 'Checking images against manifests';
+    case 'staging': return `Staging ${r.image} (reboots twice)`;
+    case 'gate': return `Health gate until ${hm(p.deadline)}: image, radios, clients back`;
     case 'rolling_back': return `Rolling back to ${r.previous}: ${p.why}`;
     default: return p.step || '';
   }
@@ -97,31 +97,31 @@ function imagePanel(store, name, all, rollouts) {
   let action;
   if (!store.me) action = null;
   else if (!admin) {
-    action = h('p', { class: 'lock' }, icon(LOCK), h('span', {}, 'Upgrading reboots the access point, which needs membership of ', h('b', {}, ADMIN_GROUP), '.'));
+    action = h('p', { class: 'lock' }, icon(LOCK), h('span', {}, 'Upgrading needs ', h('b', {}, ADMIN_GROUP), '.'));
   } else {
     const why = !newest ? 'No image is kept for it.'
       : newest === imgs.running ? 'It runs its newest kept image.'
-        : busy ? `The rollout of ${busy.image} to ${busy.ap} is not over.`
+        : busy ? `Rollout of ${busy.image} to ${busy.ap} in progress`
           : held ? `${held[0]} is held until ${hm(held[1].held.until)}: ${held[1].held.reason}.`
-          : !imgs.running ? 'What it runs is not known, so it could not be rolled back.'
+          : !imgs.running ? 'Running image unknown, so no rollback possible'
             : null;
     const btn = h('button', { type: 'button', class: 'btn primary', disabled: !!why }, icon(UP), h('span', {}, newest ? `Upgrade to ${newest}` : 'Upgrade'));
     btn.addEventListener('click', async () => {
       const yes = await ask(document.body, {
         title: `Upgrade ${name}?`,
-        text: `The controller stages ${newest} on ${name}, which takes its Wi-Fi down for a few minutes while it reboots twice; its clients roam to the other access point. If it is not back healthy within the gate's time, ${imgs.running} is staged again.`,
+        text: `${name} reboots twice, Wi-Fi down a few minutes. Clients roam to another AP. If unhealthy, it rolls back to ${imgs.running}.`,
         confirm: 'Upgrade',
       });
       if (!yes) return;
       btn.disabled = true;
       const res = await store.upgrade(name, newest);
-      if (res.status !== 202) await ask(document.body, { title: 'Not upgraded', text: res.error || 'The controller could not be reached.', confirm: 'OK' });
+      if (res.status !== 202) await ask(document.body, { title: 'Not upgraded', text: res.error || 'Controller unreachable.', confirm: 'OK' });
     });
     action = h('div', { class: 'cfg-action' }, btn, why ? h('small', { class: 'muted' }, why) : null);
   }
   const facts = h('dl', { class: 'facts' },
     fact('Runs', imgs.running || h('span', { class: 'muted' }, 'not known')),
-    imgs.either ? fact('Or', imgs.either, ' ', h('small', {}, 'a rollout failed part way')) : null,
+    imgs.either ? fact('Or', imgs.either, ' ', h('small', {}, 'rollout failed part way')) : null,
     fact('Kept', kept.length ? h('span', { class: 'kept' }, kept.map((id) => h('code', { class: id === newest ? 'newest' : '' }, id))) : h('span', { class: 'muted' }, 'none')));
   return h('div', {}, h('div', { class: 'cfg-head' }, h('h3', {}, 'Image')), facts, action, mine[0] ? rolloutPanel(mine[0]) : null);
 }
@@ -147,7 +147,7 @@ export default {
         limits.el.hidden = !store.keyed;
         if (!store.keyed) {
           const [title, text] = store.waiting();
-          list.replaceChildren(h('div', { class: 'panel empty' }, h('strong', {}, title), h('p', {}, text)));
+          list.replaceChildren(h('div', { class: 'panel empty' }, h('strong', {}, title), text ? h('p', {}, text) : null));
           return;
         }
         limits.update();
@@ -156,7 +156,7 @@ export default {
           manage.images ? 'images rolled out here' : 'rollouts off'].join(', ');
         if (!manage.configs && !manage.images) {
           list.replaceChildren(h('div', { class: 'panel empty' }, h('strong', {}, 'Nothing is managed here'),
-            h('p', {}, 'The controller signs live configurations with [configs] and rolls images out with [rollouts] in its configuration.')));
+            h('p', {}, 'Needs [configs] and [rollouts] in the controller config.')));
           return;
         }
         const aps = Object.entries(store.state.aps).sort(([a], [b]) => a.localeCompare(b));

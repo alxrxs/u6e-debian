@@ -131,11 +131,11 @@ export default {
         empty.hidden = !!rows.length;
         if (!rows.length) {
           const filtered = all.length > 0;
-          const [title, text] = filtered ? ['No client matches these filters', 'Change the filters, or clear them to see every client.']
+          const [title, text] = filtered ? ['No matching clients', '']
             : !store.keyed ? store.waiting()
-              : anyUp ? ['No clients are associated', 'Clients appear here as they join any SSID.']
-                : ['No access point is connected', 'Clients are listed once an AP’s agent reports them.'];
-          empty.replaceChildren(h('strong', {}, title), h('p', {}, text));
+              : anyUp ? ['No clients connected', '']
+                : ['No AP connected', ''];
+          empty.replaceChildren(h('strong', {}, title), text ? h('p', {}, text) : null);
           if (filtered) {
             empty.append(h('button', { class: 'more', type: 'button', onclick: () => {
               Object.assign(f, { q: '', band: '', ap: '' });

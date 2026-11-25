@@ -16,8 +16,8 @@ const REFRESH_MS = 15000;
 function asker(s) {
   switch (s.origin) {
     case 'admin': return s.by ? `${s.by}, an admin` : 'an admin';
-    case 'query': return s.reason === undefined ? 'the AP, as the client asked' : `the AP, as the client asked: ${btmReason(s.reason)}`;
-    default: return 'the AP, of its own accord';
+    case 'query': return s.reason === undefined ? 'the AP, client asked' : `the AP, client asked (${btmReason(s.reason)})`;
+    default: return 'the AP, on its own';
   }
 }
 
@@ -89,7 +89,7 @@ export function steeringTable(store, list, { client = true } = {}) {
 export function stickyWords(s, settings) {
   return [
     h('b', { class: 'q-poor' }, `Sticky on ${s.ap} for ${duration((Date.now() - s.since) / 1000)}`),
-    ` at ${s.signal} dBm on ${bandName(s.band)}, below ${settings?.sticky_dbm ?? -72} dBm, while ${s.view.ap} last heard it at ${s.view.signal} dBm`,
+    ` · ${s.signal} dBm on ${bandName(s.band)} (limit ${settings?.sticky_dbm ?? -72}) · ${s.view.ap} heard ${s.view.signal} dBm`,
     h('span', { class: 'muted' }, ` (${ago(s.view.at)})`),
   ];
 }
@@ -115,10 +115,10 @@ function apCard(name, a) {
   return h('section', { class: 'panel roam-ap' },
     h('h2', {}, name),
     h('dl', { class: 'readings' },
-      fact('Roams in, last day', String(a.roams), kinds.length ? kinds.map(([k, v]) => `${ROAM_KINDS[k] || k} ${v}`).join(', ') : 'none'),
-      fact('Failed', h('span', { class: a.failed ? 'q-poor' : null }, String(a.failed)), 'sign-ins refused, or gone within 30 s'),
-      fact('Sticky now', h('span', { class: a.sticky ? 'q-poor' : null }, String(a.sticky)), 'clients better heard elsewhere'),
-      fact('Steering asked', String(asked), asked ? `admins ${n(st.asked, 'admin')}, client queries ${n(st.asked, 'query')}, the AP ${n(st.asked, 'ap')}` : 'none kept'),
+      fact('Roams in (24 h)', String(a.roams), kinds.length ? kinds.map(([k, v]) => `${ROAM_KINDS[k] || k} ${v}`).join(', ') : 'none'),
+      fact('Failed', h('span', { class: a.failed ? 'q-poor' : null }, String(a.failed)), 'refused, or gone in 30 s'),
+      fact('Sticky now', h('span', { class: a.sticky ? 'q-poor' : null }, String(a.sticky)), 'better heard elsewhere'),
+      fact('Steering asked', String(asked), asked ? `admin ${n(st.asked, 'admin')} · client ${n(st.asked, 'query')} · AP ${n(st.asked, 'ap')}` : 'none'),
       fact('Answers', `${n(st.answers, 'accepted')} accepted`, asked
         ? [`${n(st.answers, 'rejected')} declined${rejected.length ? ` (${rejected.map(([c, v]) => `${btmAnswer(Number(c)).replace('declined: ', '')} ${v}`).join(', ')})` : ''}, ${n(st.answers, 'none')} unanswered`]
         : ''),
@@ -179,19 +179,22 @@ export default {
         drawn = stamp;
         if (!d || d.error !== undefined) {
           sub.textContent = '';
-          aps.replaceChildren(h('div', { class: 'panel empty' }, h('p', {}, !d ? 'Loading the roams.' : 'The controller cannot be reached; this page tries again.')));
+          aps.replaceChildren(h('div', { class: 'panel empty' }, h('p', {}, !d ? 'Loading roams…' : 'Controller unreachable. Retrying.')));
           return;
         }
         const s = d.settings;
-        sub.textContent = `${d.roams.length} roam${d.roams.length === 1 ? '' : 's'} and ${d.steering.length} steering request${d.steering.length === 1 ? '' : 's'} kept`;
+        sub.textContent = `${d.roams.length} roam${d.roams.length === 1 ? '' : 's'} · ${d.steering.length} steering request${d.steering.length === 1 ? '' : 's'}`;
         const names = Object.keys(store.state.aps).concat(Object.keys(d.aps)).filter((x, i, l) => l.indexOf(x) === i).sort();
         aps.replaceChildren(...names.map((n) => apCard(n, d.aps[n] || { roams: 0, failed: 0, sticky: 0 })));
         stickyBox.replaceChildren(d.sticky.length ? stickyTable(store, d.sticky)
-          : empty(`No client is sticky: none is below ${s.sticky_dbm} dBm while another AP last heard it ${s.better_db} dB better.`));
-        roamsBox.replaceChildren(d.roams.length ? roamsTable(store, d.roams) : empty('No client has roamed since the controller started.'));
-        steerBox.replaceChildren(d.steering.length ? steeringTable(store, d.steering)
-          : empty('No access point has asked a client to move since the controller started (802.11v BSS transition).'));
-        note.textContent = `Kept since the controller started, a week at most. A client is sticky below ${s.sticky_dbm} dBm on one AP while another AP heard it at least ${s.better_db} dB better: that AP’s last reading of it while it was associated there, which stands for ${Math.round(s.view_ms / 3600000)} hours at most, while that AP’s radio runs at the same power and while the client stays within ${s.moved_db} dB of its first reading where it is (no AP can hear a client associated elsewhere). The time between APs runs from the old AP’s last sign of the client to the new AP authorizing it; “≤” where the old AP’s last report is all there is. A client moved if it roamed within ${s.move_ms / 1000} s of its answer.`;
+          : empty('No sticky clients'));
+        roamsBox.replaceChildren(d.roams.length ? roamsTable(store, d.roams) : empty('No roams yet'));
+        steerBox.replaceChildren(d.steering.length ? steeringTable(store, d.steering) : empty('No steering requests yet (802.11v)'));
+        note.textContent = `Kept ≤ 7 days · sticky: < ${s.sticky_dbm} dBm, another AP ${s.better_db} dB better · moved: roamed ≤ ${s.move_ms / 1000} s after answering`;
+        // The fine print of each rule, on demand.
+        note.title = `The other AP’s reading is its last while the client was on it, valid ${Math.round(s.view_ms / 3600000)} h at the same radio power, `
+          + `while the client stays within ${s.moved_db} dB where it is. Time between APs: old AP’s last sign to new AP’s authorization; `
+          + '“≤” when only the old AP’s last report is known.';
       },
     };
     return view;

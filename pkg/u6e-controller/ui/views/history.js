@@ -18,7 +18,7 @@ export function ended(e) {
     case 'eap-failed': return 'its sign-in failed';
     case 'eap-timeout': return 'its sign-in timed out';
     case 'inactive': return 'it had gone silent';
-    case 'unobserved': return 'unseen: its AP’s link or the controller was away';
+    case 'unobserved': return 'unseen (AP or controller offline)';
     default: return e.why || '';
   }
 }
@@ -74,7 +74,7 @@ function words(e) {
         default: return { tone: e.server ? 'bad' : 'warn', text: [`Sign-in timed out: ${timedOut(e.server)}`] };
       }
     case 'psk-mismatch':
-      return { tone: 'bad', text: ['Gave a passphrase that does not match'] };
+      return { tone: 'bad', text: ['Wrong passphrase'] };
     case 'radius': {
       const node = e.node ? ` (${e.node})` : '';
       if (!e.accept) return { tone: 'bad', text: [`RADIUS${node} rejected a sign-in claiming ${e.user}: ${e.detail}`] };
@@ -96,7 +96,7 @@ function words(e) {
       return { tone: e.ok ? '' : 'bad', text: [`${actor(e)} ${DID[e.action] || e.action} it${result}`] };
     }
     case 'guard': {
-      const more = e.repeats ? `, ${e.repeats} more times since the last report` : '';
+      const more = e.repeats ? ` (+${e.repeats} since last report)` : '';
       return { tone: 'bad', text: [`Broke the ${GUARDS[e.guard] || e.guard}: ${e.detail}${more}.${e.dropped ? ' Dropped.' : ''}`] };
     }
     case 'service': {
@@ -107,8 +107,8 @@ function words(e) {
       const proxy = e.proxy_name || e.proxy;
       const owner = e.owner_name || e.owner;
       return e.answering
-        ? { tone: '', text: [`${proxy} answers for ${owner} while it sleeps`, h('span', { class: 'muted' }, ` · sleep proxy for ${e.ip}, not a guard violation`)] }
-        : { tone: 'warn', text: [`${proxy} no longer answers for ${owner} as its sleep proxy`, h('span', { class: 'muted' }, ` · its use of ${e.ip} is a guard violation again`)] };
+        ? { tone: '', text: [`${proxy} is sleep proxy for ${owner}`, h('span', { class: 'muted' }, ` · ${e.ip}, allowed`)] }
+        : { tone: 'warn', text: [`${proxy} stopped being sleep proxy for ${owner}`, h('span', { class: 'muted' }, ` · ${e.ip} flagged again`)] };
     }
     default:
       return { tone: '', text: [e.kind] };

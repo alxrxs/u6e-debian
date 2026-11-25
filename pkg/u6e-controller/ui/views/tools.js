@@ -46,7 +46,7 @@ export function limitStates(limits, key) {
     if (!s) continue;
     const [tone, word] = STATUS[s.status] || ['', s.status];
     const counted = s.status === 'enforced' && (s.down_bytes || s.up_bytes)
-      ? ` · ${bytes(s.down_bytes)} down, ${bytes(s.up_bytes)} up through its classes` : '';
+      ? ` · ${bytes(s.down_bytes)} down, ${bytes(s.up_bytes)} up shaped` : '';
     rows.push(h('li', {}, h('b', {}, ap), ' ', h('span', { class: `chip ${tone}` }, word),
       h('small', {}, ` ${s.detail}${counted}`)));
   }
@@ -72,15 +72,15 @@ function kbitOf(input) {
 
 /** What an answer to a limit's change says: [tone, text]. */
 export function limitOutcome(res, what) {
-  if (res.status === 0) return ['bad', `${what} not set: the controller could not be reached.`];
-  if (res.status === 403) return ['bad', res.error === 'not an admin' ? `${what} not set: your account is not in ${ADMIN_GROUP}.` : `${what} not set: reload the page and try again.`];
+  if (res.status === 0) return ['bad', `${what} not set: controller unreachable.`];
+  if (res.status === 403) return ['bad', res.error === 'not an admin' ? `${what} not set: needs ${ADMIN_GROUP}.` : `${what} not set: reload and retry.`];
   if (res.status !== 200) return ['bad', `${what} not set: ${res.error || `status ${res.status}`}.`];
   const results = res.results || [];
   const failed = results.filter((r) => !r.ok);
-  if (!results.some((r) => r.ap)) return ['ok', `${what} saved. No access point is connected; each is given it as it connects.`];
+  if (!results.some((r) => r.ap)) return ['ok', `${what} saved. No AP connected. Each gets it on connect.`];
   const told = results.filter((r) => r.ok && r.ap).map((r) => `${r.ap} (${r.detail})`);
   const fails = failed.map((r) => `${r.ap || 'the controller'}: ${r.detail}`);
-  return [failed.length ? 'bad' : 'ok', `${what} saved and given to ${told.join(', ') || 'no AP'}.${fails.length ? ` ${fails.join('; ')}.` : ''}`];
+  return [failed.length ? 'bad' : 'ok', `${what} saved, sent to ${told.join(', ') || 'no AP'}.${fails.length ? ` ${fails.join(', ')}.` : ''}`];
 }
 
 function resultLine(el, [tone, text]) {
@@ -90,7 +90,7 @@ function resultLine(el, [tone, text]) {
 }
 
 function lockNote(store, what) {
-  return h('p', { class: 'lock' }, icon(LOCK), h('span', {}, store.me ? `Viewing only: ${what} needs membership of ` : `${what} needs membership of `, h('b', {}, ADMIN_GROUP), '.'));
+  return h('p', { class: 'lock' }, icon(LOCK), h('span', {}, store.me ? `View only. ${what} needs ` : `${what} needs `, h('b', {}, ADMIN_GROUP), '.'));
 }
 
 /** The rate limit panel of client `mac`. */
@@ -106,7 +106,7 @@ export function limitPanel(store, mac) {
   const result = h('p', { class: 'result', role: 'status', hidden: true });
   const el = h('section', { class: 'panel tool' },
     h('div', { class: 'tool-head' }, h('h2', {}, 'Rate limit'),
-      h('small', { class: 'muted' }, 'Enforced by the access point’s NSS shaper, per direction')),
+      h('small', { class: 'muted' }, 'NSS shaper, per direction')),
     now, states, form, lock, result);
   let busy = false;
   let shown = '';
@@ -124,17 +124,17 @@ export function limitPanel(store, mac) {
     const d = kbitOf(down.input);
     const u = kbitOf(up.input);
     if (d === undefined || u === undefined) {
-      resultLine(result, ['bad', 'A rate is 0.064 to 2000 Mbit/s; leave a direction empty for none.']);
+      resultLine(result, ['bad', 'Rate: 0.064–2000 Mbit/s. Leave empty for none.']);
       return;
     }
     if (d === null && u === null) {
-      resultLine(result, ['bad', 'Give a download or an upload rate, or remove the limit.']);
+      resultLine(result, ['bad', 'Enter a rate, or remove the limit.']);
       return;
     }
     send({ down_kbit: d, up_kbit: u }, 'Limit');
   });
   clear.addEventListener('click', async () => {
-    const yes = await ask(document.body, { title: 'Remove the limit?', text: 'The client is shaped no more, but for its SSID’s limit, if it has one.', confirm: 'Remove' });
+    const yes = await ask(document.body, { title: 'Remove the limit?', text: 'Only its SSID’s limit (if any) applies after this.', confirm: 'Remove' });
     if (yes) send({ down_kbit: null, up_kbit: null }, 'Removal');
   });
 
@@ -149,7 +149,7 @@ export function limitPanel(store, mac) {
       ssidRate ? h('div', {}, h('dt', {}, `Its SSID, ${ssid}`), h('dd', {}, limitText(ssidRate),
         h('small', {}, mine ? ' replaced by its own, direction by direction' : ' shared with its SSID’s other unlimited clients, on each radio'))) : null,
     ].filter(Boolean));
-    states.replaceChildren(mine ? limitStates(limits, mac) || h('p', { class: 'muted tool-note' }, 'No access point has said how it stands yet.') : '');
+    states.replaceChildren(mine ? limitStates(limits, mac) || h('p', { class: 'muted tool-note' }, 'No AP has confirmed it yet.') : '');
     const admin = !!store.me?.admin;
     form.hidden = !admin;
     lock.replaceChildren(admin ? '' : lockNote(store, 'Limiting'));
@@ -203,7 +203,7 @@ function ssidRow(store, ssid) {
     const d = kbitOf(down.input);
     const u = kbitOf(up.input);
     if (d === undefined || u === undefined || (d === null && u === null)) {
-      resultLine(result, ['bad', 'A rate is 0.064 to 2000 Mbit/s, in at least one direction.']);
+      resultLine(result, ['bad', 'Rate: 0.064–2000 Mbit/s, at least one direction.']);
       return;
     }
     send({ down_kbit: d, up_kbit: u }, `${ssid}’s limit`);
@@ -242,7 +242,7 @@ export function ssidLimitsPanel(store) {
   const lock = h('div');
   const el = h('section', { class: 'panel tool' },
     h('div', { class: 'tool-head' }, h('h2', {}, 'Rate limits per SSID'),
-      h('small', { class: 'muted' }, 'Shared by the SSID’s clients without a limit of their own: download on each of its radios apart, upload together')),
+      h('small', { class: 'muted', title: 'Download per radio, upload combined' }, 'Shared by clients without their own limit')),
     list, lock);
   function update() {
     const names = ssidsOf(store);
@@ -251,7 +251,7 @@ export function ssidLimitsPanel(store) {
     const els = names.map((n) => rows.get(n).el);
     if (els.length !== list.children.length || els.some((e, i) => list.children[i] !== e)) list.replaceChildren(...els);
     for (const r of rows.values()) r.update();
-    if (!names.length) list.replaceChildren(h('p', { class: 'muted tool-note' }, 'No access point has told its SSIDs yet.'));
+    if (!names.length) list.replaceChildren(h('p', { class: 'muted tool-note' }, 'No AP has reported its SSIDs yet.'));
     lock.replaceChildren(store.me?.admin ? '' : lockNote(store, 'Limiting'));
   }
   return { el, update };
@@ -274,16 +274,16 @@ function textField(label, attrs) {
 
 /** How a capture took the flows, in words. */
 export function mechanismText(m) {
-  if (m === 'mirror') return 'Its connections stay offloaded; the NSS copies their packets.';
-  if (m === 'off offload') return 'Taken off the offload for the capture: its traffic, and no other client’s, goes through the access point’s CPU until it ends.';
+  if (m === 'mirror') return 'Stays offloaded. The NSS mirrors its packets.';
+  if (m === 'off offload') return 'Off the offload while capturing. Only its traffic uses the AP CPU.';
   return '';
 }
 
 /** What an answer to a capture's start or stop says. */
 function captureOutcome(res, what) {
-  if (res.status === 0) return ['bad', `${what}: the controller could not be reached.`];
-  if (res.status === 403) return ['bad', res.error === 'not an admin' ? `${what}: your account is not in ${ADMIN_GROUP}.` : `${what}: reload the page and try again.`];
-  if (res.status === 404) return ['bad', `${what}: the client is not associated with any access point.`];
+  if (res.status === 0) return ['bad', `${what}: controller unreachable.`];
+  if (res.status === 403) return ['bad', res.error === 'not an admin' ? `${what}: needs ${ADMIN_GROUP}.` : `${what}: reload and retry.`];
+  if (res.status === 404) return ['bad', `${what}: client not on any AP.`];
   if (res.status >= 400) return ['bad', `${what}: ${res.error || `status ${res.status}`}.`];
   return ['ok', what === 'Not started' ? '' : `${what}.`];
 }
@@ -305,9 +305,10 @@ export function capturePanel(store, mac) {
   const result = h('p', { class: 'result', role: 'status', hidden: true });
   const el = h('section', { class: 'panel tool' },
     h('div', { class: 'tool-head' }, h('h2', {}, 'Capture'),
-      h('small', { class: 'muted' }, 'On the access point the client is on, downloaded as pcapng')),
+      h('small', { class: 'muted' }, 'On its AP, as pcapng')),
     running, form, lock, result, list,
-    h('p', { class: 'muted tool-note' }, 'Traffic between two clients of one BSS never reaches the access point’s host (its radio forwards it), so no capture holds it. The radios’ air is not captured: a monitor interface cut an associated client’s traffic for as long as it existed. Files are kept a day.'));
+    h('p', { class: 'muted tool-note', title: 'Client-to-client traffic on one BSS stays in the radio. A monitor interface would cut the client off.' },
+      'Not captured: client-to-client traffic on one AP, raw air. Kept 1 day.'));
   let busy = false;
 
   /** The filter the fields make, or why they make none. */
@@ -318,8 +319,8 @@ export function capturePanel(store, mac) {
     const pr = proto.input.value || null;
     if (n && (pr === 'icmp' || pr === 'arp')) return 'A port goes with TCP or UDP.';
     const a = host.input.value.trim();
-    if (a && !/^[0-9a-fA-F.:]+$/.test(a)) return 'A host is an IPv4 or IPv6 address.';
-    if (a && pr === 'arp' && a.includes(':')) return 'ARP carries IPv4 addresses only.';
+    if (a && !/^[0-9a-fA-F.:]+$/.test(a)) return 'Host: an IPv4 or IPv6 address.';
+    if (a && pr === 'arp' && a.includes(':')) return 'ARP: IPv4 only.';
     return { proto: pr, port: n, host: a || null };
   }
 
@@ -358,7 +359,7 @@ export function capturePanel(store, mac) {
       const left = Math.max(0, live.secs - Math.floor((Date.now() - live.at) / 1000));
       running.replaceChildren(h('div', { class: 'capture-live' },
         h('p', { class: 'result', 'data-tone': 'wait', role: 'status' }, icon(REC),
-          h('span', {}, h('b', {}, `Capturing on ${live.ap}`), ` · ${bytes(live.bytes)} of ${bytes(live.max_bytes)} (${pctDone} %) · ${duration(left)} left at most · filter ${live.filter}`,
+          h('span', {}, h('b', {}, `Capturing on ${live.ap}`), ` · ${bytes(live.bytes)} of ${bytes(live.max_bytes)} (${pctDone} %) · ≤ ${duration(left)} left · filter ${live.filter}`,
             live.mechanism ? h('small', { class: 'block' }, mechanismText(live.mechanism)) : null)),
         admin ? h('div', { class: 'tool-buttons' }, stop) : null));
     } else {
@@ -366,7 +367,7 @@ export function capturePanel(store, mac) {
     }
     form.hidden = !admin || !!live;
     start.disabled = busy || !onAp;
-    start.title = onAp ? '' : 'Not associated with any access point';
+    start.title = onAp ? '' : 'Not on any AP';
     start.toggleAttribute('aria-busy', busy);
     lock.replaceChildren(admin ? '' : lockNote(store, 'Capturing'));
     const done = mine.filter((c) => !c.running);

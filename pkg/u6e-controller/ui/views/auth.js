@@ -12,13 +12,13 @@ const REFRESH_MS = 15000;
 
 /** What the client's AP saw, in words. */
 function apSide(s) {
-  if (!s) return h('span', { class: 'muted' }, 'nothing: its AP never heard it try');
+  if (!s) return h('span', { class: 'muted' }, 'no attempt heard');
   const what = {
     'eap-failed': 'Sign-in rejected',
     'eap-timeout': `Sign-in timed out: ${timedOut(s.server)}`,
-    'psk-mismatch': 'A passphrase that does not match',
+    'psk-mismatch': 'Wrong passphrase',
   }[s.kind] || s.kind;
-  const never = s.kind === 'eap-timeout' && !s.reached_radius ? 'it never reached RADIUS' : '';
+  const never = s.kind === 'eap-timeout' && !s.reached_radius ? 'never reached RADIUS' : '';
   return [what, h('small', {}, [s.ap ? `on ${s.ap}` : '', never].filter(Boolean).join(' · '))];
 }
 
@@ -31,7 +31,7 @@ function radiusSide(r, log, mac) {
     return [r.detail, h('small', {}, [claimed, r.node].filter(Boolean).join(' · '))];
   }
   if (log === 'up') return h('span', { class: 'muted' }, 'no rejection');
-  return h('span', { class: 'muted' }, 'unknown: its log is not read');
+  return h('span', { class: 'muted' }, 'unknown (log not read)');
 }
 
 function status(c) {
@@ -71,18 +71,18 @@ export default {
       update() {
         if (!loading && Date.now() - fetched > REFRESH_MS) load();
         const rows = data?.clients || [];
-        sub.textContent = data?.clients ? `Clients that failed to get on in the last 24 hours: ${rows.length}` : '';
+        sub.textContent = data?.clients ? `${rows.length} failed client${rows.length === 1 ? '' : 's'} in 24 h` : '';
         note.hidden = !data?.radius || data.radius === 'up';
         note.textContent = data?.radius === 'off'
-          ? 'RADIUS’s log is not read: only what the access points saw is shown.'
-          : 'RADIUS’s log cannot be read right now: its verdicts are missing until it can.';
+          ? 'RADIUS log not read. AP view only.'
+          : 'RADIUS log unreadable. Its verdicts are missing for now.';
         table.hidden = !rows.length;
         empty.hidden = !!rows.length;
         if (!rows.length) {
-          const [title, text] = !data ? ['Loading', 'Asking the controller.']
-            : data.error !== undefined ? ['The controller cannot be reached', 'This page tries again every 15 seconds.']
-              : ['No client failed to get on', 'A client whose sign-in fails, times out or gives a wrong passphrase appears here, with RADIUS’s reason beside it.'];
-          empty.replaceChildren(h('strong', {}, title), h('p', {}, text));
+          const [title, text] = !data ? ['Loading…', '']
+            : data.error !== undefined ? ['Controller unreachable', 'Retrying every 15 s.']
+              : ['No auth failures', 'Failed, timed-out and wrong-passphrase sign-ins show here.'];
+          empty.replaceChildren(h('strong', {}, title), text ? h('p', {}, text) : null);
           return;
         }
         body.replaceChildren(...rows.map((c) => {
