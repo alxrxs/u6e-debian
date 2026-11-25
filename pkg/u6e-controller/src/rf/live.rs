@@ -129,8 +129,7 @@ pub async fn converge(
             }
             if p.planned_dfs {
                 entry.detail = format!(
-                    "{}; its channel needs a radar check (DFS), which a live switch cannot \
-                     run: the next configuration push takes it there",
+                    "{} · DFS radar check, applies at next config push",
                     p.kept.clone().unwrap_or_default()
                 );
                 continue;

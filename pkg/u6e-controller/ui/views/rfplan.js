@@ -19,9 +19,9 @@ const COMMIT = 'M12 8a4 4 0 1 0 0 8a4 4 0 0 0 0-8M3 12h5M16 12h5';
 /** How often the plan is asked for again while it is shown. */
 const EVERY_MS = 60_000;
 
-/** The planner's reason as a sentence. */
-function sentence(text) {
-  return text ? `${text[0].toUpperCase()}${text.slice(1)}.` : '';
+/** The planner's reason, capitalised: short phrases, no full stop. */
+function phrase(text) {
+  return text ? `${text[0].toUpperCase()}${text.slice(1)}` : '';
 }
 
 /** A setting's parts, each marked when it differs from `other`'s; `channel`
@@ -41,8 +41,8 @@ function signed(db) {
   return `${db > 0 ? '+' : db < 0 ? '−' : '±'}${Math.abs(db).toFixed(0)} dB`;
 }
 
-function effect(label, value, detail) {
-  return h('div', {}, h('dt', {}, label), h('dd', {}, value, detail ? h('small', {}, detail) : null));
+function effect(label, value, detail, title) {
+  return h('div', { title }, h('dt', {}, label), h('dd', {}, value, detail ? h('small', {}, detail) : null));
 }
 
 /** From one setting to another: the first quiet, the changes marked. */
@@ -51,9 +51,10 @@ function move(from, to) {
     h('span', { class: 'to', 'aria-label': 'to' }, '→'), h('span', {}, ...parts(to, from)));
 }
 
-/** One radio's proposal; `pick` is its checkbox, when it may be chosen, and
- * `others` the keys of its group's others. */
-function row(r, pick, others) {
+/** One radio's proposal; `pick` is its checkbox, when it may be chosen,
+ * `others` the keys of its group's others, `clientDbm` what clients are
+ * taken to send at. */
+function row(r, pick, others, clientDbm) {
   const chips = [];
   if (r.pending) {
     const off = r.not_as_planned;
@@ -62,7 +63,13 @@ function row(r, pick, others) {
   }
   else if (r.kept) chips.push(h('span', { class: 'chip' }, 'Kept'));
   else if (r.change && !r.measured) chips.push(h('span', { class: 'chip warn' }, 'Unmeasured'));
-  if (r.restart) chips.push(h('span', { class: 'chip warn', title: r.restart }, 'Needs a radar check'));
+  if (r.restart) chips.push(h('span', { class: 'chip warn', title: phrase(r.restart) }, 'Radar check'));
+  // The site file's power above what the radio may send on its channel.
+  const site = r.current.power;
+  if (site !== undefined && r.planned_power !== undefined && r.planned_power < site) {
+    chips.push(h('span', { class: 'chip', title: 'Site file power clamped to the channel’s limit' },
+      `${site}→${r.planned_power} dBm (ch ${r.current.channel} max)`));
+  }
   if (others.length) chips.push(h('span', { class: 'chip', title: 'Applied together or not at all' }, `With ${others.join(', ')}`));
   let setting;
   if (r.pending && r.runs) setting = move(r.runs, r.current);
@@ -73,13 +80,13 @@ function row(r, pick, others) {
     ? effect('Busy', '–', 'not measured')
     : r.change && shift
       ? effect('Busy', `${r.busy.toFixed(0)} % → ${r.predicted_busy.toFixed(0)} %`, 'predicted')
-      : effect('Busy', `${r.busy.toFixed(0)} %`, `${r.foreign.toFixed(0)} % other networks`);
+      : effect('Busy', `${r.busy.toFixed(0)} %`, `${r.foreign.toFixed(0)} % others`, 'Others: airtime of other networks');
+  const tip = `Weakest 10 % of clients${clientDbm === undefined ? '' : `, sending at ${clientDbm} dBm`}`;
   const snr = r.snr === undefined
-    ? effect('Client SNR', '–', 'no clients heard')
-    : effect('Client SNR', `${r.snr.toFixed(0)} dB`, r.change ? `weakest tenth, ${signed(r.snr_change)}` : 'weakest tenth');
-  const clients = effect('Clients', r.clients === undefined ? '–' : r.clients.toFixed(1), r.hours ? `over ${r.hours} h` : null);
-  const why = [h('p', { class: 'plan-why' }, sentence(r.reason))];
-  if (r.restart) why.push(h('p', { class: 'plan-why warn' }, sentence(r.restart)));
+    ? effect('Client SNR', '–', 'no clients')
+    : effect('Client SNR', `${r.snr.toFixed(0)} dB`, r.change ? `weakest, ${signed(r.snr_change)}` : 'weakest', tip);
+  const clients = effect('Clients', r.clients === undefined ? '–' : r.clients.toFixed(1), r.hours ? `${r.hours} h avg` : null);
+  const why = [h('p', { class: 'plan-why' }, phrase(r.reason))];
   return h('li', { class: 'plan-radio', 'data-band': r.band, 'data-change': String(!!r.change) },
     h('div', { class: 'plan-pick' }, pick),
     h('div', { class: 'plan-main' },
@@ -141,12 +148,11 @@ export function rfPlan(store) {
     const n = picked.length;
     const restarts = picked.filter((r) => r.restart).length;
     const restart = restarts
-      ? ` ${restarts === 1 ? 'One of them needs' : `${restarts} of them need`} a radar check, which a live switch cannot run: the next configuration push takes ${restarts === 1 ? 'it' : 'them'} there.`
+      ? ` ${restarts} need${restarts === 1 ? 's' : ''} a DFS radar check and appl${restarts === 1 ? 'ies' : 'y'} at the next config push.`
       : '';
     const yes = await ask(document.body, {
       title: `Apply ${n} ${n === 1 ? 'change' : 'changes'}?`,
-      text: `The controller commits ${n === 1 ? 'it' : 'them'} to ${plan.site?.file || 'the site file'} as wifi-controller, naming you, ` +
-        'and moves the radios there live: a channel switch announcement moves their clients along, without a reboot.' + restart,
+      text: `Commits to ${plan.site?.file || 'the site file'} in your name and moves the radios live. Clients follow, no reboot.` + restart,
       confirm: 'Commit',
     });
     if (!yes) return;
@@ -158,11 +164,11 @@ export function rfPlan(store) {
     applying = false;
     const notMoved = (res.live || []).filter((l) => !l.ok);
     const moved = notMoved.length
-      ? ` Not moved yet: ${notMoved.map((l) => `${l.key}, ${l.detail}`).join('; ')}.`
-      : ' The radios were moved live.';
+      ? ` Not moved yet: ${notMoved.map((l) => `${l.key} (${l.detail})`).join(', ')}.`
+      : ' Radios moved live.';
     result = res.ok
       ? [notMoved.length ? 'warn' : 'ok', `Committed ${res.commit.slice(0, 12)} to ${plan.site?.file || 'the site file'}.${moved}`]
-      : ['bad', `Not applied: ${res.error || 'the controller could not be reached'}.`];
+      : ['bad', `Not applied: ${res.error || 'controller unreachable'}.`];
     await load();
   }
 
@@ -180,16 +186,15 @@ export function rfPlan(store) {
     const admin = !!store.me?.admin;
     if (!admin) {
       if (!store.me) return null;
-      return h('p', { class: 'lock plan-lock' }, icon(LOCK), h('span', {},
-        'Viewing only: applying a plan commits to the site file and moves radios, which needs membership of ', h('b', {}, ADMIN_GROUP), '.'));
+      return h('p', { class: 'lock plan-lock' }, icon(LOCK), h('span', {}, 'View only. Applying needs ', h('b', {}, ADMIN_GROUP), '.'));
     }
     const n = changes.filter((r) => chosen.has(r.key)).length;
     const button = h('button', { type: 'button', class: 'btn primary', disabled: !n || applying, 'aria-busy': applying || null }, icon(COMMIT),
       h('span', {}, applying ? 'Committing…' : n ? `Apply ${n} ${n === 1 ? 'change' : 'changes'}` : 'Apply'));
     button.addEventListener('click', apply);
     const what = changes.length
-      ? `${n} of ${changes.length} ${changes.length === 1 ? 'proposal' : 'proposals'} chosen`
-      : 'Nothing to apply: every radio stays as it is.';
+      ? `${n} of ${changes.length} chosen`
+      : 'Nothing to apply';
     return h('div', { class: 'plan-foot' }, h('span', { class: 'muted' }, what), button);
   }
 
@@ -201,18 +206,18 @@ export function rfPlan(store) {
     refresh.disabled = loading;
     refresh.toggleAttribute('aria-busy', loading);
     if (!plan) {
-      sub.textContent = 'From what each radio measured over the last hours';
-      body.replaceChildren(h('div', { class: 'empty' }, h('strong', {}, 'Working out the plan'), h('p', {}, 'The proposals appear as soon as the controller has scored the radios.')));
+      sub.textContent = 'From each radio’s measurements';
+      body.replaceChildren(h('div', { class: 'empty' }, h('strong', {}, 'Working out the plan…')));
       return;
     }
     if (plan.status === 0) {
-      body.replaceChildren(h('div', { class: 'empty' }, h('strong', {}, 'The controller cannot be reached'), h('p', {}, 'The plan appears once it answers again.')));
+      body.replaceChildren(h('div', { class: 'empty' }, h('strong', {}, 'Controller unreachable')));
       return;
     }
     if (plan.configured === false) {
-      sub.textContent = 'Proposes each radio’s channel, width and power from what it measured';
-      body.replaceChildren(h('div', { class: 'empty' }, h('strong', {}, 'The RF planner is off'),
-        h('p', {}, 'The controller’s configuration has no [rf] section: no site file to read the radios from or to commit a plan to.')));
+      sub.textContent = 'Channel, width and power per radio';
+      body.replaceChildren(h('div', { class: 'empty' }, h('strong', {}, 'RF planner off'),
+        h('p', {}, 'No [rf] section in the controller config.')));
       return;
     }
     if (plan.error) {
@@ -220,8 +225,8 @@ export function rfPlan(store) {
       return;
     }
     const site = plan.site || {};
-    sub.replaceChildren(`From each radio’s last ${plan.window_hours} h · ${site.file} at `, h('span', { class: 'mono' }, (site.rev || '').slice(0, 12)),
-      site.fetched ? `, fetched ${ago(site.fetched)}` : '');
+    sub.replaceChildren(`${site.file} at `, h('span', { class: 'mono' }, (site.rev || '').slice(0, 12)),
+      site.fetched ? ` · fetched ${ago(site.fetched)}` : '');
     const admin = !!store.me?.admin;
     const radios = plan.radios || [];
     const changes = radios.filter((r) => r.change);
@@ -239,10 +244,10 @@ export function rfPlan(store) {
           render();
         });
       }
-      return row(r, pick, group);
+      return row(r, pick, group, plan.client_dbm);
     }));
     const notes = (plan.notes || []).map((n) => h('p', { class: 'plan-note' }, icon(INFO), h('span', {}, n)));
-    if (site.error) notes.push(h('p', { class: 'plan-note warn' }, icon(BAD), h('span', {}, `The site file could not be fetched (${site.error}); this plan reads it as last fetched.`)));
+    if (site.error) notes.push(h('p', { class: 'plan-note warn', title: site.error }, icon(BAD), h('span', {}, 'Site file fetch failed. Using the last copy.')));
     body.replaceChildren(...[...notes, list, resultLine(), foot(changes)].filter(Boolean));
   }
 

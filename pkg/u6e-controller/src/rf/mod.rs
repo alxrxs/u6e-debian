@@ -252,6 +252,9 @@ fn proposal(p: &Proposal) -> Value {
     if let Some(k) = &p.kept {
         o["kept"] = k.clone().into();
     }
+    if let Some(w) = p.planned_power {
+        o["planned_power"] = w.into();
+    }
     if let Some(r) = &p.restart {
         o["restart"] = r.clone().into();
     }
@@ -312,6 +315,7 @@ pub async fn get_plan(Ext(web): Ext<Web>) -> Response {
         "at": unix_ms(SystemTime::now()),
         "hash": hash(&plan, &inputs),
         "window_hours": planner.settings.rules.window_hours,
+        "client_dbm": planner.settings.rules.client_dbm,
         "notes": plan.notes,
         "site": site,
         "radios": plan
@@ -562,17 +566,29 @@ pub async fn apply(Ext(web): Ext<Web>, req: HeaderMap, body: Bytes) -> Response 
                 .iter()
                 .map(|p| {
                     let key = p.key();
-                    let rs: Vec<&Result<String, String>> =
-                        moved.iter().filter(|(k, _)| *k == key).map(|(_, r)| r).collect();
+                    let rs: Vec<&Result<String, String>> = moved
+                        .iter()
+                        .filter(|(k, _)| *k == key)
+                        .map(|(_, r)| r)
+                        .collect();
                     let (ok, detail) = if rs.is_empty() && p.restart.is_some() {
-                        (false, "committed; takes effect with the next configuration push (radar check)".to_owned())
+                        (
+                            false,
+                            "committed · DFS radar check, applies at next config push".to_owned(),
+                        )
                     } else if rs.is_empty() {
-                        (false, "not moved now: it is moved once its AP can be asked".to_owned())
+                        (
+                            false,
+                            "not moved yet · moves once its AP answers".to_owned(),
+                        )
                     } else {
                         let ok = rs.iter().all(|r| r.is_ok());
-                        let said: Vec<&str> = rs.iter().map(|r| match r {
-                            Ok(d) | Err(d) => d.as_str(),
-                        }).collect();
+                        let said: Vec<&str> = rs
+                            .iter()
+                            .map(|r| match r {
+                                Ok(d) | Err(d) => d.as_str(),
+                            })
+                            .collect();
                         (ok, said.join("; "))
                     };
                     json!({ "key": key, "ok": ok, "detail": detail })
@@ -743,7 +759,7 @@ mod tests {
         };
         assert_eq!(
             check(&ungrouped, &site, &one).unwrap_err(),
-            "ap1's 6 GHz radio on channel 69 would share spectrum with ap2's on channel 69"
+            "ap1 6 GHz ch 69 overlaps ap2 ch 69"
         );
     }
 }

@@ -602,6 +602,7 @@ fn the_plan_is_for_anyone_and_says_what_it_rests_on() {
     let p = plan(&r);
     assert_eq!(p["configured"], true);
     assert_eq!(p["window_hours"], 24);
+    assert_eq!(p["client_dbm"], 15);
     assert_eq!(p["site"]["file"], FILE);
     assert_eq!(
         p["site"]["rev"],
@@ -612,7 +613,7 @@ fn the_plan_is_for_anyone_and_says_what_it_rests_on() {
         p["notes"][0]
             .as_str()
             .unwrap()
-            .contains("No AP reports scans")
+            .contains("APs don't scan other channels")
     );
     assert_eq!(p["radios"].as_array().unwrap().len(), 6);
     // ap1 has the client, so ap2 leaves the 2.4 GHz channel they share.
@@ -642,7 +643,7 @@ fn the_plan_is_for_anyone_and_says_what_it_rests_on() {
     );
     assert_eq!(
         radio(&p, "ap2/radio5")["kept"],
-        "the site file keeps its channel (planner: fixed)"
+        "channel pinned in site file (planner: fixed)"
     );
 }
 
@@ -796,7 +797,7 @@ fn an_applied_plan_is_a_commit_an_event_and_a_live_switch() {
     );
     assert_eq!(
         after["kept"],
-        "not as planned: it runs channel 6 at 20 MHz, the site file says channel 1 at 20 MHz"
+        "runs ch 6 at 20 MHz, site file says ch 1 at 20 MHz"
     );
     // What it shows measured is of the channel it still runs.
     assert_eq!(after["busy"], 30.0, "{after}");

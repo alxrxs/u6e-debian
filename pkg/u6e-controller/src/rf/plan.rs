@@ -359,7 +359,7 @@ impl Ctx<'_> {
     /// Whether a block in the table needs DFS, or why it is not one.
     fn dfs_of(&self, band: Band, chans: &[u16]) -> Result<bool, String> {
         let Some(table) = self.table else {
-            return Err("there is no channel table for the site's country".into());
+            return Err("no channel table for the country".into());
         };
         let mut dfs = false;
         for c in chans {
@@ -367,10 +367,7 @@ impl Ctx<'_> {
                 .iter()
                 .find(|r| (r.lo..=r.hi).contains(c));
             let Some(r) = range else {
-                return Err(format!(
-                    "channel {c} is not one {} allows here",
-                    self.country
-                ));
+                return Err(format!("ch {c} not allowed in {}", self.country));
             };
             dfs |= r.dfs;
         }
@@ -396,19 +393,17 @@ impl Ctx<'_> {
     /// Where the radio of `ap` may be at `primary` and `width`, or why not.
     fn allowed(&self, ap: &str, band: Band, primary: u16, width: u16) -> Result<Place, String> {
         if !self.rules.widths[band_index(band)].contains(&width) {
-            return Err(format!("{width} MHz is not a width it may use"));
+            return Err(format!("{width} MHz not allowed"));
         }
         let chans = channels::block(band, primary, width)
-            .ok_or_else(|| format!("no {width} MHz block holds channel {primary}"))?;
+            .ok_or_else(|| format!("no {width} MHz block at ch {primary}"))?;
         if band == Band::B6 && !channels::psc(primary) {
-            return Err(format!(
-                "channel {primary} is no preferred scanning channel"
-            ));
+            return Err(format!("ch {primary} not a preferred scanning channel"));
         }
         let dfs = self.dfs_of(band, &chans)?;
         let max = self.power_limit(ap, band, primary);
         if dfs && !self.rules.dfs {
-            return Err("its channels need DFS".into());
+            return Err("needs DFS, which is off".into());
         }
         let heard = self.neighbours.get(ap).into_iter().flatten();
         let mut theirs = heard.filter(|n| {
@@ -418,9 +413,9 @@ impl Ctx<'_> {
                 && (chans.contains(&n.primary) || chans.contains(&n.secondary))
         });
         if let Some(n) = theirs.find(|n| n.primary != primary) {
+            // 20/40 coexistence makes their primary this one's too.
             return Err(format!(
-                "a 20/40 MHz network of others on {} and {} has {} as its primary, which 20/40 \
-                 coexistence makes this one's too",
+                "neighbour network on ch {}+{} sets primary {}",
                 n.primary, n.secondary, n.primary
             ));
         }
@@ -428,10 +423,7 @@ impl Ctx<'_> {
             *b == band && who != ap && channels::overlap(band, &chans, other)
         });
         if let Some((_, other, who)) = clash {
-            return Err(format!(
-                "it would share spectrum with {who}'s channel {}",
-                other[0]
-            ));
+            return Err(format!("overlaps {who} ch {}", other[0]));
         }
         Ok(Place { chans, max, dfs })
     }
@@ -466,17 +458,9 @@ fn power(
         return (now, None);
     }
     let heard = hears(p0);
-    let why = if next > p0 {
-        format!(
-            "the weakest tenth of its clients would hear it at {heard:.0} dB SNR, under the \
-             {TARGET_SNR:.0} dB aimed at"
-        )
-    } else {
-        format!(
-            "the weakest tenth of its clients would hear it at {heard:.0} dB SNR, more than \
-             {HEADROOM:.0} dB over the {TARGET_SNR:.0} dB aimed at: less power reaches fewer neighbours"
-        )
-    };
+    // Lower: less power reaches fewer neighbours.
+    let way = if next > p0 { "higher" } else { "lower" };
+    let why = format!("SNR {heard:.0} dB, target {TARGET_SNR:.0} → {way} power");
     (Some(next), Some(why))
 }
 
@@ -501,16 +485,12 @@ pub fn plan(inputs: &Inputs) -> Plan {
     let country = site.country.as_deref().unwrap_or("");
     let table = rules.countries.get(country);
     let mut notes = vec![format!(
-        "No AP reports scans of other channels: the plan rests on each radio's survey of its own \
-         channel and its clients' signal over the last {} h, and moves a radio only onto spectrum \
-         one of the site's radios has measured, or off a conflict. What clients hear of an AP is \
-         estimated with clients sending at {} dBm.",
-        rules.window_hours, rules.client_dbm
+        "Based on each radio's own channel over the last {} h. APs don't scan other channels.",
+        rules.window_hours
     )];
     if table.is_none() {
         notes.push(format!(
-            "The configuration has no channel table for the site's country ({country:?}): nothing \
-             is proposed."
+            "No channel table for country {country:?}. Nothing proposed."
         ));
     }
     let mut ctx = Ctx {
@@ -543,34 +523,21 @@ pub fn plan(inputs: &Inputs) -> Plan {
             // there, clamped, which is never out of step.
             let limit = ctx.power_limit(ap, sr.band, sr.channel);
             let stated = sr.power.map(|p| capped(p, limit));
-            if let (Some(p), Some(s)) = (sr.power, stated)
-                && s < p
-            {
-                notes.push(format!(
-                    "{ap}'s {} radio: the site file's {p} dBm is clamped to {s} dBm, the most it \
-                     sends on channel {}",
-                    band_name(sr.band),
-                    sr.channel
-                ));
-            }
             let dfs = channels::block(sr.band, sr.channel, width)
                 .and_then(|b| ctx.dfs_of(sr.band, &b).ok())
                 .unwrap_or(false);
             let mut pending = false;
             // What keeps the whole radio as it is.
             let whole = match (snap, radio) {
-                (None, _) => Some(format!("{ap} is not one of this controller's APs")),
-                (Some(None), _) => Some(format!("{ap} is not connected")),
-                (_, None) => Some(format!("{ap} reports no {} radio", band_name(sr.band))),
-                (_, Some(r)) if !r.up => Some("the radio is down".into()),
-                _ if sr.width.is_none() => {
-                    Some("its width is one the planner does not handle".into())
-                }
+                (None, _) => Some("not this controller's AP".into()),
+                (Some(None), _) => Some("AP offline".into()),
+                (_, None) => Some(format!("AP reports no {} radio", band_name(sr.band))),
+                (_, Some(r)) if !r.up => Some("radio down".into()),
+                _ if sr.width.is_none() => Some("width not handled by the planner".into()),
                 (_, Some(r)) if (r.channel, r.width_mhz) != (sr.channel, width) => {
                     pending = true;
                     Some(format!(
-                        "not as planned: it runs channel {} at {} MHz, the site file says \
-                         channel {} at {width} MHz",
+                        "runs ch {} at {} MHz, site file says ch {} at {width} MHz",
                         r.channel, r.width_mhz, sr.channel
                     ))
                 }
@@ -581,19 +548,19 @@ pub fn plan(inputs: &Inputs) -> Plan {
                 {
                     pending = true;
                     Some(format!(
-                        "not as planned: it sends at {} dBm, the site file says {} dBm",
+                        "sends {} dBm, site file says {} dBm",
                         runs(r).power.unwrap_or_default(),
                         stated.unwrap_or_default()
                     ))
                 }
-                _ if sr.pins.radio => Some("the site file keeps it (planner: fixed)".into()),
+                _ if sr.pins.radio => Some("pinned in site file (planner: fixed)".into()),
                 _ => None,
             };
             let power_kept = sr.pins.power || whole.is_some();
             let channel = sr
                 .pins
                 .channel
-                .then(|| "the site file keeps its channel (planner: fixed)".to_owned());
+                .then(|| "channel pinned in site file (planner: fixed)".to_owned());
             let kept = whole.or(channel);
             items.push(Item {
                 ap,
@@ -701,7 +668,7 @@ pub fn clash(site: &Site, chosen: &[(String, Band, Setting)]) -> Option<String> 
                 && channels::overlap(*band, &block_of(*band, s), &block_of(*band, t));
             if shared {
                 return Some(format!(
-                    "{a}'s {} radio on channel {} would share spectrum with {b}'s on channel {}",
+                    "{a} {} ch {} overlaps {b} ch {}",
                     band_name(*band),
                     s.channel,
                     t.channel
@@ -788,7 +755,7 @@ fn choose(ctx: &Ctx, item: &Item, clients: &[(f64, f64)]) -> (Option<Candidate>,
     let stay = candidate(ctx, item, clients, (sr.channel, width));
     if let Some(kept) = &item.kept {
         let mut why = vec![kept.clone()];
-        why.extend(here.err().map(|e| format!("though {e}")));
+        why.extend(here.err().map(|e| format!("but {e}")));
         return (stay, why);
     }
     let widths = &ctx.rules.widths[band_index(sr.band)];
@@ -810,17 +777,10 @@ fn choose(ctx: &Ctx, item: &Item, clients: &[(f64, f64)]) -> (Option<Candidate>,
             .into_iter()
             .reduce(|a, b| if better(&b, &a, true) { b } else { a });
         let Some(best) = best else {
-            return (
-                None,
-                vec![format!("{e}, and no setting it may use is left")],
-            );
+            return (None, vec![format!("{e} · no allowed setting left")]);
         };
-        let onto = if best.measured {
-            ""
-        } else {
-            ", onto spectrum none of the site's radios has measured"
-        };
-        return (Some(best), vec![format!("{e}, so it moves{onto}")]);
+        // The UI marks a move onto unmeasured spectrum itself.
+        return (Some(best), vec![e]);
     };
     // A move it is free not to make must rest on measurements and be worth it.
     let moves = all
@@ -829,8 +789,7 @@ fn choose(ctx: &Ctx, item: &Item, clients: &[(f64, f64)]) -> (Option<Candidate>,
     match moves.reduce(|a, b| if better(b, a, false) { b } else { a }) {
         Some(b) if b.score >= stay.score * (1.0 + GAIN) => {
             let why = format!(
-                "channel {} at {} MHz measured {:.0} % busy with other networks, against {:.0} % on its own: \
-                 {:.0} % more for its clients",
+                "ch {} at {} MHz {:.0} % busy from other networks vs {:.0} % now · +{:.0} % for clients",
                 b.primary,
                 b.width,
                 b.foreign,
@@ -898,32 +857,22 @@ fn decide(ctx: &Ctx, item: &Item) -> Proposal {
         }
         let moves = block_of(sr.band, &p.proposed) != block_of(sr.band, &current);
         if c.dfs && moves {
-            p.restart = Some(
-                "a DFS channel: it needs a radar check (CAC), which a live channel switch cannot \
-                 run, so it takes effect with the next configuration push"
-                    .into(),
-            );
+            p.restart = Some("DFS radar check (CAC) · applies at next config push".into());
         }
         why.extend(c.power_why);
     }
     if m.is_none() && item.kept.is_none() && !p.changes() {
-        why.push(format!(
-            "nothing was measured on it in the last {} h",
-            ctx.rules.window_hours
-        ));
+        why.push(format!("nothing measured in {} h", ctx.rules.window_hours));
     }
     if why.is_empty() {
         let primary = if sr.pins.primary {
-            " (its primary channel is kept: no_pri_sec_switch)"
+            " (primary pinned: no_pri_sec_switch)"
         } else {
             ""
         };
-        why.push(format!(
-            "no setting it may use scores {:.0} % better{primary}",
-            GAIN * 100.0
-        ));
+        why.push(format!("no option {:.0} % better{primary}", GAIN * 100.0));
     }
-    p.reason = why.join("; ");
+    p.reason = why.join(" · ");
     p
 }
 
@@ -1182,16 +1131,12 @@ mod tests {
         let moved = of(&p, "ap2/radio24");
         let ch = moved.proposed.channel;
         assert!(ch <= 2 || ch >= 10, "channel {ch} still overlaps 6");
-        assert_eq!(
-            moved.reason,
-            "it would share spectrum with ap1's channel 6, so it moves, onto spectrum none of \
-             the site's radios has measured"
-        );
+        assert_eq!(moved.reason, "overlaps ap1 ch 6");
         assert!(!moved.measured);
         assert_eq!(changed(&p), ["ap2/radio24"]);
         // It frees nothing another proposal takes: no group.
         assert_eq!(moved.group, None);
-        assert!(p.notes[0].contains("No AP reports scans"));
+        assert!(p.notes[0].contains("APs don't scan other channels"));
     }
 
     #[test]
@@ -1202,7 +1147,7 @@ mod tests {
         let kept = of(&p, "ap2/radio5");
         assert_eq!(
             kept.kept.as_deref(),
-            Some("the site file keeps its channel (planner: fixed)")
+            Some("channel pinned in site file (planner: fixed)")
         );
         assert_eq!(at(&kept.proposed), (149, 80, Some(23)));
         for r in p.radios.iter().filter(|r| r.band == Band::B6) {
@@ -1250,11 +1195,7 @@ mod tests {
         );
         let r5 = of(&run(&kept, &snaps, &h, &rules()), "ap1/radio5").clone();
         assert_eq!(r5.proposed.channel, 36);
-        assert!(
-            r5.reason.contains("its primary channel is kept"),
-            "{}",
-            r5.reason
-        );
+        assert!(r5.reason.contains("primary pinned"), "{}", r5.reason);
         // A 20/40 MHz network of others on 165 and 169 heard by ap1: the
         // block there must take its primary, whichever it is.
         let heard = |primary, secondary| {
@@ -1288,8 +1229,7 @@ mod tests {
         assert_eq!(at(&r6.proposed), (37, 160, Some(24)));
         assert_eq!((r6.snr, r6.snr_change), (Some(19.0), 6.0));
         assert!(
-            r6.reason
-                .contains("would hear it at 19 dB SNR, under the 25 dB"),
+            r6.reason.contains("SNR 19 dB, target 25 → higher power"),
             "{}",
             r6.reason
         );
@@ -1351,9 +1291,6 @@ mod tests {
         assert!(!of(&p, "ap1/radio24").changes());
         assert!(!of(&p, "ap1/radio24").pending);
         assert_eq!(of(&p, "ap1/radio24").planned_power, Some(17));
-        assert!(p.notes.iter().any(|n| n
-            == "ap1's 2.4 GHz radio: the site file's 20 dBm is clamped to 17 dBm, the most it \
-                sends on channel 6"));
         // ap2's moves for its channel alone, its power as the file has it.
         assert_eq!(of(&p, "ap2/radio24").proposed.power, Some(20));
     }
@@ -1382,11 +1319,6 @@ mod tests {
         assert!(!r6.pending, "{:?}", r6.kept);
         assert_eq!(r6.planned_power, Some(19));
         assert_eq!(r6.proposed.power, r6.current.power);
-        assert!(
-            p.notes
-                .iter()
-                .any(|n| n.contains("26 dBm is clamped to 19 dBm"))
-        );
     }
 
     /// An AP that reports no limit: its radios keep their power.
@@ -1418,7 +1350,7 @@ mod tests {
         assert!(r5.measured);
         assert!(
             r5.reason
-                .contains("measured 4 % busy with other networks, against 40 % on its own"),
+                .contains("4 % busy from other networks vs 40 % now"),
             "{}",
             r5.reason
         );
@@ -1491,7 +1423,7 @@ mod tests {
         let alone = [("ap1".to_owned(), Band::B6, r1.proposed)];
         assert_eq!(
             clash(&site, &alone).as_deref(),
-            Some("ap1's 6 GHz radio on channel 69 would share spectrum with ap2's on channel 69")
+            Some("ap1 6 GHz ch 69 overlaps ap2 ch 69")
         );
         let together = [alone[0].clone(), ("ap2".to_owned(), Band::B6, r2.proposed)];
         assert_eq!(clash(&site, &together), None);
@@ -1509,14 +1441,12 @@ mod tests {
         assert!(!r5.changes() && r5.pending);
         assert_eq!(
             r5.kept.as_deref(),
-            Some(
-                "not as planned: it runs channel 44 at 80 MHz, the site file says channel 36 at 80 MHz"
-            )
+            Some("runs ch 44 at 80 MHz, site file says ch 36 at 80 MHz")
         );
         assert_eq!(r5.runs.map(|s| s.channel), Some(44));
         let r6 = of(&p, "ap1/radio6");
         assert!(!r6.changes());
-        assert_eq!(r6.reason, "nothing was measured on it in the last 24 h");
+        assert_eq!(r6.reason, "nothing measured in 24 h");
         // Power the radio does not send at yet is out of step too.
         let mut quiet = fixture("ap1");
         quiet[2].dbm = 12;
@@ -1526,30 +1456,27 @@ mod tests {
         assert!(r6.pending);
         assert_eq!(
             r6.kept.as_deref(),
-            Some("not as planned: it sends at 12 dBm, the site file says 18 dBm")
+            Some("sends 12 dBm, site file says 18 dBm")
         );
         // ap2 away: its spectrum is kept, so ap1 moves off its 2.4 GHz channel.
         let (_, a) = snapshots(&fixture("ap1"));
         let p = run(SITE, &[("ap1", Some(&a)), ("ap2", None)], &h, &rules());
-        assert_eq!(
-            of(&p, "ap2/radio24").kept.as_deref(),
-            Some("ap2 is not connected")
-        );
+        assert_eq!(of(&p, "ap2/radio24").kept.as_deref(), Some("AP offline"));
         assert!(of(&p, "ap1/radio24").changes());
         let p = run(SITE, &[("ap1", Some(&a))], &h, &rules());
         assert_eq!(
             of(&p, "ap2/radio6").kept.as_deref(),
-            Some("ap2 is not one of this controller's APs")
+            Some("not this controller's AP")
         );
         let mut none = rules();
         none.countries.clear();
         let p = run(SITE, &[("ap1", Some(&a)), ("ap2", Some(&b))], &h, &none);
-        assert!(p.notes[1].contains("no channel table"));
+        assert!(p.notes[1].contains("No channel table"));
         assert!(
             p.radios
                 .iter()
                 .filter(|r| r.kept.is_none())
-                .all(|r| r.reason.contains("no setting it may use is left"))
+                .all(|r| r.reason.contains("no allowed setting left"))
         );
     }
 
