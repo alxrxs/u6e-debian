@@ -3,9 +3,11 @@
 //! which ARP inspection and the IP source guard report as a client using
 //! another's address. Such a report is a sleep proxy's, not a violation,
 //! when the client advertises `_sleep-proxy._udp` itself (an offer within
-//! its TTL) and its newest address record for that address stands (within
-//! its TTL, at most [`RECORD_MAX_MS`]) and is newer than any its bound owner
-//! sent of it: the owner announcing its own again ends it. Any other report,
+//! its TTL) and sent an address record of that address within
+//! [`RECORD_MAX_MS`], whatever its TTL (a proxy answers on demand and never
+//! announces again, so its records outlive their TTL), newer than any its
+//! bound owner sent of it: the proxy's goodbye of the address, or the owner
+//! announcing its own, ends it. Any other report,
 //! and those of the other guards, stays a violation. The APs' guards know
 //! nothing of this: where they enforce, they drop the proxy's frames still.
 //!
@@ -22,8 +24,8 @@ use crate::services::{Site, live};
 
 /// The service type a sleep proxy advertises.
 pub const SERVICE: &str = "_sleep-proxy._udp.local";
-/// The longest an address record counts as answered for, whatever TTL it
-/// gave.
+/// How long after it last came a proxy's address record counts as answered
+/// for, whatever TTL it gave.
 pub const RECORD_MAX_MS: u64 = 2 * 3600 * 1000;
 /// The (proxy, address) pairs remembered, at most.
 pub const PAIRS: usize = 256;
@@ -60,7 +62,7 @@ pub fn address(v: &Violation) -> Option<Ipv4Addr> {
 
 /// Whether `a` still stands at `now_ms`.
 fn stands(a: &MdnsAddr, now_ms: u64) -> bool {
-    a.at_ms + (u64::from(a.ttl_s) * 1000).min(RECORD_MAX_MS) > now_ms
+    a.at_ms + RECORD_MAX_MS > now_ms
 }
 
 /// A change of whether a client answers for an address as a sleep proxy.
@@ -198,12 +200,12 @@ mod tests {
     }
 
     /// The live case: the speaker offers a sleep proxy and answered for the
-    /// sleeper's address 30 s ago, the sleeper last an hour ago.
+    /// sleeper's address 30 s ago, the sleeper last three hours ago.
     fn proxying() -> (Vec<MdnsDevice>, Vec<MdnsOffer>) {
         let own = Ipv4Addr::new(192, 0, 2, 14);
         let devices = vec![
             device(PROXY, &[(own, 120, 5000), (ip(), 120, 30_000)]),
-            device(OWNER, &[(ip(), 120, 3_600_000)]),
+            device(OWNER, &[(ip(), 120, 3 * 3_600_000)]),
         ];
         (devices, vec![offer(PROXY, SERVICE, 4500, 60_000)])
     }
@@ -242,13 +244,20 @@ mod tests {
         let (mut devices, offers) = proxying();
         devices[0].addrs.retain(|a| a.ip != IpAddr::V4(ip()));
         assert_eq!(judge(&devices, &offers, &report(Guard::Arp)), None);
-        // Nor one whose record ran out, said goodbye, or is past the cap
-        // whatever its TTL.
-        for (ttl, ago) in [(120, 121_000), (0, 1000), (u32::MAX, RECORD_MAX_MS)] {
+        // Its record counts for the hold whatever its TTL: not past it, nor
+        // once it said goodbye.
+        let cases = [
+            (120, 121_000, Some(OWNER)),
+            (120, RECORD_MAX_MS - 1, Some(OWNER)),
+            (120, RECORD_MAX_MS, None),
+            (u32::MAX, RECORD_MAX_MS, None),
+            (0, 1000, None),
+        ];
+        for (ttl, ago, want) in cases {
             let (mut devices, offers) = proxying();
             (devices[0].addrs[1].ttl_s, devices[0].addrs[1].at_ms) = (ttl, NOW - ago);
             let got = judge(&devices, &offers, &report(Guard::Arp));
-            assert_eq!(got, None, "TTL {ttl}, {ago} ms ago");
+            assert_eq!(got, want, "TTL {ttl}, {ago} ms ago");
         }
     }
 
