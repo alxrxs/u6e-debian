@@ -48,7 +48,8 @@ const ACCEL: i32 = 2;
 /// ECM's own message buffer: one connection fits in one read.
 const BUF: usize = 32 * 1024;
 
-/// One connection; "from" is the end that opened it.
+/// One connection; "from" is the end ECM saw send first, which for bridged
+/// traffic need not be the one that opened it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Conn {
     pub proto: u8,
@@ -58,7 +59,7 @@ pub struct Conn {
     pub dst: IpAddr,
     pub dport: u16,
     pub dst_mac: [u8; 6],
-    /// What the opening end sent, and what the other end sent.
+    /// What the "from" end sent, and what the other end sent.
     pub from_bytes: u64,
     pub to_bytes: u64,
     pub from_packets: u64,
@@ -323,9 +324,9 @@ impl EcmTable {
     }
 }
 
-/// `c` as the station at its opening end (`opened`) or at the other sees it.
-fn flow(c: &Conn, opened: bool) -> Flow {
-    let (tx_bytes, rx_bytes, tx_packets, rx_packets) = if opened {
+/// `c` as the station at its `src` end (`is_src`) or at the other sees it.
+fn flow(c: &Conn, is_src: bool) -> Flow {
+    let (tx_bytes, rx_bytes, tx_packets, rx_packets) = if is_src {
         (c.from_bytes, c.to_bytes, c.from_packets, c.to_packets)
     } else {
         (c.to_bytes, c.from_bytes, c.to_packets, c.from_packets)
@@ -342,7 +343,7 @@ fn flow(c: &Conn, opened: bool) -> Flow {
         rx_packets,
         offloaded: c.offloaded,
         age_s: c.age_s,
-        client_is_src: opened,
+        client_is_src: is_src,
     }
 }
 
@@ -557,8 +558,8 @@ mod tests {
         let macs: Vec<_> = f.clients.iter().map(|c| c.mac).collect();
         assert_eq!(macs, [m(0x08), m(0x0e), m(0x0f), m(0x16)]);
         let v6 = |n: u16| IpAddr::from([0x2001, 0xdb8, 0, 0, 0, 0, 0, n]);
-        // :0f is the far end of an mDNS connection a wired host opened, so it
-        // sent none of its bytes.
+        // :0f is the far end of an mDNS connection a wired host sent first
+        // on, so it sent none of its bytes.
         assert_eq!(
             f.clients[2],
             ClientFlows {
@@ -662,7 +663,7 @@ mod tests {
             ]
         );
         assert_eq!(f.clients[0].top[0].src, f.clients[1].top[0].src);
-        // Each says which end it is: the one that opened it, and the other.
+        // Each says which end it is: `src`, or the other.
         let ends: Vec<_> = f.clients.iter().map(|c| c.top[0].client_is_src).collect();
         assert_eq!(ends, [true, false, true]);
     }

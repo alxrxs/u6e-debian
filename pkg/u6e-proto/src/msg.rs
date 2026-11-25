@@ -641,7 +641,8 @@ pub struct Flow {
     pub rx_packets: u64,
     pub offloaded: bool,
     pub age_s: u32,
-    /// The client is `src`, the end that opened it; else it is `dst`.
+    /// The client is `src`, the end ECM saw send first (not necessarily the
+    /// one that opened it); else it is `dst`.
     pub client_is_src: bool,
 }
 

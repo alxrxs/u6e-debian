@@ -42,13 +42,14 @@ export function flowTable(rows, { of } = {}) {
     h('tbody', {}, rows.map(({ flow: f, mac }) => {
       // The remote end is the one that is not the client's.
       const inbound = !f.client_is_src;
+      const opened = { client: 'connected out', remote: 'connected in' }[f.opened];
       const [rip, rport, lport] = inbound ? [f.src, f.sport, f.dport] : [f.dst, f.dport, f.sport];
       return h('tr', {},
         of ? h('td', { class: 'c-client' }, of(mac)) : null,
         h('td', { class: 'c-proto' }, protoName(f.proto)),
         h('td', { class: 'c-remote' }, h('span', { class: 'mono' }, endpoint(rip, rport, f.proto)),
           f.remote_name ? h('small', { class: 'rname' }, f.remote_name) : null,
-          inbound ? h('small', {}, 'opened by the remote end') : null),
+          opened ? h('small', {}, opened) : null),
         h('td', { class: 'c-port mono', 'data-label': 'port' }, PORTS.has(f.proto) ? String(lport) : '–'),
         h('td', { class: 'c-down num', 'data-label': '↓' }, bytes(f.rx_bytes)),
         h('td', { class: 'c-up num', 'data-label': '↑' }, bytes(f.tx_bytes)),

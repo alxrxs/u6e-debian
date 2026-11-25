@@ -2483,10 +2483,10 @@ fn flows_api_shape() {
         "top": [
             {"proto": 6, "src": "192.0.2.10", "sport": 50000, "dst": "198.51.100.1",
              "dport": 443, "tx_bytes": 1000, "rx_bytes": 10000, "tx_packets": 10,
-             "rx_packets": 20, "offloaded": true, "age": 30, "client_is_src": true},
+             "rx_packets": 20, "offloaded": true, "age": 30, "client_is_src": true, "opened": "client"},
             {"proto": 6, "src": "2001:db8::10", "sport": 50000, "dst": "2001:db8:1::1",
              "dport": 443, "tx_bytes": 10, "rx_bytes": 100, "tx_packets": 10,
-             "rx_packets": 20, "offloaded": false, "age": 30, "client_is_src": true},
+             "rx_packets": 20, "offloaded": false, "age": 30, "client_is_src": true, "opened": "client"},
         ],
     });
     let want = json!({"ap1": {"at": at, "seq": 1, "complete": true,

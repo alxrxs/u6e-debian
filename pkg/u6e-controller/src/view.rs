@@ -134,8 +134,31 @@ pub fn flows_of(state: &State, f: &Flows, at: SystemTime, client: Option<[u8; 6]
     })
 }
 
-/// One connection; `src` opened it, the client is the end
-/// `client_is_src` says, and tx/rx are the client's.
+/// The lowest port of the ephemeral range Linux and most systems pick a
+/// connection's own port from.
+const EPHEMERAL: u16 = 32768;
+
+/// Which end opened `f`, `client` or `remote`, when its ports tell: one
+/// ephemeral against one below the range. ECM's `src` is only the end it saw
+/// send first, often mid-stream, so it says nothing of that.
+fn opener(f: &Flow) -> Option<&'static str> {
+    if !matches!(f.proto, 6 | 17 | 132) {
+        return None;
+    }
+    let (client, remote) = if f.client_is_src {
+        (f.sport, f.dport)
+    } else {
+        (f.dport, f.sport)
+    };
+    match (client >= EPHEMERAL, remote >= EPHEMERAL) {
+        (true, false) => Some("client"),
+        (false, true) => Some("remote"),
+        _ => None,
+    }
+}
+
+/// One connection; the client is the end `client_is_src` says, tx/rx are
+/// the client's, and `opened` the end that opened it when its ports tell.
 fn flow(state: &State, f: &Flow) -> Value {
     let mut o = json!({
         "proto": f.proto,
@@ -150,6 +173,7 @@ fn flow(state: &State, f: &Flow) -> Value {
         "offloaded": f.offloaded,
         "age": f.age_s,
         "client_is_src": f.client_is_src,
+        "opened": opener(f),
     });
     if let Some(name) = state.dns_name(&names::remote(f)) {
         o["remote_name"] = name.into();
@@ -1309,6 +1333,35 @@ fn counters(prev: &Station, now: &Station, secs: f64) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_opener_is_told_by_an_ephemeral_port_alone() {
+        let conn = |client_is_src, sport, dport| Flow {
+            proto: 6,
+            src: "192.0.2.10".parse().unwrap(),
+            sport,
+            dst: "198.51.100.7".parse().unwrap(),
+            dport,
+            tx_bytes: 0,
+            rx_bytes: 0,
+            tx_packets: 0,
+            rx_packets: 0,
+            offloaded: false,
+            age_s: 0,
+            client_is_src,
+        };
+        // A camera's connection out, though ECM saw the far end send first.
+        assert_eq!(opener(&conn(false, 30001, 47224)), Some("client"));
+        assert_eq!(opener(&conn(true, 47224, 30001)), Some("client"));
+        // A server on the client: its port 8009, the far end's 51234.
+        assert_eq!(opener(&conn(true, 8009, 51234)), Some("remote"));
+        // Both ephemeral, or both below the range: nothing to tell.
+        assert_eq!(opener(&conn(true, 50000, 60000)), None);
+        assert_eq!(opener(&conn(true, 443, 8080)), None);
+        let mut icmp = conn(true, 47224, 30001);
+        icmp.proto = 1;
+        assert_eq!(opener(&icmp), None);
+    }
 
     #[test]
     fn diff_is_a_merge_patch_of_what_changed() {
