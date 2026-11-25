@@ -789,7 +789,7 @@ fn choose(ctx: &Ctx, item: &Item, clients: &[(f64, f64)]) -> (Option<Candidate>,
     match moves.reduce(|a, b| if better(b, a, false) { b } else { a }) {
         Some(b) if b.score >= stay.score * (1.0 + GAIN) => {
             let why = format!(
-                "ch {} at {} MHz {:.0} % busy from other networks vs {:.0} % now · +{:.0} % for clients",
+                "quieter ch {} at {} MHz: {:.0} % vs {:.0} % other networks · +{:.0} % for clients",
                 b.primary,
                 b.width,
                 b.foreign,
@@ -1349,8 +1349,7 @@ mod tests {
         assert_eq!(at(&r5.proposed), (165, 80, Some(23)), "{}", r5.reason);
         assert!(r5.measured);
         assert!(
-            r5.reason
-                .contains("4 % busy from other networks vs 40 % now"),
+            r5.reason.contains("4 % vs 40 % other networks"),
             "{}",
             r5.reason
         );
