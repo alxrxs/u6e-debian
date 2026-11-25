@@ -135,6 +135,10 @@ pub struct Services {
     status: HashMap<OfferKey, (Status, String)>,
     /// The APs whose whole table came since the last look.
     fresh: BTreeSet<String>,
+    /// Each AirPlay offer's group as it last told it, kept while a member
+    /// of that group is at the site: a pair stays one while a member is
+    /// silent, gone or forgotten.
+    members: BTreeMap<OfferKey, Member>,
     pub events: VecDeque<Event>,
 }
 
@@ -337,11 +341,28 @@ impl Services {
             }
             seen.insert(key, (now, (*ap).to_owned()));
         }
-        let home = site
+        let home: BTreeMap<[u8; 6], String> = site
             .devices
             .iter()
             .map(|(ap, d)| (d.mac, (*ap).to_owned()))
             .collect();
+        let told: Vec<(OfferKey, Member)> = (site.offers.iter())
+            .filter_map(|(_, o)| Some(((o.mac, o.instance.clone()), member(o, now_ms)?)))
+            .collect();
+        // An offer that tells no group now keeps the one it told last.
+        self.members.extend(told);
+        let alive: BTreeSet<(&str, String)> = (self.members.iter())
+            .filter(|((mac, _), _)| home.contains_key(mac))
+            .map(|(_, m)| (m.by, m.id.clone()))
+            .collect();
+        self.members
+            .retain(|_, m| alive.contains(&(m.by, m.id.clone())));
+        while self.members.len() > MDNS_OFFERS {
+            let oldest = (self.members.iter())
+                .min_by_key(|(_, m)| m.seen_ms)
+                .map(|(k, _)| k.clone());
+            oldest.map(|k| self.members.remove(&k));
+        }
         (self.status, self.home) = (seen, home);
         self.fresh.clear();
         for e in &out {
@@ -352,6 +373,41 @@ impl Services {
         }
         out
     }
+}
+
+/// An AirPlay offer's group, as it last told it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Member {
+    /// `gid`, else `tsid`, and its value.
+    by: &'static str,
+    id: String,
+    name: Option<String>,
+    leader: bool,
+    seen_ms: u64,
+}
+
+fn txt<'a>(o: &'a MdnsOffer, key: &str) -> Option<&'a str> {
+    let v = (o.txt.iter())
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str());
+    v.filter(|v| !v.is_empty())
+}
+
+/// The group `o` tells at `now_ms`, when it is an AirPlay offer that tells
+/// one.
+fn member(o: &MdnsOffer, now_ms: u64) -> Option<Member> {
+    if !o.service.eq_ignore_ascii_case(AIRPLAY) {
+        return None;
+    }
+    let (by, id) =
+        (txt(o, "gid").map(|g| ("gid", g))).or_else(|| txt(o, "tsid").map(|t| ("tsid", t)))?;
+    Some(Member {
+        by,
+        id: id.to_owned(),
+        name: txt(o, "gpn").map(str::to_owned),
+        leader: txt(o, "igl") == Some("1"),
+        seen_ms: now_ms,
+    })
 }
 
 /// The site's view of the APs' tables: each device from its AP.
@@ -453,8 +509,9 @@ fn macs(list: &[[u8; 6]]) -> Value {
     list.iter().map(|m| Value::from(mac::format(*m))).collect()
 }
 
-fn offer_json(o: &MdnsOffer, now_ms: u64) -> Value {
-    let status = if o.withdrawn.is_some() {
+/// How an offer stands at `now_ms`, as the UI reads it.
+fn offer_status(o: &MdnsOffer, now_ms: u64) -> &'static str {
+    if o.withdrawn.is_some() {
         "gone"
     } else if !live(o, now_ms) {
         "unconfirmed"
@@ -464,7 +521,11 @@ fn offer_json(o: &MdnsOffer, now_ms: u64) -> Value {
         "answering"
     } else {
         "missing"
-    };
+    }
+}
+
+fn offer_json(o: &MdnsOffer, now_ms: u64) -> Value {
+    let status = offer_status(o, now_ms);
     let txt: Map<String, Value> = (o.txt.iter())
         .map(|(k, v)| (k.clone(), Value::from(v.as_str())))
         .collect();
@@ -601,7 +662,7 @@ pub fn view(
     json!({
         "aps": aps_json(services, now_ms),
         "devices": devices,
-        "groups": groups(&site, device),
+        "groups": groups(services, &site, device, now_ms),
         "services": services_json,
         "targets": targets(&site),
     })
@@ -633,38 +694,45 @@ fn aps_json(services: &Services, now_ms: u64) -> Value {
 /// sharing a group, named by their `gpn`, the leader `igl=1`. A group is its
 /// `gid` (the AirPlay group, which a stereo pair's members share), else its
 /// `tsid` (the timing group, which they share too); both are read, as which
-/// one a HomePod pair sets is to be seen on the real pair.
-fn groups(site: &Site, device: Option<[u8; 6]>) -> Value {
-    fn txt<'a>(o: &'a MdnsOffer, key: &str) -> Option<&'a str> {
-        let v = o
-            .txt
-            .iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.as_str());
-        v.filter(|v| !v.is_empty())
-    }
-    let mut by_group: BTreeMap<(&str, &str), Vec<&MdnsOffer>> = BTreeMap::new();
-    for (_, o) in &site.offers {
-        let group =
-            (txt(o, "gid").map(|g| ("gid", g))).or_else(|| txt(o, "tsid").map(|t| ("tsid", t)));
-        if let Some(group) = group
-            && o.service.eq_ignore_ascii_case(AIRPLAY)
-        {
-            by_group.entry(group).or_default().push(o);
-        }
+/// one a HomePod pair sets is to be seen on the real pair. Each member is
+/// the group as its offer last told it, with how that offer stands now
+/// (`gone` once no AP holds it) and since when a silent one has been; a
+/// group shows while one of its members is at `site`.
+fn groups(services: &Services, site: &Site, device: Option<[u8; 6]>, now_ms: u64) -> Value {
+    let here: BTreeSet<[u8; 6]> = site.devices.iter().map(|(_, d)| d.mac).collect();
+    let offers: BTreeMap<(&[u8; 6], &str), &MdnsOffer> = (site.offers.iter())
+        .map(|(_, o)| ((&o.mac, o.instance.as_str()), *o))
+        .collect();
+    let mut by_group: BTreeMap<(&str, &str), Vec<(&OfferKey, &Member)>> = BTreeMap::new();
+    for (k, m) in &services.members {
+        by_group.entry((m.by, &m.id)).or_default().push((k, m));
     }
     let list: Vec<Value> = (by_group.into_iter())
-        .filter(|(_, members)| members.iter().map(|o| o.mac).collect::<BTreeSet<_>>().len() > 1)
-        .filter(|(_, members)| device.is_none_or(|d| members.iter().any(|o| o.mac == d)))
-        .map(|((by, id), members)| {
-            let name = members.iter().find_map(|o| txt(o, "gpn"));
-            let members: Vec<Value> = (members.iter())
-                .map(|o| {
+        .filter(|(_, ms)| ms.iter().map(|(k, _)| k.0).collect::<BTreeSet<_>>().len() > 1)
+        .filter(|(_, ms)| ms.iter().any(|(k, _)| here.contains(&k.0)))
+        .filter(|(_, ms)| device.is_none_or(|d| ms.iter().any(|(k, _)| k.0 == d)))
+        .map(|((by, id), ms)| {
+            let name = (ms.iter())
+                .filter(|(_, m)| m.name.is_some())
+                .max_by_key(|(_, m)| m.seen_ms)
+                .and_then(|(_, m)| m.name.clone());
+            let members: Vec<Value> = (ms.iter())
+                .map(|(k, m)| {
+                    let status = (offers.get(&(&k.0, k.1.as_str())))
+                        .map_or("gone", |o| offer_status(o, now_ms));
+                    let since = match services.status.get(*k) {
+                        Some((Status::Silent { since_ms }, _)) if status == "silent" => {
+                            Some(*since_ms)
+                        }
+                        _ => None,
+                    };
                     json!({
-                        "mac": mac::format(o.mac),
-                        "instance": o.instance,
-                        "label": instance_label(&o.instance),
-                        "leader": txt(o, "igl") == Some("1"),
+                        "mac": mac::format(k.0),
+                        "instance": k.1,
+                        "label": instance_label(&k.1),
+                        "leader": m.leader,
+                        "status": status,
+                        "since": since,
                     })
                 })
                 .collect();
@@ -1159,6 +1227,77 @@ mod tests {
         let v = view(&s, None, None, &Names, T0);
         assert_eq!(v["groups"][0]["tsid"], "T1");
         assert_eq!(v["groups"][0]["members"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_group_outlives_a_member_that_stops_answering_or_leaves() {
+        let mut s = Services::default();
+        s.apply("ap1", pair_table(), T0);
+        let members = |s: &Services| {
+            let v = view(s, None, None, &Names, T0 + 9000);
+            (v["groups"][0]["members"].as_array().cloned())
+                .unwrap_or_default()
+                .iter()
+                .map(|m| {
+                    (
+                        m["label"].as_str().unwrap().to_owned(),
+                        m["status"].clone(),
+                        m["since"].clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        // The right misses three in a row: silent since its first miss.
+        let mut right = offer(RIGHT, "Right", "G", false);
+        (right.missed, right.missed_in_row) = (3, 3);
+        right.missed_ms = Some(BOOT + 1000);
+        let delta = |r: Read| Read {
+            now_ms: BOOT + 2000,
+            ..r
+        };
+        s.apply(
+            "ap1",
+            delta(Read {
+                offers: vec![right],
+                ..Read::default()
+            }),
+            T0 + 2000,
+        );
+        assert_eq!(
+            members(&s),
+            [
+                ("Left".into(), json!("answering"), Value::Null),
+                ("Right".into(), json!("silent"), json!(T0 + 1000)),
+            ]
+        );
+        // The left stops telling its group, the right leaves the AP: still
+        // one group, the right gone from it.
+        let mut left = offer(LEFT, "Left", "G", true);
+        left.txt.retain(|(k, _)| k != "gid");
+        let gone = Read {
+            offers: vec![left],
+            gone: vec![
+                MdnsKey::Offer(RIGHT, format!("Right.{AIRPLAY}")),
+                MdnsKey::Device(RIGHT),
+            ],
+            ..Read::default()
+        };
+        s.apply("ap1", delta(gone), T0 + 3000);
+        assert_eq!(
+            members(&s),
+            [
+                ("Left".into(), json!("answering"), Value::Null),
+                ("Right".into(), json!("gone"), Value::Null),
+            ]
+        );
+        // With the left gone too, the group is.
+        let both = Read {
+            gone: vec![MdnsKey::Device(LEFT)],
+            ..Read::default()
+        };
+        s.apply("ap1", delta(both), T0 + 4000);
+        assert!(members(&s).is_empty());
+        assert!(s.members.is_empty());
     }
 
     #[test]
