@@ -84,7 +84,8 @@ W=$RF/etc/systemd/system/multi-user.target.wants
 ln -sf /usr/lib/systemd/system/systemd-networkd.service $W/systemd-networkd.service
 
 # Boot traces on raw eMMC sectors past the last partition (survive the
-# fallback to stock): early marker at 5000000, full log at 5001000.
+# fallback to stock): early marker at 5000000, full log at 5001000; the last
+# firmware crash dump goes at 5010000 (up to 32 MiB, see u6e-coredump).
 cat > $RF/usr/local/sbin/u6e-bootlog <<'LOG'
 #!/bin/sh
 # Full boot trace once the system is up; raw sectors only, never stock's filesystems.
@@ -983,6 +984,13 @@ rm -f $RF/etc/systemd/system/multi-user.target.wants/qrtr-ns.service
 # A radio's firmware crash dump stays in sysfs for five minutes only: keep the
 # latest one (about 4 MB compressed) for scp, and log where it is. Firmware
 # memory holds the session keys, so it is root's only.
+# A radio the driver recovered from a crash comes back serving clients but
+# starved of downlink (iPhones flee it every 20-60 s; restarting hostapd does
+# not help), so the access point reboots instead: the dump goes to raw eMMC
+# sectors past the boot traces first (data, then the header naming it, so a
+# torn write leaves no header), and u6e-coredump-restore puts it back at boot.
+# Not within 10 minutes of boot, so a radio that crashes at every start cannot
+# turn the access point into a reboot loop.
 cat > $RF/usr/local/sbin/u6e-coredump <<'DUMP'
 #!/bin/sh
 set -eu
@@ -993,11 +1001,59 @@ rm -f $dir/*.gz
 f=$dir/$(date -u +%Y%m%dT%H%M%SZ)-$dev.gz
 gzip -1 < "$1/data" > "$f"
 echo 1 > "$1/data"
-logger -t u6e-coredump -p daemon.warning "firmware crash dump of $dev saved: $f ($(stat -c %s "$f") bytes)"
+size=$(stat -c %s "$f")
+logger -t u6e-coredump -p daemon.warning "firmware crash dump of $dev saved: $f ($size bytes)"
+up=$(cut -d. -f1 /proc/uptime)
+if [ "$up" -lt 600 ]; then
+	logger -t u6e-coredump -p daemon.err "not rebooting: up only ${up}s, so $dev runs on as the driver recovered it"
+	exit 0
+fi
+if [ "$size" -le 33553920 ]; then
+	dd if="$f" of=/dev/mmcblk0 bs=512 seek=5010001 conv=fsync,sync 2>/dev/null
+	printf 'U6EDUMP %s %s\n' "${f##*/}" "$size" | dd of=/dev/mmcblk0 bs=512 seek=5010000 conv=fsync,sync 2>/dev/null
+else
+	logger -t u6e-coredump -p daemon.err "crash dump of $dev too large to keep across the reboot ($size bytes)"
+fi
+logger -t u6e-coredump -p daemon.warning "rebooting: $dev crashed and a recovered radio is not trusted"
+systemctl --no-block reboot
 DUMP
 chmod 0755 $RF/usr/local/sbin/u6e-coredump
 printf '%s\n' 'ACTION=="add", SUBSYSTEM=="devcoredump", RUN+="/usr/local/sbin/u6e-coredump /sys%p"' \
 	> $RF/etc/udev/rules.d/80-u6e-coredump.rules
+# The dump the last crash kept on eMMC back into /var/lib/u6e-coredump, and
+# the raw copy wiped (it holds firmware memory, so the session keys).
+cat > $RF/usr/local/sbin/u6e-coredump-restore <<'RESTORE'
+#!/bin/sh
+set -eu
+umask 077
+read -r magic name size <<EOF || true
+$(dd if=/dev/mmcblk0 bs=512 skip=5010000 count=1 2>/dev/null | tr -d '\0' | head -n1)
+EOF
+[ "$magic" = U6EDUMP ] || exit 0
+case $name in *[!0-9A-Za-z.:_-]* | '' | .*) exit 1 ;; esac
+case $size in *[!0-9]* | '') exit 1 ;; esac
+[ "$size" -le 33553920 ]
+dir=/var/lib/u6e-coredump
+mkdir -p $dir
+dd if=/dev/mmcblk0 bs=512 skip=5010001 count=$(((size + 511) / 512)) 2>/dev/null | head -c "$size" > "$dir/$name"
+dd if=/dev/zero of=/dev/mmcblk0 bs=512 seek=5010000 count=$(((size + 511) / 512 + 1)) conv=fsync 2>/dev/null
+logger -t u6e-coredump -p daemon.warning "firmware crash dump from before the reboot restored: $dir/$name ($size bytes)"
+RESTORE
+chmod 0755 $RF/usr/local/sbin/u6e-coredump-restore
+cat > $RF/etc/systemd/system/u6e-coredump-restore.service <<'UNIT'
+[Unit]
+Description=U6E firmware crash dump from before the reboot, back from eMMC
+Requires=dev-mmcblk0.device
+After=dev-mmcblk0.device local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/u6e-coredump-restore
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+ln -sf /etc/systemd/system/u6e-coredump-restore.service $W/u6e-coredump-restore.service
 depmod -b $RF "$R"
 
 # Firmware: ath11k for this board's radios, its Bluetooth, and regdb only.
