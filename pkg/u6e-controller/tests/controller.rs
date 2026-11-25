@@ -1245,6 +1245,74 @@ fn assets_served_with_cache_headers() {
     }
 }
 
+#[test]
+fn the_operators_brand_and_theme_are_served_with_the_page() {
+    let r = controller(Timing::default());
+    let (_, page) = http_request(r.c.http, "/", "");
+    assert!(page.contains("<span>Wi-Fi</span>"), "{page}");
+    assert!(!page.contains("/theme/"), "{page}");
+    let (head, _) = http_request(r.c.http, "/theme/theme.css", "");
+    assert!(head.starts_with("http/1.1 404"), "{head}");
+
+    let dir = TempDir::new("themed");
+    let theme = dir.0.join("theme");
+    fs::create_dir_all(theme.join("fonts")).unwrap();
+    fs::write(theme.join("theme.css"), ":root { --accent: #123456; }").unwrap();
+    fs::write(theme.join("fonts/sans.woff2"), "wOF2").unwrap();
+    let extra = format!(
+        "[ui]\nbrand = \"Example <Org>\"\ntheme = \"{}\"\n",
+        theme.display()
+    );
+    let r = configured(
+        Timing::default(),
+        &dir.0,
+        420,
+        Arc::new(FakeStage::default()),
+        &extra,
+    );
+    let (head, page) = http_request(r.c.http, "/", "");
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert!(
+        header(&head, "content-security-policy").is_some_and(|c| c.contains("font-src 'self'"))
+    );
+    assert!(
+        page.contains("<title>Example &lt;Org&gt; Wi-Fi controller</title>"),
+        "{page}"
+    );
+    assert!(page.contains("<span class=\"brand-name\">Example &lt;Org&gt;</span> Wi-Fi"));
+    // After the built-in stylesheet, so its tokens win.
+    let builtin = page.find("/style.css").unwrap();
+    let themed = page.find("href=\"/theme/theme.css\"").unwrap();
+    assert!(builtin < themed, "{page}");
+
+    let (head, body) = http_request(r.c.http, "/theme/theme.css", "");
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert_eq!(
+        header(&head, "content-type"),
+        Some("text/css; charset=utf-8")
+    );
+    assert_eq!(header(&head, "cache-control"), Some("no-cache"));
+    assert_eq!(body, ":root { --accent: #123456; }");
+    let tag = header(&head, "etag").unwrap().to_owned();
+    let (head, _) = http_request(
+        r.c.http,
+        "/theme/theme.css",
+        &format!("If-None-Match: {tag}\r\n"),
+    );
+    assert!(head.starts_with("http/1.1 304"), "{head}");
+    let (head, _) = http_request(r.c.http, "/theme/fonts/sans.woff2", "");
+    assert_eq!(header(&head, "content-type"), Some("font/woff2"));
+    for missing in [
+        "/theme/../config.toml",
+        "/theme/%2e%2e/theme/theme.css",
+        "/theme/fonts",
+        "/theme/nope.css",
+    ] {
+        let (head, _) = http_request(r.c.http, missing, "");
+        assert!(head.starts_with("http/1.1 404"), "{missing}: {head}");
+    }
+}
+
 /// The quoted import specifiers of a module (`from './x.js'`).
 fn imports(module: &str) -> Vec<String> {
     let after = module.split("from '").skip(1);

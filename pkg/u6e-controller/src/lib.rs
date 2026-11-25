@@ -69,6 +69,7 @@ pub mod state;
 mod store;
 #[cfg(test)]
 mod testdir;
+pub mod theme;
 pub mod timeline;
 pub mod traffic;
 pub mod view;

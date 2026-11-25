@@ -33,6 +33,8 @@ import vlans from './views/vlans.js';
 const HISTORY = 1800;
 const SAMPLE_MS = 2000;
 const EVENTS_KEPT = 5000;
+/** The UI's name, the operator's brand before "Wi-Fi" when they set one. */
+const NAME = document.querySelector('meta[name="application-name"]').content;
 
 const store = {
   state: { aps: {}, clients: {} },
@@ -479,7 +481,7 @@ function render() {
       : `Controller unreachable. Retry in ${s} s.`;
   }
   const title = { devices: 'Devices', clients: 'Clients', client: 'Client', auth: 'Auth problems', vlans: 'VLANs', flows: 'Flows', roaming: 'Roaming', services: 'Services', spectrum: 'Spectrum', config: 'Config', events: 'Events', test: 'Test my connection' }[currentName];
-  document.title = `${title} – Wi-Fi`;
+  document.title = `${title} – ${NAME}`;
   current?.update();
 }
 

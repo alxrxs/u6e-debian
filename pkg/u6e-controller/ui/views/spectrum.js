@@ -102,7 +102,7 @@ function setup(canvas) {
   const ctx = canvas.getContext('2d');
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, w, ht);
-  ctx.font = '11px system-ui, -apple-system, "Segoe UI", sans-serif';
+  ctx.font = `11px ${palette().sans}`;
   return { ctx, w, h: ht };
 }
 
@@ -207,7 +207,7 @@ function drawSpectrum(canvas, frame, hold, band, primary) {
   if (!frame) {
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.font = '13px system-ui, -apple-system, "Segoe UI", sans-serif';
+    ctx.font = `13px ${p.sans}`;
     ctx.fillText('Shown while the radio scans.', (box.l + box.r) / 2, (box.t + box.b) / 2);
     return;
   }
@@ -224,9 +224,9 @@ function drawSpectrum(canvas, frame, hold, band, primary) {
     ctx.globalAlpha = 1;
     ctx.fillStyle = colour;
     ctx.textAlign = 'center';
-    ctx.font = '600 11px system-ui, -apple-system, "Segoe UI", sans-serif';
+    ctx.font = `600 11px ${p.sans}`;
     ctx.fillText('Primary', x(primary), box.t - 5);
-    ctx.font = '11px system-ui, -apple-system, "Segoe UI", sans-serif';
+    ctx.font = `11px ${p.sans}`;
   }
   ctx.strokeStyle = p.rule;
   ctx.setLineDash([2, 3]);

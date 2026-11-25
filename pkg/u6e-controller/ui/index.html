@@ -4,9 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
-<title>Wi-Fi controller</title>
+<title>{{name}} controller</title>
+<meta name="application-name" content="{{name}}">
 <link rel="icon" href="{{assets}}/icon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="{{assets}}/style.css">
+{{theme}}
 <script src="{{assets}}/theme.js"></script>
 <link rel="modulepreload" href="{{assets}}/util.js">
 <link rel="modulepreload" href="{{assets}}/charts.js">
@@ -31,8 +33,8 @@
 <body>
 <header class="bar">
   <a class="brand" href="#/devices">
-    <img src="{{assets}}/icon.svg" alt="" width="22" height="22">
-    <span>Wi-Fi</span>
+    <img class="brand-icon" src="{{assets}}/icon.svg" alt="" width="22" height="22">
+    <span>{{brand}}Wi-Fi</span>
   </a>
   <nav class="tabs" aria-label="Views">
     <a href="#/devices" data-view="devices">Devices</a>

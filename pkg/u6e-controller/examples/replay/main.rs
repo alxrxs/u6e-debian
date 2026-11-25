@@ -61,12 +61,14 @@
 //! (`vlans`), which puts each on its entry's VLAN as it joins; with
 //! `--bao-down` it answers every request 503, as a sealed one does, and
 //! with `--mapping-refused` the mapping has a group RADIUS refuses.
+//! `--brand=<name>` and `--theme=<directory>` are the `[ui]` section's, to
+//! see a theme as it is served.
 //! The web listener adds what the sign-in proxy in front of a controller
 //! would: a user, a member of the admin group unless `--viewer` is given,
 //! and, unless the request names one, the address of the laptop
 //! (`02:00:00:00:00:02`) as the one it came from, so the Test page tests it.
 //!
-//!   cargo run -p u6e-controller --example replay [-- [<web address>] [--viewer] [--ha-down] [--bao-down] [--mapping-refused]]
+//!   cargo run -p u6e-controller --example replay [-- [<web address>] [--viewer] [--ha-down] [--bao-down] [--mapping-refused] [--brand=<name>] [--theme=<directory>]]
 //!
 //! The web address defaults to 127.0.0.1:8080.
 
@@ -1573,6 +1575,14 @@ async fn main() -> io::Result<()> {
     let ha_down = args.iter().any(|a| a == "--ha-down");
     let bao_down = args.iter().any(|a| a == "--bao-down");
     let refused = args.iter().any(|a| a == "--mapping-refused");
+    let flag = |name: &str| args.iter().find_map(|a| a.strip_prefix(name));
+    let mut ui = String::new();
+    if let Some(b) = flag("--brand=") {
+        ui += &format!("brand = {b:?}\n");
+    }
+    if let Some(t) = flag("--theme=") {
+        ui += &format!("theme = {t:?}\n");
+    }
     let web = args
         .iter()
         .find(|a| !a.starts_with("--"))
@@ -1618,7 +1628,7 @@ async fn main() -> io::Result<()> {
          leave_after_secs = 60\ndevices = [{{ mac = \"{}\", name = \"office_printer\" }}, \
          {{ mac = \"{}\", name = \"spare_phone\" }}]\n\
          [mac_auth]\nurl = \"https://127.0.0.1:{}\"\nca = \"{}/ca.pem\"\ntoken = \"{}\"\n\
-         path = \"mac-auth\"\nvlans = [{}]\nssids = [\"{}\"]\n",
+         path = \"mac-auth\"\nvlans = [{}]\nssids = [\"{}\"]\n[ui]\n{}",
         policy.display(),
         history.display(),
         managed.join("captures").display(),
@@ -1641,6 +1651,7 @@ async fn main() -> io::Result<()> {
         bao_token.display(),
         vlans::VLANS.map(|v| v.to_string()).join(", "),
         vlans::SSID,
+        ui,
     );
     let config = Config::parse(&config).map_err(io::Error::other)?;
     let identity = Identity::from_pem(KEY_CONTROLLER).map_err(io::Error::other)?;

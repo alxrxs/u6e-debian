@@ -203,6 +203,7 @@ export function palette() {
     surface: get('surface'), sunken: get('sunken'), other: get('other'), accent: get('accent'),
     ok: get('ok'), warn: get('warn'), bad: get('bad'),
     band: { '2.4': get('b24'), 5: get('b5'), 6: get('b6') },
+    sans: get('sans'),
   };
 }
 

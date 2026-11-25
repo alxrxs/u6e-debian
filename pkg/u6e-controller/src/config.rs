@@ -42,7 +42,10 @@
 //! KV-v2 mount (`secret` unless set) and path, the VLANs an admin may put a
 //! device in, the SSIDs whose clients MAC authentication places, the most
 //! entries the mapping may hold (`entries_max`, 512 unless set); the
-//! mapping is not shown or edited without it.
+//! mapping is not shown or edited without it; and, in `[ui]`, the web UI's
+//! branding (`theme`): the name shown before "Wi-Fi" (`brand`) and the
+//! directory of the operator's theme served at `/theme/` (`theme`), the
+//! built-in look without it.
 //!
 //! ```toml
 //! listen_agents = "[::]:8443"
@@ -106,6 +109,10 @@
 //! path = "mac-auth"
 //! vlans = [42, 43]
 //! ssids = ["iot"]
+//!
+//! [ui]
+//! brand = "Example Org"
+//! theme = "/etc/wifi-controller/theme"
 //! ```
 
 use std::collections::{BTreeMap, HashMap};
@@ -117,7 +124,7 @@ use serde::Deserialize;
 use u6e_proto::mac;
 use u6e_proto::msg::{Binding, GuardConfig, Limit, LimitTarget, Rate, check_limits};
 
-use crate::{configs, leases, macauth, mtls, presence, radius, rf, roaming, rollout};
+use crate::{configs, leases, macauth, mtls, presence, radius, rf, roaming, rollout, theme};
 
 /// The parsed, checked configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,6 +180,7 @@ pub struct Config {
     pub mac_auth: Option<macauth::Settings>,
     /// The host's monitoring certificate, if anything speaks mutual TLS.
     pub monitoring_tls: Option<mtls::Settings>,
+    pub ui: theme::Settings,
 }
 
 impl Config {
@@ -233,6 +241,7 @@ struct File {
     presence: Option<PresenceFile>,
     mac_auth: Option<MacAuthFile>,
     monitoring_tls: Option<MonitoringTlsFile>,
+    ui: Option<theme::File>,
 }
 
 #[derive(Deserialize)]
@@ -450,6 +459,8 @@ pub enum ConfigError {
     MacAuth(String),
     /// `[monitoring_tls]` is not one, or a `tls = true` has none: why.
     MonitoringTls(String),
+    /// `[ui]` is not one: why.
+    Ui(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -466,7 +477,7 @@ impl fmt::Display for ConfigError {
                 "public_origin is not scheme://host[:port] (no path, no trailing slash)",
             ),
             Self::NoAdminGroup => f.write_str("admin_group is empty"),
-            Self::Section(e) | Self::Rf(e) => f.write_str(e),
+            Self::Section(e) | Self::Rf(e) | Self::Ui(e) => f.write_str(e),
             Self::BadExporter(e) => write!(f, "leases.exporters: {e:?} is not host:port"),
             Self::Radius(e) => write!(f, "radius: {e}"),
             Self::Guards(e) => write!(f, "guards: {e}"),
@@ -563,6 +574,10 @@ impl Config {
         }
         let presence = file.presence.map(presence_settings).transpose()?;
         let mac_auth = file.mac_auth.map(mac_auth_settings).transpose()?;
+        let ui = file
+            .ui
+            .map_or_else(|| Ok(theme::Settings::default()), theme::File::check)
+            .map_err(ConfigError::Ui)?;
         Ok(Config {
             listen_agents: file.listen_agents,
             listen_http: file.listen_http,
@@ -589,6 +604,7 @@ impl Config {
             presence,
             mac_auth,
             monitoring_tls,
+            ui,
         })
     }
 }

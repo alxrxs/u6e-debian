@@ -49,6 +49,7 @@ use crate::policy::{self, Policy, Store};
 use crate::rf::{self, Planner};
 use crate::rollout::Engine;
 use crate::state::{Action, Shared, State, Waiter, action_name};
+use crate::theme;
 
 /// The user the sign-in proxy names.
 pub const USER_HEADER: &str = "x-forwarded-preferred-username";
@@ -73,6 +74,8 @@ pub struct Access {
     pub rollouts: Option<Engine>,
     /// The reverse lookups of what a page shows.
     pub lookups: Lookups,
+    /// The operator's brand and theme.
+    pub ui: theme::Settings,
 }
 
 impl Access {
@@ -86,6 +89,7 @@ impl Access {
             rf: rf::from(config.rf.as_ref()),
             rollouts: None,
             lookups,
+            ui: config.ui.clone(),
         }
     }
 }

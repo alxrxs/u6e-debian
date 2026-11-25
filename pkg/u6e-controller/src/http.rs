@@ -4,9 +4,10 @@
 //!
 //! The UI's files are served under `/assets/<version>/`, the version a hash of
 //! them all, so they can be cached for good and a new binary still reaches
-//! every browser at once; the page itself is revalidated on each load. The
-//! WebSocket's first message names the APs it watches (`{"subscribe":["ap1"]}`
-//! or `{"subscribe":"*"}`, with `"flows":true` for their clients' flows too);
+//! every browser at once; the page itself is revalidated on each load, and
+//! carries the operator's brand and theme, the theme's files served under
+//! `/theme/` (`theme`). The WebSocket's first message names the APs it
+//! watches (`{"subscribe":["ap1"]}` or `{"subscribe":"*"}`, with `"flows":true` for their clients' flows too);
 //! it then gets their state as one JSON `key`, a JSON merge `patch` of what
 //! changed after each update, and their new `events`. While it is open each of
 //! those APs reports every 2 s, and its flows every 10 s (less often for a
@@ -57,7 +58,7 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -77,7 +78,7 @@ use crate::services;
 use crate::spectrum::{self, Watching};
 use crate::state::{Change, Full, ROLLOUT_LOG_CAP, Shared, WatchGuard};
 use crate::view;
-use crate::{captures, limits, macauth, names, rf, sessions, speedtest, traffic};
+use crate::{captures, limits, macauth, names, rf, sessions, speedtest, theme, traffic};
 
 /// How long a new WebSocket may take to say what it watches.
 const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -94,9 +95,10 @@ const JS: &str = "text/javascript; charset=utf-8";
 const SVG: &str = "image/svg+xml";
 
 /// The page allows only its own files and its own WebSocket (and the
-/// stylesheet's inline `data:` images).
+/// stylesheet's inline `data:` images), a theme's fonts among them.
 const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; \
-                   connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+                   font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; \
+                   frame-ancestors 'none'";
 
 /// One embedded file of the UI.
 struct Asset {
@@ -144,17 +146,16 @@ const FILES: [Asset; 23] = [
 const INDEX: &str = include_str!("../ui/index.html");
 
 /// The files with their entity tags, the version they make up, and the page
-/// pointing at that version.
+/// pointing at that version (its brand and theme still to fill in).
 struct Ui {
     version: String,
     files: Vec<(&'static Asset, String)>,
     index: String,
-    index_tag: String,
 }
 
 /// A strong entity tag of `body`: its hash, which is all a cache needs to
 /// tell two versions apart.
-fn tag(body: &[u8]) -> String {
+pub(crate) fn tag(body: &[u8]) -> String {
     let mut h = DefaultHasher::new();
     h.write(body);
     format!("\"{:016x}\"", h.finish())
@@ -165,20 +166,40 @@ static UI: LazyLock<Ui> = LazyLock::new(|| {
     let all: String = files.iter().map(|(_, t)| t.as_str()).collect();
     let version = tag(all.as_bytes()).trim_matches('"')[..12].to_owned();
     let index = INDEX.replace("{{assets}}", &format!("/assets/{version}"));
-    let index_tag = tag(index.as_bytes());
     Ui {
         version,
         files,
         index,
-        index_tag,
     }
 });
 
+/// The page as this listener serves it, with its entity tag.
+struct Page {
+    html: String,
+    tag: String,
+}
+
 /// The web listener's routes.
 pub fn router(state: Shared, access: Access) -> Router {
+    let html = theme::page(&UI.index, &access.ui);
+    let page = Arc::new(Page {
+        tag: tag(html.as_bytes()),
+        html,
+    });
+    let dir: Option<Arc<std::path::Path>> = access.ui.theme.as_deref().map(Arc::from);
     Router::new()
-        .route("/", get(index))
+        .route(
+            "/",
+            get(move |req: HeaderMap| index(Arc::clone(&page), req)),
+        )
         .route("/assets/{*path}", get(asset))
+        .route(
+            "/theme/{*path}",
+            get(move |Path(path): Path<String>, req: HeaderMap| {
+                let dir = dir.clone();
+                async move { theme::file(dir.as_deref(), &path, &req).await }
+            }),
+        )
         .route("/api/aps", get(api_aps))
         .route("/api/clients", get(api_clients))
         .route("/api/events", get(api_events))
@@ -222,10 +243,10 @@ pub fn router(state: Shared, access: Access) -> Router {
 }
 
 /// `body` as `kind`, or 304 when the client holds `etag` already.
-fn cached(
+pub(crate) fn cached(
     req: &HeaderMap,
     kind: &'static str,
-    body: &'static [u8],
+    body: impl IntoResponse,
     etag: &str,
     cache: &'static str,
 ) -> Response {
@@ -250,9 +271,8 @@ fn cached(
     resp
 }
 
-async fn index(req: HeaderMap) -> Response {
-    let ui = &*UI;
-    let mut resp = cached(&req, HTML, ui.index.as_bytes(), &ui.index_tag, "no-cache");
+async fn index(page: Arc<Page>, req: HeaderMap) -> Response {
+    let mut resp = cached(&req, HTML, page.html.clone(), &page.tag, "no-cache");
     let h = resp.headers_mut();
     h.insert(
         header::CONTENT_SECURITY_POLICY,

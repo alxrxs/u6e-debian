@@ -141,7 +141,7 @@ function drawLine(canvas) {
   lo = Math.min(lo, ys[0]);
   hi = Math.max(hi, ys[ys.length - 1]);
 
-  ctx.font = '11px system-ui, -apple-system, "Segoe UI", sans-serif';
+  ctx.font = `11px ${p.sans}`;
   const left = Math.max(...ys.map((v) => ctx.measureText(format(v)).width)) + 10;
   const box = { l: left, r: w - 4, t: 6, b: h - 20 };
   const t0 = times[0];
@@ -223,7 +223,7 @@ function drawLine(canvas) {
     ctx.fill();
     lines.push(`${s.label} ${format(v)}`);
   }
-  ctx.font = '12px system-ui, -apple-system, "Segoe UI", sans-serif';
+  ctx.font = `12px ${p.sans}`;
   const tw = Math.max(...lines.map((l) => ctx.measureText(l).width)) + 16;
   const th = lines.length * 17 + 8;
   const tx = xx + 10 + tw > box.r ? xx - 10 - tw : xx + 10;
@@ -275,7 +275,7 @@ function drawBars(canvas) {
   const totals = Array.from({ length: count }, (_, i) => series.reduce((sum, s) => sum + (s.values[i] || 0), 0));
   const ys = ticks(0, Math.max(1, ...totals));
   const hi = ys[ys.length - 1];
-  ctx.font = '11px system-ui, -apple-system, "Segoe UI", sans-serif';
+  ctx.font = `11px ${p.sans}`;
   const left = Math.max(...ys.map((v) => ctx.measureText(format(v)).width)) + 10;
   const box = { l: left, r: w - 4, t: 6, b: h - 20 };
   const slot = (box.r - box.l) / count;
@@ -333,7 +333,7 @@ function drawBars(canvas) {
   ctx.globalAlpha = 1;
   const t = start + i * step;
   const lines = [`${dayOf(t)}, ${hm(t)}`, ...series.map((s) => `${s.label} ${format(s.values[i] || 0)}`)];
-  ctx.font = '12px system-ui, -apple-system, "Segoe UI", sans-serif';
+  ctx.font = `12px ${p.sans}`;
   const tw = Math.max(...lines.map((l) => ctx.measureText(l).width)) + 16;
   const th = lines.length * 17 + 8;
   const xx = box.l + (i + 0.5) * slot;
