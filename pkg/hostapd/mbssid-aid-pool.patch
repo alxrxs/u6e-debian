@@ -1,0 +1,122 @@
+From c6b5da27a7389c4aaefe66ebe2d1100d352d65a7 Mon Sep 17 00:00:00 2001
+From: Andrei-Alexandru Bleortu <me@andrei-z.com>
+Date: Thu, 26 Nov 2026 17:44:37 +0200
+Subject: [PATCH 1/2] AP: Release an MBSSID AID into the pool it was taken from
+
+Transmitted and nontransmitted BSSIDs share one AID pool, kept in the
+transmitted BSS. hostapd_get_aid() marked bit b there and gave out AID
+b + 2^n, but ap_free_sta() cleared bit AID - 1 in the station's own BSS.
+With a Multiple BSSID set (n > 0) that left the station's bit set, so
+each AID given on a nontransmitted BSSID was lost for good, and on the
+transmitted BSSID it released the bit of the next AID instead, which
+could belong to another associated station; the next station then got
+that station's AID as well.
+
+Keep bit AID - 1 for AID everywhere, as ap_free_sta(), the MLD link
+setup and the UHR reservation already do, and use the shared pool when
+an AID is released or marked for an MLD link. hostapd_get_aid() starts
+from AID 2^n, the first one the TIM leaves for STAs.
+
+On an ath11k AP with a Multiple BSSID set on 6 GHz, AIDs on the
+nontransmitted BSSID climbed to 2007 within hours of roaming, and 210
+associations in two months were given an AID another associated STA
+held.
+
+Assisted-by: LLM
+Signed-off-by: Andrei-Alexandru Bleortu <me@andrei-z.com>
+---
+ src/ap/ieee802_11.c | 31 ++++++++++++++-----------------
+ src/ap/sta_info.c   |  9 ++++++---
+ 2 files changed, 20 insertions(+), 20 deletions(-)
+
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index 736b1bda3..430e913e2 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -6168,7 +6168,8 @@ static u32 hostapd_get_aid_word(struct hostapd_data *hapd,
+ 				continue;
+ 			}
+ 
+-			aid_word |= link_bss->sta_aid[i];
++			aid_word |=
++				hostapd_mbssid_get_tx_bss(link_bss)->sta_aid[i];
+ 		}
+ 
+ 		return aid_word;
+@@ -6242,11 +6243,12 @@ static int hostapd_get_wds_mld_ifname_id(struct hostapd_data *hapd,
+ 
+ int hostapd_get_aid(struct hostapd_data *hapd, struct sta_info *sta)
+ {
+-	int i, j = 32, aid;
++	int i, j, aid, first;
+ 
+ 	/* Transmitted and non-transmitted BSSIDs share the same AID pool, so
+ 	 * use the shared storage in the transmitted BSS to find the next
+-	 * available value. */
++	 * available value. Bit (AID - 1) of sta_aid[] stands for each AID, as
++	 * everywhere the pool is marked or released. */
+ 	hapd = hostapd_mbssid_get_tx_bss(hapd);
+ 
+ 	/* get a unique AID */
+@@ -6258,21 +6260,15 @@ int hostapd_get_aid(struct hostapd_data *hapd, struct sta_info *sta)
+ 	if (TEST_FAIL())
+ 		return -1;
+ 
+-	for (i = 0; i < AID_WORDS; i++) {
+-		u32 aid_word = hostapd_get_aid_word(hapd, sta, i);
+-
+-		if (aid_word == (u32) -1)
+-			continue;
+-		for (j = 0; j < 32; j++) {
+-			if (!(aid_word & BIT(j)))
+-				break;
+-		}
+-		if (j < 32)
++	/* In the TIM, bits 1 to 2^n - 1 stand for the nontransmitted BSSIDs
++	 * of the set, so the first AID for a STA is 2^n. */
++	first = 1 << hostapd_max_bssid_indicator(hapd);
++	for (aid = first; aid <= 2007; aid++) {
++		i = (aid - 1) / 32;
++		j = (aid - 1) % 32;
++		if (!(hostapd_get_aid_word(hapd, sta, i) & BIT(j)))
+ 			break;
+ 	}
+-	if (j == 32)
+-		return -1;
+-	aid = i * 32 + j + (1 << hostapd_max_bssid_indicator(hapd));
+ 	if (aid > 2007)
+ 		return -1;
+ 
+@@ -7904,7 +7900,8 @@ int ieee80211_ml_process_link(struct hostapd_data *hapd,
+ 			status = WLAN_STATUS_UNSPECIFIED_FAILURE;
+ 			goto out;
+ 		}
+-		hapd->sta_aid[(sta->aid - 1) / 32] |= BIT((sta->aid - 1) % 32);
++		hostapd_mbssid_get_tx_bss(hapd)->sta_aid[(sta->aid - 1) / 32] |=
++			BIT((sta->aid - 1) % 32);
+ 		sta->listen_interval = origin_sta->listen_interval;
+ 		if (update_ht_state(hapd, sta) > 0 && set_beacon)
+ 			*set_beacon = true;
+diff --git a/src/ap/sta_info.c b/src/ap/sta_info.c
+index a8b3fde78..b2d043561 100644
+--- a/src/ap/sta_info.c
++++ b/src/ap/sta_info.c
+@@ -339,9 +339,12 @@ void ap_free_sta(struct hostapd_data *hapd, struct sta_info *sta)
+ 	ap_sta_hash_del(hapd, sta);
+ 	ap_sta_list_del(hapd, sta);
+ 
+-	if (sta->aid > 0)
+-		hapd->sta_aid[(sta->aid - 1) / 32] &=
+-			~BIT((sta->aid - 1) % 32);
++	if (sta->aid > 0) {
++		/* The AID came from the pool the Multiple BSSID set shares */
++		struct hostapd_data *pool = hostapd_mbssid_get_tx_bss(hapd);
++
++		pool->sta_aid[(sta->aid - 1) / 32] &= ~BIT((sta->aid - 1) % 32);
++	}
+ 
+ #ifdef CONFIG_IEEE80211BE
+ 	if (sta->wds_ifname_id > 0 && remove) {
+-- 
+2.47.3
+
